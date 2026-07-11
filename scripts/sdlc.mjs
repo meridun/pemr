@@ -296,13 +296,14 @@ export function planHeal(labelNames) {
 }
 
 /**
- * Which local branches are safe to delete as ancestry-merged into `dev`.
- * `mergedBranches` is the raw `git branch --merged dev` line list. Never
- * returns dev, master, or the current branch. Pure — the caller still
- * re-confirms each with `git merge-base --is-ancestor` before deleting.
+ * Which local branches are safe to delete as ancestry-merged into the
+ * integration branch. `mergedBranches` is the raw `git branch --merged` line
+ * list. Never returns dev, main, master, or the current branch. Pure — the
+ * caller still re-confirms each with `git merge-base --is-ancestor` before
+ * deleting.
  */
 export function planBranchPrune(mergedBranches, currentBranch) {
-  const keep = new Set(['dev', 'master', currentBranch]);
+  const keep = new Set(['dev', 'main', 'master', currentBranch]);
   return (mergedBranches ?? [])
     .map((line) => {
       // `git branch` marks the current branch with `* ` and a branch checked
@@ -320,7 +321,7 @@ export function planBranchPrune(mergedBranches, currentBranch) {
 
 /** Branch names whose upstream shows `[gone]` in `git branch -vv` output. Pure. */
 export function parseGoneBranches(branchVvOutput, currentBranch) {
-  const keep = new Set(['dev', 'master', currentBranch]);
+  const keep = new Set(['dev', 'main', 'master', currentBranch]);
   const gone = [];
   for (const line of (branchVvOutput ?? '').split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -387,6 +388,22 @@ export function computeDigest(issues, prevNumbers = null) {
 
 const defaultGh = (args) => execFileSync('gh', args, { encoding: 'utf8' });
 const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8' });
+
+/**
+ * Integration branch for this repo, detected from origin/HEAD (falls back to
+ * `dev`, the template default). Memoized per process.
+ */
+let cachedIntegrationBranch = null;
+function integrationBranch(git) {
+  if (cachedIntegrationBranch) return cachedIntegrationBranch;
+  try {
+    const ref = git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).trim();
+    cachedIntegrationBranch = ref.replace(/^refs\/remotes\/origin\//, '') || 'dev';
+  } catch {
+    cachedIntegrationBranch = 'dev';
+  }
+  return cachedIntegrationBranch;
+}
 
 /** Fetch an issue's label names via gh. */
 function fetchLabelNames(gh, issue) {
@@ -500,12 +517,13 @@ function cmdWorktree(args, { git, log }, root) {
   const repoName = path.basename(root);
   const target = path.resolve(root, '..', `${repoName}-wt-${issue}`);
   git(['fetch', 'origin']);
-  // Reuse an existing branch if present; otherwise create it off origin/dev.
+  // Reuse an existing branch if present; otherwise create it off the
+  // integration branch's remote tip.
   const existing = git(['branch', '--list', branch]).trim();
   if (existing) {
     git(['worktree', 'add', target, branch]);
   } else {
-    git(['worktree', 'add', '-b', branch, target, 'origin/dev']);
+    git(['worktree', 'add', '-b', branch, target, `origin/${integrationBranch(git)}`]);
   }
   log(`worktree: ${target} (branch ${branch})`);
 }
@@ -641,34 +659,36 @@ function cmdGitMaint(args, { git, gh, log }) {
 
   git(['fetch', 'origin', '--prune']);
 
-  // Update dev without touching the working tree.
-  const devBefore = (() => {
+  const integ = integrationBranch(git);
+
+  // Update the integration branch without touching the working tree.
+  const integBefore = (() => {
     try {
-      return git(['rev-parse', 'dev']).trim();
+      return git(['rev-parse', integ]).trim();
     } catch {
       return null;
     }
   })();
   try {
-    if (current === 'dev') git(['pull', '--ff-only', 'origin', 'dev']);
-    else git(['fetch', 'origin', 'dev:dev']);
-    const devAfter = git(['rev-parse', 'dev']).trim();
+    if (current === integ) git(['pull', '--ff-only', 'origin', integ]);
+    else git(['fetch', 'origin', `${integ}:${integ}`]);
+    const integAfter = git(['rev-parse', integ]).trim();
     log(
-      devBefore === devAfter
-        ? 'dev update: already current'
-        : `dev update: ${devBefore?.slice(0, 8)}..${devAfter.slice(0, 8)}`,
+      integBefore === integAfter
+        ? `${integ} update: already current`
+        : `${integ} update: ${integBefore?.slice(0, 8)}..${integAfter.slice(0, 8)}`,
     );
   } catch (err) {
-    log(`dev update: skipped (${String(err.message).split('\n')[0]})`);
+    log(`${integ} update: skipped (${String(err.message).split('\n')[0]})`);
   }
 
   // Ancestry-merged prune.
-  const merged = git(['branch', '--merged', 'dev']).split(/\r?\n/);
+  const merged = git(['branch', '--merged', integ]).split(/\r?\n/);
   const candidates = planBranchPrune(merged, current);
   const pruned = [];
   for (const b of candidates) {
     try {
-      git(['merge-base', '--is-ancestor', b, 'dev']); // throws (nonzero) if not ancestor
+      git(['merge-base', '--is-ancestor', b, integ]); // throws (nonzero) if not ancestor
       git(['branch', '-D', b]);
       pruned.push(b);
     } catch {
