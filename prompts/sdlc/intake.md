@@ -1,6 +1,6 @@
 # Intake worker (template)
 
-Stage: `stage:intake` → `stage:design` *or* `stage:queued` · Owner: `proj-researcher`
+Stage: `stage:intake` → `stage:design` *or* `stage:queued` · Owner: `pemr-researcher`
 
 Triages one raw idea: is it coherent, in scope, and non-duplicate? Routes it forward, parks it
 for a human call, or closes it.

@@ -15,7 +15,7 @@ deep reference, decisions with lasting rationale.
 
 New knowledge goes here (L3) when it's: broadly useful, verified (not a hunch), and either too
 detailed for a skill (L2) or not needed often enough to justify auto-loading. See
-[proj-doc-tiers](../.github/skills/proj-doc-tiers/SKILL.md) for the full four-lens placement
+[pemr-doc-tiers](../.github/skills/pemr-doc-tiers/SKILL.md) for the full four-lens placement
 process.
 
 ## Suggested starting entry points

@@ -1,12 +1,12 @@
 ---
-name: proj-researcher
+name: pemr-researcher
 description: "Explore the codebase, find existing patterns, and gather context before implementation. Use when searching for prior art or answering architectural questions."
 tools: [read, search]
 model: haiku
 effort: low
 ---
 
-# proj-researcher
+# pemr-researcher
 
 Example agent shim — rename/replace for your project. Agent bodies are **shims**: this file
 should stay under 70 lines (CI-enforced by `scripts/check-meta-drift.mjs`). Real instructions

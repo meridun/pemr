@@ -1,14 +1,14 @@
 ---
-name: proj-doc-tiers
+name: pemr-doc-tiers
 description: Harvest session learnings into the documentation tier system and audit/reorganize the tiers (L1 copilot-instructions, L2 skills, L3 docs, agents, memory). Use when a session ends with discoverable information ("harvest this session", "update the doc tiers", "capture what we learned"), or when auditing, rebalancing, or reorganizing the documentation system.
 ---
 
-# proj-doc-tiers
+# pemr-doc-tiers
 
 Harvest session learnings into the documentation tier system, and audit/reorganize the tiers.
 This skill owns the tier **system** — placement, routing, budgets, freshness, and the
 memory-vs-docs boundary. Per-artifact authoring conventions stay in
-[proj-agent-skill](../proj-agent-skill/SKILL.md) — load it on demand when applying changes; do
+[pemr-agent-skill](../pemr-agent-skill/SKILL.md) — load it on demand when applying changes; do
 not duplicate its content here.
 
 ## When to Use
@@ -23,7 +23,7 @@ not duplicate its content here.
 
 - Authoring or editing a single L3 doc for a feature → do it directly, following
   `docs/Documentation.md`
-- Creating/updating one skill or agent with known placement → `proj-agent-skill`
+- Creating/updating one skill or agent with known placement → `pemr-agent-skill`
 - Recording something only relevant to the current conversation → nowhere; let it go
 
 ## Artifacts in Scope
@@ -68,7 +68,7 @@ Invoked at session end. Extract what the session learned and route each piece to
      **promote to L3** and shrink the memory to a pointer
 3. **Report** — table: finding → target artifact → action (create/update/delete/promote) →
    rationale (one line). Get approval before editing.
-4. **Apply** — load `proj-agent-skill` for skill/agent edits. Order: L3 first, L2 next, L1 last
+4. **Apply** — load `pemr-agent-skill` for skill/agent edits. Order: L3 first, L2 next, L1 last
    and only if routing changed.
 5. **Verify** — `npm run sync:claude-config && npm run check:meta-drift` (if adopted).
 
@@ -94,5 +94,5 @@ Full-system sweep, run occasionally or scoped on request ("audit just the skills
 
 ## Cross References
 
-- [proj-agent-skill](../proj-agent-skill/SKILL.md) — skill/agent authoring, promotion rules detail
+- [pemr-agent-skill](../pemr-agent-skill/SKILL.md) — skill/agent authoring, promotion rules detail
 - [docs/Documentation.md](../../../docs/Documentation.md) — L3 content governance
