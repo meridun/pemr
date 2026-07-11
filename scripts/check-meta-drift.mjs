@@ -8,11 +8,11 @@
  *   1. Agent shims growing back into content-copies. `.github/agents/*.agent.md`
  *      are shims — the real content lives in skills. If a body balloons past the
  *      cap it is almost certainly a restated skill table (finding #1).
- *   2. Dangling `proj-*` references. Any `proj-<name>` mentioned in the lane
+ *   2. Dangling `pemr-*` references. Any `pemr-<name>` mentioned in the lane
  *      prompts, agent shims, or copilot-instructions must resolve to a real
  *      `.github/skills/<name>/SKILL.md` OR a `.github/agents/<name>.agent.md`
  *      (finding #2/#3 — a prompt hard-depending on a skill that isn't there).
- *   3. SKILL.md files exceeding the L2 length cap from `proj-agent-skill`.
+ *   3. SKILL.md files exceeding the L2 length cap from `pemr-agent-skill`.
  *
  * Intentionally dumb: line counts + a reference regex, no markdown parsing.
  *
@@ -31,16 +31,16 @@ const SDLC_PROMPTS_DIR = path.join(ROOT, 'prompts', 'sdlc');
 const COPILOT_INSTRUCTIONS = path.join(ROOT, '.github', 'copilot-instructions.md');
 
 // Agent files are shims; the largest legitimate shim body today is ~54 lines
-// (proj-researcher). A content-copy drift blows well past this. Headroom
+// (pemr-researcher). A content-copy drift blows well past this. Headroom
 // keeps the check green on current files while still catching the drift class.
 export const AGENT_BODY_LINE_CAP = 70;
 
-// L2 length cap declared by the proj-agent-skill skill.
+// L2 length cap declared by the pemr-agent-skill skill.
 export const SKILL_LINE_CAP = 400;
 
-// Matches an proj-* reference token. Trailing punctuation (backticks, commas,
-// slashes for possessive `proj-x/y`) is excluded by the char class.
-const REF_RE = /proj-[a-z0-9]+(?:-[a-z0-9]+)*/g;
+// Matches an pemr-* reference token. Trailing punctuation (backticks, commas,
+// slashes for possessive `pemr-x/y`) is excluded by the char class.
+const REF_RE = /pemr-[a-z0-9]+(?:-[a-z0-9]+)*/g;
 
 /** Count body lines of an agent file (everything after the closing frontmatter `---`). */
 export function agentBodyLineCount(raw) {
@@ -54,7 +54,7 @@ export function agentBodyLineCount(raw) {
   return normalized.split(/\r?\n/).length;
 }
 
-/** Extract the unique set of proj-* reference tokens from text. */
+/** Extract the unique set of pemr-* reference tokens from text. */
 export function extractRefs(text) {
   return new Set(text.match(REF_RE) ?? []);
 }
@@ -67,12 +67,12 @@ async function readDirEntries(dir) {
   }
 }
 
-/** Set of valid proj-* names: skill directory names + agent file basenames. */
+/** Set of valid pemr-* names: skill directory names + agent file basenames. */
 async function collectKnownNames() {
   const known = new Set();
 
   for (const entry of await readDirEntries(SKILLS_DIR)) {
-    if (entry.isDirectory() && entry.name.startsWith('proj-')) {
+    if (entry.isDirectory() && entry.name.startsWith('pemr-')) {
       known.add(entry.name);
     }
   }
@@ -90,7 +90,7 @@ async function listFiles(dir, filter) {
     .map((e) => path.join(dir, e.name));
 }
 
-/** Files whose proj-* references must all resolve. */
+/** Files whose pemr-* references must all resolve. */
 async function referenceSources() {
   const files = [
     ...(await listFiles(SDLC_PROMPTS_DIR, (n) => n.endsWith('.md'))),
@@ -120,7 +120,7 @@ async function main() {
     }
   }
 
-  // Rule 2: dangling proj-* references.
+  // Rule 2: dangling pemr-* references.
   const known = await collectKnownNames();
   for (const file of await referenceSources()) {
     const text = await fs.readFile(file, 'utf8');

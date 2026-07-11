@@ -59,5 +59,5 @@ This repo was generated from
 [meridun/model-repo](https://github.com/meridun/model-repo) and carries its
 documentation-tier system, token-optimizer hooks, role-based model routing, and the agentic
 SDLC pipeline. See [docs/Documentation.md](docs/Documentation.md) and
-[docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The `proj-` skill/agent
-prefix is still the template default and will be renamed to `pemr-` as the app takes shape.
+[docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The skill/agent
+prefix has been renamed from the template default to `pemr-`.
