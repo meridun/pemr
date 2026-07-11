@@ -2,7 +2,12 @@
 
 Project-level adaptation of the orchestration pattern from
 [Nanako0129/pilotfish](https://github.com/Nanako0129/pilotfish) (MIT), restructured so the
-configuration is **repo-committed and shared** rather than per-machine global. The frontier model
+configuration is **repo-committed and shared** rather than per-machine global.
+
+> **Upstream pin:** blended from pilotfish **v1.1.2**. To re-sync with upstream, diff its
+> `templates/agents/` against `.github/agents/*.agent.md` and its
+> `templates/claude-md.orchestration.md` against the `## Orchestration` section of
+> `.github/copilot-instructions.md`, then bump this pin. The frontier model
 plans, decides, and reviews in the main session; cheaper models execute volume work through role
 agents. Quality is protected by fresh-context verification, not by using the biggest model
 everywhere.

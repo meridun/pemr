@@ -2,6 +2,8 @@
 name: proj-researcher
 description: "Explore the codebase, find existing patterns, and gather context before implementation. Use when searching for prior art or answering architectural questions."
 tools: Read, Grep, Glob
+model: haiku
+effort: low
 ---
 
 # proj-researcher
