@@ -66,9 +66,11 @@ one frontmatter line per agent file.
 Rules: spec delegations in one shot (goal, constraints, done-criteria, paths, and the *why*);
 start with the cheapest plausible role and escalate one tier after two failures; non-trivial
 changes get a `verifier` pass before "done" (fresh context beats self-critique); scout findings
-are inputs, not verified facts. Don't delegate single-file reads, decisions, or anything the user
-asked *you* to judge — delegation has overhead. If the harness can't spawn subagents (some
-Copilot surfaces), apply each role's checklist inline instead.
+are inputs, not verified facts — re-scout or sanity-check before a decision hinges on a single
+scouted fact; ad-hoc subagents outside these roles must set `model` explicitly — never let a
+fan-out inherit the main-session model. Don't delegate single-file reads, decisions, or anything
+the user asked *you* to judge — delegation has overhead. If the harness can't spawn subagents
+(some Copilot surfaces), apply each role's checklist inline instead.
 
 ## Tone
 
