@@ -1,0 +1,13 @@
+{
+  "name": "model-repo",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Template: doc-tier bootstrap, token optimizer tools, agentic SDLC setup",
+  "type": "module",
+  "scripts": {
+    "sync:claude-config": "node scripts/sync-claude-config.mjs",
+    "sync:claude-config:check": "node scripts/sync-claude-config.mjs --check",
+    "check:meta-drift": "node scripts/check-meta-drift.mjs",
+    "sdlc": "node scripts/sdlc.mjs"
+  }
+}

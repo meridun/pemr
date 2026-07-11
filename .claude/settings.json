@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/graphify-nudge.py 2>/dev/null || python .claude/hooks/graphify-nudge.py 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"Caveman mode: be terse. No preamble, no restated question, no closing recap or summary unless asked. Do not restate content already written into an artifact (file, issue, PR comment) this turn. The output format a task specifies is a ceiling, not a floor. Exception: security warnings, irreversible actions, and ambiguous multi-step plans get full sentences.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
