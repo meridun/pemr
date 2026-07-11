@@ -1,4 +1,45 @@
+# --- Node / template tooling ---
 node_modules/
 graphify-out/
 .sdlc-cache/
 *.log
+
+# --- PEMR: NO PERSONAL / MEDICAL DATA IN THIS REPO ---
+# This repository is FRAMEWORK + DOCUMENTATION ONLY. The live database, source
+# scans, generated exports, and backups all live OUTSIDE the repo (local-only /
+# cloud-synced data dir). The patterns below are a hard backstop so data can never
+# be committed even by accident.
+data/
+inbox/
+sources/
+exports/
+backups/
+config.toml
+
+# SQLite database + WAL sidecars (any name, anywhere)
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# Common medical document formats (backstop against dropping a scan in the tree)
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.dcm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Allow-list: example/template files that ARE framework, not data
+!docs/**/*.png
+!data/dictionary.example.toml

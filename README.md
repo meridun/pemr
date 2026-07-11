@@ -1,53 +1,63 @@
-# model-repo
+# pemr
 
-Template repo (`is_template: true` on GitHub — use the "Use this template" button, or
-`gh repo create my-new-project --template meridun/model-repo`).
+**Personal EMR** — a local-first, family-scale medical record framework. Source documents
+(scanned labs, visit notes, etc.) are retained as-is; a **SQLite database is the source of
+truth** for structured data. Deterministic work — ingest, deduplication, query, analysis,
+and brief-generation — lives in a **Python CLI engine** wrapped by a **thin MCP server**, so
+AI agents call typed tools instead of re-inventing the logic on every request.
 
-Bootstraps three things for a new project working with Claude Code / GitHub Copilot:
+> ⚠️ **This repository is framework + documentation only. No personal or medical data lives
+> here.** The live database, source scans, generated exports, and backups all reside outside
+> the repo in a local data directory. `.gitignore` hard-blocks databases, documents, and the
+> `data/ inbox/ sources/ exports/ backups/` dirs as a backstop.
 
-1. **Documentation tier system (L1/L2/L3)** — cheap-first context loading so agents don't
-   re-derive the same architecture facts every session. See
-   [docs/Documentation.md](docs/Documentation.md).
-2. **Token optimizer tools**:
-   - **Caveman mode** — a `UserPromptSubmit` hook that keeps agent replies terse by default
-     (`.claude/settings.json`).
-   - **vtk** — a git/gh/npm output-filtering wrapper (bring your own binary; wiring notes in
-     [docs/Development_TokenTools.md](docs/Development_TokenTools.md)).
-   - **graphify** — codebase-to-knowledge-graph tool with a `PreToolUse` nudge hook
-     (`.claude/hooks/graphify-nudge.py`) that steers agents to `graphify query` before raw
-     grep/read once a graph exists.
-3. **Role-based model routing** — six repo-committed role agents (`scout`, `Explore`,
-   `mech-executor`, `executor`, `verifier`, `security-executor`) pinned to cost tiers via
-   frontmatter, plus a role-only orchestration policy in L1. Adapted from
-   [pilotfish](https://github.com/Nanako0129/pilotfish) (MIT), moved from global to project
-   level so it ships with the repo. See
-   [docs/Development_ModelRouting.md](docs/Development_ModelRouting.md).
-4. **Agentic SDLC setup** — an issue-driven pipeline (`intake → design → queued → build →
-   verify → audit → ship`) with a deterministic `sdlc` CLI (`scripts/sdlc.mjs`) for the
-   label/branch mechanics, and worker prompts in `prompts/sdlc/`.
+## What it does
 
-## Quick start
+- **Ingest without duplication** — content-hash on source files (catches re-scans) plus
+  semantic dedup keys on extracted rows (same clinical fact from two documents → one row).
+- **Query fast** — canned + ad-hoc reads over a typed schema (labs, meds, procedures,
+  appointments) with a generic `observations` catch-all for the long tail.
+- **Generate on demand** — master health summary, per-appointment "walk-in readiness"
+  briefs, and a chronological journal, all rendered from the DB so they never drift.
+- **Extend to the whole family** — one DB, `person_id` on every row; adding a member is one
+  command, not a fork of the tooling.
 
-1. Generate a repo from this template.
-2. Rename the `proj-` skill/agent prefix to your project's own (find/replace across
-   `.github/skills/`, `.github/agents/`, `prompts/sdlc/`, `.github/copilot-instructions.md`,
-   `scripts/check-meta-drift.mjs`).
-3. Fill in `docs/Overview.md` and `docs/Architecture.md` with your actual system.
-4. `npm install` then `npm run sync:claude-config` to mirror `.github/` into `.claude/`.
-5. Delete anything you don't need (the SDLC pipeline in particular is opt-in — it assumes a
-   GitHub Issues-driven workflow with `gh` available).
+Full design — schema, dedup algorithm, ingest pipeline, tool surface, backup — in
+[docs/Architecture.md](docs/Architecture.md).
 
-## Layout
+## Design decisions
 
-```
-.github/copilot-instructions.md   L1 — loaded every request (principles + routing)
-.github/skills/*/SKILL.md         L2 — loaded on demand (detailed patterns)
-docs/*.md                         L3 — loaded explicitly (deep reference)
-.github/agents/*.agent.md         Subagent shims (canonical source)
-.claude/                          Claude Code mirror, generated — do not hand-edit
-prompts/sdlc/                     Agentic SDLC worker prompts
-scripts/                          sync-claude-config, check-meta-drift, sdlc CLI
-```
+| Area | Choice |
+|---|---|
+| Structured store | SQLite (source of truth); source scans retained on disk |
+| Schema | Hybrid — typed tables + generic `observations` |
+| Multi-person | Single DB, `person_id` everywhere |
+| Generated docs | Rendered views from the DB (disposable) |
+| Ingestion | Agent does vision→structure; tools validate + dedup + commit |
+| Interface | Python CLI engine + thin MCP wrapper |
+| Dedup | Content-hash (documents) + semantic keys (rows) |
+| Backup | `VACUUM INTO` snapshot → cloud-synced folder; live DB stays local |
 
-`.claude/skills/` and `.claude/agents/` are generated by `npm run sync:claude-config` from the
-`.github/` sources — never hand-edit them.
+## Status
+
+Pre-implementation. Design is locked; build proceeds in phases (skeleton → ingest/dedup →
+query → render → MCP → backup → care-gap rules) per the Architecture doc.
+
+## Data / privacy posture
+
+Local-first. The live `pemr.db` sits on a **non-synced** local path (WAL sidecars corrupt
+under cloud sync); only clean `VACUUM INTO` snapshots sync to Drive/OneDrive. Private-ish,
+not encrypted-at-rest by default — an encrypted-snapshot upgrade is a drop-in later. No
+HIPAA/PHI compliance layer and no provider interoperability; this is a personal archive, and
+it assists appointment prep and research — it does not give clinical advice.
+
+---
+
+## Framework scaffolding (from the template)
+
+This repo was generated from
+[meridun/model-repo](https://github.com/meridun/model-repo) and carries its
+documentation-tier system, token-optimizer hooks, role-based model routing, and the agentic
+SDLC pipeline. See [docs/Documentation.md](docs/Documentation.md) and
+[docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The `proj-` skill/agent
+prefix is still the template default and will be renamed to `pemr-` as the app takes shape.
