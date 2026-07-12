@@ -43,6 +43,9 @@ Full design — schema, dedup algorithm, ingest pipeline, tool surface, backup �
 Design is locked; build proceeds in phases (skeleton → ingest/dedup → query → render → MCP →
 backup → care-gap rules) per the Architecture doc. **Phase 1 (skeleton) is done**: package
 layout, `migrations/001_init.sql`, `pemr migrate`, `pemr person add|list|show`, config, CI.
+**Phase 2 (ingest + two-layer dedup) is done**: content-hash blob store + commit-extraction
+(`pemr ingest`), semantic dedup keys with conflict staging (`migrations/002_conflict.sql`,
+`pemr review-conflicts`), starter analyte/name dictionary.
 
 ## Data / privacy posture
 
