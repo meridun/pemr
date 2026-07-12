@@ -1,8 +1,8 @@
 {
-  "name": "model-repo",
+  "name": "pemr",
   "version": "0.0.1",
   "private": true,
-  "description": "Template: doc-tier bootstrap, token optimizer tools, agentic SDLC setup",
+  "description": "Personal EMR — SDLC tooling wrapper around the Python engine (SQLite is truth)",
   "type": "module",
   "scripts": {
     "sync:claude-config": "node scripts/sync-claude-config.mjs",

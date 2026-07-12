@@ -1,0 +1,68 @@
+# Analyte / name synonym dictionary — STARTER (framework, not personal data).
+#
+# Copy to data/dictionary.toml (gitignored) and grow it for your own records, or
+# point at it with `--dictionary` / [paths].dictionary_file. This is the ONE place
+# fuzzy medical naming gets pinned down deterministically: norm() maps each synonym
+# to a single canonical token so `A1c`, `HbA1c`, `Hemoglobin A1c` all collapse to
+# one dedup identity. Agents propose additions; a human approves them.
+#
+# Keys are matched AFTER norm() lowercases, trims and collapses whitespace, so write
+# keys in that already-normalized form (lowercase, single spaces). Seeded from common
+# lab-panel headers; extend as real documents surface new spellings.
+
+[synonyms]
+# --- Glycemic ---
+"a1c" = "hba1c"
+"hb a1c" = "hba1c"
+"hemoglobin a1c" = "hba1c"
+"glycated hemoglobin" = "hba1c"
+"glycosylated hemoglobin" = "hba1c"
+"glucose, fasting" = "glucose_fasting"
+"fasting glucose" = "glucose_fasting"
+"fasting blood glucose" = "glucose_fasting"
+
+# --- Lipids ---
+"total cholesterol" = "cholesterol_total"
+"cholesterol, total" = "cholesterol_total"
+"ldl" = "ldl_cholesterol"
+"ldl-c" = "ldl_cholesterol"
+"ldl cholesterol" = "ldl_cholesterol"
+"hdl" = "hdl_cholesterol"
+"hdl-c" = "hdl_cholesterol"
+"hdl cholesterol" = "hdl_cholesterol"
+"triglycerides" = "triglycerides"
+"trig" = "triglycerides"
+
+# --- Thyroid ---
+"tsh" = "tsh"
+"thyroid stimulating hormone" = "tsh"
+"free t4" = "free_t4"
+"ft4" = "free_t4"
+"free t3" = "free_t3"
+"ft3" = "free_t3"
+
+# --- Renal / metabolic ---
+"creatinine" = "creatinine"
+"cr" = "creatinine"
+"egfr" = "egfr"
+"estimated gfr" = "egfr"
+"bun" = "bun"
+"blood urea nitrogen" = "bun"
+
+# --- Hematology ---
+"hemoglobin" = "hemoglobin"
+"hgb" = "hemoglobin"
+"hb" = "hemoglobin"
+"hematocrit" = "hematocrit"
+"hct" = "hematocrit"
+"white blood cell count" = "wbc"
+"wbc" = "wbc"
+"platelet count" = "platelets"
+"platelets" = "platelets"
+
+# --- Vitamins ---
+"vitamin d" = "vitamin_d_25oh"
+"vitamin d, 25-hydroxy" = "vitamin_d_25oh"
+"25-hydroxyvitamin d" = "vitamin_d_25oh"
+"vitamin b12" = "vitamin_b12"
+"b12" = "vitamin_b12"

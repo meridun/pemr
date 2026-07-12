@@ -14,6 +14,7 @@ EXPECTED_TABLES = {
     "procedure",
     "appointment",
     "observation",
+    "conflict",
     "schema_migrations",
 }
 
@@ -32,7 +33,7 @@ def test_connect_applies_pragmas(conn):
 
 def test_migrate_creates_all_tables(conn):
     applied = db.migrate(conn)
-    assert applied == ["001_init.sql"]
+    assert applied == ["001_init.sql", "002_conflict.sql"]
     tables = {
         row["name"]
         for row in conn.execute(
@@ -43,13 +44,43 @@ def test_migrate_creates_all_tables(conn):
 
 
 def test_migrate_is_idempotent(conn):
-    assert db.migrate(conn) == ["001_init.sql"]
+    assert db.migrate(conn) == ["001_init.sql", "002_conflict.sql"]
     assert db.migrate(conn) == []  # second run: nothing pending
 
 
 def test_migrate_records_versions(conn):
     db.migrate(conn)
-    assert db.applied_versions(conn) == {"001_init.sql"}
+    assert db.applied_versions(conn) == {"001_init.sql", "002_conflict.sql"}
+
+
+def test_multi_statement_migration_rolls_back_partial_ddl(conn, tmp_path):
+    # A migration whose 2nd statement fails must leave NO partial schema behind —
+    # executescript implicitly commits, so atomicity lives in the wrapping txn.
+    mdir = tmp_path / "migrations"
+    mdir.mkdir()
+    (mdir / "001_partial.sql").write_text(
+        "CREATE TABLE good (x INTEGER);\n"
+        "INSERT INTO does_not_exist (x) VALUES (1);"  # runtime failure, 2nd statement
+    )
+    with pytest.raises(RuntimeError, match="001_partial.sql"):
+        db.migrate(conn, mdir)
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "good" not in tables  # first statement rolled back too
+    assert db.applied_versions(conn) == set()
+
+
+def test_require_migrated(conn):
+    with pytest.raises(db.NotMigratedError, match="pemr migrate"):
+        db.require_migrated(conn)
+    assert not db.is_migrated(conn)
+    db.migrate(conn)
+    db.require_migrated(conn)  # no raise
+    assert db.is_migrated(conn)
 
 
 def test_migrate_applies_in_order_and_tracks_new_files(conn, tmp_path):
