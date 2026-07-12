@@ -1,0 +1,25 @@
+# PEMR configuration — copy to config.toml (gitignored) and edit for your machine.
+#
+# Path policy (Architecture.md §8):
+#   * data_dir is LOCAL-ONLY — never inside OneDrive/Google Drive/Dropbox. The live
+#     SQLite DB runs in WAL mode; cloud sync corrupts the -wal/-shm sidecars mid-write.
+#   * backup_dir and sources_dir ARE cloud-synced — backups are consistent single-file
+#     `VACUUM INTO` snapshots, sources are immutable content-addressed blobs. Both are
+#     safe for sync and give off-machine copies of the irreplaceable data.
+
+[paths]
+# Local-only data root: holds pemr.db (+ -wal/-shm), inbox/, exports/.
+data_dir = 'C:\pemr-data'
+
+# Cloud-synced: timestamped `pemr backup` snapshots land here.
+backup_dir = 'C:\Users\you\My Drive\pemr\backups'
+
+# Cloud-synced: retained original documents, content-addressed (sha256).
+sources_dir = 'C:\Users\you\My Drive\pemr\sources'
+
+# People roster — informational convenience; the DB `person` table is the source of
+# truth (`pemr person add`). Listed here so a fresh machine knows who to re-add.
+[[people]]
+slug = "jane-doe"
+full_name = "Jane Doe"
+dob = "1980-01-01"

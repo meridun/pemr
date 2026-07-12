@@ -41,7 +41,7 @@ Add rows here as your project grows multi-skill build sequences, e.g.:
 
 | Task | Skill sequence |
 |---|---|
-| Session-end knowledge harvest / doc-tier audit | `proj-doc-tiers` → `proj-agent-skill` |
+| Session-end knowledge harvest / doc-tier audit | `pemr-doc-tiers` → `pemr-agent-skill` |
 
 ## Orchestration (role delegation)
 

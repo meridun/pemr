@@ -1,5 +1,5 @@
 ---
-name: proj-agent-skill
+name: pemr-agent-skill
 description: Create and maintain Agent Skills for this repository. Use when adding new skills, updating existing skills, or registering skills in copilot-instructions.md.
 ---
 
@@ -34,7 +34,7 @@ Frontmatter (`name`, `description`) then `## When to Use` / `## When NOT to Use`
 
 ### Naming Conventions
 
-- **Directory name**: `proj-<descriptive-name>` (lowercase, hyphens) — swap `proj-` for your own
+- **Directory name**: `pemr-<descriptive-name>` (lowercase, hyphens) — swap `pemr-` for your own
   project prefix
 - **Name in frontmatter**: Must match directory name exactly
 - **Description**: Start with verb phrase, include "Use when..." trigger
@@ -75,12 +75,12 @@ that the sync check can't catch:
 
 - an `.github/agents/*.agent.md` body over 70 lines — agents are **shims**, content lives in
   skills;
-- a `proj-*` name referenced in `.github/agents/*.agent.md` or `copilot-instructions.md` that
+- a `pemr-*` name referenced in `.github/agents/*.agent.md` or `copilot-instructions.md` that
   resolves to **no** `.github/skills/<name>/SKILL.md` **or** `.github/agents/<name>.agent.md` (a
   dangling reference);
 - a `SKILL.md` over the 400-line L2 cap below.
 
-It is dumb by design (line counts + regex, no markdown parsing), so an illustrative `proj-*` token
+It is dumb by design (line counts + regex, no markdown parsing), so an illustrative `pemr-*` token
 written in prose must still resolve to a real skill/agent or be reworded.
 
 ## Writing Effective Skill Content
@@ -126,7 +126,7 @@ Skills should stay **focused and scannable**. If a skill exceeds ~400 lines:
 ## Documentation Tier Model (L1/L2/L3)
 
 Skills are the L2 tier in the AI documentation cache hierarchy — see the canonical tier/budget
-table in [proj-doc-tiers](../proj-doc-tiers/SKILL.md#artifacts-in-scope).
+table in [pemr-doc-tiers](../pemr-doc-tiers/SKILL.md#artifacts-in-scope).
 
 ### Tier Routing Rules
 
