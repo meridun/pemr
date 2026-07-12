@@ -45,7 +45,9 @@ backup → care-gap rules) per the Architecture doc. **Phase 1 (skeleton) is don
 layout, `migrations/001_init.sql`, `pemr migrate`, `pemr person add|list|show`, config, CI.
 **Phase 2 (ingest + two-layer dedup) is done**: content-hash blob store + commit-extraction
 (`pemr ingest`), semantic dedup keys with conflict staging (`migrations/002_conflict.sql`,
-`pemr review-conflicts`), starter analyte/name dictionary.
+`pemr review-conflicts`), starter analyte/name dictionary. **Phase 3 (query layer) is done**:
+structured reads (`pemr query labs|meds|timeline`), full-text search over OCR text + record
+fields (`migrations/003_fts.sql`, `pemr find`), and lab `pemr trends` — all with `--json`.
 
 ## Data / privacy posture
 
