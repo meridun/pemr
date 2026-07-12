@@ -53,6 +53,21 @@ def test_load_missing_dictionary_is_empty(tmp_path):
     assert dedup.load_dictionary(None) == {}
 
 
+def test_norm_treats_underscores_as_spaces():
+    assert dedup.norm("blood_pressure") == "blood pressure"
+    d = dedup.load_dictionary(DICT_PATH)
+    assert dedup.norm("blood_pressure", d) == dedup.norm("Blood Pressure", d) \
+        == "blood_pressure"
+
+
+def test_vitals_synonyms_map_to_canonical():
+    d = dedup.load_dictionary(DICT_PATH)
+    for spelling in ("Pulse", "pulse rate", "Heart Rate"):
+        assert dedup.norm(spelling, d) == "pulse"
+    for spelling in ("BP", "Blood Pressure", "blood_pressure"):
+        assert dedup.norm(spelling, d) == "blood_pressure"
+
+
 # --- dedup_key determinism ----------------------------------------------------
 
 def test_dedup_key_is_stable_across_formatting():
@@ -69,6 +84,16 @@ def test_dedup_key_is_stable_across_formatting():
 def test_dedup_key_differs_by_person():
     row = {"test_name": "hba1c", "collected_at": "2026-01-02", "value_num": 5.7}
     assert dedup.dedup_key("lab_result", row, 1) != dedup.dedup_key("lab_result", row, 2)
+
+
+def test_observation_key_variants_share_dedup_key():
+    # Two scans of the same vital: one extraction pass says "blood_pressure",
+    # the other "Blood Pressure" — must collapse even without a dictionary.
+    row_a = {"obs_type": "vital", "key": "blood_pressure", "value_text": "155/90",
+             "observed_at": "2024-06-20"}
+    row_b = {"obs_type": "vital", "key": "Blood Pressure", "value_text": "155/90",
+             "observed_at": "2024-06-20"}
+    assert dedup.dedup_key("observation", row_a, 1) == dedup.dedup_key("observation", row_b, 1)
 
 
 def test_dedup_key_differs_by_date():
