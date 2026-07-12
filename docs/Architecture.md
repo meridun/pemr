@@ -164,7 +164,9 @@ CREATE TABLE observation (
   observation_id INTEGER PRIMARY KEY,
   person_id      INTEGER NOT NULL REFERENCES person(person_id),
   document_id    INTEGER REFERENCES document(document_id),
-  obs_type       TEXT NOT NULL,           -- 'blood_pressure','weight','allergy','immunization'...
+  obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
+                                           -- 'blood_pressure'/'weight'), 'condition',
+                                           -- 'allergy' (phase 4 render.py convention)
   observed_at    TEXT,
   key            TEXT,
   value_num      REAL,
@@ -345,5 +347,8 @@ it's the best possible dedup/extraction test corpus.
   (ingest/commit paths unchanged) and backfilled on migrate. A semantic/vector sidecar
   can bolt on later without schema changes if keyword search proves insufficient.
 - **Med interactions in briefs**: rules-based flags only, or call an external drug DB?
-  (Recommend rules + "verify with pharmacist" framing — no clinical guarantees.)
+  (Recommend rules + "verify with pharmacist" framing — no clinical guarantees.) **Partially
+  resolved (phase 4):** deferred out of the deterministic engine — external drug knowledge
+  isn't pure-function-of-DB-state work. `render brief` emits a placeholder section for
+  phase 5's agent layer to fill; the rules-vs-external-DB choice itself is still open.
 ```
