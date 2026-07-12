@@ -153,30 +153,39 @@ def ingest_document(
     ext = src.suffix.lower()
     dest = blob_dest(sources_dir, sha, ext)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if not dest.exists():  # content-addressed => identical bytes, never overwrite
+    # content-addressed => identical bytes, never overwrite. Track whether *this*
+    # call created the blob so a failed `document` insert doesn't orphan it
+    # (carry-forward advisory from #4): clean up only what we wrote.
+    blob_created = not dest.exists()
+    if blob_created:
         shutil.copy2(src, dest)
 
     ocr_text = run_ocr(dest) if ocr else None
 
-    with conn:
-        cur = conn.execute(
-            """
-            INSERT INTO document
-              (sha256, person_id, doc_date, category, provider, source_path,
-               ocr_text, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                sha,
-                person_id,
-                doc_date,
-                category,
-                provider,
-                _relative_source_path(sha, ext),
-                ocr_text,
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            ),
-        )
+    try:
+        with conn:
+            cur = conn.execute(
+                """
+                INSERT INTO document
+                  (sha256, person_id, doc_date, category, provider, source_path,
+                   ocr_text, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sha,
+                    person_id,
+                    doc_date,
+                    category,
+                    provider,
+                    _relative_source_path(sha, ext),
+                    ocr_text,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+    except Exception:
+        if blob_created:
+            dest.unlink(missing_ok=True)
+        raise
     document = get_document_by_id(conn, cur.lastrowid)
     assert document is not None  # just inserted
     return IngestResult(status="new", document=document)

@@ -338,8 +338,12 @@ it's the best possible dedup/extraction test corpus.
 
 - **Analyte dictionary seed**: start from your existing lab CSVs' column headers, or a
   standard LOINC subset?
-- **FTS**: SQLite FTS5 is plenty; confirm you don't need semantic/vector search over
-  notes (could add a sidecar later).
+- **FTS**: ~~SQLite FTS5 is plenty; confirm you don't need semantic/vector search over
+  notes (could add a sidecar later).~~ **Resolved (phase 3):** plain SQLite FTS5, no
+  vector sidecar. `migrations/003_fts.sql` adds a standalone `record_fts` index over
+  `document.ocr_text` + record text fields, kept current by triggers on the base tables
+  (ingest/commit paths unchanged) and backfilled on migrate. A semantic/vector sidecar
+  can bolt on later without schema changes if keyword search proves insufficient.
 - **Med interactions in briefs**: rules-based flags only, or call an external drug DB?
   (Recommend rules + "verify with pharmacist" framing — no clinical guarantees.)
 ```
