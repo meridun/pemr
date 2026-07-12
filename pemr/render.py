@@ -238,9 +238,15 @@ def render_summary(
     lab_lines = []
     for r in _abnormal_labs(conn, person_id):
         flag = f" [{r['flag']}]" if r["flag"] else ""
-        ref = ""
-        if r["ref_low"] is not None or r["ref_high"] is not None:
-            ref = f"  (ref {_fmt(r['ref_low'])}-{_fmt(r['ref_high'])})"
+        low, high = r["ref_low"], r["ref_high"]
+        if low is not None and high is not None:
+            ref = f"  (ref {_fmt(low)}-{_fmt(high)})"
+        elif high is not None:
+            ref = f"  (ref <= {_fmt(high)})"
+        elif low is not None:
+            ref = f"  (ref >= {_fmt(low)})"
+        else:
+            ref = ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
             f"{_lab_value(r)}{flag}{ref}"
