@@ -6,7 +6,7 @@ The instructions above are shared with VS Code Copilot via `.github/copilot-inst
 
 ## Skills and Agents
 
-- The `proj-*` skills and subagents referenced above live as the canonical source in
+- The `pemr-*` skills and subagents referenced above live as the canonical source in
   `.github/skills/` and `.github/agents/*.agent.md`, and are mirrored into `.claude/skills/` and
   `.claude/agents/*.md` (with Claude Code-compatible frontmatter) so Claude Code can discover them.
 - **Do not hand-edit `.claude/skills/` or `.claude/agents/`** — edit the `.github/` source and run

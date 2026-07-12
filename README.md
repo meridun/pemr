@@ -40,8 +40,9 @@ Full design — schema, dedup algorithm, ingest pipeline, tool surface, backup �
 
 ## Status
 
-Pre-implementation. Design is locked; build proceeds in phases (skeleton → ingest/dedup →
-query → render → MCP → backup → care-gap rules) per the Architecture doc.
+Design is locked; build proceeds in phases (skeleton → ingest/dedup → query → render → MCP →
+backup → care-gap rules) per the Architecture doc. **Phase 1 (skeleton) is done**: package
+layout, `migrations/001_init.sql`, `pemr migrate`, `pemr person add|list|show`, config, CI.
 
 ## Data / privacy posture
 
@@ -59,5 +60,5 @@ This repo was generated from
 [meridun/model-repo](https://github.com/meridun/model-repo) and carries its
 documentation-tier system, token-optimizer hooks, role-based model routing, and the agentic
 SDLC pipeline. See [docs/Documentation.md](docs/Documentation.md) and
-[docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The `proj-` skill/agent
-prefix is still the template default and will be renamed to `pemr-` as the app takes shape.
+[docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The skill/agent
+prefix has been renamed from the template default to `pemr-`.

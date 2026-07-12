@@ -5,8 +5,8 @@ of subagent "workers", one per pipeline stage, each doing one pass over one GitH
 stopping. State lives entirely on the issue (labels + comments) — workers share no context with
 each other or with whatever dispatched them.
 
-This is a **template** — fill in the project name, adjust the stage list, and replace the
-`proj-*` skill/agent names with your own before relying on it.
+Adopted for **PEMR** — stage list and `pemr-*` skill/agent names below are this repo's
+live configuration (originally generated from the model-repo template).
 
 ## Stage graph
 
