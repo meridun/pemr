@@ -9,7 +9,9 @@ graphify-out/
 # scans, generated exports, and backups all live OUTSIDE the repo (local-only /
 # cloud-synced data dir). The patterns below are a hard backstop so data can never
 # be committed even by accident.
-data/
+# NB: `data/*` (not `data/`) so the allow-listed example below can be re-included —
+# git cannot re-include a file whose parent directory is itself excluded.
+data/*
 inbox/
 sources/
 exports/
