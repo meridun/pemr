@@ -338,8 +338,13 @@ it's the best possible dedup/extraction test corpus.
 
 ## Open questions
 
-- **Analyte dictionary seed**: start from your existing lab CSVs' column headers, or a
-  standard LOINC subset?
+- **Analyte dictionary seed**: ~~start from your existing lab CSVs' column headers, or a
+  standard LOINC subset?~~ **Resolved (phase 4.5):** seed from the real-corpus report
+  vocabulary (CSV `test_name` headers + observed report abbreviations), not LOINC. The
+  starter `data/dictionary.example.toml` now carries CMP/CBC panel codes, serum free
+  light chains and SPEP naming variants; `norm()` additionally strips parenthetical
+  qualifiers (`(HGB)`, `(SPEP)`, `(calculated)`) and compares units case-insensitively
+  so the dictionary only needs bare canonical spellings.
 - **FTS**: ~~SQLite FTS5 is plenty; confirm you don't need semantic/vector search over
   notes (could add a sidecar later).~~ **Resolved (phase 3):** plain SQLite FTS5, no
   vector sidecar. `migrations/003_fts.sql` adds a standalone `record_fts` index over
