@@ -33,7 +33,7 @@ def test_connect_applies_pragmas(conn):
 
 def test_migrate_creates_all_tables(conn):
     applied = db.migrate(conn)
-    assert applied == ["001_init.sql", "002_conflict.sql"]
+    assert applied == ["001_init.sql", "002_conflict.sql", "003_fts.sql"]
     tables = {
         row["name"]
         for row in conn.execute(
@@ -44,13 +44,15 @@ def test_migrate_creates_all_tables(conn):
 
 
 def test_migrate_is_idempotent(conn):
-    assert db.migrate(conn) == ["001_init.sql", "002_conflict.sql"]
+    assert db.migrate(conn) == ["001_init.sql", "002_conflict.sql", "003_fts.sql"]
     assert db.migrate(conn) == []  # second run: nothing pending
 
 
 def test_migrate_records_versions(conn):
     db.migrate(conn)
-    assert db.applied_versions(conn) == {"001_init.sql", "002_conflict.sql"}
+    assert db.applied_versions(conn) == {
+        "001_init.sql", "002_conflict.sql", "003_fts.sql"
+    }
 
 
 def test_multi_statement_migration_rolls_back_partial_ddl(conn, tmp_path):

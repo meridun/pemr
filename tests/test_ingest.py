@@ -1,5 +1,7 @@
 """Document ingest: hashing, content-addressed blob store, layer-1 dedup."""
 
+import sqlite3
+
 import pytest
 
 from pemr import db, ingest, persons
@@ -83,6 +85,23 @@ def test_ingest_on_unmigrated_db_raises(tmp_path, sources):
             ingest.ingest_document(fresh, _make_file(tmp_path), "jane-doe", sources)
     finally:
         fresh.close()
+
+
+def test_failed_insert_does_not_orphan_blob(conn, tmp_path, sources):
+    # carry-forward advisory from #4: if the `document` INSERT fails, the blob this
+    # call copied into sources/ must be cleaned up, not left orphaned. A BEFORE INSERT
+    # trigger forces the insert to abort *after* the blob has been staged.
+    src = _make_file(tmp_path, "scan.txt", b"orphan check bytes")
+    sha = ingest.hash_file(src)
+    conn.execute(
+        "CREATE TRIGGER boom BEFORE INSERT ON document "
+        "BEGIN SELECT RAISE(ABORT, 'insert exploded'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.Error, match="insert exploded"):
+        ingest.ingest_document(conn, src, "jane-doe", sources)
+    assert not (sources / sha[:2] / f"{sha}.txt").exists()  # blob cleaned up
 
 
 def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch, capsys):
