@@ -128,7 +128,7 @@ def query_timeline(
     for r in conn.execute(
         "SELECT * FROM procedure WHERE person_id = ?", (person_id,)
     ).fetchall():
-        outcome = f" — {r['outcome']}" if r["outcome"] else ""
+        outcome = f" - {r['outcome']}" if r["outcome"] else ""
         add(r["performed_on"], "procedure", f"{r['name']}{outcome}", r["document_id"])
 
     for r in conn.execute(
@@ -136,7 +136,7 @@ def query_timeline(
     ).fetchall():
         who = " ".join(p for p in (r["provider"], r["specialty"]) if p)
         why = r["reason"] or r["summary"] or ""
-        summary = " — ".join(p for p in (who, why) if p) or "appointment"
+        summary = " - ".join(p for p in (who, why) if p) or "appointment"
         add(r["scheduled_for"], "appointment", summary, r["document_id"])
 
     for r in conn.execute(

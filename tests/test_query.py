@@ -130,6 +130,20 @@ def test_timeline_carries_provenance(seeded):
     assert any(e["document_id"] is not None for e in events)
 
 
+def test_timeline_summaries_are_ascii_safe(seeded):
+    """§4 cp1252/cp437 console lesson: human-table summaries must be ASCII-only, or
+    they crash on a non-UTF-8 Windows console (regression for the em-dash bounce —
+    procedure ' - outcome' and 'provider - reason' joins used a U+2014 em-dash)."""
+    events = query.query_timeline(seeded, "jane-doe")
+    proc = next(e for e in events if e["type"] == "procedure")
+    appt = next(e for e in events if e["type"] == "appointment")
+    assert " - normal" in proc["summary"]          # ascii hyphen, not em-dash
+    assert "Dr. Smith Endocrinology - diabetes follow-up" == appt["summary"]
+    for e in events:
+        assert e["summary"].isascii(), f"non-ASCII summary would crash cp437: {e['summary']!r}"
+        e["summary"].encode("cp437")  # raises UnicodeEncodeError if not console-safe
+
+
 # --- full-text search ---------------------------------------------------------
 
 def test_find_matches_ocr_and_records(seeded):
