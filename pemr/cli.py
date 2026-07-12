@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, db, dedup, ingest, persons, query
+from . import __version__, db, dedup, ingest, persons, query, render
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
 _DEFAULT_DICTIONARY = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -405,6 +405,70 @@ def _cmd_trends(args: argparse.Namespace) -> int:
     return _with_conn_person(args, work)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 4: render (summary / brief / journal)
+# --------------------------------------------------------------------------- #
+
+def _emit_markdown(markdown: str, out: str | None) -> int:
+    """Write rendered Markdown to ``--out`` or stdout (the §5 shell-redirect default)."""
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(markdown)
+        except OSError as exc:
+            print(f"error: cannot write {out}: {exc}", file=sys.stderr)
+            return 1
+        print(f"wrote {out}")
+        return 0
+    # Default stdout keeps the documented `> exports/...` redirect contract. Output is
+    # ASCII-only by construction (render layer), so a cp1252/cp437 console is safe.
+    print(markdown, end="" if markdown.endswith("\n") else "\n")
+    return 0
+
+
+def _render_with_conn(args: argparse.Namespace, work) -> int:
+    """Open the DB, run ``work(conn)``, translating render's friendly failures
+    (un-migrated DB, unknown person slug, unknown appointment id) into rc=1 stderr."""
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            return work(conn)
+        except db.NotMigratedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (query.PersonNotFoundError, render.AppointmentNotFoundError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_render_summary(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        markdown = render.render_summary(conn, args.person, dictionary=dictionary)
+        return _emit_markdown(markdown, args.out)
+
+    return _render_with_conn(args, work)
+
+
+def _cmd_render_brief(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        markdown = render.render_brief(conn, args.appointment, dictionary=dictionary)
+        return _emit_markdown(markdown, args.out)
+
+    return _render_with_conn(args, work)
+
+
+def _cmd_render_journal(args: argparse.Namespace) -> int:
+    def work(conn):
+        markdown = render.render_journal(conn, args.person, since=args.since)
+        return _emit_markdown(markdown, args.out)
+
+    return _render_with_conn(args, work)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pemr", description="Personal EMR engine — SQLite is truth."
@@ -522,6 +586,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_trends.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     p_trends.add_argument("--json", action="store_true", help="machine-readable output")
     p_trends.set_defaults(func=_cmd_trends)
+
+    # --- phase 4: render (summary / brief / journal) ----------------------
+    p_render = sub.add_parser(
+        "render", help="generate Markdown documents from DB state (read-only)"
+    )
+    render_sub = p_render.add_subparsers(dest="render_command", required=True)
+
+    r_summary = render_sub.add_parser(
+        "summary", help="master summary for a person -> Markdown on stdout"
+    )
+    r_summary.add_argument("--person", required=True, help="owner slug")
+    r_summary.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_summary.add_argument("--out", help="write to file instead of stdout")
+    r_summary.set_defaults(func=_cmd_render_summary)
+
+    r_brief = render_sub.add_parser(
+        "brief", help="walk-in brief for one appointment -> Markdown on stdout"
+    )
+    r_brief.add_argument(
+        "--appointment", type=int, required=True, help="appointment id"
+    )
+    r_brief.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_brief.add_argument("--out", help="write to file instead of stdout")
+    r_brief.set_defaults(func=_cmd_render_brief)
+
+    r_journal = render_sub.add_parser(
+        "journal", help="narrative chronology for a person -> Markdown on stdout"
+    )
+    r_journal.add_argument("--person", required=True, help="owner slug")
+    r_journal.add_argument("--since", help="ISO date; keep events on/after this date")
+    r_journal.add_argument("--out", help="write to file instead of stdout")
+    r_journal.set_defaults(func=_cmd_render_journal)
 
     return parser
 

@@ -67,11 +67,19 @@
 "vitamin b12" = "vitamin_b12"
 "b12" = "vitamin_b12"
 
+# --- observation obs_type conventions (phase 4 render layer) ---
+# The render layer (master summary / appointment brief) reads three obs_type
+# families out of the generic `observation` table. Extraction agents should emit:
+#   * obs_type='vital'     key=<canonical vital token below>  (blood_pressure ...)
+#   * obs_type='condition' key=<condition name>   value_text=<optional detail>
+#   * obs_type='allergy'   key=<allergen>         value_text=<optional reaction>
+# "Latest vitals" in the summary is the most recent `vital` row per normalized key.
+
 # --- Vitals (observation keys) ---
 # Canonical observation-key vocabulary — extraction agents should emit these
-# tokens as `observation.key`: blood_pressure, bmi, weight, height,
-# temperature, pulse, spo2, respiratory_rate. Underscores in input are
-# treated as spaces by norm(), so "blood_pressure" matches "blood pressure".
+# tokens as `observation.key` (with obs_type='vital'): blood_pressure, bmi,
+# weight, height, temperature, pulse, spo2, respiratory_rate. Underscores in
+# input are treated as spaces by norm(), so "blood_pressure" matches "blood pressure".
 "blood pressure" = "blood_pressure"
 "bp" = "blood_pressure"
 "bmi" = "bmi"
