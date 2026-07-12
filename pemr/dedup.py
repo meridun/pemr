@@ -111,12 +111,15 @@ def load_dictionary(path: str | Path | None) -> dict[str, str]:
 
 
 def _collapse(value: str) -> str:
-    return _WS.sub(" ", value.strip().lower())
+    # Underscores count as separators: machine-generated keys like
+    # "blood_pressure" must collapse to the same token as "Blood Pressure".
+    return _WS.sub(" ", value.strip().lower().replace("_", " "))
 
 
 def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
-    """Normalize a free-text field: lowercase, trim, collapse whitespace, then map
-    synonyms through the dictionary. ``None`` -> ``""`` (deterministic key part)."""
+    """Normalize a free-text field: lowercase, trim, collapse whitespace (underscores
+    count as whitespace), then map synonyms through the dictionary. ``None`` -> ``""``
+    (deterministic key part)."""
     if value is None:
         return ""
     collapsed = _collapse(str(value))
@@ -408,10 +411,12 @@ def resolve_conflict(
     note: str | None = None,
 ) -> None:
     """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row) or
-    'incoming' (overwrite the stored record's non-key fields with the incoming row).
+    'incoming' (overwrite the stored record's payload fields with the incoming row).
 
-    Key fields are identical by construction (a differing key would not have
-    collided), so overwriting only touches non-key columns; the dedup_key stays put.
+    Overwriting touches only the payload columns (``_COMPARE_FIELDS``) whose
+    disagreement defined the conflict, plus provenance ``document_id``. Identity
+    fields keep their stored display form (they are equal after norm() by
+    construction, but may differ in casing/spacing); the dedup_key stays put.
     """
     db.require_migrated(conn)
     if keep not in ("existing", "incoming"):
@@ -451,7 +456,7 @@ def _overwrite_record(
 ) -> None:
     assignments = ["document_id = ?"]
     values: list[object] = [document_id]
-    for name in FIELD_SPECS[record_type]:
+    for name in _COMPARE_FIELDS[record_type]:
         assignments.append(f"{name} = ?")
         values.append(incoming.get(name))
     values.append(key)

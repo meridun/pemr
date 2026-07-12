@@ -62,6 +62,25 @@ def test_resolve_keep_incoming_overwrites_row(conn, staged):
     assert "keep-incoming" in row["resolution"] and "correction" in row["resolution"]
 
 
+def test_resolve_keep_incoming_preserves_identity_fields(conn):
+    # Same fact, but the second scan's OCR differs in identity-field casing AND
+    # a payload value. keep-incoming must update the payload + provenance while
+    # leaving the stored identity display form ("hba1c") alone.
+    doc_a = _doc(conn, "doc-c")
+    doc_b = _doc(conn, "doc-d")
+    dedup.commit_extraction(conn, doc_a, {"lab_result": [
+        {"test_name": "hba1c", "collected_at": "2026-01-02", "value_num": 5.7}]})
+    summary = dedup.commit_extraction(conn, doc_b, {"lab_result": [
+        {"test_name": "HBA1C", "collected_at": "2026-01-02", "value_num": 6.2}]})
+    assert summary.counts["conflict"] == 1
+    conflict_id = dedup.list_conflicts(conn)[-1]["conflict_id"]
+    dedup.resolve_conflict(conn, conflict_id, keep="incoming")
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["test_name"] == "hba1c"      # identity display form preserved
+    assert row["value_num"] == 6.2          # payload overwritten
+    assert row["document_id"] == doc_b      # provenance points at the winner
+
+
 def test_resolve_unknown_id_raises(conn):
     with pytest.raises(ValueError, match="no conflict"):
         dedup.resolve_conflict(conn, 999, keep="existing")
