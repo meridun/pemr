@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, db, dedup, ingest, persons
+from . import __version__, db, dedup, ingest, persons, query
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
 _DEFAULT_DICTIONARY = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -263,6 +263,148 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Phase 3: query / find / trends
+# --------------------------------------------------------------------------- #
+
+# Internal columns never emitted in --json (unstable / not part of the contract).
+_HIDDEN_FIELDS = ("dedup_key",)
+
+
+def _clean(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k not in _HIDDEN_FIELDS}
+
+
+def _print_json(payload: object) -> None:
+    # ensure_ascii keeps output cp1252-console-safe (phase 2 lesson).
+    print(json.dumps(payload, indent=2, ensure_ascii=True, default=str))
+
+
+def _fmt(value: object) -> str:
+    return "" if value is None else str(value)
+
+
+def _with_conn_person(args: argparse.Namespace, work):
+    """Open the DB, run ``work(conn)``, translating the two friendly failure modes
+    (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            return work(conn)
+        except db.NotMigratedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except query.PersonNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_query_labs(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        rows = query.query_labs(
+            conn, args.person, test=args.test, since=args.since, dictionary=dictionary
+        )
+        if args.json:
+            _print_json([_clean(r) for r in rows])
+            return 0
+        if not rows:
+            print("no lab results")
+            return 0
+        for r in rows:
+            value = r["value_num"] if r["value_num"] is not None else r["value_text"]
+            unit = f" {r['unit']}" if r["unit"] else ""
+            flag = f"  [{r['flag']}]" if r["flag"] else ""
+            ref = ""
+            if r["ref_low"] is not None or r["ref_high"] is not None:
+                ref = f"  (ref {_fmt(r['ref_low'])}-{_fmt(r['ref_high'])})"
+            print(f"{_fmt(r['collected_at']):19}  {r['test_name']:20}  "
+                  f"{_fmt(value)}{unit}{flag}{ref}")
+        return 0
+
+    return _with_conn_person(args, work)
+
+
+def _cmd_query_meds(args: argparse.Namespace) -> int:
+    def work(conn):
+        rows = query.query_meds(conn, args.person, active=args.active)
+        if args.json:
+            _print_json([_clean(r) for r in rows])
+            return 0
+        if not rows:
+            print("no active medications" if args.active else "no medications")
+            return 0
+        for r in rows:
+            dose = f"  {r['dose']}" if r["dose"] else ""
+            freq = f"  {r['frequency']}" if r["frequency"] else ""
+            span = _fmt(r["started_on"]) + (f" -> {r['ended_on']}" if r["ended_on"] else " -> (current)")
+            status = f"  [{r['status']}]" if r["status"] else ""
+            print(f"{r['name']:24}{dose}{freq}  {span}{status}")
+        return 0
+
+    return _with_conn_person(args, work)
+
+
+def _cmd_query_timeline(args: argparse.Namespace) -> int:
+    def work(conn):
+        events = query.query_timeline(conn, args.person, since=args.since)
+        if args.json:
+            _print_json(events)
+            return 0
+        if not events:
+            print("no events")
+            return 0
+        for e in events:
+            prov = f"  (doc #{e['document_id']})" if e["document_id"] is not None else ""
+            print(f"{e['date']:10}  {e['type']:12}  {e['summary']}{prov}")
+        return 0
+
+    return _with_conn_person(args, work)
+
+
+def _cmd_find(args: argparse.Namespace) -> int:
+    def work(conn):
+        hits = query.find(conn, args.person, args.query)
+        if args.json:
+            _print_json(hits)
+            return 0
+        if not hits:
+            print("no matches")
+            return 0
+        for h in hits:
+            prov = f"  (doc #{h['document_id']})" if h["document_id"] is not None else ""
+            print(f"{h['source_table']}#{h['source_id']}{prov}: {h['snippet']}")
+        return 0
+
+    return _with_conn_person(args, work)
+
+
+def _cmd_trends(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        result = query.trends(conn, args.person, args.test, dictionary=dictionary)
+        if args.json:
+            _print_json(result)
+            return 0
+        if result["count"] == 0:
+            print(f"no numeric results for '{result['test']}'")
+            return 0
+        unit = f" {result['unit']}" if result["unit"] else ""
+        print(f"{result['test']}  ({result['count']} point(s))")
+        print(f"  min    {_fmt(result['min'])}{unit}")
+        print(f"  max    {_fmt(result['max'])}{unit}")
+        print(f"  latest {_fmt(result['latest'])}{unit}  @ {_fmt(result['latest_at'])}")
+        if result["slope_per_day"] is None:
+            print("  slope  n/a (need >=2 dated points)")
+        else:
+            print(f"  slope  {result['slope_per_day']:+.4g}{unit}/day")
+        return 0
+
+    return _with_conn_person(args, work)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pemr", description="Personal EMR engine — SQLite is truth."
@@ -339,6 +481,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="list resolved conflicts too"
     )
     p_review.set_defaults(func=_cmd_review_conflicts)
+
+    # --- phase 3: query / find / trends -----------------------------------
+    p_query = sub.add_parser("query", help="structured reads over the record tables")
+    query_sub = p_query.add_subparsers(dest="query_command", required=True)
+
+    q_labs = query_sub.add_parser("labs", help="lab results for a person")
+    q_labs.add_argument("--person", required=True, help="owner slug")
+    q_labs.add_argument("--test", help="analyte name (dictionary-normalized)")
+    q_labs.add_argument("--since", help="ISO date; keep rows on/after this date")
+    q_labs.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    q_labs.add_argument("--json", action="store_true", help="machine-readable output")
+    q_labs.set_defaults(func=_cmd_query_labs)
+
+    q_meds = query_sub.add_parser("meds", help="medications for a person")
+    q_meds.add_argument("--person", required=True, help="owner slug")
+    q_meds.add_argument("--active", action="store_true", help="current meds only")
+    q_meds.add_argument("--json", action="store_true", help="machine-readable output")
+    q_meds.set_defaults(func=_cmd_query_meds)
+
+    q_timeline = query_sub.add_parser(
+        "timeline", help="merged chronological event stream"
+    )
+    q_timeline.add_argument("--person", required=True, help="owner slug")
+    q_timeline.add_argument("--since", help="ISO date; keep events on/after this date")
+    q_timeline.add_argument("--json", action="store_true", help="machine-readable output")
+    q_timeline.set_defaults(func=_cmd_query_timeline)
+
+    p_find = sub.add_parser("find", help="full-text search over OCR text + record fields")
+    p_find.add_argument("--person", required=True, help="owner slug")
+    p_find.add_argument("query", help="search text")
+    p_find.add_argument("--json", action="store_true", help="machine-readable output")
+    p_find.set_defaults(func=_cmd_find)
+
+    p_trends = sub.add_parser(
+        "trends", help="min/max/latest/slope for one analyte over time"
+    )
+    p_trends.add_argument("--person", required=True, help="owner slug")
+    p_trends.add_argument("--test", required=True, help="analyte name (dictionary-normalized)")
+    p_trends.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    p_trends.add_argument("--json", action="store_true", help="machine-readable output")
+    p_trends.set_defaults(func=_cmd_trends)
 
     return parser
 
