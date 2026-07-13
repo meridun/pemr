@@ -147,6 +147,15 @@ def _cmd_person_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
+    ocr_text = None
+    if getattr(args, "ocr_text_file", None):
+        try:
+            with open(args.ocr_text_file, encoding="utf-8") as fh:
+                ocr_text = fh.read()
+        except OSError as exc:
+            print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
+            return 1
+
     conn = db.connect(_resolve_db_path(args))
     try:
         try:
@@ -159,6 +168,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
                 category=args.category,
                 provider=args.provider,
                 ocr=(args.ocr == "tesseract"),
+                ocr_text=ocr_text,
             )
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -180,6 +190,12 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         f"ingested document #{doc.document_id} (sha256 {doc.sha256[:12]}...) "
         f"-> sources/{doc.source_path}"
     )
+    if not result.ocr_text_populated:
+        print(
+            "note: no ocr_text stored — `find` (full-text search) will not see this "
+            "document. Supply --ocr-text-file <path> or --ocr tesseract.",
+            file=sys.stderr,
+        )
     print(f"next: extract, then `pemr commit-extraction --document {doc.document_id} --json <file>`")
     return 0
 
@@ -514,6 +530,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--provider")
     p_ingest.add_argument(
         "--ocr", choices=["tesseract"], help="pre-fill ocr_text (soft dependency)"
+    )
+    p_ingest.add_argument(
+        "--ocr-text-file",
+        dest="ocr_text_file",
+        help="file of agent-supplied document text to store as ocr_text (wins over --ocr)",
     )
     p_ingest.set_defaults(func=_cmd_ingest)
 
