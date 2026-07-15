@@ -6,9 +6,12 @@
 # to a single canonical token so `A1c`, `HbA1c`, `Hemoglobin A1c` all collapse to
 # one dedup identity. Agents propose additions; a human approves them.
 #
-# Keys are matched AFTER norm() lowercases, trims and collapses whitespace, so write
-# keys in that already-normalized form (lowercase, single spaces). Seeded from common
-# lab-panel headers; extend as real documents surface new spellings.
+# Keys are matched AFTER norm() lowercases, trims and collapses whitespace AND strips
+# parenthetical qualifiers, so write keys in that already-normalized form: lowercase,
+# single spaces, and NO parentheses — norm() removes `(HGB)`, `(SPEP)`, `(calculated)`
+# etc. before lookup, so `Hemoglobin (HGB)` matches the bare `hemoglobin` key. Seeded
+# from common lab-panel headers plus the real-corpus report vocabulary (CMP/CBC panel
+# codes, serum free light chains, SPEP); extend as new documents surface new spellings.
 
 [synonyms]
 # --- Glycemic ---
@@ -44,6 +47,7 @@
 # --- Renal / metabolic ---
 "creatinine" = "creatinine"
 "cr" = "creatinine"
+"crea" = "creatinine"
 "egfr" = "egfr"
 "estimated gfr" = "egfr"
 "bun" = "bun"
@@ -59,6 +63,17 @@
 "wbc" = "wbc"
 "platelet count" = "platelets"
 "platelets" = "platelets"
+"plt" = "platelets"
+
+# --- Basic metabolic panel (CMP abbreviations) ---
+# Report codes for non-fasting serum chemistries. (Fasting glucose is its own token
+# under Glycemic — a bare `Glucose`/`GLUC` reading is not a fasting result.)
+"glucose" = "glucose"
+"gluc" = "glucose"
+"sodium" = "sodium"
+"na" = "sodium"
+"potassium" = "potassium"
+"k" = "potassium"
 
 # --- Vitamins ---
 "vitamin d" = "vitamin_d_25oh"
@@ -66,6 +81,24 @@
 "25-hydroxyvitamin d" = "vitamin_d_25oh"
 "vitamin b12" = "vitamin_b12"
 "b12" = "vitamin_b12"
+"vit b12" = "vitamin_b12"
+
+# --- Myeloma / paraprotein panel (SPEP, serum free light chains) ---
+# Serum free light chains, their ratio, the monoclonal spike and the immunoglobulin
+# quant / beta-2 microglobulin that track plasma-cell disease. Parenthetical method
+# tags like `(SPEP)` are stripped by norm() before this lookup.
+"kappa" = "kappa_free_light_chain"
+"free kappa light chain" = "kappa_free_light_chain"
+"lambda" = "lambda_free_light_chain"
+"free lambda light chain" = "lambda_free_light_chain"
+"k/l ratio" = "kappa_lambda_ratio"
+"kappa/lambda ratio" = "kappa_lambda_ratio"
+"m-spike" = "m_spike"
+"immunoglobulin g" = "igg"
+"immunoglobulin g, qn, serum" = "igg"
+"b2 microglobulin" = "beta2_microglobulin"
+"beta2 microglobulin" = "beta2_microglobulin"
+"beta-2 microglobulin" = "beta2_microglobulin"
 
 # --- observation obs_type conventions (phase 4 render layer) ---
 # The render layer (master summary / appointment brief) reads three obs_type
