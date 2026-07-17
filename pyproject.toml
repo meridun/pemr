@@ -8,6 +8,12 @@ version = "0.1.0"
 description = "Local-first personal EMR engine — SQLite is the source of truth"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+# The phase-5 MCP wrapper (pemr/mcp_server.py). Optional: the engine, CLI, and the
+# wrapper's own tool functions/tests need none of it — only `python -m pemr.mcp_server`
+# does. Installed with `pip install pemr[mcp]`.
+mcp = ["mcp>=1.0"]
+
 [project.scripts]
 pemr = "pemr.cli:main"
 

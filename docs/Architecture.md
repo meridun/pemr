@@ -262,17 +262,19 @@ pemr backup                                              # VACUUM INTO snapshot
 pemr migrate                                             # apply pending migrations
 ```
 
-### MCP tools (thin wrappers, same verbs)
+### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
-`add_record`, `ingest_document`, `commit_extraction`, `find_records`, `query_labs`,
-`get_timeline`, `lab_trends`, `care_gaps`, `appointment_brief`, `master_summary`,
-`review_conflicts`. Each returns structured JSON. The MCP server shells the CLI or calls
-the Python functions directly — one implementation, two front doors.
+Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
+`trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `ingest`,
+`commit_extraction`, `review_conflicts` (resolution gated on human sign-off). Each returns the
+same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
+calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`
+annotations expose the read/write split to the client.
 
 `AGENTS.md` documents this contract so any agent (Cowork, Claude Code, local) knows to
 **call tools, not reinvent** — and specifically: never write to the DB except through
-`commit_extraction`/`add_record`; always `ingest` before extracting; dictionary additions
-go through review.
+`commit_extraction`/`person_add`/`ingest`; always `ingest` (with `ocr_text` populated) before
+extracting; dictionary additions go through human review, never agent-direct edits.
 
 ---
 
@@ -326,7 +328,7 @@ Because they regenerate from truth, they never drift. Old exports are disposable
    both dedup layers, conflict table. (The determinism payload.)
 3. **Query layer** — `query`, `find` (FTS5 over `ocr_text` + records), `trends`.
 4. **Render** — master summary + appointment brief + journal.
-5. **MCP wrapper** + `AGENTS.md` contract.
+5. **MCP wrapper** + `AGENTS.md` contract. **Done.**
 6. **Backup** command + scheduled task.
 7. **Care-gap rules** (`due`) — vaccines/screenings by age/sex; lowest priority, highest
    ongoing value.
@@ -351,9 +353,10 @@ it's the best possible dedup/extraction test corpus.
   `document.ocr_text` + record text fields, kept current by triggers on the base tables
   (ingest/commit paths unchanged) and backfilled on migrate. A semantic/vector sidecar
   can bolt on later without schema changes if keyword search proves insufficient.
-- **Med interactions in briefs**: rules-based flags only, or call an external drug DB?
-  (Recommend rules + "verify with pharmacist" framing — no clinical guarantees.) **Partially
-  resolved (phase 4):** deferred out of the deterministic engine — external drug knowledge
-  isn't pure-function-of-DB-state work. `render brief` emits a placeholder section for
-  phase 5's agent layer to fill; the rules-vs-external-DB choice itself is still open.
+- **Med interactions in briefs**: ~~rules-based flags only, or call an external drug DB?~~
+  **Resolved (phase 5):** neither — an external API would send meds off-machine, and an
+  in-engine rules DB isn't a pure function of DB state. `render brief`'s placeholder section is
+  filled by the **agent's own general knowledge**, under fixed framing `AGENTS.md` mandates
+  verbatim (AI-generated, not a drug-interaction DB, verify with pharmacist; never claims safety
+  or gives dosing/start-stop advice).
 ```
