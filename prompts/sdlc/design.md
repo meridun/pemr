@@ -26,3 +26,9 @@ needs a storyboard/mockup; a pure-engineering design-exempt item shouldn't have 
 
 ### 4. STOP
 One-line result: `DESIGN: <#issue> → ADVANCE|PARK|BOUNCE — <reason>`
+
+## Notes
+- **Idempotent.** An existing settled design (in-thread or in a linked design artifact) is
+  presumed good — re-confirm it still matches the current issue body and codebase, don't
+  redesign. An item rewound here by a human: read their rewind comment; only the part it (or your
+  own check) invalidates gets reworked.
