@@ -227,3 +227,17 @@ def test_agents_md_has_the_four_must_sections():
         "Medication-interaction section",
     ):
         assert heading in text, f"AGENTS.md missing MUST section: {heading}"
+
+
+# --------------------------------------------------------------------------- #
+# Wire surface — the *registered* tool names must equal TOOL_NAMES (the contract
+# lint above only sees the documented strings; this asserts the real MCP surface,
+# so a rename can't silently ship names AGENTS.md never mentions). Requires the
+# optional `mcp` SDK; skipped when it isn't installed.
+# --------------------------------------------------------------------------- #
+
+def test_registered_tool_names_equal_contract():
+    pytest.importorskip("mcp")
+    server = mcp_server.build_server()
+    registered = {t.name for t in server._tool_manager.list_tools()}
+    assert registered == set(mcp_server.TOOL_NAMES)
