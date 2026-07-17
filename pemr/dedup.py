@@ -147,10 +147,20 @@ def _date_only(value: object) -> str:
     return text.replace("T", " ").split(" ")[0]
 
 
-def _round_value(value: object) -> str:
-    if value is None or value == "":
+def _norm_ts(value: object) -> str:
+    """Normalize an ISO date/datetime for use as a dedup-key identity part, keeping
+    *full precision* (unlike :func:`_date_only`, which truncates to the date).
+
+    A timestamped draw (``2026-01-02T09:00``) and a bare-date draw (``2026-01-02``)
+    stay distinct, and two draws on the same day at different times keep distinct keys
+    — so serial same-day repeats (GTT, peri-op, inpatient q6h) survive as separate
+    rows. A re-read/correction of the *same* draw carries the same timestamp, collides,
+    and surfaces as a CONFLICT via :data:`_COMPARE_FIELDS`. Only the ``T``/space
+    separator and surrounding/collapsed whitespace are normalized, so trivial
+    formatting differences don't fork the key."""
+    if value is None:
         return ""
-    return str(round(float(value)))
+    return _WS.sub(" ", str(value).strip().replace("T", " "))
 
 
 def _hash_parts(parts: list[object]) -> str:
@@ -167,8 +177,7 @@ def dedup_key(
         return norm(row.get(field_name), dictionary)
 
     if record_type == "lab_result":
-        parts = [person_id, n("test_name"), _date_only(row.get("collected_at")),
-                 _round_value(row.get("value_num"))]
+        parts = [person_id, n("test_name"), _norm_ts(row.get("collected_at"))]
     elif record_type == "medication":
         parts = [person_id, n("name"), _collapse(str(row.get("dose") or "")),
                  _date_only(row.get("started_on"))]
@@ -177,11 +186,8 @@ def dedup_key(
     elif record_type == "appointment":
         parts = [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     elif record_type == "observation":
-        value = row.get("value_num")
-        if value is None:
-            value = _collapse(str(row.get("value_text") or ""))
-        parts = [person_id, n("obs_type"), _date_only(row.get("observed_at")),
-                 n("key"), value]
+        parts = [person_id, n("obs_type"), _norm_ts(row.get("observed_at")),
+                 n("key")]
     else:  # pragma: no cover - guarded by validate()
         raise ValidationError(f"unknown record type: {record_type}")
     return _hash_parts(parts)
@@ -247,10 +253,11 @@ class CommitSummary:
 # Payload fields compared to decide duplicate-vs-conflict once dedup_keys match.
 # Identity fields (those feeding the dedup_key) are equal by construction — a
 # difference there yields a *different* key and hence a new row, never a collision —
-# so they are deliberately excluded here. The lone exception is the measured value:
-# value_num feeds the lab/observation key via a lossy round(), so a corrected value
-# in the same round-bucket still collides and must surface as a CONFLICT, not a
-# silent duplicate — hence value_num appears below.
+# so they are deliberately excluded here. The measured value is deliberately NOT an
+# identity field: the lab/observation keys carry temporal identity (collected_at /
+# observed_at at full precision) but not the value, so a corrected or re-read value on
+# an otherwise-matching key collides and surfaces here as a CONFLICT instead of a
+# silent duplicate — hence value_num/value_text appear below.
 _COMPARE_FIELDS: dict[str, list[str]] = {
     "lab_result": ["value_num", "value_text", "unit", "ref_low", "ref_high", "flag", "loinc"],
     "medication": ["route", "frequency", "ended_on", "prescriber", "status"],

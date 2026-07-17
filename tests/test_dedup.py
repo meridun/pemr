@@ -110,12 +110,14 @@ def test_corpus_naming_variants_share_canonical_token():
 def test_dedup_key_is_stable_across_formatting():
     d = dedup.load_dictionary(DICT_PATH)
     a = dedup.dedup_key("lab_result",
-                        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 5.7},
+                        {"test_name": "HbA1c", "collected_at": "2026-01-02T09:30", "value_num": 5.7},
                         person_id=1, dictionary=d)
     b = dedup.dedup_key("lab_result",
-                        {"test_name": "  a1c ", "collected_at": "2026-01-02T09:30", "value_num": 5.7},
+                        {"test_name": "  a1c ", "collected_at": "2026-01-02 09:30", "value_num": 6.2},
                         person_id=1, dictionary=d)
-    assert a == b  # same fact, different spelling/whitespace/time-of-day -> one key
+    # same draw (person/analyte/timestamp), different spelling/whitespace, T-vs-space
+    # separator, AND a differing value -> one key (value is no longer an identity field)
+    assert a == b
 
 
 def test_dedup_key_differs_by_person():
@@ -206,7 +208,8 @@ def test_differing_value_stages_conflict(conn):
     doc1 = _make_document(conn)
     doc2 = _make_document(conn)
     dedup.commit_extraction(conn, doc1, {"lab_result": [_lab(5.7)]}, d)
-    # same key bucket (round(5.7)==round(6.2)==6) but a corrected value -> conflict
+    # same person/analyte/date (the dedup key) but a corrected value -> conflict.
+    # The value is no longer in the key, so this fires regardless of magnitude.
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [_lab(6.2)]}, d)
     assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
     # original row untouched, no second lab row inserted
@@ -269,10 +272,74 @@ def test_corrected_value_still_conflicts_after_normalization(conn):
     r1 = {"test_name": "HGB", "collected_at": "2026-03-01", "value_num": 13.1,
           "unit": "g/dL"}
     r2 = {"test_name": "Hemoglobin (HGB)", "collected_at": "2026-03-01",
-          "value_num": 13.4, "unit": "G/DL"}  # same round-bucket, corrected value
+          "value_num": 13.4, "unit": "G/DL"}  # same draw, corrected value
     dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
     assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+
+
+def test_far_apart_correction_conflicts_not_duplicates(conn):
+    # Issue #20 headline: a large-magnitude correction (92 -> 130, same draw) used to
+    # slip through as a silent new row because value fed the key via round(). With the
+    # value out of the key it now collides on person/analyte/timestamp -> conflict.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc1 = _make_document(conn)
+    doc2 = _make_document(conn)
+    r1 = {"test_name": "Glucose", "collected_at": "2026-04-01T08:00", "value_num": 92,
+          "unit": "mg/dL"}
+    r2 = {"test_name": "GLUC", "collected_at": "2026-04-01T08:00", "value_num": 130,
+          "unit": "mg/dL"}  # OCR re-read of the *same* draw, wildly different value
+    dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
+    summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+def test_serial_same_day_draws_are_distinct_rows(conn):
+    # Two genuine draws on the same day at different times (GTT / peri-op / inpatient
+    # q6h) carry distinct timestamps -> distinct keys -> two rows, no data loss.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _make_document(conn)
+    rows = [
+        {"test_name": "Glucose", "collected_at": "2026-04-01T08:00", "value_num": 92,
+         "unit": "mg/dL"},
+        {"test_name": "Glucose", "collected_at": "2026-04-01T14:00", "value_num": 130,
+         "unit": "mg/dL"},
+    ]
+    summary = dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
+    assert summary.counts == {"new": 2, "duplicate": 0, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+
+
+def test_observation_correction_conflicts_not_duplicates(conn):
+    # Same latent defect for observation: value used to be *in* the key, so a corrected
+    # reading silently duplicated. With value out of the key it now conflicts.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc1 = _make_document(conn)
+    doc2 = _make_document(conn)
+    o1 = {"obs_type": "vital", "key": "systolic", "observed_at": "2026-05-01T09:00",
+          "value_num": 120}
+    o2 = {"obs_type": "vital", "key": "systolic", "observed_at": "2026-05-01T09:00",
+          "value_num": 155}  # re-read of the same measurement, corrected value
+    dedup.commit_extraction(conn, doc1, {"observation": [o1]}, d)
+    summary = dedup.commit_extraction(conn, doc2, {"observation": [o2]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 1
+
+
+def test_serial_same_day_observations_are_distinct_rows(conn):
+    # Two same-day vitals at different times stay as two rows.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _make_document(conn)
+    rows = [
+        {"obs_type": "vital", "key": "systolic", "observed_at": "2026-05-01T09:00",
+         "value_num": 120},
+        {"obs_type": "vital", "key": "systolic", "observed_at": "2026-05-01T17:00",
+         "value_num": 138},
+    ]
+    summary = dedup.commit_extraction(conn, doc, {"observation": rows}, d)
+    assert summary.counts == {"new": 2, "duplicate": 0, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 2
 
 
 def test_commit_unknown_type_rolls_back(conn):
