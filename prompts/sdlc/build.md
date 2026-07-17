@@ -27,3 +27,10 @@ Per the [README](README.md) universal loop — lane `stage:build`, idle reply `B
 
 ### 4. STOP
 One-line result: `BUILD: <#issue> → ADVANCE|CONTINUE|BOUNCE — <reason>`
+
+## Notes
+- **Idempotent.** An existing pushed branch with green targeted tests = done → ADVANCE; re-runs
+  continue an incomplete branch, they never restart it. An item **rewound here by a human** is
+  reconciled per the [README](README.md) universal loop: read their rewind comment, post a
+  reconciliation note (what's already implemented + evidence, what remains), and build only the
+  gap — existing work is presumed good unless the comment or your own check says otherwise.

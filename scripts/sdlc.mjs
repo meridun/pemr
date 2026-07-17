@@ -16,10 +16,10 @@
  *   sdlc worktree <issue> [<branch>]  add a sibling git worktree for the issue's branch
  *   sdlc comment <issue> <file>       post a body-file comment (plumbing only)
  *
- * Commands (dispatcher-side — issue #615; each a pure function of gh/git state):
+ * Commands (dispatcher-side — issue #615; each a pure function of gh/git/fs state):
  *   sdlc gate     [--reap]            per-issue wip-lock ages from timeline events → LIVE/REAP/CLEAR (#613)
- *   sdlc lock     <run-id>            take the dispatcher singleton lock (pinned dispatch-lock issue)
- *   sdlc unlock   <run-id>            release the dispatcher singleton lock
+ *   sdlc maint-lock    <run-id>       acquire the per-machine maintenance lock (.git/sdlc-maint.lock)
+ *   sdlc maint-release <run-id>       release the maintenance lock (idempotent)
  *   sdlc lanes                        per-lane depth + eligibility + the ≠1 stage-label check (#614)
  *   sdlc heal     [<lane>] <issue>    post-worker self-heal: did the worker clear its lock?
  *   sdlc git-maint                    fetch, ff dev, prune ancestry/squash-merged branches, PR state
@@ -170,42 +170,41 @@ export function planGate(wipItems, thresholdMs = WIP_STALE_MS) {
 }
 
 /**
- * Dispatcher singleton-lock decision from the dispatch-lock issue's comments
- * (`[{ body, createdAt }]`, chronological). The most recent `lock <run-id> <ts>`
- * comment holds the mutex unless a matching `unlock <run-id>` follows it or it
- * is older than the threshold (dead dispatcher). Pure.
+ * The machine maintenance-lock reap threshold (dispatch.md Step -1): 30 min,
+ * not the 2h worker threshold — maintenance takes minutes, so a longer freeze
+ * only delays recovery.
  */
-export function planLock(comments, nowMs, thresholdMs = WIP_STALE_MS) {
-  let holder = null;
-  for (const c of comments ?? []) {
-    const lock = c.body?.match(/^lock\s+(\S+)/);
-    const unlock = c.body?.match(/^unlock\s+(\S+)/);
-    if (lock) holder = { runId: lock[1], createdAt: c.createdAt };
-    else if (unlock && holder && unlock[1] === holder.runId) holder = null;
-  }
-  if (!holder) return { held: false, holder: null, stale: false };
-  const ageMs = nowMs - new Date(holder.createdAt).getTime();
-  const stale = ageMs >= thresholdMs;
-  return { held: !stale, holder: holder.runId, stale, ageMs };
+export const MAINT_STALE_MS = 30 * 60 * 1000;
+
+/**
+ * Machine maintenance-lock decision (dispatch.md Step -1). There is no
+ * dispatcher singleton: this lock only serializes Step 0a (git/worktree/
+ * artifact maintenance) on ONE machine, never aborts a cycle, and runs on
+ * different machines never contend. `state` is `{ exists, ageMs }` — age
+ * measured from the lock's owner.txt timestamp. Pure.
+ */
+export function planMaintLock(state, thresholdMs = MAINT_STALE_MS) {
+  if (!state?.exists) return { action: 'acquire' };
+  if (state.ageMs < thresholdMs) return { action: 'skip' }; // live run — skip Step 0a, never abort
+  return { action: 'reap' }; // holder presumed dead — reap by atomic rename
 }
 
 /**
  * Claim-verify race decision from an issue's comments (`[{ body, createdAt }]`,
- * chronological). Considers `sdlc:claim <run-id> <lane>` comments newer than the
- * last outcome EMIT (a comment starting with ADVANCE/BOUNCE/PARK/CONTINUE or a
- * reap). Winner = earliest claim; ties break to the lexicographically lower
- * run-id. Pure.
+ * chronological) plus the claim boundary: the newest `sdlc:wip` *unlabeled*
+ * timeline event (see `lastUnlabeledAt`), or null if the label was never
+ * removed. Every outcome EMIT removes `sdlc:wip`, so claims at/before that
+ * event are settled history — and a reaper strip also (correctly) invalidates
+ * earlier claims, which an outcome-comment heuristic would miss. Winner =
+ * earliest live claim; ties break to the lexicographically lower run-id. Pure.
  */
-export function planClaimVerify(comments, myRunId) {
-  const OUTCOME = /^(ADVANCE|BOUNCE|PARK|CONTINUE|sdlc-dispatch: reaped)/;
-  let claims = [];
+export function planClaimVerify(comments, myRunId, boundaryIso = null) {
+  const claims = [];
   for (const c of comments ?? []) {
-    if (OUTCOME.test(c.body ?? '')) {
-      claims = []; // claims before an outcome are settled history
-      continue;
-    }
     const m = c.body?.match(/^sdlc:claim\s+(\S+)/);
-    if (m) claims.push({ runId: m[1], createdAt: c.createdAt });
+    if (!m) continue;
+    if (boundaryIso && c.createdAt <= boundaryIso) continue; // settled history
+    claims.push({ runId: m[1], createdAt: c.createdAt });
   }
   if (!claims.some((c) => c.runId === myRunId)) {
     return { won: false, winner: null, reason: 'own claim not found' };
@@ -225,6 +224,21 @@ export function lastLabeledAt(timelineEvents, label) {
   let latest = null;
   for (const ev of timelineEvents ?? []) {
     if (ev.event === 'labeled' && ev.label?.name === label && ev.created_at) {
+      if (latest === null || ev.created_at > latest) latest = ev.created_at;
+    }
+  }
+  return latest;
+}
+
+/**
+ * The most recent time `label` was removed, from GitHub issue timeline events.
+ * Returns an ISO string or null. Pure over the parsed `/timeline` payload.
+ * For `sdlc:wip` this is the claim-verify boundary (see `planClaimVerify`).
+ */
+export function lastUnlabeledAt(timelineEvents, label) {
+  let latest = null;
+  for (const ev of timelineEvents ?? []) {
+    if (ev.event === 'unlabeled' && ev.label?.name === label && ev.created_at) {
       if (latest === null || ev.created_at > latest) latest = ev.created_at;
     }
   }
@@ -258,8 +272,8 @@ export function computeLanes(issues) {
     const stages = stagesOf(issue.labels);
     // Multiple stage labels are always corrupt. Zero is only corrupt when the
     // issue still carries a machine flag (wip/needs-human) — a stage-less open
-    // issue is otherwise a legitimate state: post-ship awaiting PR merge, the
-    // dispatch-lock issue, or simply not (yet) in the pipeline.
+    // issue is otherwise a legitimate state: post-ship awaiting PR merge, or
+    // simply not (yet) in the pipeline.
     const zeroButFlagged =
       stages.length === 0 &&
       (issue.labels.includes(WIP_LABEL) || issue.labels.includes('sdlc:needs-human'));
@@ -448,14 +462,34 @@ function cmdClaim(args, { gh, git, log }) {
     throw new SdlcError('--verify requires a run-id + lane: sdlc claim <issue> <run-id> <lane> --verify');
   }
   gh(['issue', 'edit', issue, '--add-label', WIP_LABEL]);
+  let myCommentUrl = null;
   if (runId) {
     // The label is the visibility signal; this comment is the ownership record
     // and race tiebreaker (see prompts/sdlc/README.md CLAIM).
-    gh(['issue', 'comment', issue, '--body', `sdlc:claim ${runId} ${lane}`]);
+    myCommentUrl = String(gh(['issue', 'comment', issue, '--body', `sdlc:claim ${runId} ${lane}`]) ?? '').trim();
   }
   if (verify) {
-    const result = planClaimVerify(fetchLockComments(gh, issue), runId);
+    // Boundary = newest sdlc:wip unlabel event; unavailable → null, which
+    // treats every claim as live (safe: strictly more competitors, never fewer).
+    let boundary = null;
+    try {
+      const timeline = JSON.parse(gh(['api', `repos/{owner}/{repo}/issues/${issue}/timeline`, '--paginate']));
+      boundary = lastUnlabeledAt(timeline, WIP_LABEL);
+    } catch {
+      boundary = null;
+    }
+    const result = planClaimVerify(fetchIssueComments(gh, issue), runId, boundary);
     if (!result.won) {
+      // README CLAIM iii: the winner's claim and the label stay untouched; only
+      // our own claim comment may be marked superseded.
+      const own = myCommentUrl?.match(/issuecomment-(\d+)/);
+      if (own) {
+        try {
+          gh(['api', '-X', 'PATCH', `repos/{owner}/{repo}/issues/comments/${own[1]}`, '-f', `body=sdlc:claim ${runId} ${lane} (superseded)`]);
+        } catch {
+          // cosmetic — losing cleanly matters more than the note
+        }
+      }
       log(`claim: LOST race on #${issue} to ${result.winner ?? '(unknown)'} — leave the label, pick the next item.`);
       process.exitCode = 1;
       return;
@@ -566,6 +600,21 @@ function cmdGate(args, { gh, log }) {
   for (const it of plan.reap) {
     log(`gate: REAP #${it.number} (stale ${fmtAge(it.ageMs)})`);
     if (reap) {
+      // Verify-before-write: the snapshot may be stale under concurrent
+      // dispatchers — another run may have reaped and a new worker claimed
+      // since. Re-fetch the newest claim and recompute the age before writing.
+      let freshAgeMs = null;
+      try {
+        const claims = fetchIssueComments(gh, it.number).filter((c) => /^sdlc:claim\s/.test(c.body ?? ''));
+        const newest = claims[claims.length - 1];
+        if (newest) freshAgeMs = Date.now() - new Date(newest.createdAt).getTime();
+      } catch {
+        freshAgeMs = null;
+      }
+      if (freshAgeMs !== null && freshAgeMs < WIP_STALE_MS) {
+        log(`  reap skipped — fresh claim (${fmtAge(freshAgeMs)}); another run got here first.`);
+        continue;
+      }
       gh(['issue', 'edit', String(it.number), '--remove-label', WIP_LABEL]);
       gh([
         'issue',
@@ -581,43 +630,94 @@ function cmdGate(args, { gh, log }) {
   if (plan.decision === 'clear') log('gate: CLEAR — no wip locks.');
 }
 
-/** Find the pinned dispatcher-mutex issue by its exact title. */
-function findDispatchLockIssue(gh) {
-  const list = JSON.parse(
-    gh(['issue', 'list', '--state', 'open', '--search', 'sdlc:dispatch-lock in:title', '--json', 'number,title']),
-  );
-  const hit = list.find((i) => i.title === 'sdlc:dispatch-lock');
-  if (!hit) throw new SdlcError('no open issue titled "sdlc:dispatch-lock" — create + pin it first');
-  return hit.number;
-}
-
-function fetchLockComments(gh, issue) {
+function fetchIssueComments(gh, issue) {
   return JSON.parse(
     gh(['issue', 'view', String(issue), '--json', 'comments', '--jq', '[.comments[] | {body: .body, createdAt: .createdAt}]']),
   );
 }
 
-function cmdLock(args, { gh, log }) {
+/** The machine maintenance-lock directory (inside .git: never tracked or swept). */
+function maintLockDir(root) {
+  return path.join(root, '.git', 'sdlc-maint.lock');
+}
+
+/** Best-effort owner + age of a held maintenance lock. */
+function readMaintOwner(dir) {
+  const ageFromMtime = () => {
+    try {
+      return Date.now() - fs.statSync(dir).mtimeMs;
+    } catch {
+      return 0; // dir vanished mid-read — treat as freshly held; next cycle acquires
+    }
+  };
+  try {
+    const txt = fs.readFileSync(path.join(dir, 'owner.txt'), 'utf8').trim();
+    const [runId, ...stamp] = txt.split(/\s+/);
+    const ts = new Date(stamp.join(' ')).getTime();
+    if (runId && !Number.isNaN(ts)) return { runId, ageMs: Date.now() - ts };
+    return { runId: runId || 'unknown', ageMs: ageFromMtime() };
+  } catch {
+    return { runId: 'unknown', ageMs: ageFromMtime() };
+  }
+}
+
+function cmdMaintLock(args, { log }, root) {
   const runId = args[0];
-  if (!runId) throw new SdlcError('lock requires a run-id: sdlc lock <run-id>');
-  const issue = findDispatchLockIssue(gh);
-  const plan = planLock(fetchLockComments(gh, issue), Date.now());
-  if (plan.held) {
-    log(`lock: HELD by ${plan.holder} (${fmtAge(plan.ageMs)}) — abort the cycle.`);
+  if (!runId) throw new SdlcError('maint-lock requires a run-id: sdlc maint-lock <run-id>');
+  const dir = maintLockDir(root);
+  const acquire = () => {
+    fs.mkdirSync(dir); // atomic, fail-if-exists: exactly one contender succeeds
+    fs.writeFileSync(path.join(dir, 'owner.txt'), `${runId} ${new Date().toISOString()}\n`);
+  };
+  try {
+    acquire();
+    log(`maint-lock: ACQUIRED ${runId}`);
+    return;
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+  }
+  const owner = readMaintOwner(dir);
+  const plan = planMaintLock({ exists: true, ageMs: owner.ageMs });
+  if (plan.action === 'skip') {
+    log(`maint-lock: HELD by ${owner.runId} (${fmtAge(owner.ageMs)}) — skip maintenance this cycle; never abort over this lock.`);
     process.exitCode = 1;
     return;
   }
-  if (plan.stale) log(`lock: superseding stale lock from ${plan.holder} (${fmtAge(plan.ageMs)}, no unlock).`);
-  gh(['issue', 'comment', String(issue), '--body', `lock ${runId} ${new Date().toISOString()}`]);
-  log(`lock: ACQUIRED ${runId} (issue #${issue}).`);
+  // Stale (holder presumed dead) → reap by rename: atomic, exactly one contender wins.
+  const stale = `${dir}.stale-${runId}`;
+  try {
+    fs.renameSync(dir, stale);
+  } catch {
+    log('maint-lock: HELD — another run just reaped or holds it; skip maintenance this cycle.');
+    process.exitCode = 1;
+    return;
+  }
+  fs.rmSync(stale, { recursive: true, force: true });
+  try {
+    acquire();
+  } catch {
+    log('maint-lock: HELD — lost the post-reap acquire race; skip maintenance this cycle.');
+    process.exitCode = 1;
+    return;
+  }
+  log(`maint-lock: REAPED stale lock from ${owner.runId} (${fmtAge(owner.ageMs)}); ACQUIRED ${runId}`);
 }
 
-function cmdUnlock(args, { gh, log }) {
+function cmdMaintRelease(args, { log }, root) {
   const runId = args[0];
-  if (!runId) throw new SdlcError('unlock requires a run-id: sdlc unlock <run-id>');
-  const issue = findDispatchLockIssue(gh);
-  gh(['issue', 'comment', String(issue), '--body', `unlock ${runId}`]);
-  log(`unlock: RELEASED ${runId} (issue #${issue}).`);
+  const dir = maintLockDir(root);
+  if (!fs.existsSync(dir)) {
+    log('maint-release: RELEASED (already clear)'); // idempotent — a missing lock is a successful no-op
+    return;
+  }
+  const owner = readMaintOwner(dir);
+  if (runId && owner.runId !== 'unknown' && owner.runId !== runId) {
+    log(`maint-release: NOT OWNER — held by ${owner.runId}; left in place.`);
+    process.exitCode = 1;
+    return;
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  log(`maint-release: RELEASED${runId ? ` ${runId}` : ''}`);
 }
 
 function cmdLanes(args, { gh, log }) {
@@ -785,8 +885,8 @@ const USAGE = `sdlc — deterministic SDLC pipeline one-shots
 
   Dispatcher-side:
   sdlc gate     [--reap]            per-issue wip-lock ages (timeline-based) → LIVE/REAP/CLEAR
-  sdlc lock     <run-id>            take the dispatcher singleton lock (exits 1 if held)
-  sdlc unlock   <run-id>            release the dispatcher singleton lock
+  sdlc maint-lock    <run-id>       acquire the per-machine maintenance lock (exit 1 = held: skip Step 0a, never abort)
+  sdlc maint-release <run-id>       release the maintenance lock (idempotent)
   sdlc lanes                        per-lane depth + eligibility + ≠1 stage integrity
   sdlc heal     [<lane>] <issue>    post-worker self-heal check (still locked?)
   sdlc git-maint                    fetch, ff dev, prune merged branches, PR state
@@ -801,8 +901,8 @@ const COMMANDS = {
   worktree: cmdWorktree,
   comment: cmdComment,
   gate: cmdGate,
-  lock: cmdLock,
-  unlock: cmdUnlock,
+  'maint-lock': cmdMaintLock,
+  'maint-release': cmdMaintRelease,
   lanes: cmdLanes,
   heal: cmdHeal,
   'git-maint': cmdGitMaint,
