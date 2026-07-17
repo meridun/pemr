@@ -32,3 +32,9 @@ not a checklist to tick. Assume the build is broken until your own evidence says
 
 ### 4. STOP
 One-line result: `VERIFY: <#issue> → ADVANCE|BOUNCE — <reason>`
+
+## Notes
+- **Idempotent.** A green report for the current branch HEAD = done; any new commit invalidates
+  it. An item rewound here by a human with a still-valid green report → re-confirm cheaply and
+  ADVANCE, unless their rewind comment names a reason to distrust it — then re-verify that part.
+  Evidence that the work already shipped (merged PR) → PARK with the evidence for a human to close.

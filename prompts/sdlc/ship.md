@@ -13,6 +13,9 @@ You are the **ship worker**. Process **exactly one** issue, then stop.
 Per the [README](README.md) universal loop — lane `stage:ship`, idle reply `SHIP: idle`.
 
 ### 2. WORK
+Idempotency first: a PR for this branch already open with the docs fan-out done → skip to
+**ADVANCE**; a PR for this branch already **merged** with the issue still open → PARK with the
+merge evidence for a human to close (intake's merge sweep normally handles these). Otherwise:
 - **Merge the integration branch (`dev`) into the feature branch unconditionally** — the PR must
   be mergeable, and ship is the lane that always merges (per the README staleness rule).
   Docs-only conflicts you may resolve yourself; **code conflicts BOUNCE → `stage:build`** naming
@@ -20,7 +23,9 @@ Per the [README](README.md) universal loop — lane `stage:ship`, idle reply `SH
 - Push the branch, open a PR against `dev` (or your integration branch) with a summary and a
   link to the issue (`Closes #<n>`).
 - Update any L3 docs the change invalidated or that document new behavior (see
-  `docs/Documentation.md`).
+  `docs/Documentation.md`; when applying the tiered-docs discipline, the `pemr-doc-tiers` skill at
+  `.github/skills/pemr-doc-tiers/SKILL.md` carries the naming/sizing/placement rules — apply them
+  inline).
 - No-branch fallback: if the feature was already merged outside the pipeline, skip PR creation
   and instead comment confirming it's live, then close.
 

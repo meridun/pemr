@@ -42,6 +42,10 @@ export const SKILL_LINE_CAP = 400;
 // slashes for possessive `pemr-x/y`) is excluded by the char class.
 const REF_RE = /pemr-[a-z0-9]+(?:-[a-z0-9]+)*/g;
 
+// Tokens that match REF_RE but are not skill/agent references: `pemr-wt` is
+// the issue-worktree path prefix (`C:\Claude\pemr-wt-<issue>`).
+const IGNORED_REFS = new Set(['pemr-wt']);
+
 /** Count body lines of an agent file (everything after the closing frontmatter `---`). */
 export function agentBodyLineCount(raw) {
   const match = raw.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n([\s\S]*)$/);
@@ -56,7 +60,10 @@ export function agentBodyLineCount(raw) {
 
 /** Extract the unique set of pemr-* reference tokens from text. */
 export function extractRefs(text) {
-  return new Set(text.match(REF_RE) ?? []);
+  const refs = (text.match(REF_RE) ?? []).filter(
+    (ref) => !IGNORED_REFS.has(ref) && ![...IGNORED_REFS].some((ig) => ref.startsWith(`${ig}-`)),
+  );
+  return new Set(refs);
 }
 
 async function readDirEntries(dir) {
