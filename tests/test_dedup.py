@@ -169,6 +169,56 @@ def test_validate_rejects_wrong_type():
         )
 
 
+@pytest.mark.parametrize("bad", ["06/15/2026", "not-a-date", "2026-13-01",
+                                  "2026-01-32", "20260102", "2026/01/02", "Jan 2 2026"])
+def test_validate_rejects_non_iso_date(bad):
+    # Non-ISO date strings must be rejected by name+value (issue #19): they sort
+    # lexically ahead of real ISO dates and corrupt the timeline.
+    with pytest.raises(dedup.ValidationError, match=r"collected_at.*ISO date"):
+        dedup.validate_row(
+            "lab_result",
+            {"test_name": "Sodium", "value_num": 140, "collected_at": bad},
+        )
+
+
+@pytest.mark.parametrize("good", ["2026-01-02", "2026-01-02T09:30",
+                                   "2026-01-02T09:30:00", "2026-01-02 09:30:00",
+                                   "2026-01-02T09:30:00+00:00", "2026-01-02T09:30:00Z"])
+def test_validate_accepts_iso_dates_and_timestamps(good):
+    # Full ISO timestamps are accepted alongside bare YYYY-MM-DD.
+    dedup.validate_row(
+        "lab_result",
+        {"test_name": "Sodium", "value_num": 140, "collected_at": good},
+    )
+
+
+def test_validate_rejects_non_iso_date_across_record_types():
+    # Every date-typed field, not just lab_result.collected_at, is guarded.
+    with pytest.raises(dedup.ValidationError, match=r"started_on.*ISO date"):
+        dedup.validate_row("medication", {"name": "Metformin", "started_on": "06/15/2026"})
+    with pytest.raises(dedup.ValidationError, match=r"ended_on.*ISO date"):
+        dedup.validate_row("medication", {"name": "Metformin", "ended_on": "bad"})
+    with pytest.raises(dedup.ValidationError, match=r"performed_on.*ISO date"):
+        dedup.validate_row("procedure", {"name": "MRI", "performed_on": "13/01/2026"})
+    with pytest.raises(dedup.ValidationError, match=r"scheduled_for.*ISO date"):
+        dedup.validate_row("appointment", {"scheduled_for": "next tuesday"})
+    with pytest.raises(dedup.ValidationError, match=r"observed_at.*ISO date"):
+        dedup.validate_row("observation", {"obs_type": "vital", "observed_at": "2026/01/02"})
+
+
+def test_commit_bad_date_rolls_back_whole_batch(conn):
+    # End-to-end: a non-ISO date in a committed batch rolls the whole thing back.
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError, match="ISO date"):
+        dedup.commit_extraction(
+            conn, doc,
+            {"lab_result": [_lab(5.7),
+                            {"test_name": "Sodium", "value_num": 140,
+                             "collected_at": "06/15/2026"}]},
+        )
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 0
+
+
 # --- commit_extraction: new / duplicate / conflict ----------------------------
 
 def _lab(value):
