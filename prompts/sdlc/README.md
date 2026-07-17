@@ -28,10 +28,12 @@ plumbing wrapper that posts a body the agent already authored.
 
 ## How to run
 
-- **Scheduled**: a dispatcher (see [`dispatch.md`](dispatch.md)) runs periodically: a dispatcher
-  singleton gate, a per-issue wip gate (stale-lock reaping only — a fresh lock just makes that
-  one issue ineligible), git + worktree maintenance, then one worker subagent per non-empty
-  lane. Locking is per-issue (claim comments, below), so lane workers may run concurrently.
+- **Scheduled**: a dispatcher (see [`dispatch.md`](dispatch.md)) runs periodically: a per-issue
+  wip gate (stale-lock reaping, verify-before-write — a fresh lock just makes that one issue
+  ineligible), machine-locked git + worktree maintenance, then one worker subagent per non-empty
+  lane. There is no dispatcher singleton: overlapping dispatch runs — same machine or different
+  machines — deconflict via per-issue claims (claim comments, below), a per-machine maintenance
+  lock, and idempotent GitHub writes.
 - **Manual**: paste this README plus a lane file's body into an agent session. Identical
   behavior — the prompt doesn't know what fired it. Mint your own run-id for the claim comment;
   manual and scheduled runs coexist safely because claims deconflict per-issue.
@@ -46,7 +48,11 @@ plumbing wrapper that posts a body the agent already authored.
       you mint for a manual run), then runs the claim-verify race check. The label is the
       visibility signal; the claim comment is the ownership record and tiebreaker (earliest
       claim newer than the last outcome EMIT wins; ties break to the lexicographically lower
-      run-id).
+      run-id). "Newer than the last outcome EMIT" has a machine-visible boundary: the issue's
+      most recent `sdlc:wip` *unlabeled* timeline event — every outcome EMIT removes `sdlc:wip`,
+      and a reaper strip also (correctly) invalidates earlier claims. The lock is machine-owned
+      and volatile; the dispatcher's reaper may strip it, and it re-checks the claim comment's
+      run-id + timestamp immediately before doing so.
    2. **Lost the race** (the command exits non-zero and says so) → leave the label and the
       winner's claim untouched, delete nothing, and go pick the next eligible item.
 2. **WORK** — per the lane file, with these constraints:
@@ -55,7 +61,19 @@ plumbing wrapper that posts a body the agent already authored.
      Where a lane names a role (`verifier`, `security-executor`, …) it names the **stance and
      checklist you apply inline**, not a subagent to dispatch. Cost-tiering happens one level
      up: the dispatcher sets each worker's `model` per lane (see `dispatch.md`).
-   - **Idempotent** — if the stage's artifact already exists, treat as done; don't redo it.
+   - **Idempotent — reconcile, don't re-execute.** If the stage's artifact already exists, treat
+     as done; don't redo it. Schedulers fire on a clock, not on need — a re-run must be a safe
+     no-op. The same applies to items a human rewound to an earlier stage or reopened after
+     close: investigate what already exists before doing any work. Evidence hierarchy: merged
+     code / branch state / PR status › recorded reports for the current HEAD › issue comments ›
+     labels — cite what you relied on when you no-op. Presume an existing valid artifact good
+     unless the human's rewind comment gives a reason to distrust it or your own check finds
+     something significant; then redo exactly the invalidated part. Keep the check cheap — dig
+     deeper only when evidence conflicts, and PARK if it stays ambiguous rather than burn the
+     pass. For partial work, post a short reconciliation note (what's already done + evidence,
+     what remains) before continuing, then do only the gap. If the item is conclusively shipped
+     already, PARK with the evidence (PR#, commit, observed behavior) for a human to close —
+     don't march it through the remaining lanes.
    - **Worktree isolation** — never work in the main checkout; it may hold human WIP or another
      worker. For any lane that touches a branch, use the issue-scoped worktree
      `../<repo>-wt-<issue#>`: `npm run sdlc worktree <issue> [<branch>]` creates it (or reuses
@@ -79,7 +97,23 @@ plumbing wrapper that posts a body the agent already authored.
 3. **EMIT exactly one outcome** — ADVANCE, BOUNCE, or PARK — never silent. Every outcome removes
    `sdlc:wip` on the way out. **Leave the worktree in place** — dispatcher maintenance prunes
    worktrees for merged/dead branches, and a reaped issue's next worker reuses it.
-4. **STOP** — reply the lane's one-line result. One item per pass; never pick up a second.
+4. **STOP** — reply the lane's one-line result, then end the reply with a fenced **JSON result
+   block** — the machine-parseable contract the dispatcher consumes (prose stays for humans):
+
+   ```json
+   {"issue": 60, "outcome": "ADVANCE", "next_stage": "verify", "notes": "one-line summary"}
+   ```
+
+   - `outcome`: `ADVANCE` | `BOUNCE` | `PARK` | `CONTINUE` | `IDLE`.
+   - `next_stage`: the stage label the item sits in after the outcome (e.g. `"verify"` after a
+     build ADVANCE, `"build"` after a build CONTINUE or a bounce to build, unchanged lane for
+     PARK); `null` for IDLE.
+   - Idle pass: `{"issue": null, "outcome": "IDLE", "next_stage": null, "notes": ""}`.
+   - The block is always the **last** element of the reply, exactly one per reply. A lane a project
+     configures to process multiple items in one pass returns an **array** of result objects, one
+     per item.
+
+   One item per pass; never pick up a second.
 
 ## Files
 

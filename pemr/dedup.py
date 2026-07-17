@@ -82,6 +82,7 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
 KNOWN_TYPES = tuple(FIELD_SPECS)
 
 _WS = re.compile(r"\s+")
+_PAREN = re.compile(r"\([^)]*\)")
 
 
 class ValidationError(ValueError):
@@ -116,13 +117,23 @@ def _collapse(value: str) -> str:
     return _WS.sub(" ", value.strip().lower().replace("_", " "))
 
 
+def _strip_qualifiers(value: str) -> str:
+    """Drop parenthetical qualifiers (``(SPEP)``, ``(HGB)``, ``(calculated)``) that
+    label a value's method/source without changing *which analyte it is*, then
+    re-collapse whitespace. Applied inside :func:`norm` so real-report spellings like
+    ``Hemoglobin (HGB)`` or ``M-Spike (SPEP)`` reduce to their bare analyte name and
+    the dictionary only has to carry the minimal spelling, not every parenthesized
+    variant a lab happens to print."""
+    return _WS.sub(" ", _PAREN.sub(" ", value)).strip()
+
+
 def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
     """Normalize a free-text field: lowercase, trim, collapse whitespace (underscores
-    count as whitespace), then map synonyms through the dictionary. ``None`` -> ``""``
-    (deterministic key part)."""
+    count as whitespace), strip parenthetical qualifiers, then map synonyms through
+    the dictionary. ``None`` -> ``""`` (deterministic key part)."""
     if value is None:
         return ""
-    collapsed = _collapse(str(value))
+    collapsed = _strip_qualifiers(_collapse(str(value)))
     if dictionary:
         return dictionary.get(collapsed, collapsed)
     return collapsed
@@ -254,6 +265,13 @@ def _stored_fields(record_type: str, row_map: dict) -> dict:
     return {name: row_map.get(name) for name in FIELD_SPECS[record_type]}
 
 
+def _norm_unit(value: object) -> str:
+    """Units compare case-insensitively: ``MG/DL`` and ``mg/dL`` are the same unit,
+    not a conflict (real reports vary the casing freely). Stored display casing is
+    left untouched — this only governs the duplicate-vs-conflict decision."""
+    return "" if value is None else str(value).strip().lower()
+
+
 def _rows_equal(record_type: str, existing: sqlite3.Row, incoming: dict) -> bool:
     """True when two rows with a matching dedup_key are the *same fact* (a duplicate)
     rather than a conflicting one — i.e. their payload fields all agree."""
@@ -262,6 +280,12 @@ def _rows_equal(record_type: str, existing: sqlite3.Row, incoming: dict) -> bool
         ev = existing_map.get(name)
         iv = incoming.get(name)
         if ev is None and iv is None:
+            continue
+        # Unit strings are compared case-insensitively so casing variants across
+        # documents don't stage a spurious conflict.
+        if name == "unit":
+            if _norm_unit(ev) != _norm_unit(iv):
+                return False
             continue
         # Numeric columns round-trip through SQLite as float; compare numerically.
         if isinstance(ev, _NUM) and isinstance(iv, _NUM):
