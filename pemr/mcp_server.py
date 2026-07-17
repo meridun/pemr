@@ -334,60 +334,66 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     ro = {"readOnlyHint": True}
     rw = {"readOnlyHint": False}
 
+    # Tools are registered with explicit `name=` so the wire surface equals TOOL_NAMES —
+    # FastMCP otherwise registers under the function name (`*_tool`), and an agent
+    # following AGENTS.md (which documents the CLI-mirroring names) would call a
+    # nonexistent tool. The `*_tool` function names stay distinct from the plain
+    # connection-injected tool functions above they delegate to.
+
     # -- read-only --
-    @server.tool(annotations=ro)
+    @server.tool(name="person_list", annotations=ro)
     def person_list_tool() -> list[dict]:
         return _run(person_list)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="person_show", annotations=ro)
     def person_show_tool(slug: str) -> dict:
         return _run(person_show, slug=slug)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="query", annotations=ro)
     def query_tool(kind: str, person: str, test: str | None = None,
                    since: str | None = None, active: bool = False) -> list[dict]:
         return _run(query, kind=kind, person=person, test=test, since=since, active=active)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="find", annotations=ro)
     def find_tool(person: str, query_text: str) -> list[dict]:
         return _run(find, person=person, query_text=query_text)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="trends", annotations=ro)
     def trends_tool(person: str, test: str) -> dict:
         return _run(trends, person=person, test=test)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="render_summary", annotations=ro)
     def render_summary_tool(person: str) -> dict:
         return _run(render_summary, person=person)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="render_brief", annotations=ro)
     def render_brief_tool(appointment: int) -> dict:
         return _run(render_brief, appointment=appointment)
 
-    @server.tool(annotations=ro)
+    @server.tool(name="render_journal", annotations=ro)
     def render_journal_tool(person: str, since: str | None = None) -> dict:
         return _run(render_journal, person=person, since=since)
 
     # -- write --
-    @server.tool(annotations=rw)
+    @server.tool(name="person_add", annotations=rw)
     def person_add_tool(slug: str, full_name: str, dob: str | None = None,
                         sex: str | None = None, blood_type: str | None = None,
                         notes: str | None = None) -> dict:
         return _run(person_add, slug=slug, full_name=full_name, dob=dob, sex=sex,
                     blood_type=blood_type, notes=notes)
 
-    @server.tool(annotations=rw)
+    @server.tool(name="ingest", annotations=rw)
     def ingest_tool(file: str, person: str, ocr_text: str | None = None,
                     doc_date: str | None = None, category: str | None = None,
                     provider: str | None = None, ocr: bool = False) -> dict:
         return _run(ingest_document, file=file, person=person, ocr_text=ocr_text,
                     doc_date=doc_date, category=category, provider=provider, ocr=ocr)
 
-    @server.tool(annotations=rw)
+    @server.tool(name="commit_extraction", annotations=rw)
     def commit_extraction_tool(document_id: int, records: dict) -> dict:
         return _run(commit_extraction, document_id=document_id, records=records)
 
-    @server.tool(annotations=rw)
+    @server.tool(name="review_conflicts", annotations=rw)
     def review_conflicts_tool(resolve: int | None = None, keep: str = "existing",
                               signoff: str | None = None, note: str | None = None,
                               all: bool = False) -> object:
