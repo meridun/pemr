@@ -195,11 +195,11 @@ Each typed/observation row computes a deterministic `dedup_key` from normalized 
 so the *same clinical fact* extracted from two different documents collapses to one row.
 
 ```
-lab_result.dedup_key   = hash(person_id | norm(test_name) | collected_at_date | round(value))
+lab_result.dedup_key   = hash(person_id | norm(test_name) | collected_at)
 medication.dedup_key    = hash(person_id | norm(name) | dose | started_on)
 procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
-observation.dedup_key   = hash(person_id | obs_type | observed_at | key | value)
+observation.dedup_key   = hash(person_id | obs_type | observed_at | key)
 ```
 
 `norm()` = lowercase, trim, collapse whitespace, map synonyms via an **analyte/name
@@ -207,10 +207,23 @@ dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` 
 canonical `hba1c`. The dictionary is the one place fuzzy naming gets pinned down
 deterministically; agents propose additions, you approve.
 
+The **measured value is deliberately *not* in the key** — temporal identity carries the
+draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
+document gives one, date when it only gives a date), not truncated to the date. Two draws
+of the same analyte on the same day at different times (serial glucose, peri-op, inpatient
+q6h) get distinct timestamps → distinct keys → two rows preserved; a correction or OCR
+re-read of the *same* draw carries the same timestamp → collides → surfaces as a conflict
+(below). When only a date is available, same-day differing values collide → conflict; that
+safety bias is intentional (a spurious conflict on a genuine repeat is human-recoverable, a
+silent duplicate of a correction poisons `trends`/brief/`query` irrecoverably).
+
 **Conflict handling.** On dedup-key collision with *differing* non-key fields (e.g. a
 corrected value), don't silently drop — write to a `conflict` staging table and surface
 it: `pemr review-conflicts`. Human/agent resolves. This is the safety valve that keeps
-"no duplicates" from quietly meaning "lost the corrected result."
+"no duplicates" from quietly meaning "lost the corrected result." Because the value is out
+of the key, this fires for *any* magnitude of value change on a matching draw — the
+headline `Glucose 92 → 95` (or `92 → 130`) case that previously slipped through as a silent
+new row now stages a conflict.
 
 ---
 
