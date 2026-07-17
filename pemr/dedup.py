@@ -81,12 +81,46 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
 
 KNOWN_TYPES = tuple(FIELD_SPECS)
 
+# Date-typed fields per record type. These feed timeline sort / trends date math and
+# the dedup_key (via _date_only), all of which assume a lexically-sortable ISO date —
+# so validate_row enforces strict ISO on them, not just the base `str` type.
+DATE_FIELDS: dict[str, frozenset[str]] = {
+    "lab_result": frozenset({"collected_at"}),
+    "medication": frozenset({"started_on", "ended_on"}),
+    "procedure": frozenset({"performed_on"}),
+    "appointment": frozenset({"scheduled_for"}),
+    "observation": frozenset({"observed_at"}),
+}
+
 _WS = re.compile(r"\s+")
 _PAREN = re.compile(r"\([^)]*\)")
+
+# A date value must begin with a strict `YYYY-MM-DD` (the part _date_only slices for
+# the dedup_key and timeline sort); an optional time component may follow after `T` or
+# a space. Calendar validity (real month/day, valid time) is then confirmed by
+# datetime.fromisoformat below.
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?")
 
 
 class ValidationError(ValueError):
     """Raised when the extraction JSON violates a record schema."""
+
+
+def _is_iso_date(value: str) -> bool:
+    """True when ``value`` is a strict ISO date (``YYYY-MM-DD``) or ISO timestamp
+    (``YYYY-MM-DD`` + ``T``/space + a valid time, optionally with offset/``Z``).
+
+    Non-ISO forms like ``06/15/2026`` or ``not-a-date`` are rejected — they would
+    otherwise sort lexically ahead of real ISO dates and corrupt the timeline."""
+    if not _ISO_DATE_RE.fullmatch(value):
+        return False
+    try:
+        # datetime.fromisoformat (3.11+) parses date-only and full timestamps and
+        # enforces calendar/time validity; `Z` is accepted only from 3.11 onward.
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -216,6 +250,11 @@ def validate_row(record_type: str, row: object) -> None:
             raise ValidationError(
                 f"{record_type}.{name}: expected {_type_names(types)}, "
                 f"got {type(value).__name__}"
+            )
+        if name in DATE_FIELDS.get(record_type, frozenset()) and not _is_iso_date(value):
+            raise ValidationError(
+                f"{record_type}.{name}: expected ISO date (YYYY-MM-DD) or ISO "
+                f"timestamp, got {value!r}"
             )
 
 
