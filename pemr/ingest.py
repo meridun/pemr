@@ -39,6 +39,15 @@ class IngestResult:
     def is_duplicate(self) -> bool:
         return self.status == "duplicate"
 
+    @property
+    def ocr_text_populated(self) -> bool:
+        """Whether the stored document ended up with any OCR/transcription text.
+
+        The `AGENTS.md` contract asks agents to populate `ocr_text` on every ingest
+        (empty FTS otherwise); this lets a caller self-check without a follow-up read.
+        """
+        return bool(self.document.ocr_text)
+
 
 _READ_CHUNK = 1 << 20  # 1 MiB
 
@@ -130,12 +139,20 @@ def ingest_document(
     category: str | None = None,
     provider: str | None = None,
     ocr: bool = False,
+    ocr_text: str | None = None,
 ) -> IngestResult:
     """Ingest one document: hash, layer-1 dedup, blob store, insert `document`.
 
     On a content-hash hit (layer 1), the existing document is returned with
     status "duplicate" and nothing is written. Otherwise the blob is copied into
     the immutable content-addressed store and a new `document` row is inserted.
+
+    ``ocr_text`` is caller-supplied document text (the agent's own transcription —
+    the `AGENTS.md` default path, which beats tesseract on messy scans). When
+    provided it wins; otherwise ``ocr=True`` falls back to a best-effort tesseract
+    pass. An empty/whitespace-only string is treated as absent. Populating text here
+    is what makes a document findable via FTS (`find`), so it is a warning-not-error
+    when it ends up empty — see :attr:`IngestResult.ocr_text_populated`.
     """
     db.require_migrated(conn)
 
@@ -160,7 +177,8 @@ def ingest_document(
     if blob_created:
         shutil.copy2(src, dest)
 
-    ocr_text = run_ocr(dest) if ocr else None
+    supplied = ocr_text.strip() if ocr_text else None
+    ocr_text = supplied or (run_ocr(dest) if ocr else None)
 
     try:
         with conn:
