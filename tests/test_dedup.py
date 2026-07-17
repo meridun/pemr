@@ -68,6 +68,43 @@ def test_vitals_synonyms_map_to_canonical():
         assert dedup.norm(spelling, d) == "blood_pressure"
 
 
+def test_norm_strips_parenthetical_qualifiers():
+    d = dedup.load_dictionary(DICT_PATH)
+    # `(HGB)` / `(HCT)` / `(SPEP)` are method/label tags, not different analytes.
+    assert dedup.norm("Hemoglobin (HGB)", d) == "hemoglobin"
+    assert dedup.norm("Hematocrit (HCT)", d) == "hematocrit"
+    assert dedup.norm("M-Spike (SPEP)", d) == "m_spike"
+    # Stripping happens even without a dictionary (pure normalization step).
+    assert dedup.norm("Creatinine (calculated)") == "creatinine"
+
+
+# Real-corpus naming variants (issue #11): report-side spelling <-> CSV-side spelling
+# for the same clinical fact. Every pair must collapse to a single canonical token or
+# the same analyte splits into parallel rows/series downstream.
+_CORPUS_VARIANTS = [
+    ("GLUC", "Glucose"),
+    ("NA", "Sodium"),
+    ("K", "Potassium"),
+    ("CREA", "Creatinine"),
+    ("Hemoglobin (HGB)", "HGB"),
+    ("Hematocrit (HCT)", "HCT"),
+    ("Platelet count", "PLT"),
+    ("Free Kappa light chain", "Kappa"),
+    ("Free Lambda light chain", "Lambda"),
+    ("Kappa/Lambda ratio", "K/L Ratio"),
+    ("M-Spike (SPEP)", "M-Spike"),
+    ("Immunoglobulin G, Qn, Serum", "Immunoglobulin G"),
+    ("VIT B12", "Vitamin B12"),
+    ("B2 Microglobulin", "Beta-2 Microglobulin"),
+]
+
+
+def test_corpus_naming_variants_share_canonical_token():
+    d = dedup.load_dictionary(DICT_PATH)
+    for report, csv in _CORPUS_VARIANTS:
+        assert dedup.norm(report, d) == dedup.norm(csv, d), (report, csv)
+
+
 # --- dedup_key determinism ----------------------------------------------------
 
 def test_dedup_key_is_stable_across_formatting():
@@ -177,6 +214,65 @@ def test_differing_value_stages_conflict(conn):
     assert conn.execute("SELECT value_num FROM lab_result").fetchone()["value_num"] == 5.7
     assert conn.execute("SELECT COUNT(*) AS n FROM conflict WHERE status='open'"
                         ).fetchone()["n"] == 1
+
+
+def test_unit_casing_difference_is_duplicate_not_conflict(conn):
+    # `MG/DL` (report) vs `mg/dL` (CSV) is the same unit — must not stage a conflict.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc1 = _make_document(conn)
+    doc2 = _make_document(conn)
+    r1 = {"test_name": "Glucose", "collected_at": "2026-02-01", "value_num": 95,
+          "unit": "MG/DL"}
+    r2 = {"test_name": "GLUC", "collected_at": "2026-02-01", "value_num": 95,
+          "unit": "mg/dL"}
+    dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
+    summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+def test_real_corpus_overlap_dedups_not_splits(conn):
+    """Acceptance (issue #11): a report document and the historical CSV committed as a
+    second document must recognize every overlapping fact — none slip through as new,
+    unit casing doesn't fabricate conflicts, one stored row per analyte so `trends`
+    can't split a series and `render summary` can't double-count."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc_report = _make_document(conn)
+    doc_csv = _make_document(conn)
+    date = "2026-01-05"
+    # Same person, same date, same value per analyte — only the spelling and unit
+    # casing differ between the two documents.
+    report_rows = [
+        {"test_name": report, "collected_at": date, "value_num": float(i + 1),
+         "unit": "MG/DL"}
+        for i, (report, _csv) in enumerate(_CORPUS_VARIANTS)
+    ]
+    csv_rows = [
+        {"test_name": csv, "collected_at": date, "value_num": float(i + 1),
+         "unit": "mg/dL"}
+        for i, (_report, csv) in enumerate(_CORPUS_VARIANTS)
+    ]
+    s1 = dedup.commit_extraction(conn, doc_report, {"lab_result": report_rows}, d)
+    assert s1.counts == {"new": len(_CORPUS_VARIANTS), "duplicate": 0, "conflict": 0}
+    s2 = dedup.commit_extraction(conn, doc_csv, {"lab_result": csv_rows}, d)
+    assert s2.counts == {"new": 0, "duplicate": len(_CORPUS_VARIANTS), "conflict": 0}
+    # One row per analyte, not two — the split-series / double-count damage is gone.
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] \
+        == len(_CORPUS_VARIANTS)
+
+
+def test_corrected_value_still_conflicts_after_normalization(conn):
+    # Normalization must not swallow a genuine value change into a silent duplicate.
+    d = dedup.load_dictionary(DICT_PATH)
+    doc1 = _make_document(conn)
+    doc2 = _make_document(conn)
+    r1 = {"test_name": "HGB", "collected_at": "2026-03-01", "value_num": 13.1,
+          "unit": "g/dL"}
+    r2 = {"test_name": "Hemoglobin (HGB)", "collected_at": "2026-03-01",
+          "value_num": 13.4, "unit": "G/DL"}  # same round-bucket, corrected value
+    dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
+    summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
 
 
 def test_commit_unknown_type_rolls_back(conn):

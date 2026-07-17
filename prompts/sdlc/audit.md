@@ -29,3 +29,9 @@ find reasons this should NOT ship, not to rubber-stamp verify's pass.
 
 ### 4. STOP
 One-line result: `AUDIT: <#issue> → ADVANCE|BOUNCE — <reason>`
+
+## Notes
+- **Idempotent.** A clean report for the current branch HEAD = done; any new commit invalidates
+  it. An item rewound here by a human with a still-valid clean report → re-confirm cheaply and
+  ADVANCE, unless their rewind comment names a reason to distrust it — then re-audit that part.
+  Evidence that the work already shipped (merged PR) → PARK with the evidence for a human to close.
