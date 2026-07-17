@@ -8,6 +8,7 @@
     "sync:claude-config": "node scripts/sync-claude-config.mjs",
     "sync:claude-config:check": "node scripts/sync-claude-config.mjs --check",
     "check:meta-drift": "node scripts/check-meta-drift.mjs",
-    "sdlc": "node scripts/sdlc.mjs"
+    "sdlc": "node scripts/sdlc.mjs",
+    "test": "node --test"
   }
 }
