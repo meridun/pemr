@@ -25,6 +25,35 @@ from .dedup import norm
 # can never be mis-parsed as FTS syntax (each token is quoted as a phrase, AND-ed).
 _WORD = re.compile(r"\w+", re.UNICODE)
 
+# Medication ``status`` values that end the course even when no explicit ``ended_on``
+# date was extracted (issue #21). ``status`` is unconstrained at the DB layer
+# (migrations/001_init.sql documents active|discontinued|prn, but extraction agents emit
+# terminal values like completed/stopped as well), so matching is lowercased and trimmed.
+TERMINAL_MED_STATUSES = frozenset({"completed", "stopped", "discontinued"})
+
+
+def _row_get(row: sqlite3.Row | dict, key: str) -> object:
+    """Column access that tolerates a missing key on either a dict or ``sqlite3.Row``."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def med_is_current(row: sqlite3.Row | dict) -> bool:
+    """True when a medication is still current: no end date *and* no terminal status.
+
+    An explicit ``status='active'`` always counts as current (even alongside an end
+    date). A terminal status (:data:`TERMINAL_MED_STATUSES`) ends the course even when
+    no ``ended_on`` was extracted — the contradiction behind issue #21, where a
+    ``completed`` med with a null ``ended_on`` rendered as ``(current)``."""
+    status = str(_row_get(row, "status") or "").strip().lower()
+    if status == "active":
+        return True
+    if _row_get(row, "ended_on"):
+        return False
+    return status not in TERMINAL_MED_STATUSES
+
 
 class PersonNotFoundError(ValueError):
     """Raised when a slug does not resolve to a person (friendly rc=1 at the CLI)."""
@@ -77,15 +106,17 @@ def query_labs(
 def query_meds(
     conn: sqlite3.Connection, slug: str, active: bool = False
 ) -> list[dict]:
-    """Medications for a person. ``active`` keeps only current ones — no end date, or
-    an explicit ``status='active'`` (Architecture.md §5)."""
+    """Medications for a person. ``active`` keeps only current ones — no end date and
+    no terminal status, or an explicit ``status='active'`` (Architecture.md §5). A
+    terminal status (completed/stopped/discontinued) ends the course even without an
+    ``ended_on``, so such rows are excluded from ``active`` (issue #21)."""
     person_id = resolve_person_id(conn, slug)
-    sql = "SELECT * FROM medication WHERE person_id = ?"
-    params: list[object] = [person_id]
+    sql = ("SELECT * FROM medication WHERE person_id = ? "
+           "ORDER BY (started_on IS NULL), started_on, name")
+    rows = [dict(r) for r in conn.execute(sql, (person_id,)).fetchall()]
     if active:
-        sql += " AND (ended_on IS NULL OR status = 'active')"
-    sql += " ORDER BY (started_on IS NULL), started_on, name"
-    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        rows = [r for r in rows if med_is_current(r)]
+    return rows
 
 
 def query_timeline(

@@ -67,6 +67,28 @@ def test_query_meds_active_json(ready, capsys):
     assert [m["name"] for m in payload] == ["Metformin"]
 
 
+def test_query_meds_terminal_status_renders_ended_not_current(ready, capsys):
+    """Issue #21: a completed med with no ended_on must not render '(current)'."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": "Amoxicillin", "dose": "250mg", "frequency": "BID",
+                        "started_on": "2026-05-20", "status": "completed"}],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    amox = next(line for line in out.splitlines() if "Amoxicillin" in line)
+    assert "(current)" not in amox
+    assert "(ended)" in amox
+    assert "[completed]" in amox
+    # the still-current med is unaffected
+    metformin = next(line for line in out.splitlines() if "Metformin" in line)
+    assert "(current)" in metformin
+
+
 def test_query_timeline_json(ready, capsys):
     assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
     events = json.loads(capsys.readouterr().out)
