@@ -318,7 +318,7 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:  # friendly nudge, not a traceback
         raise SystemExit(
-            "error: the MCP server needs the optional `mcp` SDK — install with "
+            "error: the MCP server needs the optional `mcp` SDK - install with "
             "`pip install pemr[mcp]` (or `pip install mcp`)."
         ) from exc
 

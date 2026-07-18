@@ -21,7 +21,7 @@ _SENTINEL_TABLE = "document"
 class NotMigratedError(RuntimeError):
     """Raised when an operation runs against a database with no schema applied."""
 
-    def __init__(self, message: str = "database not migrated — run `pemr migrate` first"):
+    def __init__(self, message: str = "database not migrated - run `pemr migrate` first"):
         super().__init__(message)
 
 
