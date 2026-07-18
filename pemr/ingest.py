@@ -124,7 +124,7 @@ def _person_id_for_slug(conn: sqlite3.Connection, slug: str) -> int:
     ).fetchone()
     if row is None:
         raise IngestError(
-            f"no person with slug '{slug}' — add them first: `pemr person add`"
+            f"no person with slug '{slug}' - add them first: `pemr person add`"
         )
     return row["person_id"]
 
