@@ -31,9 +31,17 @@ def test_connect_applies_pragmas(conn):
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
+ALL_MIGRATIONS = [
+    "001_init.sql",
+    "002_conflict.sql",
+    "003_fts.sql",
+    "004_person_deactivate.sql",
+]
+
+
 def test_migrate_creates_all_tables(conn):
     applied = db.migrate(conn)
-    assert applied == ["001_init.sql", "002_conflict.sql", "003_fts.sql"]
+    assert applied == ALL_MIGRATIONS
     tables = {
         row["name"]
         for row in conn.execute(
@@ -44,15 +52,19 @@ def test_migrate_creates_all_tables(conn):
 
 
 def test_migrate_is_idempotent(conn):
-    assert db.migrate(conn) == ["001_init.sql", "002_conflict.sql", "003_fts.sql"]
+    assert db.migrate(conn) == ALL_MIGRATIONS
     assert db.migrate(conn) == []  # second run: nothing pending
 
 
 def test_migrate_records_versions(conn):
     db.migrate(conn)
-    assert db.applied_versions(conn) == {
-        "001_init.sql", "002_conflict.sql", "003_fts.sql"
-    }
+    assert db.applied_versions(conn) == set(ALL_MIGRATIONS)
+
+
+def test_person_has_deactivated_at_column(conn):
+    db.migrate(conn)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(person)").fetchall()}
+    assert "deactivated_at" in cols
 
 
 def test_multi_statement_migration_rolls_back_partial_ddl(conn, tmp_path):

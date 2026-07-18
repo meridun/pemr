@@ -120,7 +120,7 @@ def _cmd_person_add(args: argparse.Namespace) -> int:
 def _cmd_person_list(args: argparse.Namespace) -> int:
     conn = db.connect(_resolve_db_path(args))
     try:
-        people = persons.list_people(conn)
+        people = persons.list_people(conn, include_inactive=args.all_people)
     finally:
         conn.close()
     if not people:
@@ -128,8 +128,16 @@ def _cmd_person_list(args: argparse.Namespace) -> int:
         return 0
     for p in people:
         dob = f"  dob={p.dob}" if p.dob else ""
-        print(f"#{p.person_id}  {p.slug}  {p.full_name}{dob}")
+        status = "  [inactive]" if p.deactivated_at else ""
+        print(f"#{p.person_id}  {p.slug}  {p.full_name}{dob}{status}")
     return 0
+
+
+def _print_person(person) -> None:
+    """Print one person record as aligned key/value lines (the `person show` shape,
+    reused by `person edit`/`deactivate`/`reactivate` so they echo the updated record)."""
+    for key, value in asdict(person).items():
+        print(f"{key:14} {value if value is not None else ''}")
 
 
 def _cmd_person_show(args: argparse.Namespace) -> int:
@@ -141,8 +149,83 @@ def _cmd_person_show(args: argparse.Namespace) -> int:
     if person is None:
         print(f"error: no person with slug '{args.slug}'", file=sys.stderr)
         return 1
-    for key, value in asdict(person).items():
-        print(f"{key:12} {value if value is not None else ''}")
+    _print_person(person)
+    return 0
+
+
+def _cmd_person_edit(args: argparse.Namespace) -> int:
+    # A flag left unset is None -> not part of the update; an explicit empty string
+    # (e.g. --dob "") is passed through and clears that nullable column (persons.py).
+    fields: dict[str, str] = {}
+    if args.name is not None:
+        fields["full_name"] = args.name
+    if args.dob is not None:
+        fields["dob"] = args.dob
+    if args.sex is not None:
+        fields["sex"] = args.sex
+    if args.blood_type is not None:
+        fields["blood_type"] = args.blood_type
+    if args.notes is not None:
+        fields["notes"] = args.notes
+
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            person = persons.update_person(conn, args.slug, **fields)
+        except persons.PersonNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    _print_person(person)
+    return 0
+
+
+def _cmd_person_deactivate(args: argparse.Namespace) -> int:
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            person = persons.deactivate_person(conn, args.slug)
+        except persons.PersonNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    print(f"deactivated {person.slug} (as of {person.deactivated_at})")
+    return 0
+
+
+def _cmd_person_reactivate(args: argparse.Namespace) -> int:
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            person = persons.reactivate_person(conn, args.slug)
+        except persons.PersonNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    print(f"reactivated {person.slug}")
+    return 0
+
+
+def _cmd_person_remove(args: argparse.Namespace) -> int:
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            person = persons.remove_person(conn, args.slug)
+        except persons.PersonNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except persons.PersonHasDependentsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    print(f"removed person #{person.person_id}: {person.slug}")
     return 0
 
 
@@ -519,11 +602,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.set_defaults(func=_cmd_person_add)
 
     p_list = person_sub.add_parser("list", help="list people")
+    p_list.add_argument(
+        "--all", dest="all_people", action="store_true",
+        help="include deactivated people",
+    )
     p_list.set_defaults(func=_cmd_person_list)
 
     p_show = person_sub.add_parser("show", help="show one person")
     p_show.add_argument("slug")
     p_show.set_defaults(func=_cmd_person_show)
+
+    p_edit = person_sub.add_parser(
+        "edit", help="update a person's fields (partial; slug is not editable)"
+    )
+    p_edit.add_argument("slug")
+    p_edit.add_argument("--name", help="full name (non-empty)")
+    p_edit.add_argument("--dob", help='ISO date; pass "" to clear')
+    p_edit.add_argument("--sex", help='pass "" to clear')
+    p_edit.add_argument("--blood-type", dest="blood_type", help='pass "" to clear')
+    p_edit.add_argument("--notes", help='pass "" to clear')
+    p_edit.set_defaults(func=_cmd_person_edit)
+
+    p_deactivate = person_sub.add_parser(
+        "deactivate", help="soft-deactivate a person (reversible; hides from list)"
+    )
+    p_deactivate.add_argument("slug")
+    p_deactivate.set_defaults(func=_cmd_person_deactivate)
+
+    p_reactivate = person_sub.add_parser(
+        "reactivate", help="undo deactivate (restore to the default list)"
+    )
+    p_reactivate.add_argument("slug")
+    p_reactivate.set_defaults(func=_cmd_person_reactivate)
+
+    p_remove = person_sub.add_parser(
+        "remove", help="hard-delete a person (only if they have no records)"
+    )
+    p_remove.add_argument("slug")
+    p_remove.set_defaults(func=_cmd_person_remove)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
