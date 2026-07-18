@@ -417,9 +417,14 @@ def _cmd_trends(args: argparse.Namespace) -> int:
         print(f"{result['test']}  ({result['count']} point(s))")
         print(f"  min    {_fmt(result['min'])}{unit}")
         print(f"  max    {_fmt(result['max'])}{unit}")
-        print(f"  latest {_fmt(result['latest'])}{unit}  @ {_fmt(result['latest_at'])}")
+        tie = result.get("latest_tie", 0)
+        tie_note = f"  (1 of {tie} at this timestamp)" if tie > 1 else ""
+        print(
+            f"  latest {_fmt(result['latest'])}{unit}"
+            f"  @ {_fmt(result['latest_at'])}{tie_note}"
+        )
         if result["slope_per_day"] is None:
-            print("  slope  n/a (need >=2 dated points)")
+            print("  slope  n/a (need >=2 distinct dates)")
         else:
             print(f"  slope  {result['slope_per_day']:+.4g}{unit}/day")
         return 0
