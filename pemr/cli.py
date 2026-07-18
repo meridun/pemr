@@ -397,7 +397,8 @@ def _cmd_find(args: argparse.Namespace) -> int:
             return 0
         for h in hits:
             prov = f"  (doc #{h['document_id']})" if h["document_id"] is not None else ""
-            print(f"{h['source_table']}#{h['source_id']}{prov}: {h['snippet']}")
+            who = "" if args.person is not None else f"{h['person']}  "
+            print(f"{who}{h['source_table']}#{h['source_id']}{prov}: {h['snippet']}")
         return 0
 
     return _with_conn_person(args, work)
@@ -600,7 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     q_timeline.set_defaults(func=_cmd_query_timeline)
 
     p_find = sub.add_parser("find", help="full-text search over OCR text + record fields")
-    p_find.add_argument("--person", required=True, help="owner slug")
+    p_find.add_argument("--person", help="owner slug; omit to search all people")
     p_find.add_argument("query", help="search text")
     p_find.add_argument("--json", action="store_true", help="machine-readable output")
     p_find.set_defaults(func=_cmd_find)
