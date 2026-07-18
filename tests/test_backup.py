@@ -3,8 +3,10 @@
 Covers snapshot round-trip/validity, local-time filename + same-minute collision,
 the daily/weekly rotation algorithm (newest-per-day/week, same-day/same-week
 collapse, older-than-window pruning, ISO-week + year-rollover edges, non-matching
-filenames left untouched, fresh snapshot always survives), and the CLI wiring
-(--no-rotate, --json, missing-DB and unresolvable-backup-dir rc=1).
+filenames left untouched, fresh snapshot always survives — including the
+``protect=`` guard that keeps the just-written snapshot under degenerate keep 0/0),
+and the CLI wiring (--no-rotate, --json, missing-DB and unresolvable-backup-dir rc=1,
+negative retention rejected).
 """
 
 from datetime import datetime
@@ -241,6 +243,28 @@ def test_rotate_empty_dir_is_noop(tmp_path):
     assert result.kept == [] and result.pruned == []
 
 
+def test_rotate_protect_survives_zero_retention(tmp_path):
+    # Contract invariant made unconditional: with keep_daily=0 and keep_weekly=0
+    # (empty buckets), the protected just-written snapshot is still retained.
+    out = tmp_path / "backups"
+    fresh = _snap("20260701", "1200")
+    _touch_snapshots(out, [fresh, _snap("20260630"), _snap("20260620")])
+    result = backup.rotate(out, keep_daily=0, keep_weekly=0, protect=out / fresh)
+    assert {p.name for p in result.kept} == {fresh}
+    assert fresh not in {p.name for p in result.pruned}
+    assert (out / fresh).exists()
+
+
+def test_rotate_without_protect_zero_retention_prunes_everything(tmp_path):
+    # Documents the boundary: absent `protect`, keep 0/0 is a full purge — which is
+    # exactly why the CLI always passes protect and rejects negative counts.
+    out = tmp_path / "backups"
+    _touch_snapshots(out, [_snap("20260701"), _snap("20260630")])
+    result = backup.rotate(out, keep_daily=0, keep_weekly=0)
+    assert result.kept == []
+    assert len(result.pruned) == 2
+
+
 # --------------------------------------------------------------------------- #
 # CLI wiring
 # --------------------------------------------------------------------------- #
@@ -339,3 +363,31 @@ def test_cli_backup_retention_from_config(tmp_path, capsys, monkeypatch):
     assert rc == 0
     # config keep_daily=1/keep_weekly=0 prunes the old 2020 snapshot.
     assert not (out / _snap("20200101")).exists()
+
+
+def test_cli_backup_zero_retention_keeps_fresh_snapshot(tmp_path, capsys):
+    # keep_daily=0 keep_weekly=0 must still leave the just-written snapshot on disk
+    # (the audit finding: a run must never prune its own output). rc=0, kept >= 1.
+    _seed_db(tmp_path / "pemr.db")
+    out = tmp_path / "backups"
+    rc = _run(tmp_path, "backup", "--backup-dir", str(out), "--json",
+              "--keep-daily", "0", "--keep-weekly", "0")
+    import json as _json
+    assert rc == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert Path(payload["snapshot"]).exists()
+    assert len(payload["kept"]) == 1
+    assert payload["pruned"] == []
+    assert len(list(out.glob("pemr-*.sqlite"))) == 1
+
+
+def test_cli_backup_negative_retention_rejected(tmp_path, capsys):
+    # Negative retention has no policy meaning and previously mapped to "delete all";
+    # it is now rejected before any pruning (rc=1), and the snapshot still survives.
+    _seed_db(tmp_path / "pemr.db")
+    out = tmp_path / "backups"
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, "backup", "--backup-dir", str(out), "--keep-daily", "-3")
+    assert "cannot be negative" in str(exc.value)
+    # The snapshot was written before rotation; the failure leaves it intact.
+    assert len(list(out.glob("pemr-*.sqlite"))) == 1
