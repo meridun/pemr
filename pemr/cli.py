@@ -355,7 +355,13 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
         for r in rows:
             dose = f"  {r['dose']}" if r["dose"] else ""
             freq = f"  {r['frequency']}" if r["frequency"] else ""
-            span = _fmt(r["started_on"]) + (f" -> {r['ended_on']}" if r["ended_on"] else " -> (current)")
+            if r["ended_on"]:
+                end = f" -> {r['ended_on']}"
+            elif query.med_is_current(r):
+                end = " -> (current)"
+            else:  # terminal status but no explicit end date (issue #21)
+                end = " -> (ended)"
+            span = _fmt(r["started_on"]) + end
             status = f"  [{r['status']}]" if r["status"] else ""
             print(f"{r['name']:24}{dose}{freq}  {span}{status}")
         return 0
