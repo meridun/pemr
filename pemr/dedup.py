@@ -361,7 +361,7 @@ def commit_extraction(
         "SELECT * FROM document WHERE document_id = ?", (document_id,)
     ).fetchone()
     if doc is None:
-        raise ValidationError(f"no document with id {document_id} — ingest it first")
+        raise ValidationError(f"no document with id {document_id} - ingest it first")
     person_id = doc["person_id"]
     if person_id is None:
         raise ValidationError(
