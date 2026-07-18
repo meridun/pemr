@@ -275,6 +275,11 @@ pemr backup                                              # VACUUM INTO snapshot
 pemr migrate                                             # apply pending migrations
 ```
 
+Invoke as `pemr <cmd>` (console script) or `python -m pemr <cmd>` (`pemr/__main__.py`,
+delegating to `cli.main`) — the latter is the portable fallback when the console-script
+launcher isn't generated (e.g. a system Python whose `Scripts`/launcher dir isn't writable
+under a PEP 660 editable install); see issue #22.
+
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
