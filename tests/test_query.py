@@ -109,6 +109,36 @@ def test_query_meds_all_vs_active(seeded):
     assert [m["name"] for m in active] == ["Metformin"]  # Lisinopril is ended
 
 
+@pytest.mark.parametrize("row, expected", [
+    ({"status": None, "ended_on": None}, True),          # nothing set -> current
+    ({"status": "", "ended_on": None}, True),            # blank status -> current
+    ({"status": "active", "ended_on": None}, True),      # explicitly active
+    ({"status": "active", "ended_on": "2024-01-01"}, True),  # explicit active wins over end
+    ({"status": "prn", "ended_on": None}, True),         # prn is not terminal
+    ({"status": "completed", "ended_on": None}, False),  # issue #21: terminal, no end date
+    ({"status": "Stopped", "ended_on": None}, False),    # case-insensitive
+    ({"status": " discontinued ", "ended_on": None}, False),  # trimmed
+    ({"status": None, "ended_on": "2024-06-01"}, False), # explicit end date
+])
+def test_med_is_current(row, expected):
+    assert query.med_is_current(row) is expected
+
+
+def test_query_meds_active_excludes_terminal_status_without_end(seeded):
+    """A med with a terminal status but no ended_on is not 'active' (issue #21)."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Amoxicillin", "dose": "250mg", "frequency": "BID",
+             "started_on": "2026-05-20", "status": "completed"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    names_all = {m["name"] for m in query.query_meds(seeded, "jane-doe")}
+    assert "Amoxicillin" in names_all  # still listed by the unfiltered query
+    names_active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True)}
+    assert "Amoxicillin" not in names_active
+
+
 # --- structured: timeline -----------------------------------------------------
 
 def test_timeline_merge_ordering_and_since(seeded):
