@@ -2,6 +2,7 @@
 FTS backfill on migrate, trends math, dictionary normalization, and person isolation."""
 
 import shutil
+import uuid
 from pathlib import Path
 
 import pytest
@@ -271,6 +272,54 @@ def test_trends_single_point_degrades_slope(seeded):
 def test_trends_unknown_analyte_is_empty(seeded):
     t = query.trends(seeded, "jane-doe", "nonesuch")
     assert t["count"] == 0 and t["slope_per_day"] is None
+
+
+def _insert_lab(conn, slug, **cols):
+    """Insert a lab_result row directly (bypassing dedup) to simulate the #20
+    same-timestamp duplicate-row state. Returns the new lab_result_id."""
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug=?", (slug,)
+    ).fetchone()["person_id"]
+    cols.setdefault("dedup_key", f"k-{uuid.uuid4()}")
+    keys = ["person_id", *cols]
+    vals = [pid, *cols.values()]
+    placeholders = ", ".join("?" for _ in keys)
+    cur = conn.execute(
+        f"INSERT INTO lab_result ({', '.join(keys)}) VALUES ({placeholders})",
+        vals,
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_trends_same_timestamp_tie_is_deterministic(seeded):
+    d = dedup.load_dictionary(DICT_PATH)
+    # Two rows with the *same* collected_at but different values (the #20 symptom).
+    # Latest must be the greater lab_result_id (most-recently-ingested), and the
+    # tie must be disclosed via latest_tie.
+    _insert_lab(seeded, "jane-doe", test_name="Glucose",
+                value_num=5.0, unit="mmol/L", collected_at="2026-07-17T09:00:00")
+    later_id = _insert_lab(seeded, "jane-doe", test_name="Glucose",
+                           value_num=5.2, unit="mmol/L",
+                           collected_at="2026-07-17T09:00:00")
+    t = query.trends(seeded, "jane-doe", "glucose", dictionary=d)
+    assert t["count"] == 2
+    assert t["latest"] == 5.2  # higher lab_result_id wins the tie
+    assert t["latest_at"] == "2026-07-17T09:00:00"
+    assert t["latest_tie"] == 2
+    assert later_id  # sanity: the later insert got a greater PK
+    assert t["slope_per_day"] is None  # one distinct date
+
+
+def test_trends_distinct_intraday_times_are_not_a_tie(seeded):
+    d = dedup.load_dictionary(DICT_PATH)
+    # Genuinely ordered intraday times must NOT trip the tie note.
+    _insert_lab(seeded, "jane-doe", test_name="Glucose",
+                value_num=5.0, unit="mmol/L", collected_at="2026-07-17T09:00:00")
+    _insert_lab(seeded, "jane-doe", test_name="Glucose",
+                value_num=5.4, unit="mmol/L", collected_at="2026-07-17T14:00:00")
+    t = query.trends(seeded, "jane-doe", "glucose", dictionary=d)
+    assert t["latest"] == 5.4 and t["latest_tie"] == 1
 
 
 # --- error surfaces -----------------------------------------------------------

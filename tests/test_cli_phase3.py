@@ -2,6 +2,7 @@
 human + --json output, empty-result rc=0 messages, unknown-slug rc=1."""
 
 import json
+import uuid
 
 import pytest
 
@@ -110,7 +111,58 @@ def test_trends_json_shape(ready, capsys):
                 *DICT_ARG, "--json") == 0
     t = json.loads(capsys.readouterr().out)
     assert t["count"] == 2
-    assert {"test", "min", "max", "latest", "slope_per_day", "unit"} <= set(t)
+    assert {"test", "min", "max", "latest", "slope_per_day", "unit",
+            "latest_tie"} <= set(t)
+
+
+def _seed_lab(tmp_path, slug, **cols):
+    """Insert a lab_result row directly (bypassing dedup) to reach the #20
+    same-timestamp duplicate state, then return."""
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug=?", (slug,)
+    ).fetchone()["person_id"]
+    cols.setdefault("dedup_key", f"k-{uuid.uuid4()}")
+    keys = ["person_id", *cols]
+    vals = [pid, *cols.values()]
+    placeholders = ", ".join("?" for _ in keys)
+    conn.execute(
+        f"INSERT INTO lab_result ({', '.join(keys)}) VALUES ({placeholders})", vals
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_trends_slope_na_message_reworded(ready, capsys):
+    """Issue #29 part A: the n/a message names distinct dates, not 'dated points'."""
+    # Single point -> slope n/a.
+    _seed_lab(ready, "jane-doe", test_name="LDL", value_num=100, unit="mg/dL",
+              collected_at="2026-01-01T08:00:00")
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "ldl", *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "n/a (need >=2 distinct dates)" in out
+    assert "dated points" not in out
+
+    # Two points that share one calendar date -> still n/a, same reworded message.
+    _seed_lab(ready, "jane-doe", test_name="Glucose", value_num=5.0, unit="mmol/L",
+              collected_at="2026-03-01T08:00:00")
+    _seed_lab(ready, "jane-doe", test_name="Glucose", value_num=5.5, unit="mmol/L",
+              collected_at="2026-03-01T20:00:00")
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "glucose", *DICT_ARG) == 0
+    assert "n/a (need >=2 distinct dates)" in capsys.readouterr().out
+
+
+def test_trends_same_timestamp_tie_disclosed(ready, capsys):
+    """Issue #29 part B: same exact timestamp with differing values is disclosed."""
+    _seed_lab(ready, "jane-doe", test_name="Glucose", value_num=5.0, unit="mmol/L",
+              collected_at="2026-07-17T09:00:00")
+    _seed_lab(ready, "jane-doe", test_name="Glucose", value_num=5.2, unit="mmol/L",
+              collected_at="2026-07-17T09:00:00")
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "glucose", *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    latest = next(line for line in out.splitlines() if "latest" in line)
+    assert "5.2" in latest  # deterministic higher-id pick
+    assert "(1 of 2 at this timestamp)" in latest
 
 
 def test_empty_results_are_clean_rc0(ready, capsys):
