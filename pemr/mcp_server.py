@@ -243,8 +243,14 @@ def query(
     return [{k: v for k, v in r.items() if k != "dedup_key"} for r in rows]
 
 
-def find(conn: sqlite3.Connection, *, person: str, query_text: str) -> list[dict[str, Any]]:
-    """[read] Full-text search over OCR text + record fields. Mirrors ``pemr find``."""
+def find(
+    conn: sqlite3.Connection, *, query_text: str, person: str | None = None
+) -> list[dict[str, Any]]:
+    """[read] Full-text search over OCR text + record fields. Mirrors ``pemr find``.
+
+    Omit ``person`` to search the whole household; each hit carries its owning
+    person slug.
+    """
     try:
         return _query.find(conn, person, query_text)
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
@@ -355,7 +361,7 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         return _run(query, kind=kind, person=person, test=test, since=since, active=active)
 
     @server.tool(name="find", annotations=ro)
-    def find_tool(person: str, query_text: str) -> list[dict]:
+    def find_tool(query_text: str, person: str | None = None) -> list[dict]:
         return _run(find, person=person, query_text=query_text)
 
     @server.tool(name="trends", annotations=ro)
