@@ -15,9 +15,13 @@ class Person:
     sex: str | None = None
     blood_type: str | None = None
     notes: str | None = None
+    deactivated_at: str | None = None   # ISO timestamp; NULL = active (migration 004)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Person":
+        # `deactivated_at` arrives with migration 004; tolerate its absence so person
+        # reads still work against a DB migrated to an earlier schema version.
+        has_deactivated = "deactivated_at" in row.keys()
         return cls(
             person_id=row["person_id"],
             slug=row["slug"],
@@ -26,6 +30,7 @@ class Person:
             sex=row["sex"],
             blood_type=row["blood_type"],
             notes=row["notes"],
+            deactivated_at=row["deactivated_at"] if has_deactivated else None,
         )
 
 

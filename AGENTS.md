@@ -47,6 +47,8 @@ Read-only tools (never mutate the DB; safe to call freely):
 Write tools (mutate the DB; the only tools that do):
 
 - `person_add` — add a person to the roster.
+- `person_edit` — update a person's fields (partial; `slug` is not editable, pass `""` to
+  clear a nullable field).
 - `ingest` — hash + blob-store + layer-1 dedup a document.
 - `commit_extraction` — validate + dedup + commit extracted rows for a document.
 - `review_conflicts` — lists conflicts read-only; **writes only when given a `resolve` id**, and

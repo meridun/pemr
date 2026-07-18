@@ -258,7 +258,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 ### CLI (the tested engine)
 
 ```
-pemr person add|list|show
+pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve ...]
@@ -283,15 +283,15 @@ under a PEP 660 editable install); see issue #22.
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
-`trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `ingest`,
-`commit_extraction`, `review_conflicts` (resolution gated on human sign-off). Each returns the
+`trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
+`ingest`, `commit_extraction`, `review_conflicts` (resolution gated on human sign-off). Each returns the
 same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
 calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`
 annotations expose the read/write split to the client.
 
 `AGENTS.md` documents this contract so any agent (Cowork, Claude Code, local) knows to
 **call tools, not reinvent** — and specifically: never write to the DB except through
-`commit_extraction`/`person_add`/`ingest`; always `ingest` (with `ocr_text` populated) before
+`commit_extraction`/`person_add`/`person_edit`/`ingest`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
 ---
