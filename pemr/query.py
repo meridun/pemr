@@ -260,15 +260,19 @@ def trends(
 ) -> dict:
     """Summary stats for one dictionary-normalized analyte over time.
 
-    Returns ``{test, count, unit, min, max, latest, latest_at, slope_per_day}``.
-    ``count`` is the number of numeric points; ``slope_per_day`` degrades to ``None``
-    with fewer than two numeric points (or a single collection date).
+    Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
+    slope_per_day}``. ``count`` is the number of numeric points; ``slope_per_day``
+    degrades to ``None`` with fewer than two distinct collection dates. ``latest`` is
+    the row with the greatest ``collected_at``, ties broken by the greatest
+    ``lab_result_id`` (most-recently-ingested wins); ``latest_tie`` counts how many
+    matched rows share that exact ``collected_at`` timestamp.
     """
     person_id = resolve_person_id(conn, slug)
     target = norm(test, dictionary)
     rows = conn.execute(
-        "SELECT value_num, unit, collected_at, test_name FROM lab_result "
-        "WHERE person_id = ? AND value_num IS NOT NULL ORDER BY collected_at",
+        "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
+        "WHERE person_id = ? AND value_num IS NOT NULL "
+        "ORDER BY collected_at, lab_result_id",
         (person_id,),
     ).fetchall()
     matched = [r for r in rows if norm(r["test_name"], dictionary) == target]
@@ -281,6 +285,7 @@ def trends(
         "max": None,
         "latest": None,
         "latest_at": None,
+        "latest_tie": 0,
         "slope_per_day": None,
     }
     if not matched:
@@ -291,9 +296,12 @@ def trends(
     result["unit"] = next(iter(units)) if len(units) == 1 else None
     result["min"] = min(values)
     result["max"] = max(values)
-    latest = matched[-1]  # rows came back ORDER BY collected_at
+    latest = matched[-1]  # rows came back ORDER BY collected_at, lab_result_id
     result["latest"] = float(latest["value_num"])
     result["latest_at"] = latest["collected_at"]
+    result["latest_tie"] = sum(
+        1 for r in matched if r["collected_at"] == latest["collected_at"]
+    )
 
     points = [
         (o, float(r["value_num"]))
