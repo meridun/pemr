@@ -102,6 +102,40 @@ def person_add(
     return asdict(person)
 
 
+def person_edit(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    full_name: str | None = None,
+    dob: str | None = None,
+    sex: str | None = None,
+    blood_type: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """[write] Edit a person's fields (partial update). Mirrors ``pemr person edit``.
+
+    Only the fields you pass change; ``slug`` is not editable. Pass an empty string for
+    a nullable field (``dob``/``sex``/``blood_type``/``notes``) to clear it to ``NULL``.
+    """
+    # None means "not provided" (skip); an explicit "" clears — same as the CLI, where
+    # an unset flag is None and `--dob ""` clears the column.
+    fields = {
+        name: value
+        for name, value in (
+            ("full_name", full_name), ("dob", dob), ("sex", sex),
+            ("blood_type", blood_type), ("notes", notes),
+        )
+        if value is not None
+    }
+    try:
+        person = _persons.update_person(conn, slug, **fields)
+    except _persons.PersonNotFoundError as exc:
+        raise ToolError(str(exc)) from exc
+    except ValueError as exc:  # empty name / no fields / unknown field
+        raise _friendly(exc) from exc
+    return asdict(person)
+
+
 def person_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """[read] List people. Mirrors ``pemr person list``."""
     return [asdict(p) for p in _persons.list_people(conn)]
@@ -307,7 +341,9 @@ READ_ONLY_TOOLS = (
     "person_list", "person_show", "query", "find", "trends",
     "render_summary", "render_brief", "render_journal",
 )
-WRITE_TOOLS = ("person_add", "ingest", "commit_extraction", "review_conflicts")
+WRITE_TOOLS = (
+    "person_add", "person_edit", "ingest", "commit_extraction", "review_conflicts",
+)
 TOOL_NAMES = READ_ONLY_TOOLS + WRITE_TOOLS
 
 
@@ -386,6 +422,14 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
                         sex: str | None = None, blood_type: str | None = None,
                         notes: str | None = None) -> dict:
         return _run(person_add, slug=slug, full_name=full_name, dob=dob, sex=sex,
+                    blood_type=blood_type, notes=notes)
+
+    @server.tool(name="person_edit", annotations=rw)
+    def person_edit_tool(slug: str, full_name: str | None = None,
+                         dob: str | None = None, sex: str | None = None,
+                         blood_type: str | None = None,
+                         notes: str | None = None) -> dict:
+        return _run(person_edit, slug=slug, full_name=full_name, dob=dob, sex=sex,
                     blood_type=blood_type, notes=notes)
 
     @server.tool(name="ingest", annotations=rw)
