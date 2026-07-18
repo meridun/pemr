@@ -104,9 +104,17 @@ def test_query_unknown_kind_raises(seeded):
 def test_find_and_trends(seeded):
     hits = mcp_server.find(seeded, person="jane-doe", query_text="glucose")
     assert hits  # ocr_text was populated, so FTS sees it
+    assert all(h["person"] == "jane-doe" for h in hits)
     tr = mcp_server.trends(seeded, person="jane-doe", test="a1c")  # dictionary-normalized
     assert tr["count"] == 2
     assert tr["latest"] == 6.5
+
+
+def test_find_household_wide_omits_person(seeded):
+    # person omitted -> whole-household search; each hit attributes its owner
+    hits = mcp_server.find(seeded, query_text="glucose")
+    assert hits and all(h["person"] == "jane-doe" for h in hits)
+    assert mcp_server.find(seeded, query_text="nonesuch-xyz") == []
 
 
 def test_renderers_return_markdown(seeded):
