@@ -177,6 +177,22 @@ def test_brief_scopes_to_appointment_and_person(seeded):
     assert "999" not in md           # john's lab must never leak in
 
 
+def test_brief_flags_abnormal_labs_with_marker_and_ref(seeded):
+    """Recent Labs in the brief must not hide an abnormal value: each abnormal lab gets
+    a marker + its reference interval, mirroring render summary; normal labs stay bare."""
+    md = render.render_brief(seeded, _upcoming_appt_id(seeded))
+    section = md.split("## Recent Labs")[1].split("##")[0]
+    lines = {ln.split("  ")[1]: ln for ln in section.splitlines() if ln.startswith("- ")}
+    # Glucose is abnormal by reference interval alone (no flag) -> marker + ref shown.
+    assert "[!]" in lines["Glucose, fasting"]
+    assert "(ref <= 100.0)" in lines["Glucose, fasting"]
+    # LDL is flag-abnormal; still marked even though it carries no reference bounds.
+    assert "[!]" in lines["LDL"]
+    # Normal labs carry neither marker nor ref note.
+    assert "[!]" not in lines["HbA1c"]
+    assert "[!]" not in lines["TSH"]
+
+
 def test_brief_has_interaction_placeholder(seeded):
     md = render.render_brief(seeded, _upcoming_appt_id(seeded))
     assert "## Medication Interaction Review" in md
