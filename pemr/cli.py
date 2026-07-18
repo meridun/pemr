@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, db, dedup, ingest, persons, query, render
+from . import __version__, backup, db, dedup, ingest, persons, query, render
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
 _DEFAULT_DICTIONARY = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -66,6 +66,45 @@ def _resolve_sources_dir(args: argparse.Namespace) -> Path:
         "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
         "[paths].sources_dir in config.toml (see config.example.toml)"
     )
+
+
+def _resolve_backup_dir(args: argparse.Namespace) -> Path:
+    override = getattr(args, "backup_dir", None)
+    if override:
+        return Path(override)
+    env = os.environ.get("PEMR_BACKUP_DIR")
+    if env:
+        return Path(env)
+    backup_dir = _load_config(args).get("paths", {}).get("backup_dir")
+    if backup_dir:
+        return Path(backup_dir)
+    raise SystemExit(
+        "error: no backup dir — pass --backup-dir, set PEMR_BACKUP_DIR, or set "
+        "[paths].backup_dir in config.toml (see config.example.toml)"
+    )
+
+
+def _resolve_retention(args: argparse.Namespace) -> tuple[int, int]:
+    """Retention counts, layered flag > [backup] config > hardcoded default."""
+    cfg = _load_config(args).get("backup", {})
+    keep_daily = (
+        args.keep_daily
+        if args.keep_daily is not None
+        else cfg.get("keep_daily", backup.DEFAULT_KEEP_DAILY)
+    )
+    keep_weekly = (
+        args.keep_weekly
+        if args.keep_weekly is not None
+        else cfg.get("keep_weekly", backup.DEFAULT_KEEP_WEEKLY)
+    )
+    keep_daily, keep_weekly = int(keep_daily), int(keep_weekly)
+    if keep_daily < 0 or keep_weekly < 0:
+        raise SystemExit(
+            "error: retention counts cannot be negative "
+            f"(keep_daily={keep_daily}, keep_weekly={keep_weekly}); "
+            "use --no-rotate to keep every snapshot"
+        )
+    return keep_daily, keep_weekly
 
 
 def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
@@ -580,6 +619,48 @@ def _cmd_render_journal(args: argparse.Namespace) -> int:
     return _render_with_conn(args, work)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 6: backup (VACUUM INTO snapshot + rotation)
+# --------------------------------------------------------------------------- #
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    backup_dir = _resolve_backup_dir(args)
+    try:
+        snap, size = backup.snapshot(db_path, backup_dir)
+    except backup.BackupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    kept: list[Path] = []
+    pruned: list[Path] = []
+    rotated = not args.no_rotate
+    if rotated:
+        keep_daily, keep_weekly = _resolve_retention(args)
+        try:
+            result = backup.rotate(backup_dir, keep_daily, keep_weekly, protect=snap)
+        except OSError as exc:
+            print(f"error: rotation failed: {exc}", file=sys.stderr)
+            return 1
+        kept, pruned = result.kept, result.pruned
+
+    if args.json:
+        _print_json({
+            "snapshot": str(snap),
+            "bytes": size,
+            "kept": [str(p) for p in kept],
+            "pruned": [str(p) for p in pruned],
+        })
+        return 0
+
+    print(f"wrote {snap} ({size} bytes)")
+    if rotated:
+        print(f"rotated: kept {len(kept)}, pruned {len(pruned)}")
+    else:
+        print("rotation skipped (--no-rotate)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pemr", description="Personal EMR engine - SQLite is truth."
@@ -767,6 +848,31 @@ def build_parser() -> argparse.ArgumentParser:
     r_journal.add_argument("--since", help="ISO date; keep events on/after this date")
     r_journal.add_argument("--out", help="write to file instead of stdout")
     r_journal.set_defaults(func=_cmd_render_journal)
+
+    # --- phase 6: backup (VACUUM INTO snapshot + rotation) ----------------
+    p_backup = sub.add_parser(
+        "backup", help="VACUUM INTO timestamped snapshot + rotate old snapshots"
+    )
+    p_backup.add_argument(
+        "--backup-dir", dest="backup_dir",
+        help="output dir (overrides PEMR_BACKUP_DIR / [paths].backup_dir)",
+    )
+    p_backup.add_argument(
+        "--keep-daily", dest="keep_daily", type=int,
+        help="retain newest snapshot for this many recent days "
+             "(default [backup].keep_daily or 7)",
+    )
+    p_backup.add_argument(
+        "--keep-weekly", dest="keep_weekly", type=int,
+        help="retain newest snapshot for this many recent ISO weeks "
+             "(default [backup].keep_weekly or 4)",
+    )
+    p_backup.add_argument(
+        "--no-rotate", dest="no_rotate", action="store_true",
+        help="take the snapshot, skip pruning entirely",
+    )
+    p_backup.add_argument("--json", action="store_true", help="machine-readable output")
+    p_backup.set_defaults(func=_cmd_backup)
 
     return parser
 
