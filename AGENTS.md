@@ -71,7 +71,26 @@ report's verbatim label.
   (`docs/Architecture.md` §3).
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. OCR text at ingest
+### 2. Observation rows — conditions, allergies, vitals
+
+`render_summary` populates its **Conditions**, **Allergies**, and **Latest Vitals** sections purely
+from `observation` rows, keyed by `obs_type`. An extraction that omits them leaves those sections
+permanently `_none recorded_`, so a visit note carrying a diagnosis, allergy, or vital reading MUST
+commit the matching `observation` rows in `commit_extraction`:
+
+- **Condition** → `obs_type='condition'`, `key=<condition name>`, optional `value_text=<detail>`.
+- **Allergy** → `obs_type='allergy'`, `key=<allergen>`, optional `value_text=<reaction>`.
+- **Vital** → `obs_type='vital'`, `key=<canonical vital token>` (below), the reading in `value_num`
+  (+ `unit`) or `value_text`. "Latest vitals" is the most recent `vital` row per normalized `key`.
+
+Canonical vital `key` tokens — emit these verbatim (same discipline as rule 1): `blood_pressure`,
+`bmi`, `weight`, `height`, `temperature`, `pulse`, `spo2`, `respiratory_rate`. `dedup.norm()`
+treats underscores as spaces, so `blood_pressure` matches "blood pressure"; the analyte dictionary
+also maps common synonyms (`bp` → `blood_pressure`), but agents SHOULD emit the canonical token
+directly. Set `observed_at` (ISO date) whenever the source gives one — it drives timeline order and
+the "latest" selection.
+
+### 3. OCR text at ingest
 
 Every `ingest` MUST end with `document.ocr_text` populated. This is what makes a document visible
 to `find` (FTS5); an ingest without it is silently unsearchable.
@@ -84,7 +103,7 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
 
-### 3. Conflict discipline
+### 4. Conflict discipline
 
 Agents never resolve staged conflicts silently.
 
@@ -96,7 +115,7 @@ Agents never resolve staged conflicts silently.
   human's instruction verbatim; the wrapper refuses the write otherwise and stores the sign-off
   text with the resolution.
 
-### 4. Medication-interaction section
+### 5. Medication-interaction section
 
 `render_brief` emits a placeholder **"Medication Interaction Review"** section for the agent layer
 to fill. The engine deliberately does not compute this: an external drug-interaction API would send
