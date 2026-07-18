@@ -206,23 +206,32 @@ def _fts_query(raw: str) -> str | None:
     return " ".join(f'"{t}"' for t in tokens)
 
 
-def find(conn: sqlite3.Connection, slug: str, query: str) -> list[dict]:
-    """Full-text search across OCR text + record text fields for one person.
+def find(conn: sqlite3.Connection, slug: str | None, query: str) -> list[dict]:
+    """Full-text search across OCR text + record text fields.
 
-    Returns hits ranked best-first, each with its source (table + id), a highlighted
-    ``snippet`` and ``document_id`` provenance.
+    With ``slug`` set, restricts to that person; with ``slug=None`` searches the
+    whole household. Returns hits ranked best-first, each carrying its owning
+    ``person`` slug, source (table + id), a highlighted ``snippet`` and
+    ``document_id`` provenance.
     """
-    person_id = resolve_person_id(conn, slug)
     match = _fts_query(query)
     if match is None:
         return []
-    rows = conn.execute(
-        "SELECT source_table, source_id, document_id, "
-        "snippet(record_fts, 4, '[', ']', '...', 12) AS snippet, rank "
-        "FROM record_fts WHERE record_fts MATCH ? AND person_id = ? "
-        "ORDER BY rank",
-        (match, person_id),
-    ).fetchall()
+    sql = (
+        "SELECT person.slug AS person, record_fts.source_table, "
+        "record_fts.source_id, record_fts.document_id, "
+        "snippet(record_fts, 4, '[', ']', '...', 12) AS snippet, record_fts.rank "
+        "FROM record_fts JOIN person ON person.person_id = record_fts.person_id "
+        "WHERE record_fts MATCH ?"
+    )
+    params: list = [match]
+    if slug is None:
+        db.require_migrated(conn)
+    else:
+        sql += " AND record_fts.person_id = ?"
+        params.append(resolve_person_id(conn, slug))
+    sql += " ORDER BY record_fts.rank"
+    rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 

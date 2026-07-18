@@ -195,6 +195,20 @@ def test_find_is_person_scoped(seeded):
     assert query.find(seeded, "john-doe", "unrelated")
 
 
+def test_find_carries_person_slug(seeded):
+    # every hit names its owning person, scoped or household-wide
+    for h in query.find(seeded, "jane-doe", "cholesterol"):
+        assert h["person"] == "jane-doe"
+
+
+def test_find_household_wide_when_slug_none(seeded):
+    # slug=None searches all people; jane can't see john's 'unrelated', the
+    # household can, and the hit is attributed to john
+    assert query.find(seeded, "jane-doe", "unrelated") == []
+    hits = query.find(seeded, None, "unrelated")
+    assert hits and all(h["person"] == "john-doe" for h in hits)
+
+
 def test_find_ignores_fts_operators_safely(seeded):
     # punctuation / bare operators must not raise or change meaning
     assert isinstance(query.find(seeded, "jane-doe", 'cholesterol AND ("'), list)

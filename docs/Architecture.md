@@ -266,6 +266,7 @@ pemr query labs --person jane --test hba1c --since 2023-01-01
 pemr query meds --person jane --active
 pemr query timeline --person jane --since 2024-01-01     # merged event stream
 pemr find --person jane "cholesterol"                    # full-text over ocr_text + records
+pemr find "mmr booster"                                  # omit --person: whole-household, slug-prefixed hits
 pemr trends --person jane --test hba1c                   # min/max/latest/slope
 pemr due --person jane                                   # screening/vaccine gaps (rules)
 pemr render summary --person jane        > exports/jane-summary.md
