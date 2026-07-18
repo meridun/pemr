@@ -97,7 +97,14 @@ def _resolve_retention(args: argparse.Namespace) -> tuple[int, int]:
         if args.keep_weekly is not None
         else cfg.get("keep_weekly", backup.DEFAULT_KEEP_WEEKLY)
     )
-    return int(keep_daily), int(keep_weekly)
+    keep_daily, keep_weekly = int(keep_daily), int(keep_weekly)
+    if keep_daily < 0 or keep_weekly < 0:
+        raise SystemExit(
+            "error: retention counts cannot be negative "
+            f"(keep_daily={keep_daily}, keep_weekly={keep_weekly}); "
+            "use --no-rotate to keep every snapshot"
+        )
+    return keep_daily, keep_weekly
 
 
 def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
@@ -542,7 +549,7 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     if rotated:
         keep_daily, keep_weekly = _resolve_retention(args)
         try:
-            result = backup.rotate(backup_dir, keep_daily, keep_weekly)
+            result = backup.rotate(backup_dir, keep_daily, keep_weekly, protect=snap)
         except OSError as exc:
             print(f"error: rotation failed: {exc}", file=sys.stderr)
             return 1

@@ -8,8 +8,10 @@ snapshots by a calendar daily + weekly retention policy.
 Because rotation prunes *irreplaceable-data* snapshots, its safety invariants are
 part of the contract, not incidental:
 
-* The snapshot just written is always the newest entry overall, so it lands in the
-  newest daily bucket and a run can never prune its own output.
+* A run can never prune its own output. The just-written snapshot lands in the newest
+  daily bucket under any ``keep_daily >= 1``; ``rotate(..., protect=<snapshot>)`` makes
+  this hold *unconditionally* — even for degenerate ``keep_daily=0, keep_weekly=0`` the
+  protected snapshot is always retained.
 * Prune only ever deletes files whose names match the ``pemr-*.sqlite`` pattern this
   command creates — anything else in the directory is out of scope by construction.
 
@@ -107,6 +109,7 @@ def rotate(
     backup_dir: str | Path,
     keep_daily: int = DEFAULT_KEEP_DAILY,
     keep_weekly: int = DEFAULT_KEEP_WEEKLY,
+    protect: str | Path | None = None,
 ) -> RotationResult:
     """Prune snapshots in ``backup_dir`` down to the daily + weekly retention set.
 
@@ -123,9 +126,16 @@ def rotate(
     5. Everything retained by neither tier is deleted. This also collapses redundant
        same-day / same-week snapshots.
 
+    ``protect`` — a snapshot that must always be retained regardless of the daily and
+    weekly counts. The caller passes the path it just wrote so that the contract
+    invariant "a run can never prune its own output" holds *unconditionally*, even for
+    degenerate retention such as ``keep_daily=0, keep_weekly=0``. Matched by filename
+    (all snapshots live in ``backup_dir``).
+
     Returns the kept and pruned paths, each newest-first.
     """
     backup_dir = Path(backup_dir)
+    protect_name = Path(protect).name if protect is not None else None
     entries: list[tuple[datetime, Path]] = []
     for path in backup_dir.glob("pemr-*.sqlite"):
         ts = _parse_ts(path.name)
@@ -134,6 +144,13 @@ def rotate(
     entries.sort(key=lambda e: e[0], reverse=True)  # newest first
 
     kept: set[Path] = set()
+
+    # Always retain the just-written snapshot: makes the "never prune own output"
+    # invariant hold even when the daily/weekly buckets are empty (keep_* == 0).
+    if protect_name is not None:
+        for _, path in entries:
+            if path.name == protect_name:
+                kept.add(path)
 
     # Daily tier: newest snapshot for each of the most recent keep_daily distinct
     # calendar days. Same-day entries are contiguous (sorted by full timestamp), so
