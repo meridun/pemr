@@ -47,7 +47,7 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
         if data_dir:
             return Path(data_dir) / "pemr.db"
     raise SystemExit(
-        "error: no database path — pass --db, set PEMR_DB, or set "
+        "error: no database path - pass --db, set PEMR_DB, or set "
         f"[paths].data_dir in {config_path} (see config.example.toml)"
     )
 
@@ -63,7 +63,7 @@ def _resolve_sources_dir(args: argparse.Namespace) -> Path:
     if sources_dir:
         return Path(sources_dir)
     raise SystemExit(
-        "error: no sources dir — pass --sources, set PEMR_SOURCES, or set "
+        "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
         "[paths].sources_dir in config.toml (see config.example.toml)"
     )
 
@@ -124,7 +124,7 @@ def _cmd_person_list(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     if not people:
-        print("no people yet — `pemr person add --slug <slug> --name <name>`")
+        print("no people yet - `pemr person add --slug <slug> --name <name>`")
         return 0
     for p in people:
         dob = f"  dob={p.dob}" if p.dob else ""
@@ -183,7 +183,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     if result.is_duplicate:
         print(
             f"duplicate: already filed as document #{doc.document_id} "
-            f"(sha256 {doc.sha256[:12]}...) — nothing ingested"
+            f"(sha256 {doc.sha256[:12]}...) - nothing ingested"
         )
         return 0
     print(
@@ -192,7 +192,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     )
     if not result.ocr_text_populated:
         print(
-            "note: no ocr_text stored — `find` (full-text search) will not see this "
+            "note: no ocr_text stored - `find` (full-text search) will not see this "
             "document. Supply --ocr-text-file <path> or --ocr tesseract.",
             file=sys.stderr,
         )
@@ -234,7 +234,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
     )
     if summary.conflict:
         print(
-            f"note: {c['conflict']} conflict(s) staged — resolve with "
+            f"note: {c['conflict']} conflict(s) staged - resolve with "
             "`pemr review-conflicts`"
         )
     return 0
@@ -493,7 +493,7 @@ def _cmd_render_journal(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pemr", description="Personal EMR engine — SQLite is truth."
+        prog="pemr", description="Personal EMR engine - SQLite is truth."
     )
     parser.add_argument("--version", action="version", version=f"pemr {__version__}")
     parser.add_argument("--db", help="path to pemr.db (overrides PEMR_DB/config)")
