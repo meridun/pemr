@@ -17,6 +17,15 @@ backup_dir = 'C:\Users\you\My Drive\pemr\backups'
 # Cloud-synced: retained original documents, content-addressed (sha256).
 sources_dir = 'C:\Users\you\My Drive\pemr\sources'
 
+# Backup snapshot rotation (`pemr backup`). Retention is layered flag > config >
+# default; these are the built-in defaults, so leave them commented unless you want
+# to change them. Rule: keep the newest snapshot for each of the last keep_daily
+# calendar days, plus the newest for each of the last keep_weekly ISO weeks; prune
+# the rest. --no-rotate on the command line disables pruning for a single run.
+# [backup]
+# keep_daily = 7
+# keep_weekly = 4
+
 # People roster — informational convenience; the DB `person` table is the source of
 # truth (`pemr person add`). Listed here so a fresh machine knows who to re-add.
 [[people]]
