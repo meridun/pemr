@@ -85,6 +85,19 @@ def _is_abnormal(row: sqlite3.Row | dict) -> bool:
     return False
 
 
+def _ref_range(row: sqlite3.Row | dict) -> str:
+    """Trailing ``(ref ...)`` note for a lab's reference interval, or ``""`` when the
+    row carries no bounds. Leading double space so callers can append it directly."""
+    low, high = row["ref_low"], row["ref_high"]
+    if low is not None and high is not None:
+        return f"  (ref {_fmt(low)}-{_fmt(high)})"
+    if high is not None:
+        return f"  (ref <= {_fmt(high)})"
+    if low is not None:
+        return f"  (ref >= {_fmt(low)})"
+    return ""
+
+
 # --------------------------------------------------------------------------- #
 # Read helpers (pure SELECTs; person already resolved to an id)
 # --------------------------------------------------------------------------- #
@@ -238,18 +251,9 @@ def render_summary(
     lab_lines = []
     for r in _abnormal_labs(conn, person_id):
         flag = f" [{r['flag']}]" if r["flag"] else ""
-        low, high = r["ref_low"], r["ref_high"]
-        if low is not None and high is not None:
-            ref = f"  (ref {_fmt(low)}-{_fmt(high)})"
-        elif high is not None:
-            ref = f"  (ref <= {_fmt(high)})"
-        elif low is not None:
-            ref = f"  (ref >= {_fmt(low)})"
-        else:
-            ref = ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{ref}"
+            f"{_lab_value(r)}{flag}{_ref_range(r)}"
         )
 
     appt_lines = [
@@ -326,8 +330,12 @@ def render_brief(
     lab_lines = []
     for r in lab_rows:
         flag = f" [{r['flag']}]" if r["flag"] else ""
+        # The brief is the doc handed to a clinician: an abnormal value must not read as
+        # ordinary, so mark it and surface its reference interval (mirrors render summary).
+        abnormal = f"  [!]{_ref_range(r)}" if _is_abnormal(r) else ""
         lab_lines.append(
-            f"- {_date_part(r['collected_at'])}  {r['test_name']}  {_lab_value(r)}{flag}"
+            f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
+            f"{_lab_value(r)}{flag}{abnormal}"
         )
 
     proc_rows = conn.execute(
