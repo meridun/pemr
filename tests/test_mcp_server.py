@@ -146,6 +146,28 @@ def test_person_add_writes(seeded):
     assert {p["slug"] for p in mcp_server.person_list(seeded)} == {"jane-doe", "john-doe"}
 
 
+def test_person_edit_writes(seeded):
+    out = mcp_server.person_edit(seeded, slug="jane-doe", dob="1981-02-03")
+    assert out["dob"] == "1981-02-03"
+    assert out["full_name"] == "Jane Doe"  # untouched partial update
+
+
+def test_person_edit_clears_nullable_with_empty_string(seeded):
+    mcp_server.person_edit(seeded, slug="jane-doe", notes="typo")
+    out = mcp_server.person_edit(seeded, slug="jane-doe", notes="")
+    assert out["notes"] is None
+
+
+def test_person_edit_unknown_slug_raises(seeded):
+    with pytest.raises(mcp_server.ToolError, match="no person"):
+        mcp_server.person_edit(seeded, slug="nobody", dob="2000-01-01")
+
+
+def test_person_edit_no_fields_raises(seeded):
+    with pytest.raises(mcp_server.ToolError, match="nothing to update"):
+        mcp_server.person_edit(seeded, slug="jane-doe")
+
+
 def test_ingest_with_agent_ocr_text(seeded, tmp_path, monkeypatch):
     monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
     scan = tmp_path / "scan.txt"
