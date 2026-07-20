@@ -88,7 +88,7 @@ CREATE TABLE observation (
   observation_id INTEGER PRIMARY KEY,
   person_id      INTEGER NOT NULL REFERENCES person(person_id),
   document_id    INTEGER REFERENCES document(document_id),
-  obs_type       TEXT NOT NULL,          -- 'blood_pressure','weight','allergy','immunization'...
+  obs_type       TEXT NOT NULL,          -- 'blood_pressure','weight','allergy','screening','immunization'...
   observed_at    TEXT,
   key            TEXT,
   value_num      REAL,

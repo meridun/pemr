@@ -73,7 +73,7 @@ report's verbatim label.
   (`docs/Architecture.md` §3).
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. Observation rows — conditions, allergies, vitals
+### 2. Observation rows — conditions, allergies, vitals, screenings, immunizations
 
 `render_summary` populates its **Conditions**, **Allergies**, and **Latest Vitals** sections purely
 from `observation` rows, keyed by `obs_type`. An extraction that omits them leaves those sections
@@ -91,6 +91,25 @@ treats underscores as spaces, so `blood_pressure` matches "blood pressure"; the 
 also maps common synonyms (`bp` → `blood_pressure`), but agents SHOULD emit the canonical token
 directly. Set `observed_at` (ISO date) whenever the source gives one — it drives timeline order and
 the "latest" selection.
+
+Two more observation families capture care-gap inputs. They have **no dedicated summary section** —
+their structured consumer is the future `pemr due` (care-gap) command, so they surface only via the
+generic `observation` loop in the appointment brief and timeline. Commit them anyway; the last-done
+date is what phase 7 needs and re-extraction to recover it later is expensive:
+
+- **Screening** → `obs_type='screening'`, `key=<snake_case screening name>` (e.g. `mammogram`,
+  `colonoscopy`, `diabetes_screening`), `observed_at=<last-done ISO date>` (the load-bearing
+  field), optional `value_text=<the source table's stated frequency / next-due, verbatim>`. The
+  frequency/next-due is context only — `pemr due` recomputes "due" from its own cadence rules.
+- **Immunization** → `obs_type='immunization'`, `key=<snake_case vaccine name>` (e.g. `influenza`,
+  `tdap`, `mmr`, `pneumococcal`), `observed_at=<date administered>`, optional `value_text=<detail:
+  dose #, lot, site>`. One row per administration; multiple rows over time = vaccination history.
+
+Vaccine overlap (influenza appears in both worlds): an **administered** vaccine → an `immunization`
+row; a health-screening-table *"due / last-done"* line → a `screening` row **only when the table is
+the sole evidence of last-done** (no administration record to capture). Don't double-count the same
+event as both. Canonical screening/vaccine vocabulary is owned by the care-gap phase — for now emit
+sensible `snake_case` tokens (same discipline as vitals) and let `dedup.norm()` handle case/spacing.
 
 ### 3. OCR text at ingest
 
