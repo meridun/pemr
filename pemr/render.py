@@ -18,6 +18,10 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
   * **vitals**     -> ``observation`` rows with ``obs_type='vital'`` whose ``key`` is one
     of the dictionary's canonical vital tokens (``blood_pressure``, ``weight`` ...).
     "Latest vitals" is the most recent row per normalized ``key``.
+  * **orders**     -> ``observation`` rows with ``obs_type='order'`` for non-medication
+    orders mined from the med-list section (DME, outpatient PT, referrals, consults):
+    ``key`` = free-text item/order name (no canonical vocabulary), optional
+    ``value_text`` = instructions and/or prescriber/target specialty.
 
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
@@ -35,6 +39,7 @@ from .dedup import norm
 OBS_CONDITION = "condition"
 OBS_ALLERGY = "allergy"
 OBS_VITAL = "vital"
+OBS_ORDER = "order"
 
 # Default window for "recent labs" in an appointment brief (last N most recent).
 _BRIEF_RECENT_LABS = 10
@@ -240,6 +245,11 @@ def render_summary(
         + (f" - {a['value_text']}" if a["key"] and a["value_text"] else "")
         for a in _observations(conn, person_id, OBS_ALLERGY)
     ]
+    order_lines = [
+        f"- {o['key'] or o['value_text'] or '(unspecified)'}"
+        + (f" - {o['value_text']}" if o["key"] and o["value_text"] else "")
+        for o in _observations(conn, person_id, OBS_ORDER)
+    ]
 
     vital_lines = []
     for v in _latest_vitals(conn, person_id, dictionary):
@@ -265,6 +275,7 @@ def render_summary(
         _section("Active Medications", med_lines),
         _section("Conditions", cond_lines),
         _section("Allergies", allergy_lines),
+        _section("Orders & Referrals", order_lines),
         _section("Latest Vitals", vital_lines),
         _section("Recent Abnormal Labs", lab_lines, empty="_none flagged_"),
         _section("Upcoming / Open Appointments", appt_lines),
