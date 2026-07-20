@@ -24,7 +24,7 @@ import re
 import sqlite3
 import tomllib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import db
@@ -83,7 +83,8 @@ KNOWN_TYPES = tuple(FIELD_SPECS)
 
 # Date-typed fields per record type. These feed timeline sort / trends date math and
 # the dedup_key (via _date_only), all of which assume a lexically-sortable ISO date —
-# so validate_row enforces strict ISO on them, not just the base `str` type.
+# so validate_row enforces ISO on them, not just the base `str` type. A partial
+# prefix (YYYY / YYYY-MM) is accepted alongside a full date; see _is_iso_date.
 DATE_FIELDS: dict[str, frozenset[str]] = {
     "lab_result": frozenset({"collected_at"}),
     "medication": frozenset({"started_on", "ended_on"}),
@@ -95,11 +96,17 @@ DATE_FIELDS: dict[str, frozenset[str]] = {
 _WS = re.compile(r"\s+")
 _PAREN = re.compile(r"\([^)]*\)")
 
-# A date value must begin with a strict `YYYY-MM-DD` (the part _date_only slices for
-# the dedup_key and timeline sort); an optional time component may follow after `T` or
-# a space. Calendar validity (real month/day, valid time) is then confirmed by
-# datetime.fromisoformat below.
+# A date value is accepted at one of three precisions, each a lexically-sortable ISO
+# prefix (so `_date_only` slicing, timeline sort and every `ORDER BY <datecol>` keep
+# working — a coarse date sorts at the start of its period):
+#   * YYYY-MM-DD (full date), optionally followed by `T`/space + a time component;
+#   * YYYY-MM    (month precision) — no time component permitted;
+#   * YYYY       (year precision)  — no time component permitted.
+# Calendar validity (real month/day, valid time, plausible year) is confirmed by the
+# datetime/date constructors in _is_iso_date below.
 _ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?")
+_ISO_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+_ISO_YEAR_RE = re.compile(r"\d{4}")
 
 
 class ValidationError(ValueError):
@@ -107,20 +114,42 @@ class ValidationError(ValueError):
 
 
 def _is_iso_date(value: str) -> bool:
-    """True when ``value`` is a strict ISO date (``YYYY-MM-DD``) or ISO timestamp
-    (``YYYY-MM-DD`` + ``T``/space + a valid time, optionally with offset/``Z``).
+    """True when ``value`` is an ISO date/timestamp at one of three precisions:
 
-    Non-ISO forms like ``06/15/2026`` or ``not-a-date`` are rejected — they would
-    otherwise sort lexically ahead of real ISO dates and corrupt the timeline."""
-    if not _ISO_DATE_RE.fullmatch(value):
-        return False
-    try:
-        # datetime.fromisoformat (3.11+) parses date-only and full timestamps and
-        # enforces calendar/time validity; `Z` is accepted only from 3.11 onward.
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return True
+        * full date ``YYYY-MM-DD``, optionally + ``T``/space + a valid time
+          (optionally with offset/``Z``) — e.g. ``2026-03-15``, ``2026-03-15T09:30Z``;
+        * month precision ``YYYY-MM`` — e.g. ``2026-03``;
+        * year precision ``YYYY`` — e.g. ``2026``.
+
+    A time component is permitted **only** at full-date precision (``2026-03T09:00``
+    is rejected). Non-ISO forms like ``06/15/2026``, ``2026-13``, ``2026-3`` or
+    ``not-a-date`` are rejected — they would otherwise sort lexically ahead of real
+    ISO dates and corrupt the timeline. Each accepted form is a prefix of the next, so
+    all three sort correctly against each other and against full dates."""
+    if _ISO_DATE_RE.fullmatch(value):
+        try:
+            # datetime.fromisoformat (3.11+) parses date-only and full timestamps and
+            # enforces calendar/time validity; `Z` is accepted only from 3.11 onward.
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return True
+    if _ISO_MONTH_RE.fullmatch(value):
+        year, month = value.split("-")
+        try:
+            # date() enforces month 01-12 and a plausible (1-9999) year in one check.
+            date(int(year), int(month), 1)
+        except ValueError:
+            return False
+        return True
+    if _ISO_YEAR_RE.fullmatch(value):
+        try:
+            # Rejects the one implausible 4-digit year, 0000 (date min year is 1).
+            date(int(value), 1, 1)
+        except ValueError:
+            return False
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +288,8 @@ def validate_row(record_type: str, row: object) -> None:
             )
         if name in DATE_FIELDS.get(record_type, frozenset()) and not _is_iso_date(value):
             raise ValidationError(
-                f"{record_type}.{name}: expected ISO date (YYYY-MM-DD) or ISO "
+                f"{record_type}.{name}: expected ISO date at year (YYYY), month "
+                f"(YYYY-MM) or full (YYYY-MM-DD) precision, or a full-date ISO "
                 f"timestamp, got {value!r}"
             )
 
