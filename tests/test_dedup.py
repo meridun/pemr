@@ -143,6 +143,18 @@ def test_dedup_key_differs_by_date():
     assert a != b
 
 
+def test_partial_and_full_date_of_same_event_are_distinct_keys():
+    # Issue #42 Q2: the dedup layer never guesses a full date refines a partial one —
+    # a YYYY-MM procedure and a later fully-dated copy get distinct keys (two rows).
+    partial = dedup.dedup_key("procedure",
+                              {"name": "Appendectomy", "performed_on": "2019-03"}, 1)
+    full = dedup.dedup_key("procedure",
+                           {"name": "Appendectomy", "performed_on": "2019-03-15"}, 1)
+    year = dedup.dedup_key("procedure",
+                           {"name": "Appendectomy", "performed_on": "2019"}, 1)
+    assert partial != full != year and partial != year
+
+
 # --- validation ---------------------------------------------------------------
 
 def test_validate_rejects_unknown_type():
@@ -192,6 +204,22 @@ def test_validate_accepts_iso_dates_and_timestamps(good):
         "lab_result",
         {"test_name": "Sodium", "value_num": 140, "collected_at": good},
     )
+
+
+@pytest.mark.parametrize("good", ["2026", "2026-01", "2026-12", "1999", "2019-03"])
+def test_validate_accepts_partial_dates(good):
+    # Issue #42: month (YYYY-MM) and year (YYYY) precision prefixes are first-class.
+    dedup.validate_row("procedure", {"name": "Appendectomy", "performed_on": good})
+
+
+@pytest.mark.parametrize("bad", ["2026-13", "2026-00", "2026-3", "2026-1", "0000",
+                                  "202X", "2026-", "2026-03-", "2026-03T09:00",
+                                  "2026T09:00", "20260", "999"])
+def test_validate_rejects_partial_date_junk(bad):
+    # Near-miss partial forms are still rejected: bad month, single-digit or missing
+    # month, implausible year, and any time component on a non-full-date precision.
+    with pytest.raises(dedup.ValidationError, match=r"performed_on.*ISO date"):
+        dedup.validate_row("procedure", {"name": "MRI", "performed_on": bad})
 
 
 def test_validate_rejects_non_iso_date_across_record_types():
