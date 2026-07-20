@@ -455,9 +455,9 @@ def _cmd_query_labs(args: argparse.Namespace) -> int:
             value = r["value_num"] if r["value_num"] is not None else r["value_text"]
             unit = f" {r['unit']}" if r["unit"] else ""
             flag = f"  [{r['flag']}]" if r["flag"] else ""
-            ref = ""
-            if r["ref_low"] is not None or r["ref_high"] is not None:
-                ref = f"  (ref {_fmt(r['ref_low'])}-{_fmt(r['ref_high'])})"
+            # Reuse render's shared helper so one-sided ranges (issue #45) render
+            # as "(ref <= 20)" / "(ref >= 8)" instead of a bogus "(ref -20.0)".
+            ref = render._ref_range(r)
             print(f"{_fmt(r['collected_at']):19}  {r['test_name']:20}  "
                   f"{_fmt(value)}{unit}{flag}{ref}")
         return 0
