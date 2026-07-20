@@ -101,12 +101,16 @@
 "beta-2 microglobulin" = "beta2_microglobulin"
 
 # --- observation obs_type conventions (phase 4 render layer) ---
-# The render layer (master summary / appointment brief) reads three obs_type
+# The render layer (master summary / appointment brief) reads four obs_type
 # families out of the generic `observation` table. Extraction agents should emit:
 #   * obs_type='vital'     key=<canonical vital token below>  (blood_pressure ...)
 #   * obs_type='condition' key=<condition name>   value_text=<optional detail>
 #   * obs_type='allergy'   key=<allergen>         value_text=<optional reaction>
+#   * obs_type='order'     key=<item/order name>  value_text=<instructions/prescriber>
 # "Latest vitals" in the summary is the most recent `vital` row per normalized key.
+# The `order` family captures non-medication orders mined from the med-list section
+# (DME, outpatient PT, referrals, pre-op consults); `key` is free-text (verbatim item
+# name), NOT a canonical token vocabulary — no synonyms are added for it here.
 
 # --- Vitals (observation keys) ---
 # Canonical observation-key vocabulary — extraction agents should emit these
