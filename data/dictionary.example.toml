@@ -66,9 +66,11 @@
 "plt" = "platelets"
 
 # --- Inflammatory markers ---
-# ESR (erythrocyte sedimentation rate). Report labels vary by method; the
-# `(modified westergren)` method tag reduces to the bare "sed rate by modified
-# westergren" form once norm() strips parentheses. All spellings collapse to `esr`.
+# ESR (erythrocyte sedimentation rate). Report labels vary by method. The
+# unparenthesized Quest label "sed rate by modified westergren" matches its own
+# key below; a parenthetical variant like "Sed Rate (Modified Westergren)" has
+# the method tag stripped by norm() and reduces to the bare "sed rate" key
+# instead. All spellings collapse to `esr`.
 "esr" = "esr"
 "sed rate" = "esr"
 "sed rate by modified westergren" = "esr"
