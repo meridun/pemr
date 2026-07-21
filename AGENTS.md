@@ -134,6 +134,22 @@ The agent fills it **from its own general knowledge**, under fixed framing it MU
 The agent MUST NEVER: claim safety or the absence of interactions, give dosing advice, or recommend
 starting, stopping, or changing a medication.
 
+### 6. Date precision
+
+Every date field (`collected_at`, `started_on`, `ended_on`, `performed_on`, `scheduled_for`,
+`observed_at`) accepts an ISO prefix at **three precisions**: full `YYYY-MM-DD` (optionally + a
+`T`/space time), month `YYYY-MM`, or year `YYYY`. Emit the **most precise prefix the source
+supports** — a full date when the document gives one, else `YYYY-MM`, else `YYYY` — never invent a
+day or month the source didn't state, and never fall back to stashing an imprecise date elsewhere.
+
+- e.g. a prior surgery cited only as "03/2019" commits as `procedure.performed_on = "2019-03"`,
+  not stashed in a condition observation's `value_text`.
+- A time component is only valid with a full date (`2026-03T09:00` is rejected).
+- Non-ISO forms (`06/15/2026`, `2026-13`, `2026-3`, `Jan 2026`) are still rejected — reformat to an
+  ISO prefix first.
+- A partial and a later full date of the same event stay **distinct rows** (the dedup layer never
+  guesses that one refines the other); reconciling them is a human conflict-review action.
+
 ## Privacy posture
 
 This repository is **public**. It is framework + documentation only.
