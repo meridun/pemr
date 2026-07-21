@@ -21,6 +21,12 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
 
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
+
+This ASCII rule governs *static, CLI-authored literals* only. *Dynamic stored
+document content* (e.g. the ``find`` snippet -- OCR'd text that can legitimately
+carry accents/em-dashes/smart quotes) is echoed verbatim, never ASCII-normalized;
+``cli.main`` reconfigures stdout/stderr to UTF-8 so a legacy Windows console
+prints it correctly instead of ``?`` (issue #46). Literal vs. data are orthogonal.
 """
 
 from __future__ import annotations
