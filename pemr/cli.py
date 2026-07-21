@@ -878,6 +878,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Force UTF-8 stdout/stderr so stored document content (accents, em-dashes,
+    # smart quotes) prints verbatim instead of `?` on a legacy Windows console
+    # codepage (cp1252/cp437). Guarded: streams without ``reconfigure`` (already
+    # wrapped, or pytest capture) are left untouched. Orthogonal to issue #23's
+    # ASCII-literal convention — that governs static messages, this governs the
+    # dynamic data echoed by ``find`` (issue #46).
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     return args.func(args)
 
