@@ -111,13 +111,20 @@
 "beta2 microglobulin" = "beta2_microglobulin"
 "beta-2 microglobulin" = "beta2_microglobulin"
 
-# --- observation obs_type conventions (phase 4 render layer) ---
-# The render layer (master summary / appointment brief) reads three obs_type
-# families out of the generic `observation` table. Extraction agents should emit:
-#   * obs_type='vital'     key=<canonical vital token below>  (blood_pressure ...)
-#   * obs_type='condition' key=<condition name>   value_text=<optional detail>
-#   * obs_type='allergy'   key=<allergen>         value_text=<optional reaction>
-# "Latest vitals" in the summary is the most recent `vital` row per normalized key.
+# --- observation obs_type conventions ---
+# Five obs_type families out of the generic `observation` table. Extraction
+# agents should emit:
+#   * obs_type='vital'        key=<canonical vital token below>  (blood_pressure ...)
+#   * obs_type='condition'    key=<condition name>     value_text=<optional detail>
+#   * obs_type='allergy'      key=<allergen>           value_text=<optional reaction>
+#   * obs_type='screening'    key=<snake_case screen>  observed_at=<last-done date>  value_text=<freq/next-due>
+#   * obs_type='immunization' key=<snake_case vaccine> observed_at=<date given>      value_text=<optional detail>
+# The first three drive the phase-4 render layer (master summary / appointment
+# brief); "Latest vitals" is the most recent `vital` row per normalized key.
+# Screening/immunization have no render section — they feed the future care-gap
+# `pemr due` command (phase 7), which owns the canonical screening/vaccine
+# vocabulary. Until then there is no dictionary here for them: agents emit
+# sensible snake_case tokens and norm() is the interim case/spacing backstop.
 
 # --- Vitals (observation keys) ---
 # Canonical observation-key vocabulary — extraction agents should emit these
