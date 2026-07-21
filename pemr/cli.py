@@ -455,9 +455,9 @@ def _cmd_query_labs(args: argparse.Namespace) -> int:
             value = r["value_num"] if r["value_num"] is not None else r["value_text"]
             unit = f" {r['unit']}" if r["unit"] else ""
             flag = f"  [{r['flag']}]" if r["flag"] else ""
-            ref = ""
-            if r["ref_low"] is not None or r["ref_high"] is not None:
-                ref = f"  (ref {_fmt(r['ref_low'])}-{_fmt(r['ref_high'])})"
+            # Reuse render's shared helper so one-sided ranges (issue #45) render
+            # as "(ref <= 20)" / "(ref >= 8)" instead of a bogus "(ref -20.0)".
+            ref = render._ref_range(r)
             print(f"{_fmt(r['collected_at']):19}  {r['test_name']:20}  "
                   f"{_fmt(value)}{unit}{flag}{ref}")
         return 0
@@ -878,6 +878,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Force UTF-8 stdout/stderr so stored document content (accents, em-dashes,
+    # smart quotes) prints verbatim instead of `?` on a legacy Windows console
+    # codepage (cp1252/cp437). Guarded: streams without ``reconfigure`` (already
+    # wrapped, or pytest capture) are left untouched. Orthogonal to issue #23's
+    # ASCII-literal convention — that governs static messages, this governs the
+    # dynamic data echoed by ``find`` (issue #46).
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     return args.func(args)
 
