@@ -73,7 +73,7 @@ report's verbatim label.
   (`docs/Architecture.md` §3).
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. Observation rows — conditions, allergies, vitals, orders
+### 2. Observation rows — conditions, allergies, vitals, orders, screenings, immunizations
 
 `render_summary` populates its **Conditions**, **Allergies**, **Orders & Referrals**, and **Latest
 Vitals** sections purely from `observation` rows, keyed by `obs_type`. An extraction that omits them
@@ -100,6 +100,25 @@ treats underscores as spaces, so `blood_pressure` matches "blood pressure"; the 
 also maps common synonyms (`bp` → `blood_pressure`), but agents SHOULD emit the canonical token
 directly. Set `observed_at` (ISO date) whenever the source gives one — it drives timeline order and
 the "latest" selection.
+
+Two more observation families capture care-gap inputs. They have **no dedicated summary section** —
+their structured consumer is the future `pemr due` (care-gap) command, so they surface only via the
+generic `observation` loop in the appointment brief and timeline. Commit them anyway; the last-done
+date is what phase 7 needs and re-extraction to recover it later is expensive:
+
+- **Screening** → `obs_type='screening'`, `key=<snake_case screening name>` (e.g. `mammogram`,
+  `colonoscopy`, `diabetes_screening`), `observed_at=<last-done ISO date>` (the load-bearing
+  field), optional `value_text=<the source table's stated frequency / next-due, verbatim>`. The
+  frequency/next-due is context only — `pemr due` recomputes "due" from its own cadence rules.
+- **Immunization** → `obs_type='immunization'`, `key=<snake_case vaccine name>` (e.g. `influenza`,
+  `tdap`, `mmr`, `pneumococcal`), `observed_at=<date administered>`, optional `value_text=<detail:
+  dose #, lot, site>`. One row per administration; multiple rows over time = vaccination history.
+
+Vaccine overlap (influenza appears in both worlds): an **administered** vaccine → an `immunization`
+row; a health-screening-table *"due / last-done"* line → a `screening` row **only when the table is
+the sole evidence of last-done** (no administration record to capture). Don't double-count the same
+event as both. Canonical screening/vaccine vocabulary is owned by the care-gap phase — for now emit
+sensible `snake_case` tokens (same discipline as vitals) and let `dedup.norm()` handle case/spacing.
 
 ### 3. OCR text at ingest
 
@@ -142,6 +161,22 @@ The agent fills it **from its own general knowledge**, under fixed framing it MU
 
 The agent MUST NEVER: claim safety or the absence of interactions, give dosing advice, or recommend
 starting, stopping, or changing a medication.
+
+### 6. Date precision
+
+Every date field (`collected_at`, `started_on`, `ended_on`, `performed_on`, `scheduled_for`,
+`observed_at`) accepts an ISO prefix at **three precisions**: full `YYYY-MM-DD` (optionally + a
+`T`/space time), month `YYYY-MM`, or year `YYYY`. Emit the **most precise prefix the source
+supports** — a full date when the document gives one, else `YYYY-MM`, else `YYYY` — never invent a
+day or month the source didn't state, and never fall back to stashing an imprecise date elsewhere.
+
+- e.g. a prior surgery cited only as "03/2019" commits as `procedure.performed_on = "2019-03"`,
+  not stashed in a condition observation's `value_text`.
+- A time component is only valid with a full date (`2026-03T09:00` is rejected).
+- Non-ISO forms (`06/15/2026`, `2026-13`, `2026-3`, `Jan 2026`) are still rejected — reformat to an
+  ISO prefix first.
+- A partial and a later full date of the same event stay **distinct rows** (the dedup layer never
+  guesses that one refines the other); reconciling them is a human conflict-review action.
 
 ## Privacy posture
 

@@ -65,6 +65,17 @@
 "platelets" = "platelets"
 "plt" = "platelets"
 
+# --- Inflammatory markers ---
+# ESR (erythrocyte sedimentation rate). Report labels vary by method. The
+# unparenthesized Quest label "sed rate by modified westergren" matches its own
+# key below; a parenthetical variant like "Sed Rate (Modified Westergren)" has
+# the method tag stripped by norm() and reduces to the bare "sed rate" key
+# instead. All spellings collapse to `esr`.
+"esr" = "esr"
+"sed rate" = "esr"
+"sed rate by modified westergren" = "esr"
+"erythrocyte sedimentation rate" = "esr"
+
 # --- Basic metabolic panel (CMP abbreviations) ---
 # Report codes for non-fasting serum chemistries. (Fasting glucose is its own token
 # under Glycemic — a bare `Glucose`/`GLUC` reading is not a fasting result.)
@@ -100,17 +111,24 @@
 "beta2 microglobulin" = "beta2_microglobulin"
 "beta-2 microglobulin" = "beta2_microglobulin"
 
-# --- observation obs_type conventions (phase 4 render layer) ---
-# The render layer (master summary / appointment brief) reads four obs_type
-# families out of the generic `observation` table. Extraction agents should emit:
-#   * obs_type='vital'     key=<canonical vital token below>  (blood_pressure ...)
-#   * obs_type='condition' key=<condition name>   value_text=<optional detail>
-#   * obs_type='allergy'   key=<allergen>         value_text=<optional reaction>
-#   * obs_type='order'     key=<item/order name>  value_text=<instructions/prescriber>
-# "Latest vitals" in the summary is the most recent `vital` row per normalized key.
+# --- observation obs_type conventions ---
+# Six obs_type families out of the generic `observation` table. Extraction
+# agents should emit:
+#   * obs_type='vital'        key=<canonical vital token below>  (blood_pressure ...)
+#   * obs_type='condition'    key=<condition name>     value_text=<optional detail>
+#   * obs_type='allergy'      key=<allergen>           value_text=<optional reaction>
+#   * obs_type='order'        key=<item/order name>    value_text=<instructions/prescriber>
+#   * obs_type='screening'    key=<snake_case screen>  observed_at=<last-done date>  value_text=<freq/next-due>
+#   * obs_type='immunization' key=<snake_case vaccine> observed_at=<date given>      value_text=<optional detail>
+# vital/condition/allergy/order drive the phase-4 render layer (master summary /
+# appointment brief); "Latest vitals" is the most recent `vital` row per normalized key.
 # The `order` family captures non-medication orders mined from the med-list section
 # (DME, outpatient PT, referrals, pre-op consults); `key` is free-text (verbatim item
 # name), NOT a canonical token vocabulary — no synonyms are added for it here.
+# Screening/immunization have no render section — they feed the future care-gap
+# `pemr due` command (phase 7), which owns the canonical screening/vaccine
+# vocabulary. Until then there is no dictionary here for them: agents emit
+# sensible snake_case tokens and norm() is the interim case/spacing backstop.
 
 # --- Vitals (observation keys) ---
 # Canonical observation-key vocabulary — extraction agents should emit these

@@ -62,6 +62,30 @@ def test_query_labs_human_and_json(ready, capsys):
     assert {"test_name", "value_num", "collected_at"} <= set(payload[0])
 
 
+def test_query_labs_one_sided_ref_range(ready, capsys):
+    """Issue #45: a lab with only ref_high must render '(ref <= N)', never '(ref -N)'."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "lab_result": [
+            {"test_name": "Ferritin", "collected_at": "2026-02-01", "value_num": 15.0,
+             "unit": "ng/mL", "ref_high": 20.0},                       # one-sided upper
+            {"test_name": "TSH", "collected_at": "2026-02-01", "value_num": 3.0,
+             "unit": "mIU/L", "ref_low": 8.0},                         # one-sided lower
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "labs", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    ferritin = next(line for line in out.splitlines() if "Ferritin" in line)
+    assert "(ref <= 20.0)" in ferritin
+    assert "(ref -" not in ferritin       # the old bug rendered "(ref -20.0)"
+    tsh = next(line for line in out.splitlines() if "TSH" in line)
+    assert "(ref >= 8.0)" in tsh
+
+
 def test_query_meds_active_json(ready, capsys):
     assert _run(ready, "query", "meds", "--person", "jane-doe", "--active", "--json") == 0
     payload = json.loads(capsys.readouterr().out)
