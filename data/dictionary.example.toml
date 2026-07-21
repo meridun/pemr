@@ -65,6 +65,17 @@
 "platelets" = "platelets"
 "plt" = "platelets"
 
+# --- Inflammatory markers ---
+# ESR (erythrocyte sedimentation rate). Report labels vary by method. The
+# unparenthesized Quest label "sed rate by modified westergren" matches its own
+# key below; a parenthetical variant like "Sed Rate (Modified Westergren)" has
+# the method tag stripped by norm() and reduces to the bare "sed rate" key
+# instead. All spellings collapse to `esr`.
+"esr" = "esr"
+"sed rate" = "esr"
+"sed rate by modified westergren" = "esr"
+"erythrocyte sedimentation rate" = "esr"
+
 # --- Basic metabolic panel (CMP abbreviations) ---
 # Report codes for non-fasting serum chemistries. (Fasting glucose is its own token
 # under Glycemic — a bare `Glucose`/`GLUC` reading is not a fasting result.)
