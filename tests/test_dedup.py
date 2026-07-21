@@ -53,6 +53,15 @@ def test_load_missing_dictionary_is_empty(tmp_path):
     assert dedup.load_dictionary(None) == {}
 
 
+def test_esr_synonyms_map_to_canonical():
+    # Issue #41: an ESR result labeled "SED RATE BY MODIFIED WESTERGREN" on a Quest
+    # report must share the `esr` identity with every other ESR spelling.
+    d = dedup.load_dictionary(DICT_PATH)
+    for spelling in ("ESR", "Sed Rate", "SED RATE BY MODIFIED WESTERGREN",
+                     "Erythrocyte Sedimentation Rate"):
+        assert dedup.norm(spelling, d) == "esr", spelling
+
+
 def test_norm_treats_underscores_as_spaces():
     assert dedup.norm("blood_pressure") == "blood pressure"
     d = dedup.load_dictionary(DICT_PATH)
