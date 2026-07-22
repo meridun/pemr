@@ -73,17 +73,26 @@ report's verbatim label.
   (`docs/Architecture.md` §3).
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. Observation rows — conditions, allergies, vitals, screenings, immunizations
+### 2. Observation rows — conditions, allergies, vitals, orders, screenings, immunizations
 
-`render_summary` populates its **Conditions**, **Allergies**, and **Latest Vitals** sections purely
-from `observation` rows, keyed by `obs_type`. An extraction that omits them leaves those sections
-permanently `_none recorded_`, so a visit note carrying a diagnosis, allergy, or vital reading MUST
-commit the matching `observation` rows in `commit_extraction`:
+`render_summary` populates its **Conditions**, **Allergies**, **Orders & Referrals**, and **Latest
+Vitals** sections purely from `observation` rows, keyed by `obs_type`. An extraction that omits them
+leaves those sections permanently `_none recorded_`, so a visit note carrying a diagnosis, allergy,
+vital reading, or non-medication order MUST commit the matching `observation` rows in
+`commit_extraction`:
 
 - **Condition** → `obs_type='condition'`, `key=<condition name>`, optional `value_text=<detail>`.
 - **Allergy** → `obs_type='allergy'`, `key=<allergen>`, optional `value_text=<reaction>`.
 - **Vital** → `obs_type='vital'`, `key=<canonical vital token>` (below), the reading in `value_num`
   (+ `unit`) or `value_text`. "Latest vitals" is the most recent `vital` row per normalized `key`.
+- **Order** → `obs_type='order'`, `key=<item/order name>`, optional `value_text=<instructions
+  and/or prescriber/target specialty>`; set `observed_at` to the order/referral date when the source
+  gives one. This is the home for **non-medication orders** mined from the med-list section —
+  durable medical equipment (e.g. a cervical collar), outpatient PT, referrals, and pre-op consults.
+  A non-medication item surfacing in the med-list section MUST be committed as an `order`
+  observation — never dropped (surviving only in `ocr_text`), and never miscommitted as a
+  `medication` or `procedure` row. Unlike vitals, `key` is free-text: emit the verbatim item name,
+  there is no canonical `order` vocabulary.
 
 Canonical vital `key` tokens — emit these verbatim (same discipline as rule 1): `blood_pressure`,
 `bmi`, `weight`, `height`, `temperature`, `pulse`, `spo2`, `respiratory_rate`. `dedup.norm()`

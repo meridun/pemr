@@ -85,6 +85,9 @@ def seeded(tmp_path):
             {"obs_type": "condition", "key": "Type 2 Diabetes", "observed_at": "2024-01-01"},
             {"obs_type": "allergy", "key": "Penicillin", "value_text": "rash",
              "observed_at": "2010-01-01"},
+            {"obs_type": "order", "key": "cervical collar", "value_text": "Dr. Smith, ortho",
+             "observed_at": "2026-02-01"},                                        # DME order
+            {"obs_type": "order", "key": "outpatient physical therapy"},          # bare item, no detail
         ],
     }, d)
 
@@ -113,7 +116,7 @@ def test_summary_header_is_self_identifying(seeded):
     assert "DOB: 1980-01-01" in md
     assert "Generated:" in md
     # source row counts so a stale export identifies itself
-    assert "labs=4" in md and "medications=2" in md and "observations=5" in md
+    assert "labs=4" in md and "medications=2" in md and "observations=7" in md
 
 
 def test_summary_active_meds_only(seeded):
@@ -126,6 +129,18 @@ def test_summary_conditions_and_allergies(seeded):
     md = render.render_summary(seeded, "jane-doe")
     assert "## Conditions" in md and "Type 2 Diabetes" in md
     assert "## Allergies" in md and "Penicillin - rash" in md
+
+
+def test_summary_orders_and_referrals(seeded):
+    """Non-medication `order` observations render under a dedicated section: item name
+    with optional prescriber/instructions detail, placed after Allergies before Vitals."""
+    md = render.render_summary(seeded, "jane-doe")
+    section = md.split("## Orders & Referrals")[1].split("##")[0]
+    assert "cervical collar - Dr. Smith, ortho" in section   # key - value_text
+    assert "outpatient physical therapy" in section          # bare item, no trailing detail
+    assert "outpatient physical therapy - " not in section   # no dangling separator
+    # placement: after Allergies, before Latest Vitals (clinical-status block stays together)
+    assert md.index("## Allergies") < md.index("## Orders & Referrals") < md.index("## Latest Vitals")
 
 
 def test_summary_latest_vitals_pick(seeded):
@@ -160,6 +175,9 @@ def test_summary_empty_sections_are_explicit(seeded):
     md = render.render_summary(seeded, "john-doe")
     assert "## Active Medications" in md and "_none recorded_" in md
     assert "## Conditions" in md
+    assert "## Orders & Referrals" in md
+    order_section = md.split("## Orders & Referrals")[1].split("##")[0]
+    assert "_none recorded_" in order_section  # no orders -> explicit empty state
     assert "## Recent Abnormal Labs" in md  # john has an abnormal LDL, so it appears
     assert "999" in md
 
