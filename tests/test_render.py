@@ -211,6 +211,32 @@ def test_brief_flags_abnormal_labs_with_marker_and_ref(seeded):
     assert "[!]" not in lines["TSH"]
 
 
+def test_brief_recent_labs_keep_abnormals_within_the_limit(seeded):
+    """A single draw can carry a 50+ analyte panel; `LIMIT N` over an alphabetical order
+    used to return the first N names of that draw and drop every abnormal in it. Newest
+    draw still comes first, but abnormal beats normal inside a draw."""
+    doc = _doc(seeded, "jane-doe", ocr="big panel", category="labs")
+    # One draw, newer than every seeded lab: 8 normals sorting before the abnormal by name.
+    rows = [
+        {"test_name": f"Analyte {c}", "collected_at": "2026-06-01T09:00",
+         "value_num": 1.0, "ref_low": 0.0, "ref_high": 2.0}
+        for c in "ABCDEFGH"
+    ]
+    rows.append({"test_name": "Zinc", "collected_at": "2026-06-01T09:00",
+                 "value_num": 99.0, "ref_low": 0.0, "ref_high": 2.0})
+    dedup.commit_extraction(seeded, doc, {"lab_result": rows})
+
+    section = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), recent_labs=3
+    ).split("## Recent Labs")[1].split("##")[0]
+    names = [ln.split("  ")[1] for ln in section.splitlines() if ln.startswith("- ")]
+    assert names[0] == "Zinc"                     # the only abnormal in the newest draw
+    assert "[!]" in section
+    assert names[1:] == ["Analyte A", "Analyte B"]  # then alphabetical within that draw
+    # Recency is still the primary axis: nothing from an older draw displaces the newest.
+    assert "Glucose, fasting" not in section
+
+
 def test_brief_has_interaction_placeholder(seeded):
     md = render.render_brief(seeded, _upcoming_appt_id(seeded))
     assert "## Medication Interaction Review" in md

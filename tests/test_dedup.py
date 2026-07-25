@@ -462,3 +462,118 @@ def test_observation_and_medication_commit(conn):
                          "key": "systolic", "value_num": 120}],
     })
     assert summary.counts["new"] == 2
+
+
+# --- rekey (dictionary-edit maintenance) --------------------------------------
+
+def _rekey_dict(**extra):
+    """Starter dictionary plus the synonyms a maintenance run is meant to pick up.
+
+    The added spellings are deliberately ones the shipped dictionary does NOT carry, so
+    the test stays green as `data/dictionary.example.toml` grows."""
+    d = dedup.load_dictionary(DICT_PATH)
+    d.update(extra)
+    return d
+
+
+def test_rekey_dry_run_reports_without_writing(conn):
+    doc = _make_document(conn)
+    # Committed with the shipped dictionary, where "cl" has no synonym.
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108},
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 5.7},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    before = {r["test_name"]: r["dedup_key"]
+              for r in conn.execute("SELECT test_name, dedup_key FROM lab_result")}
+
+    report = dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"))
+
+    assert report.applied is False
+    assert report.scanned["lab_result"] == 2
+    assert [(c.record_type, c.label) for c in report.changes] == [("lab_result", "ZZT")]
+    after = {r["test_name"]: r["dedup_key"]
+             for r in conn.execute("SELECT test_name, dedup_key FROM lab_result")}
+    assert after == before  # dry run touched nothing
+
+
+def test_rekey_apply_restores_dedup_for_a_renamed_analyte(conn):
+    d_old = dedup.load_dictionary(DICT_PATH)
+    d_new = _rekey_dict(zzt="zonulin_test")
+    doc = _make_document(conn)
+    row = {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}
+    dedup.commit_extraction(conn, doc, {"lab_result": [row]}, d_old)
+
+    # Without a rekey the same fact, committed under the new dictionary, would not
+    # match the stored key and would land as a *second* row.
+    report = dedup.rekey(conn, d_new, apply=True)
+    assert report.applied is True and len(report.changes) == 1
+    change = report.changes[0]
+    assert change.old_key != change.new_key
+
+    doc2 = _make_document(conn)
+    summary = dedup.commit_extraction(conn, doc2, {"lab_result": [row]}, d_new)
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+def test_rekey_is_idempotent(conn):
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    d_new = _rekey_dict(zzt="zonulin_test")
+    assert len(dedup.rekey(conn, d_new, apply=True).changes) == 1
+    assert dedup.rekey(conn, d_new, apply=True).changes == []
+
+
+def test_rekey_refuses_a_dictionary_that_fuses_two_facts(conn):
+    """Two methods for one analyte off one draw (CMP ALB vs SPEP Albumin) must not be
+    merged by a synonym: the run aborts whole, leaving every stored key untouched."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    before = {r["lab_result_id"]: r["dedup_key"]
+              for r in conn.execute("SELECT lab_result_id, dedup_key FROM lab_result")}
+
+    with pytest.raises(dedup.RekeyCollisionError, match="same dedup_key"):
+        dedup.rekey(conn, _rekey_dict(alb="albumin"), apply=True)
+
+    after = {r["lab_result_id"]: r["dedup_key"]
+             for r in conn.execute("SELECT lab_result_id, dedup_key FROM lab_result")}
+    assert after == before
+
+
+def test_rekey_survives_two_rows_swapping_keys(conn):
+    """UNIQUE(dedup_key) is enforced per statement, so a swap must not trip the index
+    mid-write: A takes B's old key while B takes A's."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "alpha", "collected_at": "2026-01-02", "value_num": 1},
+        {"test_name": "beta", "collected_at": "2026-01-02", "value_num": 2},
+    ]}, None)
+
+    report = dedup.rekey(conn, {"alpha": "beta", "beta": "alpha"}, apply=True)
+    assert len(report.changes) == 2
+    keys = {r["test_name"]: r["dedup_key"]
+            for r in conn.execute("SELECT test_name, dedup_key FROM lab_result")}
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    assert keys["alpha"] == dedup.dedup_key(
+        "lab_result", {"test_name": "beta", "collected_at": "2026-01-02"}, pid
+    )
+    assert len(set(keys.values())) == 2
+
+
+def test_rekey_covers_every_record_type(conn):
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {
+        "lab_result": [_lab(5.7)],
+        "medication": [{"name": "Metformin", "dose": "500mg"}],
+        "procedure": [{"name": "Colonoscopy", "performed_on": "2025-06-01"}],
+        "appointment": [{"scheduled_for": "2026-03-01", "provider": "Dr. Smith"}],
+        "observation": [{"obs_type": "vital", "key": "bp", "observed_at": "2026-01-02"}],
+    })
+    report = dedup.rekey(conn, None)
+    assert report.scanned == {t: 1 for t in dedup.KNOWN_TYPES}
+    assert report.changes == []  # same dictionary (none) -> keys already current

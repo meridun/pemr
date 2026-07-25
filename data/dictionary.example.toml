@@ -64,6 +64,18 @@
 "platelet count" = "platelets"
 "platelets" = "platelets"
 "plt" = "platelets"
+"rbc" = "rbc"
+"red blood cell count" = "rbc"
+"mcv" = "mcv"
+"mean corpuscular volume" = "mcv"
+"mch" = "mch"
+"mean corpuscular hemoglobin" = "mch"
+"mchc" = "mchc"
+"mean corpuscular hemoglobin concentration" = "mchc"
+"rdw" = "rdw"
+"red cell distribution width" = "rdw"
+"mpv" = "mpv"
+"mean platelet volume" = "mpv"
 
 # --- Inflammatory markers ---
 # ESR (erythrocyte sedimentation rate). Report labels vary by method. The
@@ -85,6 +97,36 @@
 "na" = "sodium"
 "potassium" = "potassium"
 "k" = "potassium"
+"chloride" = "chloride"
+"cl" = "chloride"
+# Total CO2 on a CMP. `bicarbonate`/`HCO3` is deliberately NOT mapped here: it is a
+# different assay label and collapsing the two would fuse two rows from one draw.
+"co2" = "co2"
+"carbon dioxide" = "co2"
+"calcium" = "calcium"
+"ca" = "calcium"
+
+# --- Liver enzymes / bilirubin ---
+"alt" = "alt"
+"sgpt" = "alt"
+"ast" = "ast"
+"sgot" = "ast"
+"alk phos" = "alkaline_phosphatase"
+"alp" = "alkaline_phosphatase"
+"alkaline phosphatase" = "alkaline_phosphatase"
+"bili t" = "bilirubin_total"
+"total bilirubin" = "bilirubin_total"
+"bilirubin, total" = "bilirubin_total"
+"ldh" = "ldh"
+"lactate dehydrogenase" = "ldh"
+
+# --- Serum protein: NOT mapped, on purpose ---
+# A CMP and an SPEP run off the SAME draw both report total protein (`TPro` /
+# `Protein, Total`) and albumin (`ALB` / `Albumin`) — different methods, slightly
+# different numbers, same person + same collected_at. Mapping `alb`->`albumin` or
+# `tpro`->`protein_total` would give those two rows one dedup key, so the second
+# would land as a staged CONFLICT (or silently collapse when the numbers happen to
+# agree). Leave the report labels distinct; revisit only with a method-aware key.
 
 # --- Vitamins ---
 "vitamin d" = "vitamin_d_25oh"
@@ -107,6 +149,12 @@
 "m-spike" = "m_spike"
 "immunoglobulin g" = "igg"
 "immunoglobulin g, qn, serum" = "igg"
+"iga" = "iga"
+"immunoglobulin a" = "iga"
+"immunoglobulin a, qn, serum" = "iga"
+"igm" = "igm"
+"immunoglobulin m" = "igm"
+"immunoglobulin m, qn, serum" = "igm"
 "b2 microglobulin" = "beta2_microglobulin"
 "beta2 microglobulin" = "beta2_microglobulin"
 "beta-2 microglobulin" = "beta2_microglobulin"
