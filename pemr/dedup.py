@@ -547,6 +547,106 @@ def resolve_conflict(
         )
 
 
+def _rekey_label(record_type: str, row: sqlite3.Row) -> str:
+    """Short human identifier for a row in `pemr rekey` output ("CL", "Metformin")."""
+    if record_type == "lab_result":
+        return row["test_name"] or ""
+    if record_type in ("medication", "procedure"):
+        return row["name"] or ""
+    if record_type == "appointment":
+        return " ".join(p for p in (row["provider"], row["scheduled_for"]) if p)
+    return " ".join(p for p in (row["obs_type"], row["key"]) if p)  # observation
+
+
+@dataclass
+class RekeyChange:
+    record_type: str
+    row_id: int
+    label: str
+    old_key: str
+    new_key: str
+
+
+@dataclass
+class RekeyReport:
+    scanned: dict[str, int] = field(default_factory=dict)      # type -> rows examined
+    changes: list[RekeyChange] = field(default_factory=list)
+    applied: bool = False
+
+
+class RekeyCollisionError(Exception):
+    """Two rows recompute to one dedup_key — the dictionary would fuse distinct facts."""
+
+
+def rekey(
+    conn: sqlite3.Connection,
+    dictionary: dict[str, str] | None = None,
+    *,
+    apply: bool = False,
+) -> RekeyReport:
+    """Recompute every stored ``dedup_key`` under the *current* dictionary.
+
+    A ``dedup_key`` is frozen at commit time, so adding a synonym (``cl`` ->
+    ``chloride``) changes the key a future commit computes for a fact already in the
+    DB: layer-2 dedup misses and the same fact lands twice. This walks the record
+    tables and re-derives each key, so stored rows keep deduping after a dictionary
+    edit. Values, provenance and row ids are untouched — only ``dedup_key`` moves.
+
+    Dry-run by default: pass ``apply=True`` to write. If two rows in a table recompute
+    to the same key the new dictionary would merge two distinct facts (typically two
+    methods for one analyte off one draw), so nothing is written and
+    :class:`RekeyCollisionError` is raised — fix the dictionary, not the data.
+    """
+    db.require_migrated(conn)
+    report = RekeyReport(applied=False)
+
+    for record_type in KNOWN_TYPES:
+        pk = f"{record_type}_id"
+        rows = conn.execute(f"SELECT * FROM {record_type}").fetchall()
+        report.scanned[record_type] = len(rows)
+        seen: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            payload = {name: row[name] for name in FIELD_SPECS[record_type]}
+            key = dedup_key(record_type, payload, row["person_id"], dictionary)
+            clash = seen.get(key)
+            if clash is not None:
+                raise RekeyCollisionError(
+                    f"{record_type}: {pk} {row[pk]} "
+                    f"({_rekey_label(record_type, row)!r}) and {pk} {clash[pk]} "
+                    f"({_rekey_label(record_type, clash)!r}) recompute to the same "
+                    "dedup_key - the dictionary maps two distinct facts onto one "
+                    "canonical name; nothing was written"
+                )
+            seen[key] = row
+            if key != row["dedup_key"]:
+                report.changes.append(RekeyChange(
+                    record_type, row[pk], _rekey_label(record_type, row),
+                    row["dedup_key"], key,
+                ))
+
+    if apply and report.changes:
+        # One transaction: a half-rekeyed table dedups inconsistently. Two passes,
+        # because `UNIQUE(dedup_key)` is enforced per statement: if two rows swap keys
+        # (or one takes a key another is about to vacate) a single-pass update trips
+        # the index mid-flight. Park every moving row on a unique placeholder first.
+        with conn:
+            for change in report.changes:
+                conn.execute(
+                    f"UPDATE {change.record_type} SET dedup_key = ? "
+                    f"WHERE {change.record_type}_id = ?",
+                    (f"rekey-pending-{change.record_type}-{change.row_id}",
+                     change.row_id),
+                )
+            for change in report.changes:
+                conn.execute(
+                    f"UPDATE {change.record_type} SET dedup_key = ? "
+                    f"WHERE {change.record_type}_id = ?",
+                    (change.new_key, change.row_id),
+                )
+    report.applied = apply
+    return report
+
+
 def _overwrite_record(
     conn: sqlite3.Connection,
     record_type: str,

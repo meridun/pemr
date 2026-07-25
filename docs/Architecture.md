@@ -207,6 +207,14 @@ dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` 
 canonical `hba1c`. The dictionary is the one place fuzzy naming gets pinned down
 deterministically; agents propose additions, you approve.
 
+**A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
+commit time, so a new synonym changes the key a *future* commit derives for a fact already
+in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` re-derives
+every stored key under the current dictionary (dry-run by default, `--apply` to write,
+values and provenance untouched). It aborts whole if two rows would recompute to one key —
+that means the new synonym fuses two distinct facts, e.g. a CMP `ALB` and an SPEP `Albumin`
+off the same draw, and the fix belongs in the dictionary rather than the data.
+
 The **measured value is deliberately *not* in the key** — temporal identity carries the
 draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
 document gives one, date when it only gives a date), not truncated to the date. Two draws
@@ -274,6 +282,7 @@ pemr render brief --appointment <id>     > exports/brief.md
 pemr render journal --person jane        > exports/jane-journal.md
 pemr backup                                              # VACUUM INTO snapshot
 pemr migrate                                             # apply pending migrations
+pemr rekey [--apply]                                     # re-derive dedup keys after a dictionary edit
 ```
 
 Invoke as `pemr <cmd>` (console script) or `python -m pemr <cmd>` (`pemr/__main__.py`,
