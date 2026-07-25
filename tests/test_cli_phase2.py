@@ -96,3 +96,85 @@ def test_commit_bad_json_is_friendly(ready, capsys):
     bad.write_text("{not json", encoding="utf-8")
     assert _run(tmp_path, "commit-extraction", "--document", "1", "--json", str(bad)) == 1
     assert "not valid JSON" in capsys.readouterr().err
+
+
+# --- rekey (dictionary-edit maintenance) --------------------------------------
+
+def _dict_file(tmp_path, name, body):
+    p = tmp_path / name
+    p.write_text("[synonyms]\n" + body, encoding="utf-8")
+    return p
+
+
+def _seed_lab(ready, tmp_path, dictionary):
+    scan = tmp_path / "rekey-scan.txt"
+    scan.write_bytes(b"zzt 108")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    doc = _document_id(tmp_path)[-1]["document_id"]
+    payload = _write_json(tmp_path, "rekey.json", {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload), "--dictionary", str(dictionary)) == 0
+    return payload
+
+
+def test_rekey_dry_run_then_apply(ready, capsys, tmp_path):
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "new.toml", '"zzt" = "zonulin_test"\n')
+    payload = _seed_lab(ready, tmp_path, old)
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 0
+    out = capsys.readouterr().out
+    assert "lab_result: 1/1 key(s) change" in out
+    assert "dry run: 1 row(s) would change" in out and "--apply" in out
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    assert "rekeyed 1 row(s)" in capsys.readouterr().out
+
+    # The point of the rekey: the same fact now dedups instead of doubling.
+    doc = _document_id(tmp_path)[-1]["document_id"]
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload), "--dictionary", str(new)) == 0
+    assert "0 new, 1 duplicate" in capsys.readouterr().out
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 0
+    assert "all dedup keys already match" in capsys.readouterr().out
+
+
+def test_rekey_json_output(ready, capsys, tmp_path):
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "new.toml", '"zzt" = "zonulin_test"\n')
+    _seed_lab(ready, tmp_path, old)
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] is False
+    assert payload["scanned"]["lab_result"] == 1
+    change = payload["changed"][0]
+    assert change["label"] == "ZZT" and change["old_key"] != change["new_key"]
+
+
+def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
+    """Exit 1 with a pointed message when the dictionary would merge two facts."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml", '"alb" = "albumin"\n')
+    scan = tmp_path / "fuse-scan.txt"
+    scan.write_bytes(b"alb 4.2 / albumin 3.6")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    doc = _document_id(tmp_path)[-1]["document_id"]
+    payload = _write_json(tmp_path, "fuse.json", {"lab_result": [
+        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload), "--dictionary", str(old)) == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    err = capsys.readouterr().err
+    assert "same dedup_key" in err and "nothing was written" in err
