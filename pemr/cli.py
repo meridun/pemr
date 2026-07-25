@@ -362,6 +362,56 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rekey(args: argparse.Namespace) -> int:
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        try:
+            report = dedup.rekey(conn, dictionary, apply=args.apply)
+        except db.NotMigratedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except dedup.RekeyCollisionError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    if args.json:
+        _print_json({
+            "applied": report.applied,
+            "scanned": report.scanned,
+            "changed": [
+                {
+                    "record_type": c.record_type,
+                    "row_id": c.row_id,
+                    "label": c.label,
+                    "old_key": c.old_key,
+                    "new_key": c.new_key,
+                }
+                for c in report.changes
+            ],
+        })
+        return 0
+
+    for record_type, count in report.scanned.items():
+        changed = sum(1 for c in report.changes if c.record_type == record_type)
+        print(f"{record_type}: {changed}/{count} key(s) change")
+    for c in report.changes:
+        print(f"  {c.record_type} #{c.row_id}  {c.label}")
+    if not report.changes:
+        print("all dedup keys already match the current dictionary")
+        return 0
+    if report.applied:
+        print(f"rekeyed {len(report.changes)} row(s)")
+    else:
+        print(
+            f"dry run: {len(report.changes)} row(s) would change - "
+            "re-run with --apply (back up first: `pemr backup`)"
+        )
+    return 0
+
+
 def _cmd_review_conflicts(args: argparse.Namespace) -> int:
     conn = db.connect(_resolve_db_path(args))
     try:
@@ -759,6 +809,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_commit.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     p_commit.set_defaults(func=_cmd_commit_extraction)
+
+    p_rekey = sub.add_parser(
+        "rekey",
+        help="recompute stored dedup keys after a dictionary edit (dry run by default)",
+    )
+    p_rekey.add_argument(
+        "--apply", action="store_true",
+        help="write the recomputed keys (default: report only)",
+    )
+    p_rekey.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    p_rekey.add_argument("--json", action="store_true", help="machine-readable output")
+    p_rekey.set_defaults(func=_cmd_rekey)
 
     p_review = sub.add_parser(
         "review-conflicts", help="list or resolve staged dedup conflicts"

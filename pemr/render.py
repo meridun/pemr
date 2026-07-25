@@ -302,7 +302,8 @@ def render_brief(
     now: datetime | None = None,
 ) -> str:
     """Markdown walk-in brief for one appointment: the appointment header, current meds,
-    recent labs (last N), procedures + observations, and an open-conflicts warning if any
+    recent labs (last N, newest draw first and abnormal-before-normal inside each draw),
+    procedures + observations, and an open-conflicts warning if any
     staged rows touch this person. Read-only.
 
     Med-interaction flags and suggested questions require external drug knowledge and are
@@ -339,11 +340,24 @@ def render_brief(
         freq = f" {m['frequency']}" if m["frequency"] else ""
         med_lines.append(f"- {m['name']}{dose}{freq}")
 
+    # Recency stays the primary axis, but a single draw can carry a 50+ analyte panel —
+    # a flat `LIMIT N` over `collected_at DESC, test_name` then returns the
+    # alphabetically-first N of that one draw and silently drops every abnormal in it.
+    # So rank abnormal-before-normal *within* each collection timestamp before the cut:
+    # the brief is the doc handed to a clinician, and the out-of-range values are the
+    # ones that must survive truncation. Abnormality is `_is_abnormal` (flag OR
+    # reference interval), which SQL can't express, so the cut happens here.
     lab_rows = conn.execute(
         "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name LIMIT ?",
-        (person_id, max(recent_labs, 0)),
+        "ORDER BY collected_at DESC, test_name",
+        (person_id,),
     ).fetchall()
+    draw_rank = {
+        ts: i for i, ts in enumerate(dict.fromkeys(r["collected_at"] for r in lab_rows))
+    }
+    # Stable sort -> test_name order survives inside each (draw, abnormal?) bucket.
+    lab_rows.sort(key=lambda r: (draw_rank[r["collected_at"]], not _is_abnormal(r)))
+    lab_rows = lab_rows[: max(recent_labs, 0)]
     lab_lines = []
     for r in lab_rows:
         flag = f" [{r['flag']}]" if r["flag"] else ""
@@ -405,7 +419,7 @@ def render_brief(
         header,
         appt_block,
         _section("Current Medications", med_lines),
-        _section(f"Recent Labs (last {recent_labs})", lab_lines),
+        _section(f"Recent Labs (last {recent_labs}, abnormal first)", lab_lines),
         _section("Procedures & Observations", ctx_lines),
         _section("Open Conflicts", conflict_lines, empty="_none_"),
         interaction,
