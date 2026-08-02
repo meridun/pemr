@@ -81,6 +81,10 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
 
 KNOWN_TYPES = tuple(FIELD_SPECS)
 
+# Key-machinery columns on every record table. Internal: they are stripped from the
+# CLI `--json` and MCP read payloads (unstable, not part of either contract).
+INTERNAL_COLUMNS = ("dedup_key", "dedup_base", "dedup_occurrence")
+
 # Date-typed fields per record type. These feed timeline sort / trends date math and
 # the dedup_key (via _date_only), all of which assume a lexically-sortable ISO date —
 # so validate_row enforces ISO on them, not just the base `str` type. A partial
@@ -231,29 +235,71 @@ def _hash_parts(parts: list[object]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def dedup_key(
+def _key_parts(
     record_type: str, row: dict, person_id: int, dictionary: dict[str, str] | None = None
-) -> str:
-    """Deterministic semantic key per Architecture.md §3. Same clinical fact from
-    two different documents -> identical key -> collapses to one row."""
+) -> list[object]:
+    """The normalized identity tuple a ``dedup_base`` hashes (Architecture.md §3).
+
+    Kept separate from the hashing so an error message can name *why* two rows
+    collide (see :func:`identity_label`) instead of quoting a bare hash.
+    """
     def n(field_name: str) -> str:
         return norm(row.get(field_name), dictionary)
 
     if record_type == "lab_result":
-        parts = [person_id, n("test_name"), _norm_ts(row.get("collected_at"))]
-    elif record_type == "medication":
-        parts = [person_id, n("name"), _collapse(str(row.get("dose") or "")),
-                 _date_only(row.get("started_on"))]
-    elif record_type == "procedure":
-        parts = [person_id, n("name"), _date_only(row.get("performed_on"))]
-    elif record_type == "appointment":
-        parts = [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
-    elif record_type == "observation":
-        parts = [person_id, n("obs_type"), _norm_ts(row.get("observed_at")),
-                 n("key")]
-    else:  # pragma: no cover - guarded by validate()
-        raise ValidationError(f"unknown record type: {record_type}")
-    return _hash_parts(parts)
+        return [person_id, n("test_name"), _norm_ts(row.get("collected_at"))]
+    if record_type == "medication":
+        return [person_id, n("name"), _collapse(str(row.get("dose") or "")),
+                _date_only(row.get("started_on"))]
+    if record_type == "procedure":
+        return [person_id, n("name"), _date_only(row.get("performed_on"))]
+    if record_type == "appointment":
+        return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
+    if record_type == "observation":
+        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), n("key")]
+    raise ValidationError(f"unknown record type: {record_type}")  # guarded by validate()
+
+
+def identity_label(
+    record_type: str, row: dict, person_id: int, dictionary: dict[str, str] | None = None
+) -> str:
+    """Human-readable rendering of the identity tuple, e.g.
+    ``person 1 | glucose | 2024-04-01``."""
+    parts = _key_parts(record_type, row, person_id, dictionary)
+    return " | ".join([f"person {parts[0]}"] + [str(p) for p in parts[1:]])
+
+
+def occurrence_key(base: str, occurrence: int) -> str:
+    """``dedup_key`` for occurrence *n* of an identity family.
+
+    Occurrence 0 IS the base, byte-for-byte — every row committed before
+    migration 005 is occurrence 0, so the numbering added no key churn. Repeats
+    admitted by ``--keep both`` hash the base together with their occurrence, which
+    keeps the key a pure function of persisted columns and therefore survives
+    :func:`rekey` (a resolution-time suffix would not).
+    """
+    if not occurrence:
+        return base
+    return _hash_parts([base, occurrence])
+
+
+def dedup_key(
+    record_type: str,
+    row: dict,
+    person_id: int,
+    dictionary: dict[str, str] | None = None,
+    occurrence: int = 0,
+) -> str:
+    """Deterministic semantic key per Architecture.md §3. Same clinical fact from
+    two different documents -> identical key -> collapses to one row.
+
+    With the default ``occurrence=0`` this returns the family's ``dedup_base``; a
+    non-zero ``occurrence`` returns the key of that sibling (see
+    :func:`occurrence_key`).
+    """
+    return occurrence_key(
+        _hash_parts(_key_parts(record_type, row, person_id, dictionary)), occurrence
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -348,9 +394,14 @@ def _norm_unit(value: object) -> str:
     return "" if value is None else str(value).strip().lower()
 
 
-def _rows_equal(record_type: str, existing: sqlite3.Row, incoming: dict) -> bool:
-    """True when two rows with a matching dedup_key are the *same fact* (a duplicate)
-    rather than a conflicting one — i.e. their payload fields all agree."""
+def _rows_equal(
+    record_type: str, existing: sqlite3.Row | dict, incoming: dict
+) -> bool:
+    """True when two rows in one identity family are the *same fact* (a duplicate)
+    rather than a conflicting one — i.e. their payload fields all agree.
+
+    ``existing`` is a stored row (or, in the pass-1 intra-payload check, an earlier
+    row of the same submission)."""
     existing_map = dict(existing)
     for name in _COMPARE_FIELDS[record_type]:
         ev = existing_map.get(name)
@@ -410,8 +461,30 @@ def commit_extraction(
             )
         if not isinstance(rows, list):
             raise ValidationError(f"{record_type}: value must be a list of records")
-        for row in rows:
+        # Two rows of ONE submission deriving one key and disagreeing on the payload is
+        # an extraction error, not a conflict for a human to adjudicate: the "existing"
+        # side would have been inserted milliseconds earlier in the same batch, so it
+        # carries no independent provenance. Reject up front (issue #58). Two *identical*
+        # rows stay benign — that is an agent listing one fact twice, and pass 2 reports
+        # it as a duplicate.
+        seen: dict[str, tuple[int, dict]] = {}
+        for index, row in enumerate(rows):
             validate_row(record_type, row)
+            base = dedup_key(record_type, row, person_id, dictionary)
+            prior = seen.get(base)
+            if prior is None:
+                seen[base] = (index, row)
+            elif not _rows_equal(record_type, prior[1], row):
+                raise ValidationError(
+                    f"{record_type}: rows {prior[0]} and {index} of this submission "
+                    f"derive the same dedup_key "
+                    f"({identity_label(record_type, row, person_id, dictionary)}) "
+                    "but carry different values. If the source gives distinct "
+                    "collection times, add them (AGENTS.md date-precision rule). If "
+                    "these are two genuine same-day results the source cannot "
+                    "timestamp, commit them in separate submissions and resolve the "
+                    "conflict with `--keep both`"
+                )
 
     summary = CommitSummary()
     detected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -420,24 +493,55 @@ def commit_extraction(
     with conn:
         for record_type, rows in records.items():
             for row in rows:
-                key = dedup_key(record_type, row, person_id, dictionary)
-                existing = conn.execute(
-                    f"SELECT * FROM {record_type} WHERE dedup_key = ?", (key,)
-                ).fetchone()
-                if existing is None:
+                base = dedup_key(record_type, row, person_id, dictionary)
+                # Match against the whole occurrence FAMILY, not one row: once
+                # `--keep both` has admitted a repeat, a third commit of that same
+                # payload must dedup against the sibling rather than fork or re-stage.
+                family = load_family(conn, record_type, base)
+                if not family:
                     row_id = _insert_record(
-                        conn, record_type, row, person_id, document_id, key
+                        conn, record_type, row, person_id, document_id, base
                     )
                     summary.new.append((record_type, row_id))
-                elif _rows_equal(record_type, existing, row):
-                    summary.duplicate.append((record_type, key))
+                    continue
+                twin = next(
+                    (f for f in family if _rows_equal(record_type, f, row)), None
+                )
+                if twin is not None:
+                    summary.duplicate.append((record_type, twin["dedup_key"]))
                 else:
+                    # Stage against occurrence 0: it is the row the conflict's
+                    # dedup_key anchors to, and the reviewer sees the family size.
                     conflict_id = _stage_conflict(
-                        conn, record_type, key, person_id, document_id,
-                        existing, row, detected_at,
+                        conn, record_type, base, person_id, document_id,
+                        family[0], row, detected_at,
                     )
                     summary.conflict.append((record_type, conflict_id))
     return summary
+
+
+def load_family(
+    conn: sqlite3.Connection, record_type: str, base: str
+) -> list[sqlite3.Row]:
+    """Every stored row sharing one ``dedup_base``, occurrence order (0 first).
+
+    Relies on migration 005's invariant that ``dedup_base`` is populated on every
+    row; every write path here maintains it.
+    """
+    return conn.execute(
+        f"SELECT * FROM {record_type} WHERE dedup_base = ? ORDER BY dedup_occurrence",
+        (base,),
+    ).fetchall()
+
+
+def count_occurrences(conn: sqlite3.Connection, record_type: str, base: str) -> int:
+    """How many rows are already stored under one identity (family size)."""
+    if record_type not in FIELD_SPECS:
+        return 0
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM {record_type} WHERE dedup_base = ?", (base,)
+    ).fetchone()
+    return int(row["n"])
 
 
 def _insert_record(
@@ -445,11 +549,14 @@ def _insert_record(
     record_type: str,
     row: dict,
     person_id: int,
-    document_id: int,
-    key: str,
+    document_id: int | None,
+    base: str,
+    occurrence: int = 0,
 ) -> int:
-    columns = ["person_id", "document_id", "dedup_key"]
-    values: list[object] = [person_id, document_id, key]
+    columns = ["person_id", "document_id", "dedup_key", "dedup_base", "dedup_occurrence"]
+    values: list[object] = [
+        person_id, document_id, occurrence_key(base, occurrence), base, occurrence,
+    ]
     for name in FIELD_SPECS[record_type]:
         if name in row and row[name] is not None:
             columns.append(name)
@@ -504,23 +611,50 @@ def list_conflicts(
     ).fetchall()
 
 
+@dataclass
+class ResolveResult:
+    """Outcome of :func:`resolve_conflict`.
+
+    ``row_id``/``occurrence`` describe the *admitted* row and are set only for
+    ``keep='both'``; the other resolutions choose between rows rather than adding
+    one. ``dedup_key`` is the key of the row the resolution landed on.
+    """
+    kept: str
+    record_type: str = ""
+    row_id: int | None = None
+    occurrence: int | None = None
+    dedup_key: str | None = None
+    no_op: bool = False          # keep-both that matched an existing sibling
+
+
+KEEP_CHOICES = ("existing", "incoming", "both")
+
+
 def resolve_conflict(
     conn: sqlite3.Connection,
     conflict_id: int,
     keep: str,
     note: str | None = None,
-) -> None:
-    """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row) or
-    'incoming' (overwrite the stored record's payload fields with the incoming row).
+) -> ResolveResult:
+    """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row),
+    'incoming' (overwrite the stored record's payload fields with the incoming row) or
+    'both' (admit the incoming row *alongside* the stored one as the next occurrence of
+    that identity — the recovery path for a genuine repeat the source cannot timestamp,
+    issue #58).
 
     Overwriting touches only the payload columns (``_COMPARE_FIELDS``) whose
     disagreement defined the conflict, plus provenance ``document_id``. Identity
     fields keep their stored display form (they are equal after norm() by
     construction, but may differ in casing/spacing); the dedup_key stays put.
+
+    ``keep='both'`` re-validates the staged JSON before it becomes a row, and is
+    idempotent by payload: if a sibling already carries that exact payload (two
+    conflicts staged from one submission, both resolved 'both') nothing is inserted
+    and the resolution records the no-op.
     """
     db.require_migrated(conn)
-    if keep not in ("existing", "incoming"):
-        raise ValueError("keep must be 'existing' or 'incoming'")
+    if keep not in KEEP_CHOICES:
+        raise ValueError("keep must be 'existing', 'incoming' or 'both'")
 
     row = conn.execute(
         "SELECT * FROM conflict WHERE conflict_id = ?", (conflict_id,)
@@ -531,7 +665,12 @@ def resolve_conflict(
         raise ValueError(f"conflict {conflict_id} is already {row['status']}")
 
     record_type = row["record_type"]
-    resolution = f"keep-{keep}" + (f": {note}" if note else "")
+    result = (
+        _plan_keep_both(conn, row) if keep == "both"
+        else ResolveResult(
+            kept=keep, record_type=record_type, dedup_key=row["dedup_key"]
+        )
+    )
     resolved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     with conn:
@@ -540,11 +679,70 @@ def resolve_conflict(
             _overwrite_record(
                 conn, record_type, row["dedup_key"], row["document_id"], incoming
             )
+        elif keep == "both" and not result.no_op:
+            result.row_id = _insert_record(
+                conn, record_type, json.loads(row["incoming_json"]),
+                row["person_id"], row["document_id"],
+                row["dedup_key"], result.occurrence or 0,
+            )
+        resolution = _resolution_text(result) + (f": {note}" if note else "")
         conn.execute(
             "UPDATE conflict SET status='resolved', resolution=?, resolved_at=? "
             "WHERE conflict_id=?",
             (resolution, resolved_at, conflict_id),
         )
+    return result
+
+
+def _resolution_text(result: ResolveResult) -> str:
+    """The auditable resolution string stored on the conflict row. keep-both records
+    which row it admitted (or matched) so the decision stays reconstructable."""
+    if result.kept != "both":
+        return f"keep-{result.kept}"
+    if result.no_op:
+        return f"keep-both (no-op: matches {result.record_type} #{result.row_id})"
+    return (
+        f"keep-both -> {result.record_type} #{result.row_id} "
+        f"occurrence={result.occurrence} key={(result.dedup_key or '')[:12]}..."
+    )
+
+
+def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveResult:
+    """Validate + number the row a ``keep='both'`` resolution would admit.
+
+    Everything that can refuse the resolution happens here, before the transaction
+    opens.
+    """
+    record_type = conflict["record_type"]
+    incoming = json.loads(conflict["incoming_json"])
+    validate_row(record_type, incoming)
+
+    if conflict["person_id"] is None:
+        raise ValueError(
+            f"conflict {conflict['conflict_id']} has no person_id - cannot admit the "
+            "incoming row as a new record"
+        )
+
+    base = conflict["dedup_key"]
+    family = load_family(conn, record_type, base)
+    pk = f"{record_type}_id"
+    twin = next((f for f in family if _rows_equal(record_type, f, incoming)), None)
+    if twin is not None:
+        # Two conflicts staged from one payload, both resolved 'both': the second
+        # must not produce a twin row.
+        return ResolveResult(
+            kept="both", record_type=record_type, row_id=int(twin[pk]),
+            occurrence=int(twin["dedup_occurrence"]),
+            dedup_key=twin["dedup_key"], no_op=True,
+        )
+
+    # Occurrence numbers are monotonic over the family and never reused, so a removed
+    # sibling leaves a hole rather than letting a later row inherit its key.
+    occurrence = max((int(f["dedup_occurrence"]) for f in family), default=-1) + 1
+    return ResolveResult(
+        kept="both", record_type=record_type, occurrence=occurrence,
+        dedup_key=occurrence_key(base, occurrence),
+    )
 
 
 def _rekey_label(record_type: str, row: sqlite3.Row) -> str:
@@ -565,6 +763,7 @@ class RekeyChange:
     label: str
     old_key: str
     new_key: str
+    new_base: str = ""      # recomputed dedup_base (new_key == new_base at occurrence 0)
 
 
 @dataclass
@@ -607,7 +806,11 @@ def rekey(
         seen: dict[str, sqlite3.Row] = {}
         for row in rows:
             payload = {name: row[name] for name in FIELD_SPECS[record_type]}
-            key = dedup_key(record_type, payload, row["person_id"], dictionary)
+            # The occurrence is a stored column, so an admitted repeat (`--keep both`)
+            # recomputes to its own key rather than colliding with its sibling.
+            occurrence = int(row["dedup_occurrence"] or 0)
+            base = dedup_key(record_type, payload, row["person_id"], dictionary)
+            key = occurrence_key(base, occurrence)
             clash = seen.get(key)
             if clash is not None:
                 raise RekeyCollisionError(
@@ -621,7 +824,7 @@ def rekey(
             if key != row["dedup_key"]:
                 report.changes.append(RekeyChange(
                     record_type, row[pk], _rekey_label(record_type, row),
-                    row["dedup_key"], key,
+                    row["dedup_key"], key, base,
                 ))
 
     if apply and report.changes:
@@ -638,10 +841,12 @@ def rekey(
                      change.row_id),
                 )
             for change in report.changes:
+                # dedup_base moves with the key: base and key are injective in each
+                # other for a fixed occurrence, so a changed key means a changed base.
                 conn.execute(
-                    f"UPDATE {change.record_type} SET dedup_key = ? "
+                    f"UPDATE {change.record_type} SET dedup_key = ?, dedup_base = ? "
                     f"WHERE {change.record_type}_id = ?",
-                    (change.new_key, change.row_id),
+                    (change.new_key, change.new_base, change.row_id),
                 )
     report.applied = apply
     return report

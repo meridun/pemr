@@ -140,8 +140,10 @@ def _latest_vitals(
 
 def _abnormal_labs(conn: sqlite3.Connection, person_id: int) -> list[dict]:
     rows = conn.execute(
+        # lab_result_id DESC breaks same-timestamp ties (a `--keep both` sibling shares
+        # its date): newest-first ordering treats the later row id as the later point.
         "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name",
+        "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
         (person_id,),
     ).fetchall()
     return [dict(r) for r in rows if _is_abnormal(r)]
@@ -349,7 +351,7 @@ def render_brief(
     # reference interval), which SQL can't express, so the cut happens here.
     lab_rows = conn.execute(
         "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name",
+        "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
         (person_id,),
     ).fetchall()
     draw_rank = {
