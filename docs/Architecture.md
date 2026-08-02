@@ -241,14 +241,17 @@ new row now stages a conflict.
 inbox/scan.pdf
   → pemr ingest inbox/scan.pdf --person jane-doe
       1. hash bytes; if known → report duplicate, stop
-      2. move blob → sources/<sha>/<sha>.pdf   (immutable)
-      3. insert document row (category/provider left null for now)
+      2. resolve document text (agent-supplied, or --ocr), then verify the owner:
+         text naming a different roster person, or a patient-identity header
+         naming nobody on the roster → refuse pre-write (--force overrides)
+      3. move blob → sources/<sha>/<sha>.pdf   (immutable)
+      4. insert document row (category/provider left null for now)
   → AGENT step (vision): read the source, emit proposed rows as JSON
       matching the record schemas (lab_result[], medication[], observation[]...)
   → pemr commit-extraction --document <id> --json extracted.json
-      4. validate JSON against schema (types, required fields)
-      5. compute dedup_keys; split into {new, duplicate, conflict}
-      6. insert new; report the rest
+      5. validate JSON against schema (types, required fields)
+      6. compute dedup_keys; split into {new, duplicate, conflict}
+      7. insert new; report the rest
   → pemr review-conflicts   (if any)
 ```
 
@@ -267,7 +270,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
-pemr ingest <file> --person <slug> [--ocr tesseract]
+pemr ingest <file> --person <slug> [--ocr tesseract] [--force]   # --force: skip owner verification
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve ...]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
