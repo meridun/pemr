@@ -387,7 +387,10 @@ extracting; dictionary additions go through human review, never agent-direct edi
 `render.py` produces your current deliverables as pure functions of DB state:
 
 - **master summary** — active meds, conditions, allergies, latest vitals, recent
-  abnormal labs, open follow-ups. One query bundle → Markdown.
+  abnormal labs, open follow-ups, open conflicts. One query bundle → Markdown. The
+  conflicts section is not decoration: an open conflict means a stored value is disputed
+  and its correction is still staged, so the summary would otherwise print the stale
+  value silently (the brief carries the same section, but it is per-appointment).
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.
