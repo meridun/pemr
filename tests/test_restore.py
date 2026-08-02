@@ -19,6 +19,7 @@ a command at all:
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,53 @@ def test_force_restore_banks_a_rescue_copy_rotation_cannot_prune(tmp_path):
 
     # And it is a real, usable database - not just a file with the right name.
     assert backup.integrity_check(rescue) == "ok"
+
+
+def test_two_force_restores_in_the_same_second_both_keep_their_rescue_copy(tmp_path):
+    """The rescue name collides at second precision; that must not abort a restore."""
+    db_path, sources = _populated(tmp_path)
+    backups = tmp_path / "backups"
+    assert _run(db_path, "backup", "--backup-dir", str(backups)) == 0
+    frozen = datetime(2026, 8, 2, 4, 8, 15)
+
+    for _ in range(2):
+        restore.restore("latest", db_path, backup_dir=backups, sources_dir=sources,
+                        force=True, now=frozen)
+
+    rescues = {p.name for p in backups.glob(f"{restore.RESCUE_PREFIX}*.sqlite")}
+    assert rescues == {
+        "pemr-prerestore-20260802-040815.sqlite",
+        "pemr-prerestore-20260802-040815-2.sqlite",
+    }
+    # The collision suffix must stay off the rotation pattern, like the base name.
+    assert all(backup._parse_ts(name) is None for name in rescues)
+
+
+def test_a_failed_install_leaves_the_sidecars_intact(tmp_path, monkeypatch):
+    """A stale -wal holds committed transactions: it must outlive an aborted install.
+
+    Hence the unlink runs *after* `os.replace`, not before: deleting the sidecars on a
+    path that then fails to install is the one way this code could lose data.
+    """
+    db_path, sources = _populated(tmp_path)
+    backups = tmp_path / "backups"
+    assert _run(db_path, "backup", "--backup-dir", str(backups)) == 0
+    db_path.unlink()
+    wal = db_path.with_name(db_path.name + "-wal")
+    shm = db_path.with_name(db_path.name + "-shm")
+    wal.write_bytes(b"stale wal holding committed transactions")
+    shm.write_bytes(b"stale shm")
+
+    def boom(src, dst):
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(restore.os, "replace", boom)
+    with pytest.raises(restore.RestoreError, match="cannot install"):
+        restore.restore("latest", db_path, backup_dir=backups, sources_dir=sources)
+
+    assert wal.read_bytes() == b"stale wal holding committed transactions"
+    assert shm.exists()
+    assert not list(tmp_path.glob("*.restore-tmp"))
 
 
 def test_restore_clears_stale_wal_and_shm_sidecars(tmp_path):
@@ -414,6 +462,16 @@ def test_verify_on_unmigrated_db_is_not_ok(tmp_path, capsys, unmigrated_db):
     assert "no schema applied" in out
 
 
+def test_verify_json_exit_code_matches_the_console_one(tmp_path, capsys, unmigrated_db):
+    """`--json` is the mode a monitoring cron picks; it must not report rc=0 here."""
+    db_path = unmigrated_db(tmp_path / "pemr.db")
+    capsys.readouterr()
+    rc = _run(db_path, "verify", "--json", "--sources", str(tmp_path / "sources"))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert rc == 1
+
+
 def test_verify_report_caps_displayed_problems(tmp_path):
     report = verify.VerifyReport(integrity="ok")
     report.problems = [f"problem {i}" for i in range(verify.PROBLEM_DISPLAY_LIMIT + 5)]
@@ -460,6 +518,51 @@ def test_corrupt_db_backup_never_reaches_rotation(tmp_path, capsys):
     assert rc == 1
     assert "snapshot failed" in capsys.readouterr().err
     assert good.exists(), "rotation must never have run"
+
+
+def test_backup_of_zero_byte_db_refuses_and_spares_the_real_snapshots(tmp_path, capsys):
+    """The drill's chain, link 2: an empty archive must not become a backup source.
+
+    `VACUUM INTO` on a 0-byte file writes a structurally valid (integrity-clean) 4 KB
+    database, so the write-time verification cannot catch this - only refusing the
+    *source* can. Until it did, one `pemr backup` here rotated the real snapshot away.
+    """
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    real = backups / "pemr-20260101-1200.sqlite"
+    real.write_bytes(b"the irreplaceable one")
+    db_path = tmp_path / "pemr.db"
+    db_path.touch()
+
+    rc = _run(db_path, "backup", "--backup-dir", str(backups),
+              "--keep-daily", "0", "--keep-weekly", "0")
+    assert rc == 1
+    assert "no database at" in capsys.readouterr().err
+    assert list(backups.glob("pemr-*.sqlite")) == [real], "rotation must never have run"
+    assert db_path.stat().st_size == 0
+
+
+def test_backup_of_unmigrated_db_refuses_and_spares_the_real_snapshots(tmp_path, capsys,
+                                                                       unmigrated_db):
+    """Same chain from the other route: a real file with no pemr schema."""
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    real = backups / "pemr-20260101-1200.sqlite"
+    real.write_bytes(b"the irreplaceable one")
+    db_path = unmigrated_db(tmp_path / "pemr.db")
+
+    rc = _run(db_path, "backup", "--backup-dir", str(backups),
+              "--keep-daily", "0", "--keep-weekly", "0")
+    assert rc == 1
+    assert "no pemr schema" in capsys.readouterr().err
+    assert list(backups.glob("pemr-*.sqlite")) == [real]
+
+
+def test_integrity_check_of_a_missing_file_is_not_ok(tmp_path):
+    """It must not answer "healthy" - nor leave 0-byte sqlite3.connect debris behind."""
+    missing = tmp_path / "gone.sqlite"
+    assert backup.integrity_check(missing) != "ok"
+    assert not missing.exists()
 
 
 def test_snapshot_name_override_is_verbatim_and_never_overwrites(tmp_path):

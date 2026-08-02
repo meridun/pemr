@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import tomllib
 from dataclasses import asdict
@@ -728,9 +729,56 @@ def _cmd_render_journal(args: argparse.Namespace) -> int:
 # Phase 6: backup (VACUUM INTO snapshot + rotation)
 # --------------------------------------------------------------------------- #
 
+def _backup_source_problem(db_path: Path) -> str | None:
+    """None if ``db_path`` is a real archive, else the refusal to print.
+
+    Returns text rather than raising so `backup` keeps its established rc=1 shape.
+
+    Issue #55: `backup.snapshot` only checks that the file *exists*, so a zero-byte or
+    schema-less `pemr.db` used to produce a structurally valid (and therefore
+    integrity-clean) 4 KB snapshot at rc=0 - which then became a legitimate rotation
+    candidate and could prune the real snapshots. That is the exact chain the issue's
+    drill describes: an empty archive becomes a valid backup source and eats the
+    backups. The `migrate` gate closed the route that manufactured the empty database;
+    this closes every other route into it.
+
+    Deliberately not inside `backup.snapshot`: `pemr restore --force` snapshots the
+    live database as a rescue copy precisely when that database may be damaged, and
+    banking a damaged database is still better than discarding it.
+    """
+    if not db.database_exists(db_path):
+        return _no_database_message(db_path)
+    # A bare sqlite3 connection, not db.connect: this must not flip journal_mode on a
+    # database it is about to refuse, and a file that will not read at all is not this
+    # function's story to tell - backup.snapshot reports the real sqlite error.
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        migrated = db.is_migrated(conn)
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    if migrated:
+        return None
+    return (
+        f"error: {db_path} has no pemr schema - refusing to snapshot it\n"
+        "a snapshot of an empty database is worthless, and rotation could prune your "
+        "real snapshots to keep it.\n"
+        "  - restoring after data loss?  pemr restore latest\n"
+        "  - starting a new archive?     pemr migrate --create"
+    )
+
+
 def _cmd_backup(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args)
     backup_dir = _resolve_backup_dir(args)
+    problem = _backup_source_problem(db_path)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     try:
         snap, size = backup.snapshot(db_path, backup_dir)
     except backup.BackupError as exc:
@@ -826,11 +874,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         report = verify.verify_report(conn, _resolve_sources_dir_optional(args))
     finally:
         conn.close()
+    # Both modes share the exit code: `--json` is what a monitoring cron picks, and a
+    # verification command that reports success on a failed verification is worse than
+    # useless there (the `ok` field is not what scripts check).
     if args.json:
         _print_json(report.as_dict())
-        return 0
-    for line in verify.format_report(report):
-        print(line)
+    else:
+        for line in verify.format_report(report):
+            print(line)
     return 0 if report.ok else 1
 
 
