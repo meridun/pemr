@@ -114,6 +114,28 @@ def test_query_meds_terminal_status_renders_ended_not_current(ready, capsys):
     assert "(current)" in metformin
 
 
+def test_query_meds_active_drops_expired_course_labelled_active(ready, capsys):
+    """Issue #57 repro: a 2024 ten-day course carrying status='active' must not come
+    back from `query meds --active`; a future end date under the same status must."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-01-01", "ended_on": "2024-01-10", "status": "active"},
+            {"name": "Skyrizi", "dose": "150mg", "frequency": "q8w",
+             "started_on": "2025-09-04", "ended_on": "2099-09-04", "status": "active"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe", "--active", "--json") == 0
+    names = [m["name"] for m in json.loads(capsys.readouterr().out)]
+    assert "Amoxicillin" not in names
+    assert "Skyrizi" in names
+
+
 def test_query_timeline_json(ready, capsys):
     assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
     events = json.loads(capsys.readouterr().out)

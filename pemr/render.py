@@ -233,7 +233,7 @@ def render_summary(
         f"observations={counts['observation']}\n"
     )
 
-    meds = query.query_meds(conn, slug, active=True)
+    meds = query.query_meds(conn, slug, active=True, now=now)
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
@@ -333,7 +333,7 @@ def render_brief(
         f"- Reason: {appt['reason'] or '(none given)'}",
     ])
 
-    meds = query.query_meds(conn, person["slug"], active=True)
+    meds = query.query_meds(conn, person["slug"], active=True, now=now)
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
