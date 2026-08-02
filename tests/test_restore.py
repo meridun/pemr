@@ -157,6 +157,43 @@ def test_read_commands_refuse_on_missing_db(tmp_path):
     assert not db_path.exists()
 
 
+@pytest.mark.parametrize("argv", [
+    ("document", "list"),
+    ("document", "edit", "1", "--category", "labs"),
+    ("document", "reassign", "1", "--person", "jane-doe"),
+    ("document", "rm", "1"),
+])
+def test_document_commands_refuse_on_missing_db(tmp_path, argv):
+    """Issue #54's `document` subcommands landed after this gate was designed and
+    opened the archive themselves, so on `dev` `pemr document list` against an absent
+    `pemr.db` created a schema-less 4 KB file and then advised `pemr migrate` - the
+    manufacture-an-empty-archive chain this issue exists to close, reopened by a
+    *read* command. They go through `cli._connect_db` like every other command.
+    """
+    db_path = tmp_path / "pemr.db"
+    with pytest.raises(SystemExit) as exc:
+        _run(db_path, *argv)
+    assert "no database at" in str(exc.value)
+    assert not db_path.exists(), "a read command must never manufacture an archive"
+
+
+def test_no_cli_command_bypasses_the_connect_gate():
+    """Structural guard on the invariant above.
+
+    The gate is only as good as its coverage: one new `db.connect(_resolve_db_path(
+    args))` call site silently reopens the hole (that is exactly how #54's `document`
+    commands arrived). `_cmd_migrate` is the single documented exception - it must be
+    able to create a database under `--create`.
+    """
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    assert "db.connect(_resolve_db_path(args))" not in source, (
+        "a CLI command connects without going through cli._connect_db - route it "
+        "through the gate (issue #55)"
+    )
+    # Two legitimate `db.connect(` sites remain: inside _connect_db, and _cmd_migrate.
+    assert source.count("db.connect(") == 2
+
+
 def test_database_exists_semantics(tmp_path):
     missing = tmp_path / "nope.db"
     assert not db.database_exists(missing)
