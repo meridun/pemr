@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import tomllib
 from dataclasses import asdict
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from . import (
     __version__, backup, db, dedup, documents, ingest, persons, query, render,
+    restore, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -54,7 +56,52 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     )
 
 
+def _no_database_message(db_path: Path) -> str:
+    """The refusal shown when a command needs a database and there isn't one.
+
+    Issue #55: the old advice here was `pemr migrate`, which happily created a brand-new
+    empty database and reported success - manufacturing a convincing empty archive for
+    the exact user whose data just vanished (and then feeding it to the next `pemr
+    backup`, whose rotation could prune the real snapshots). ASCII only (issue #23).
+    """
+    return (
+        f"error: no database at {db_path}\n"
+        "nothing was created - pemr will not conjure an empty archive over a missing "
+        "database.\n"
+        "  - restoring after data loss?  pemr restore latest\n"
+        "  - starting a new archive?     pemr migrate --create"
+    )
+
+
+def _connect_db(args: argparse.Namespace):
+    """Resolve the DB path, refuse if there is no database there, then connect.
+
+    Every CLI command that reads or writes the archive goes through here; the MCP
+    wrapper applies the same gate (:func:`pemr.mcp_server._connect`). `pemr migrate
+    --create` is the one documented way past it.
+    """
+    db_path = _resolve_db_path(args)
+    if not db.database_exists(db_path):
+        raise SystemExit(_no_database_message(db_path))
+    return db.connect(db_path)
+
+
 def _resolve_sources_dir(args: argparse.Namespace) -> Path:
+    sources_dir = _resolve_sources_dir_optional(args)
+    if sources_dir is None:
+        raise SystemExit(
+            "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
+            "[paths].sources_dir in config.toml (see config.example.toml)"
+        )
+    return sources_dir
+
+
+def _resolve_sources_dir_optional(args: argparse.Namespace) -> Path | None:
+    """As :func:`_resolve_sources_dir`, but None instead of exiting.
+
+    `restore`/`verify` must still report on the database when `sources/` is
+    unconfigured - the blob pass is skipped with a note, not fatal.
+    """
     override = getattr(args, "sources", None)
     if override:
         return Path(override)
@@ -64,13 +111,11 @@ def _resolve_sources_dir(args: argparse.Namespace) -> Path:
     sources_dir = _load_config(args).get("paths", {}).get("sources_dir")
     if sources_dir:
         return Path(sources_dir)
-    raise SystemExit(
-        "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
-        "[paths].sources_dir in config.toml (see config.example.toml)"
-    )
+    return None
 
 
-def _resolve_backup_dir(args: argparse.Namespace) -> Path:
+def _resolve_backup_dir_optional(args: argparse.Namespace) -> Path | None:
+    """Backup dir if configured, else None (`restore <path>` does not need one)."""
     override = getattr(args, "backup_dir", None)
     if override:
         return Path(override)
@@ -80,10 +125,17 @@ def _resolve_backup_dir(args: argparse.Namespace) -> Path:
     backup_dir = _load_config(args).get("paths", {}).get("backup_dir")
     if backup_dir:
         return Path(backup_dir)
-    raise SystemExit(
-        "error: no backup dir — pass --backup-dir, set PEMR_BACKUP_DIR, or set "
-        "[paths].backup_dir in config.toml (see config.example.toml)"
-    )
+    return None
+
+
+def _resolve_backup_dir(args: argparse.Namespace) -> Path:
+    backup_dir = _resolve_backup_dir_optional(args)
+    if backup_dir is None:
+        raise SystemExit(
+            "error: no backup dir — pass --backup-dir, set PEMR_BACKUP_DIR, or set "
+            "[paths].backup_dir in config.toml (see config.example.toml)"
+        )
+    return backup_dir
 
 
 def _resolve_retention(args: argparse.Namespace) -> tuple[int, int]:
@@ -123,7 +175,12 @@ def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    # The one command allowed to create a database - and only with --create. Without it
+    # `migrate` applies migrations to an existing database and nothing else (issue #55).
+    db_path = _resolve_db_path(args)
+    if not db.database_exists(db_path) and not args.create:
+        raise SystemExit(_no_database_message(db_path))
+    conn = db.connect(db_path)
     try:
         applied = db.migrate(conn, args.migrations_dir or db.DEFAULT_MIGRATIONS_DIR)
     finally:
@@ -137,7 +194,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_add(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.add_person(
@@ -159,7 +216,7 @@ def _cmd_person_add(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_list(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         people = persons.list_people(conn, include_inactive=args.all_people)
     finally:
@@ -182,7 +239,7 @@ def _print_person(person) -> None:
 
 
 def _cmd_person_show(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         person = persons.get_person(conn, args.slug)
     finally:
@@ -209,7 +266,7 @@ def _cmd_person_edit(args: argparse.Namespace) -> int:
     if args.notes is not None:
         fields["notes"] = args.notes
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.update_person(conn, args.slug, **fields)
@@ -226,7 +283,7 @@ def _cmd_person_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_deactivate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.deactivate_person(conn, args.slug)
@@ -240,7 +297,7 @@ def _cmd_person_deactivate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_reactivate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.reactivate_person(conn, args.slug)
@@ -254,7 +311,7 @@ def _cmd_person_reactivate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_remove(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.remove_person(conn, args.slug)
@@ -276,8 +333,14 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
 
 def _with_document_conn(args: argparse.Namespace, work):
     """Open the DB, run ``work(conn)``, translating every friendly `document`
-    failure mode (un-migrated DB, unknown id/slug, refusal) into rc=1 on stderr."""
-    conn = db.connect(_resolve_db_path(args))
+    failure mode (un-migrated DB, unknown id/slug, refusal) into rc=1 on stderr.
+
+    Goes through the :func:`_connect_db` gate like every other read/write command
+    (issue #55): a missing database is refused here too, rather than being created
+    on connect. `db.NotMigratedError` below still covers the distinct case of a
+    database file that exists but has no schema.
+    """
+    conn = _connect_db(args)
     try:
         try:
             return work(conn)
@@ -469,7 +532,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
             return 1
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             result = ingest.ingest_document(
@@ -524,7 +587,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
         print(f"error: {args.json} is not valid JSON: {exc}", file=sys.stderr)
         return 1
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         try:
@@ -554,7 +617,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
 
 
 def _cmd_rekey(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         try:
@@ -604,7 +667,7 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
 
 
 def _cmd_review_conflicts(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             if args.resolve is not None:
@@ -666,7 +729,7 @@ def _fmt(value: object) -> str:
 def _with_conn_person(args: argparse.Namespace, work):
     """Open the DB, run ``work(conn)``, translating the two friendly failure modes
     (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             return work(conn)
@@ -820,7 +883,7 @@ def _emit_markdown(markdown: str, out: str | None) -> int:
 def _render_with_conn(args: argparse.Namespace, work) -> int:
     """Open the DB, run ``work(conn)``, translating render's friendly failures
     (un-migrated DB, unknown person slug, unknown appointment id) into rc=1 stderr."""
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             return work(conn)
@@ -864,9 +927,56 @@ def _cmd_render_journal(args: argparse.Namespace) -> int:
 # Phase 6: backup (VACUUM INTO snapshot + rotation)
 # --------------------------------------------------------------------------- #
 
+def _backup_source_problem(db_path: Path) -> str | None:
+    """None if ``db_path`` is a real archive, else the refusal to print.
+
+    Returns text rather than raising so `backup` keeps its established rc=1 shape.
+
+    Issue #55: `backup.snapshot` only checks that the file *exists*, so a zero-byte or
+    schema-less `pemr.db` used to produce a structurally valid (and therefore
+    integrity-clean) 4 KB snapshot at rc=0 - which then became a legitimate rotation
+    candidate and could prune the real snapshots. That is the exact chain the issue's
+    drill describes: an empty archive becomes a valid backup source and eats the
+    backups. The `migrate` gate closed the route that manufactured the empty database;
+    this closes every other route into it.
+
+    Deliberately not inside `backup.snapshot`: `pemr restore --force` snapshots the
+    live database as a rescue copy precisely when that database may be damaged, and
+    banking a damaged database is still better than discarding it.
+    """
+    if not db.database_exists(db_path):
+        return _no_database_message(db_path)
+    # A bare sqlite3 connection, not db.connect: this must not flip journal_mode on a
+    # database it is about to refuse, and a file that will not read at all is not this
+    # function's story to tell - backup.snapshot reports the real sqlite error.
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        migrated = db.is_migrated(conn)
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    if migrated:
+        return None
+    return (
+        f"error: {db_path} has no pemr schema - refusing to snapshot it\n"
+        "a snapshot of an empty database is worthless, and rotation could prune your "
+        "real snapshots to keep it.\n"
+        "  - restoring after data loss?  pemr restore latest\n"
+        "  - starting a new archive?     pemr migrate --create"
+    )
+
+
 def _cmd_backup(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args)
     backup_dir = _resolve_backup_dir(args)
+    problem = _backup_source_problem(db_path)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     try:
         snap, size = backup.snapshot(db_path, backup_dir)
     except backup.BackupError as exc:
@@ -902,6 +1012,77 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Issue #55: restore (the other direction) + verify (DB + blob health)
+# --------------------------------------------------------------------------- #
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    try:
+        result = restore.restore(
+            args.snapshot,
+            db_path,
+            backup_dir=_resolve_backup_dir_optional(args),
+            sources_dir=_resolve_sources_dir_optional(args),
+            migrations_dir=args.migrations_dir,
+            force=args.force,
+        )
+    except restore.RestoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    report = result.report
+    if args.json:
+        _print_json({
+            "snapshot": str(result.snapshot),
+            "database": str(result.db_path),
+            "rescue": str(result.rescue) if result.rescue else None,
+            "cleared_sidecars": [str(p) for p in result.cleared_sidecars],
+            "applied_migrations": result.applied_migrations,
+            "report": report.as_dict() if report else None,
+        })
+        return 0
+
+    if result.rescue:
+        print(f"rescue copy of the previous database: {result.rescue}")
+    for sidecar in result.cleared_sidecars:
+        print(f"cleared stale sidecar {sidecar.name}")
+    print(f"restored {result.db_path} from {result.snapshot}")
+    if result.applied_migrations:
+        for name in result.applied_migrations:
+            print(f"applied {name}")
+    else:
+        print("migrations up to date")
+    if report is not None:
+        for line in verify.format_report(report):
+            print(line)
+        if not report.ok:
+            # Blob problems are a warning, not a failure: the database restore
+            # genuinely succeeded, and `sources/` may simply be mid-sync.
+            print(
+                "warning: the database restored, but the checks above found problems",
+                file=sys.stderr,
+            )
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    conn = _connect_db(args)
+    try:
+        report = verify.verify_report(conn, _resolve_sources_dir_optional(args))
+    finally:
+        conn.close()
+    # Both modes share the exit code: `--json` is what a monitoring cron picks, and a
+    # verification command that reports success on a failed verification is worse than
+    # useless there (the `ok` field is not what scripts check).
+    if args.json:
+        _print_json(report.as_dict())
+    else:
+        for line in verify.format_report(report):
+            print(line)
+    return 0 if report.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pemr", description="Personal EMR engine - SQLite is truth."
@@ -911,9 +1092,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="path to config.toml (default ./config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_migrate = sub.add_parser("migrate", help="apply pending migrations")
+    p_migrate = sub.add_parser(
+        "migrate", help="apply pending migrations to an existing database"
+    )
     p_migrate.add_argument(
         "--migrations-dir", help="override migrations directory (mainly for tests)"
+    )
+    p_migrate.add_argument(
+        "--create", action="store_true",
+        help="bootstrap a brand-new empty database (required when none exists)",
     )
     p_migrate.set_defaults(func=_cmd_migrate)
 
@@ -1180,6 +1367,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backup.add_argument("--json", action="store_true", help="machine-readable output")
     p_backup.set_defaults(func=_cmd_backup)
+
+    # --- issue #55: restore + verify --------------------------------------
+    p_restore = sub.add_parser(
+        "restore",
+        help="install a backup snapshot over the live database (then migrate + verify)",
+    )
+    p_restore.add_argument(
+        "snapshot",
+        help="snapshot path, a bare filename inside the backup dir, or 'latest'",
+    )
+    p_restore.add_argument(
+        "--force", action="store_true",
+        help="allow replacing an existing database (a pemr-prerestore-*.sqlite "
+             "rescue copy is taken first)",
+    )
+    p_restore.add_argument(
+        "--backup-dir", dest="backup_dir",
+        help="where snapshots live (overrides PEMR_BACKUP_DIR / [paths].backup_dir)",
+    )
+    p_restore.add_argument("--sources", help="sources blob dir (overrides config)")
+    p_restore.add_argument(
+        "--migrations-dir", help="override migrations directory (mainly for tests)"
+    )
+    p_restore.add_argument("--json", action="store_true", help="machine-readable output")
+    p_restore.set_defaults(func=_cmd_restore)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="integrity + migrations + row counts + source blob resolution (read-only)",
+    )
+    p_verify.add_argument("--sources", help="sources blob dir (overrides config)")
+    p_verify.add_argument("--json", action="store_true", help="machine-readable output")
+    p_verify.set_defaults(func=_cmd_verify)
 
     return parser
 

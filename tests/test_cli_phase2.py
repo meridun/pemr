@@ -20,7 +20,7 @@ def _write_json(tmp_path, name, obj):
 @pytest.fixture()
 def ready(tmp_path):
     """Migrated DB + a person, ready for ingest."""
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
     return tmp_path
 
@@ -81,7 +81,10 @@ def test_ingest_duplicate_reports_cleanly(ready, capsys):
     assert "duplicate" in capsys.readouterr().out
 
 
-def test_ingest_on_unmigrated_db_is_friendly(tmp_path, capsys):
+def test_ingest_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
+    # A DB file that exists but has no schema. Issue #55 made this distinct from "no DB
+    # file at all", which the missing-database gate refuses earlier and differently.
+    unmigrated_db(tmp_path / "cli.db")
     scan = tmp_path / "s.txt"
     scan.write_bytes(b"x")
     rc = _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
