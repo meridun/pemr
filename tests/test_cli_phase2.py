@@ -93,6 +93,66 @@ def test_ingest_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     assert "migrate" in capsys.readouterr().err
 
 
+# --- owner verification at ingest (issue #61) ---------------------------------
+
+def _ocr_file(tmp_path, text):
+    p = tmp_path / "ocr.txt"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_ingest_refuses_a_document_naming_someone_else(ready, capsys):
+    tmp_path = ready
+    scan = tmp_path / "wrong-owner.txt"
+    scan.write_bytes(b"a summary for a different patient")
+    ocr = _ocr_file(tmp_path, "Patient: SMITH, KAREN A    DOB: 09/09/1971")
+
+    rc = _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+              "--sources", str(tmp_path / "sources"), "--ocr-text-file", str(ocr))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "owner verification failed" in err
+    assert "SMITH, KAREN A" in err  # the evidence window, for human adjudication
+    assert "--force" in err
+    assert not _document_id(tmp_path)  # pre-write refusal: nothing landed
+
+
+def test_ingest_force_overrides_the_refusal(ready, capsys):
+    tmp_path = ready
+    scan = tmp_path / "forced.txt"
+    scan.write_bytes(b"forced anyway")
+    ocr = _ocr_file(tmp_path, "Patient: SMITH, KAREN A    DOB: 09/09/1971")
+
+    rc = _run(tmp_path, "ingest", str(scan), "--person", "jane-doe", "--force",
+              "--sources", str(tmp_path / "sources"), "--ocr-text-file", str(ocr))
+    assert rc == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out
+    assert "--force" in out.err and "reassign" in out.err  # points at the undo path
+    assert len(_document_id(tmp_path)) == 1
+
+
+def test_ingest_reports_a_verified_owner(ready, capsys):
+    tmp_path = ready
+    scan = tmp_path / "hers.txt"
+    scan.write_bytes(b"her own labs")
+    ocr = _ocr_file(tmp_path, "Patient Name: DOE, JANE\nSodium 140 mmol/L")
+
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"),
+                "--ocr-text-file", str(ocr)) == 0
+    assert "owner verified" in capsys.readouterr().out
+
+
+def test_ingest_without_text_notes_the_owner_was_not_verified(ready, capsys):
+    tmp_path = ready
+    scan = tmp_path / "untexted.txt"
+    scan.write_bytes(b"no text supplied")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    assert "owner not verified" in capsys.readouterr().err
+
+
 def test_commit_bad_json_is_friendly(ready, capsys):
     tmp_path = ready
     bad = tmp_path / "bad.json"
