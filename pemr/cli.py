@@ -15,7 +15,9 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, backup, db, dedup, ingest, persons, query, render
+from . import (
+    __version__, backup, db, dedup, documents, ingest, persons, query, render,
+)
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
 _DEFAULT_DICTIONARY = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -266,6 +268,195 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
         conn.close()
     print(f"removed person #{person.person_id}: {person.slug}")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# document recovery (list / edit / reassign / rm) - issue #54
+# --------------------------------------------------------------------------- #
+
+def _with_document_conn(args: argparse.Namespace, work):
+    """Open the DB, run ``work(conn)``, translating every friendly `document`
+    failure mode (un-migrated DB, unknown id/slug, refusal) into rc=1 on stderr."""
+    conn = db.connect(_resolve_db_path(args))
+    try:
+        try:
+            return work(conn)
+        except db.NotMigratedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (
+            documents.DocumentNotFoundError,
+            documents.OpenConflictsError,
+            documents.DictionaryDriftError,
+            documents.ReassignCollisionError,
+            persons.PersonNotFoundError,
+        ) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_document_list(args: argparse.Namespace) -> int:
+    def work(conn):
+        docs = documents.list_documents(conn, args.person)
+        if args.json:
+            _print_json(docs)
+            return 0
+        if not docs:
+            print("no documents yet - `pemr ingest <file> --person <slug>`")
+            return 0
+        for d in docs:
+            print(
+                f"#{d['document_id']:<5} {_fmt(d['doc_date']):11} "
+                f"{_fmt(d['category']):12} {_fmt(d['provider']):22} "
+                f"{_fmt(d['person']):16} {d['sha256'][:12]}  {d['record_count']} rec"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_edit(args: argparse.Namespace) -> int:
+    # A flag left unset is None -> not part of the update; an explicit empty string
+    # (e.g. --category "") clears that column (documents.py), same as `person edit`.
+    fields: dict[str, str] = {}
+    if args.doc_date is not None:
+        fields["doc_date"] = args.doc_date
+    if args.category is not None:
+        fields["category"] = args.category
+    if args.provider is not None:
+        fields["provider"] = args.provider
+
+    def work(conn):
+        doc = documents.edit_document(conn, args.document_id, **fields)
+        if args.json:
+            _print_json(doc)
+            return 0
+        for key in ("document_id", "person", "doc_date", "category", "provider",
+                    "source_path", "ingested_at", "record_count"):
+            print(f"{key:14} {_fmt(doc[key])}")
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_reassign(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        report = documents.reassign_document(
+            conn, args.document_id, args.person, dictionary, apply=args.apply
+        )
+        if args.json:
+            _print_json({
+                "document_id": report.document_id,
+                "from": report.from_slug,
+                "to": report.to_slug,
+                "applied": report.applied,
+                "unchanged": report.unchanged,
+                "target_inactive": report.target_inactive,
+                "counts": report.counts,
+                "moved": [
+                    {
+                        "record_type": c.record_type,
+                        "row_id": c.row_id,
+                        "label": c.label,
+                        "old_key": c.old_key,
+                        "new_key": c.new_key,
+                    }
+                    for c in report.changes
+                ],
+            })
+            return 0
+        if report.unchanged:
+            print(
+                f"document #{report.document_id} is already owned by "
+                f"'{report.to_slug}' - nothing to do"
+            )
+            return 0
+        print(
+            f"document #{report.document_id}: {_fmt(report.from_slug) or '(none)'} "
+            f"-> {report.to_slug}"
+        )
+        for c in report.changes:
+            print(f"  {c.record_type} #{c.row_id}  {c.label}")
+        if report.target_inactive:
+            print(f"note: '{report.to_slug}' is deactivated (records still move)")
+        if report.applied:
+            print(f"reassigned {len(report.changes)} record(s)")
+        else:
+            print(
+                f"dry run: {len(report.changes)} record(s) would move - "
+                "re-run with --apply (back up first: `pemr backup`)"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_rm(args: argparse.Namespace) -> int:
+    # The sources dir is only needed to delete the blob; keeping it (the default)
+    # must not require configured paths.
+    sources_dir = _resolve_sources_dir(args) if args.purge_blob else None
+
+    def work(conn):
+        report = documents.remove_document(
+            conn, args.document_id, sources_dir=sources_dir,
+            purge_blob=args.purge_blob, apply=args.apply,
+        )
+        if args.json:
+            _print_json({
+                "document_id": report.document_id,
+                "person": report.person_slug,
+                "sha256": report.sha256,
+                "applied": report.applied,
+                "records": report.records,
+                "record_count": report.record_count,
+                "conflicts_deleted": report.conflicts_deleted,
+                "conflicts_anchored": report.conflicts_anchored,
+                "conflicts_detached": report.conflicts_detached,
+                "blob_path": report.blob_path,
+                "blob_purged": report.blob_purged,
+            })
+            return 0
+        print(
+            f"document #{report.document_id}  {_fmt(report.person_slug)}  "
+            f"{report.sha256[:12]}"
+        )
+        for record_type, count in report.records.items():
+            if count:
+                print(f"  {record_type}: {count} row(s)")
+        print(f"  records: {report.record_count} total")
+        if report.conflicts_deleted:
+            print(f"  conflicts deleted (open): {report.conflicts_deleted}")
+        if report.conflicts_anchored:
+            print(
+                "  conflicts deleted (staged against these records): "
+                f"{report.conflicts_anchored}"
+            )
+        if report.conflicts_detached:
+            print(f"  conflicts detached (resolved): {report.conflicts_detached}")
+        if not args.purge_blob:
+            print(f"  blob kept: {report.blob_path}")
+        elif report.blob_purged:
+            print(f"  blob deleted: {report.blob_path}")
+        elif report.applied:
+            print(f"  blob already gone: {report.blob_path}")
+        else:
+            print(f"  blob would be deleted: {report.blob_path}")
+        if report.applied:
+            print(f"removed document #{report.document_id}")
+        else:
+            print(
+                "dry run: nothing was deleted - re-run with --apply "
+                "(back up first: `pemr backup`)"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
@@ -777,6 +968,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_remove.add_argument("slug")
     p_remove.set_defaults(func=_cmd_person_remove)
+
+    # --- document recovery (misfiled document escape hatch, issue #54) ----
+    p_document = sub.add_parser(
+        "document", help="inspect and recover misfiled documents"
+    )
+    document_sub = p_document.add_subparsers(dest="document_command", required=True)
+
+    d_list = document_sub.add_parser(
+        "list", help="list ingested documents, newest first"
+    )
+    d_list.add_argument("--person", help="owner slug; omit to list every person's")
+    d_list.add_argument("--json", action="store_true", help="machine-readable output")
+    d_list.set_defaults(func=_cmd_document_list)
+
+    d_edit = document_sub.add_parser(
+        "edit", help="correct a document's date/category/provider (partial)"
+    )
+    d_edit.add_argument("document_id", type=int, metavar="ID")
+    d_edit.add_argument("--doc-date", dest="doc_date", help='pass "" to clear')
+    d_edit.add_argument("--category", help='pass "" to clear')
+    d_edit.add_argument("--provider", help='pass "" to clear')
+    d_edit.add_argument("--json", action="store_true", help="machine-readable output")
+    d_edit.set_defaults(func=_cmd_document_edit)
+
+    d_reassign = document_sub.add_parser(
+        "reassign",
+        help="move a document and its records to another person (dry run by default)",
+    )
+    d_reassign.add_argument("document_id", type=int, metavar="ID")
+    d_reassign.add_argument("--person", required=True, help="new owner slug")
+    d_reassign.add_argument(
+        "--apply", action="store_true", help="write the move (default: report only)"
+    )
+    d_reassign.add_argument(
+        "--dictionary", help="synonym dictionary TOML (overrides default)"
+    )
+    d_reassign.add_argument("--json", action="store_true", help="machine-readable output")
+    d_reassign.set_defaults(func=_cmd_document_reassign)
+
+    d_rm = document_sub.add_parser(
+        "rm",
+        help="delete a document and its records (dry run by default)",
+    )
+    d_rm.add_argument("document_id", type=int, metavar="ID")
+    d_rm.add_argument(
+        "--apply", action="store_true", help="write the delete (default: report only)"
+    )
+    d_rm.add_argument(
+        "--purge-blob", dest="purge_blob", action="store_true",
+        help="also delete the stored scan (irreversible; kept by default)",
+    )
+    d_rm.add_argument("--sources", help="sources blob dir (overrides config)")
+    d_rm.add_argument("--json", action="store_true", help="machine-readable output")
+    d_rm.set_defaults(func=_cmd_document_rm)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
