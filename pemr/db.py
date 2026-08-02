@@ -25,8 +25,33 @@ class NotMigratedError(RuntimeError):
         super().__init__(message)
 
 
+def database_exists(db_path: str | Path) -> bool:
+    """True if ``db_path`` names a real, non-empty database file.
+
+    Size matters, not just presence: ``sqlite3.connect`` creates the file eagerly and
+    leaves a **zero-byte** file behind when nothing is written, so a stale 0-byte
+    ``pemr.db`` must not be mistaken for an archive. Callers (CLI/MCP) use this to
+    refuse to silently manufacture an empty database over a missing one (issue #55).
+
+    ``:memory:`` is always "existing" — it is the in-process primitive used by tests.
+    """
+    if str(db_path) == ":memory:":
+        return True
+    path = Path(db_path)
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    """Open a connection with PEMR's required pragmas applied."""
+    """Open a connection with PEMR's required pragmas applied.
+
+    Deliberately still *creates on connect* — this is the low-level primitive, used
+    with ``:memory:`` and scratch paths throughout the tests. The "refuse to create a
+    database that should already exist" gate lives one layer up, in the CLI/MCP entry
+    points (:func:`database_exists`).
+    """
     db_path = Path(db_path)
     if str(db_path) != ":memory:":
         db_path.parent.mkdir(parents=True, exist_ok=True)

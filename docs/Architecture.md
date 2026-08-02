@@ -270,6 +270,10 @@ pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve ...]
+pemr document list [--person <slug>]                     # newest first; omit --person for everyone
+pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
+pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
+pemr document rm <id> [--apply] [--purge-blob]           # delete a document + records; dry run by default
 pemr query labs --person jane --test hba1c --since 2023-01-01
 pemr query meds --person jane --active
 pemr query timeline --person jane --since 2024-01-01     # merged event stream
@@ -281,7 +285,9 @@ pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
 pemr render journal --person jane        > exports/jane-journal.md
 pemr backup                                              # VACUUM INTO snapshot
-pemr migrate                                             # apply pending migrations
+pemr restore latest [--force]                            # install a snapshot back over pemr.db (§8)
+pemr verify                                              # integrity + row counts + source-blob resolution
+pemr migrate [--create]                                  # apply pending migrations (--create bootstraps a new DB)
 pemr rekey [--apply]                                     # re-derive dedup keys after a dictionary edit
 ```
 
@@ -343,14 +349,91 @@ Because they regenerate from truth, they never drift. Old exports are disposable
 - Live `pemr.db` on a **local-only** path (out of the sync root) — WAL mode means
   `-wal`/`-shm` sidecars that cloud sync loves to corrupt mid-write.
 - `pemr backup` → `VACUUM INTO backups/pemr-YYYYMMDD-HHMM.sqlite` (a clean,
-  single-file, consistent snapshot), then the file lands in the synced folder. Point-in-
-  time restore = copy a snapshot back.
+  single-file, consistent snapshot), then the file lands in the synced folder. Every
+  snapshot is `integrity_check`ed at *write* time, before rotation can run — an
+  unreadable backup discovered at restore time is the classic failure mode, so a bad
+  snapshot is unlinked and the command fails instead of pruning good snapshots to make
+  room for a worthless one.
 - Rotation: keep last N daily + M weekly; prune older.
 - Optional: run `pemr backup` from Windows Task Scheduler nightly.
 - `sources/` (content-addressed originals) can also sync — they're immutable blobs, safe
   for sync, and give you off-machine copies of the irreplaceable scans.
 - Exposure posture per your call: private-ish, not encrypted-at-rest. Easy upgrade later
   — snapshot to an encrypted 7-Zip/age file before it syncs — without touching the schema.
+
+### Restore
+
+`pemr restore <snapshot|latest> [--force]` is the other direction. It is a command
+rather than a runbook because every failure mode here is operator error under pressure,
+and a command is testable (§5, "the tested engine"):
+
+1. **Validate the source first.** Opens as SQLite, passes `integrity_check`, and has a
+   pemr schema. Any failure aborts with the live DB untouched.
+2. **Guard the destination.** No live DB (the actual disaster) → proceeds with no flag;
+   the ergonomics are deliberately easiest when the user is panicking. A live DB present
+   → requires `--force`.
+3. **Rescue copy.** With `--force`, the current database is snapshotted to
+   `pemr-prerestore-YYYYMMDD-HHMMSS.sqlite` *before* anything is overwritten; if that
+   fails, the restore aborts. Restore is therefore non-destructive by construction.
+4. **Install atomically.** Staged as `pemr.db.restore-tmp` in the destination directory,
+   then `os.replace`d — a crash mid-install never leaves a half-written database, and a
+   failed *copy* has destroyed nothing.
+5. **Clear the sidecars**, and only now. `pemr.db-wal` / `pemr.db-shm` are deleted, so
+   SQLite cannot replay a stale WAL over the restored file. Deliberately after the
+   install rather than before: a stale `-wal` holds committed-but-uncheckpointed
+   transactions, so deleting it on a path that then failed to install would be the one
+   way this command could lose data. Nothing opens the database in between.
+6. **Migrate.** A snapshot older than the code is the *normal* case; making the operator
+   remember this step is exactly the trap.
+7. **Verify.** Prints the `pemr verify` report: integrity, migrations, per-table row
+   counts, and blob resolution.
+
+Every abort path up to and including step 4 leaves the live database exactly as it was.
+
+`pemr verify` runs step 7 on its own, any time. Blob checking is exact rather than
+heuristic — `document` stores both `sha256` and a relative content-addressed
+`source_path`, so verify resolves `sources_dir/source_path`, re-hashes, and reports
+*missing* separately from *mismatched* (a corrupted blob is a different problem from an
+unsynced one). Blob problems are a **warning at rc=0** during restore: the database
+restore genuinely succeeded, and `sources/` may simply be mid-sync. Standalone `pemr
+verify` is the opposite — it exits **1** whenever the report lists a problem, in `--json`
+mode exactly as in console mode, because `--json` is the mode a monitoring job picks and
+the exit code is what such a job checks. `verify` reports, it never repairs.
+
+**`migrate` will not create a database.** Before this existed, a user whose `pemr.db`
+had vanished was told `run pemr migrate first` by every read command — and following
+that advice built a brand-new empty database and reported success, manufacturing a
+convincing empty archive. Worse, that empty DB was then a valid backup source, so the
+next `pemr backup` snapshotted it and rotation could prune the real snapshots. `migrate`
+now refuses when there is no database (or a zero-byte one) and points at
+`pemr restore latest`; `pemr migrate --create` is the explicit bootstrap for a genuinely
+new archive.
+
+**And an empty database is not a backup source.** Closing the `migrate` route above only
+closed the first link of that chain — a zero-byte or schema-less `pemr.db` arriving any
+other way (an interrupted copy, cloud-sync debris, `type nul > pemr.db`) would still have
+been snapshotted happily, because `VACUUM INTO` on an empty file produces a structurally
+valid, integrity-clean 4 KB database that rotation then treats as the newest snapshot of
+the day. `pemr backup` therefore refuses a database that does not exist, is zero bytes,
+or has no pemr schema, *before* writing anything — so rotation is never reached and the
+real snapshots survive.
+
+### What backups do not protect you from
+
+- **Same-day loss.** Rotation keeps the *newest* snapshot per calendar day, so intra-day
+  snapshots collapse: "I corrupted the DB an hour ago" is generally **not** recoverable
+  from backups alone, because today's earlier snapshots are already gone. Take a
+  snapshot before any bulk or destructive operation (`rekey --apply`, bulk ingest) —
+  that is necessary, not optional, since it is protected only until the next backup of
+  the same day.
+- **Pinning a snapshot** is the escape hatch: rotation only ever parses and prunes names
+  matching `pemr-<8 digits>-<4|6 digits>.sqlite`, so *renaming* a snapshot off that
+  pattern makes it permanent. This is the same mechanism that makes
+  `pemr-prerestore-*.sqlite` rescue copies immune to rotation by construction.
+- **Blobs.** The DB and `sources/` are separate; a DB restored from a snapshot newer
+  than the sources backup references blobs that aren't there. `pemr restore` and
+  `pemr verify` report this, but restoring `sources/` itself is out of scope — blobs are
+  immutable and separately synced.
 
 ---
 

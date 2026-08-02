@@ -34,7 +34,7 @@ def _doc(conn, slug, ocr=None, doc_date="2026-01-01"):
 @pytest.fixture()
 def ready(tmp_path):
     """Migrated DB + jane with a few labs, a med, and an OCR'd document."""
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
     conn = db.connect(tmp_path / "cli.db")
     d = dedup.load_dictionary(DICT_ARG[1])
@@ -226,7 +226,9 @@ def test_unknown_person_is_friendly_rc1(ready, capsys):
     assert "ghost" in capsys.readouterr().err
 
 
-def test_query_on_unmigrated_db_is_friendly(tmp_path, capsys):
+def test_query_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
+    # Schema-less DB file, not an absent one - see issue #55's missing-database gate.
+    unmigrated_db(tmp_path / "cli.db")
     rc = _run(tmp_path, "query", "labs", "--person", "jane-doe")
     assert rc == 1
     assert "migrate" in capsys.readouterr().err
