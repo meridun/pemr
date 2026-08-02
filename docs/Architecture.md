@@ -95,7 +95,9 @@ CREATE TABLE document (
 );
 ```
 
-High-value typed tables (each carries `document_id` provenance + a `dedup_key`):
+High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
+005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
+in §3, omitted from the DDL below to keep the shapes readable):
 
 ```sql
 CREATE TABLE lab_result (
@@ -233,6 +235,43 @@ of the key, this fires for *any* magnitude of value change on a matching draw �
 headline `Glucose 92 → 95` (or `92 → 130`) case that previously slipped through as a silent
 new row now stages a conflict.
 
+**Occurrence model (`--keep both`).** The date-only safety bias above is only recoverable
+if a resolution can say "both of these are real." `review-conflicts --resolve --keep both`
+admits the incoming row *alongside* the stored one, so every identity is a **family** of
+one or more occurrences rather than a single row:
+
+```
+dedup_base       = hash(person_id | identity fields…)   -- shared by the family
+dedup_occurrence = 0 for the first row, 1, 2, … for admitted repeats
+dedup_key        = dedup_base                    when occurrence = 0
+                 = hash(dedup_base | occurrence) when occurrence > 0
+```
+
+Occurrence 0 reproduces the pre-005 key byte-for-byte, so the migration was a pure column
+copy — no rekey, no re-commit. The disambiguator lives in a **column**, not in a
+resolution-time suffix, because `pemr rekey` re-derives every key from payload columns: a
+suffix it could not see would recompute to the base, collide with its sibling, and abort
+the rekey. Commit-time matching is therefore family-aware — an incoming row that is
+payload-equal to *any* sibling is a duplicate, and only a genuinely different value on
+that identity stages a new conflict (against occurrence 0). That is what stops a third
+commit of an already-admitted draw from forking again. `dedup_base` is denormalized on
+purpose: the family is one indexed lookup instead of probing `hash(base|1)`, `hash(base|2)`
+… which breaks on holes when a sibling is removed.
+
+**Intra-payload collisions are rejected, not staged.** Two rows in *one* submission that
+derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
+the identity and the recovery path. A conflict whose "existing" side was inserted
+milliseconds earlier in the same batch has no independent provenance to adjudicate
+against; the overwhelmingly likely cause is a collection time the source did give and the
+extraction dropped. Two *identical* rows in one payload stay benign (first inserts, second
+reports `duplicate`) — that is an agent listing one fact twice. Genuine untimestampable
+repeats go through two submissions plus `--keep both`, which keeps the human sign-off in
+the loop rather than letting an agent self-admit near-duplicates.
+
+Because siblings legitimately share a date, every same-date ordering is tie-broken by row
+id (`query labs`, the summary/brief lab sections): the admitted row sorts as the later
+point, so `trends` deltas and "latest value" stay deterministic.
+
 ---
 
 ## 4. Ingestion pipeline
@@ -269,7 +308,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
-pemr review-conflicts [--resolve ...]
+pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default

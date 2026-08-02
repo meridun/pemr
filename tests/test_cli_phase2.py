@@ -69,6 +69,86 @@ def test_ingest_commit_review_roundtrip(ready, capsys):
     assert "resolved conflict #1" in capsys.readouterr().out
 
 
+def _stage_repeat_draw(tmp_path, capsys):
+    """The issue #58 repro through the CLI: two genuine same-day draws, one document
+    each (a single submission carrying both is now rejected up front)."""
+    sources = tmp_path / "sources"
+    for i, (value, text) in enumerate(((95, "fasting"), (148, "post-prandial")), start=1):
+        scan = tmp_path / f"g{i}.txt"
+        scan.write_bytes(f"glucose {value}".encode())
+        assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                    "--sources", str(sources)) == 0
+        payload = _write_json(tmp_path, f"g{i}.json", {"lab_result": [
+            {"test_name": "glucose", "collected_at": "2024-04-01",
+             "value_num": value, "value_text": text},
+        ]})
+        assert _run(tmp_path, "commit-extraction", "--document", str(i),
+                    "--json", str(payload)) == 0
+    capsys.readouterr()
+
+
+def test_review_conflicts_keep_both_admits_the_repeat(ready, capsys):
+    tmp_path = ready
+    _stage_repeat_draw(tmp_path, capsys)
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both",
+                "--note", "Jane confirms two draws") == 0
+    out = capsys.readouterr().out
+    assert "resolved conflict #1 (keep-both -> lab_result #2, occurrence 1)" in out
+    assert out.isascii()
+
+    capsys.readouterr()
+    assert _run(tmp_path, "query", "labs", "--person", "jane-doe", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["value_num"] for r in payload] == [95, 148]   # both queryable, in row order
+    for row in payload:                                      # internals stay internal
+        assert not {"dedup_key", "dedup_base", "dedup_occurrence"} & set(row)
+
+
+def test_review_conflicts_listing_shows_occurrences_and_the_both_hint(ready, capsys):
+    tmp_path = ready
+    _stage_repeat_draw(tmp_path, capsys)
+    assert _run(tmp_path, "review-conflicts") == 0
+    out = capsys.readouterr().out
+    assert "--keep existing|incoming|both" in out
+    assert "occurrences:" not in out          # family of 1 -> nothing to say yet
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both") == 0
+    scan = tmp_path / "g3.txt"
+    scan.write_bytes(b"glucose 210")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    payload = _write_json(tmp_path, "g3.json", {"lab_result": [
+        {"test_name": "glucose", "collected_at": "2024-04-01", "value_num": 210},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", "3",
+                "--json", str(payload)) == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "review-conflicts") == 0
+    out = capsys.readouterr().out
+    assert "occurrences: 2 rows already stored under this key" in out
+    assert out.isascii()
+
+
+def test_commit_extraction_rejects_an_intra_payload_collision(ready, capsys):
+    tmp_path = ready
+    scan = tmp_path / "g.txt"
+    scan.write_bytes(b"glucose x2")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    payload = _write_json(tmp_path, "g.json", {"lab_result": [
+        {"test_name": "glucose", "collected_at": "2024-04-01", "value_num": 95},
+        {"test_name": "glucose", "collected_at": "2024-04-01", "value_num": 148},
+    ]})
+    capsys.readouterr()
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(payload)) == 1
+    err = capsys.readouterr().err
+    assert "rows 0 and 1" in err and "--keep both" in err
+    assert err.isascii()
+
+
 def test_ingest_duplicate_reports_cleanly(ready, capsys):
     tmp_path = ready
     scan = tmp_path / "s.txt"

@@ -226,6 +226,7 @@ class ReassignChange:
     label: str
     old_key: str
     new_key: str
+    new_base: str = ""   # recomputed dedup_base (== new_key at occurrence 0)
 
 
 @dataclass
@@ -322,8 +323,13 @@ def reassign_document(
         for row in rows:
             label = dedup._rekey_label(record_type, row)
             payload = {name: row[name] for name in dedup.FIELD_SPECS[record_type]}
+            # A row admitted by `review-conflicts --keep both` is occurrence >0 of its
+            # identity family; its key hashes the base together with that stored
+            # occurrence, so the recompute has to carry it or every sibling would read
+            # as dictionary drift.
+            occurrence = int(row["dedup_occurrence"] or 0)
             current = dedup.dedup_key(
-                record_type, payload, row["person_id"], dictionary
+                record_type, payload, row["person_id"], dictionary, occurrence
             )
             if current != row["dedup_key"]:
                 raise DictionaryDriftError(
@@ -332,9 +338,10 @@ def reassign_document(
                     "changed since it was committed. Run `pemr rekey --apply` first, "
                     "then retry; nothing was written"
                 )
-            new_key = dedup.dedup_key(
+            new_base = dedup.dedup_key(
                 record_type, payload, target.person_id, dictionary
             )
+            new_key = dedup.occurrence_key(new_base, occurrence)
             # Every moving row shares one old person_id and one new one, and the drift
             # check above proves the stored keys are injective under the current
             # dictionary — so new keys cannot collide with each other or with the
@@ -352,7 +359,7 @@ def reassign_document(
                 )
             report.changes.append(
                 ReassignChange(
-                    record_type, row[pk], label, row["dedup_key"], new_key
+                    record_type, row[pk], label, row["dedup_key"], new_key, new_base
                 )
             )
 
@@ -365,9 +372,9 @@ def reassign_document(
             )
             for change in report.changes:
                 conn.execute(
-                    f"UPDATE {change.record_type} SET person_id = ?, dedup_key = ? "
-                    f"WHERE {change.record_type}_id = ?",
-                    (target.person_id, change.new_key, change.row_id),
+                    f"UPDATE {change.record_type} SET person_id = ?, dedup_key = ?, "
+                    f"dedup_base = ? WHERE {change.record_type}_id = ?",
+                    (target.person_id, change.new_key, change.new_base, change.row_id),
                 )
     report.applied = apply
     return report
