@@ -276,7 +276,7 @@ pemr query timeline --person jane --since 2024-01-01     # merged event stream
 pemr find --person jane "cholesterol"                    # full-text over ocr_text + records
 pemr find "mmr booster"                                  # omit --person: whole-household, slug-prefixed hits
 pemr trends --person jane --test hba1c                   # min/max/latest/slope
-pemr due --person jane                                   # screening/vaccine gaps (rules)
+pemr due --person jane                                   # screening/vaccine gaps — NOT IMPLEMENTED (phase 7)
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
 pemr render journal --person jane        > exports/jane-journal.md
@@ -284,6 +284,11 @@ pemr backup                                              # VACUUM INTO snapshot
 pemr migrate                                             # apply pending migrations
 pemr rekey [--apply]                                     # re-derive dedup keys after a dictionary edit
 ```
+
+Every line above is implemented and parses today **except** the one flagged `NOT IMPLEMENTED`.
+`pemr due` is phase 7 (§9) — the `screening`/`immunization` `observation` rows that
+`data/dictionary.example.toml` and `AGENTS.md` tell extraction agents to emit are accruing
+ahead of their reader, by design. Flag any future entry the same way rather than listing it bare.
 
 Invoke as `pemr <cmd>` (console script) or `python -m pemr <cmd>` (`pemr/__main__.py`,
 delegating to `cli.main`) — the latter is the portable fallback when the console-script
@@ -326,8 +331,8 @@ Because they regenerate from truth, they never drift. Old exports are disposable
 
 - One DB, `person_id` everywhere → adding a family member is `pemr person add`, nothing
   else. Same tools, same dictionary, zero code duplication.
-- Cross-person queries fall out for free: `pemr due --all`, "who's overdue for a
-  physical," family-wide med lists.
+- Cross-person queries fall out for free: `pemr due --all` (phase 7, not implemented),
+  "who's overdue for a physical," family-wide med lists.
 - New record *type*: add rows to `observation` immediately; promote to a typed table
   with a migration only when it earns its keep. Neither requires touching agents.
 
