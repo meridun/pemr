@@ -33,6 +33,21 @@ def _doc(conn, slug, ocr=None, doc_date="2026-01-01", category=None, provider=No
     return cur.lastrowid
 
 
+def _stage_conflict(conn, slug, *, record_type="lab_result", status="open"):
+    """Stage one conflict row for `slug` (the shape `dedup` writes on a key collision)."""
+    cur = conn.execute(
+        "INSERT INTO conflict (record_type, dedup_key, person_id, existing_json, "
+        "incoming_json, status, resolution, detected_at, resolved_at) VALUES "
+        "(?, 'k', (SELECT person_id FROM person WHERE slug = ?), '{}', '{}', ?, ?, "
+        "'2026-01-01', ?)",
+        (record_type, slug, status,
+         "keep-incoming" if status == "resolved" else None,
+         "2026-01-02" if status == "resolved" else None),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
 def _row_counts(conn):
     return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in _TABLES}
 
@@ -163,10 +178,37 @@ def test_summary_abnormal_lab_selection(seeded):
 
 def test_summary_upcoming_and_open_appointments(seeded):
     md = render.render_summary(seeded, "jane-doe")
-    section = md.split("## Upcoming / Open Appointments")[1]
+    section = md.split("## Upcoming / Open Appointments")[1].split("\n## ")[0]
     assert "Dr. Smith" in section    # upcoming
     assert "Dr. Open" in section     # past but no summary -> open
     assert "Dr. Past" not in section  # past + documented -> closed
+
+
+def test_summary_open_conflicts_section(seeded):
+    """The summary is the doc read between appointments, so a staged correction must be
+    visible there and not only in `review-conflicts` / a per-appointment brief: without
+    it the summary prints the stale value with no hint a correction is pending (#59)."""
+    cid = _stage_conflict(seeded, "jane-doe")
+    md = render.render_summary(seeded, "jane-doe")
+    section = md.split("## Open Conflicts")[1].split("\n## ")[0]
+    assert f"conflict #{cid} (lab_result)" in section
+    assert "`pemr review-conflicts`" in section       # tells the reader how to clear it
+
+
+def test_summary_open_conflicts_empty_state_and_scoping(seeded):
+    """Empty state is explicit (`_none_`, matching the brief), resolved conflicts drop
+    out of the section, and another person's conflict never leaks in."""
+    md = render.render_summary(seeded, "jane-doe")
+    assert "_none_" in md.split("## Open Conflicts")[1].split("\n## ")[0]
+
+    resolved = _stage_conflict(seeded, "jane-doe", status="resolved")
+    johns = _stage_conflict(seeded, "john-doe")
+    section = render.render_summary(
+        seeded, "jane-doe"
+    ).split("## Open Conflicts")[1].split("\n## ")[0]
+    assert f"conflict #{resolved}" not in section     # resolved -> not open
+    assert f"conflict #{johns}" not in section        # other person's conflict
+    assert "_none_" in section
 
 
 def test_summary_empty_sections_are_explicit(seeded):
@@ -245,13 +287,7 @@ def test_brief_has_interaction_placeholder(seeded):
 
 def test_brief_open_conflict_warning(seeded):
     # stage an open conflict for jane, then confirm the brief warns about it
-    seeded.execute(
-        "INSERT INTO conflict (record_type, dedup_key, person_id, existing_json, "
-        "incoming_json, status, detected_at) VALUES "
-        "('lab_result', 'k', (SELECT person_id FROM person WHERE slug='jane-doe'), "
-        "'{}', '{}', 'open', '2026-01-01')"
-    )
-    seeded.commit()
+    _stage_conflict(seeded, "jane-doe")
     md = render.render_brief(seeded, _upcoming_appt_id(seeded))
     section = md.split("## Open Conflicts")[1].split("##")[0]
     assert "review-conflicts" in section
