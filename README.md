@@ -42,7 +42,9 @@ Full design — schema, dedup algorithm, ingest pipeline, tool surface, backup �
 
 Design is locked; build proceeds in phases (skeleton → ingest/dedup → query → render → MCP →
 backup → care-gap rules) per the Architecture doc. **Phase 1 (skeleton) is done**: package
-layout, `migrations/001_init.sql`, `pemr migrate`, `pemr person add|list|show`, config, CI.
+layout, `migrations/001_init.sql`, `pemr migrate --create` (bootstrap a new archive; plain
+`pemr migrate` applies migrations to an existing one and will never create a database),
+`pemr person add|list|show`, config, CI.
 **Phase 2 (ingest + two-layer dedup) is done**: content-hash blob store + commit-extraction
 (`pemr ingest`), semantic dedup keys with conflict staging (`migrations/002_conflict.sql`,
 `pemr review-conflicts`), starter analyte/name dictionary. **Phase 3 (query layer) is done**:
@@ -52,7 +54,12 @@ fields (`migrations/003_fts.sql`, `pemr find`), and lab `pemr trends` — all wi
 ## Data / privacy posture
 
 Local-first. The live `pemr.db` sits on a **non-synced** local path (WAL sidecars corrupt
-under cloud sync); only clean `VACUUM INTO` snapshots sync to Drive/OneDrive. Private-ish,
+under cloud sync); only clean `VACUUM INTO` snapshots sync to Drive/OneDrive. Going the
+other way is `pemr restore latest` — it validates the snapshot, banks a rescue copy of
+whatever it replaces, clears stale WAL sidecars, migrates forward, and reports row counts
+plus source-blob resolution (`pemr verify` runs that report on its own). What backups do
+*not* cover — same-day loss, and pinning a snapshot against rotation — is spelled out in
+[Architecture §8](docs/Architecture.md#8-backup--safety). Private-ish,
 not encrypted-at-rest by default — an encrypted-snapshot upgrade is a drop-in later. No
 HIPAA/PHI compliance layer and no provider interoperability; this is a personal archive, and
 it assists appointment prep and research — it does not give clinical advice.

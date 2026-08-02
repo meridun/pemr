@@ -10,12 +10,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, backup, db, dedup, ingest, persons, query, render
+from . import (
+    __version__, backup, db, dedup, documents, ingest, persons, query, render,
+    restore, verify,
+)
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
 _DEFAULT_DICTIONARY = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -52,7 +56,52 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     )
 
 
+def _no_database_message(db_path: Path) -> str:
+    """The refusal shown when a command needs a database and there isn't one.
+
+    Issue #55: the old advice here was `pemr migrate`, which happily created a brand-new
+    empty database and reported success - manufacturing a convincing empty archive for
+    the exact user whose data just vanished (and then feeding it to the next `pemr
+    backup`, whose rotation could prune the real snapshots). ASCII only (issue #23).
+    """
+    return (
+        f"error: no database at {db_path}\n"
+        "nothing was created - pemr will not conjure an empty archive over a missing "
+        "database.\n"
+        "  - restoring after data loss?  pemr restore latest\n"
+        "  - starting a new archive?     pemr migrate --create"
+    )
+
+
+def _connect_db(args: argparse.Namespace):
+    """Resolve the DB path, refuse if there is no database there, then connect.
+
+    Every CLI command that reads or writes the archive goes through here; the MCP
+    wrapper applies the same gate (:func:`pemr.mcp_server._connect`). `pemr migrate
+    --create` is the one documented way past it.
+    """
+    db_path = _resolve_db_path(args)
+    if not db.database_exists(db_path):
+        raise SystemExit(_no_database_message(db_path))
+    return db.connect(db_path)
+
+
 def _resolve_sources_dir(args: argparse.Namespace) -> Path:
+    sources_dir = _resolve_sources_dir_optional(args)
+    if sources_dir is None:
+        raise SystemExit(
+            "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
+            "[paths].sources_dir in config.toml (see config.example.toml)"
+        )
+    return sources_dir
+
+
+def _resolve_sources_dir_optional(args: argparse.Namespace) -> Path | None:
+    """As :func:`_resolve_sources_dir`, but None instead of exiting.
+
+    `restore`/`verify` must still report on the database when `sources/` is
+    unconfigured - the blob pass is skipped with a note, not fatal.
+    """
     override = getattr(args, "sources", None)
     if override:
         return Path(override)
@@ -62,13 +111,11 @@ def _resolve_sources_dir(args: argparse.Namespace) -> Path:
     sources_dir = _load_config(args).get("paths", {}).get("sources_dir")
     if sources_dir:
         return Path(sources_dir)
-    raise SystemExit(
-        "error: no sources dir - pass --sources, set PEMR_SOURCES, or set "
-        "[paths].sources_dir in config.toml (see config.example.toml)"
-    )
+    return None
 
 
-def _resolve_backup_dir(args: argparse.Namespace) -> Path:
+def _resolve_backup_dir_optional(args: argparse.Namespace) -> Path | None:
+    """Backup dir if configured, else None (`restore <path>` does not need one)."""
     override = getattr(args, "backup_dir", None)
     if override:
         return Path(override)
@@ -78,10 +125,17 @@ def _resolve_backup_dir(args: argparse.Namespace) -> Path:
     backup_dir = _load_config(args).get("paths", {}).get("backup_dir")
     if backup_dir:
         return Path(backup_dir)
-    raise SystemExit(
-        "error: no backup dir — pass --backup-dir, set PEMR_BACKUP_DIR, or set "
-        "[paths].backup_dir in config.toml (see config.example.toml)"
-    )
+    return None
+
+
+def _resolve_backup_dir(args: argparse.Namespace) -> Path:
+    backup_dir = _resolve_backup_dir_optional(args)
+    if backup_dir is None:
+        raise SystemExit(
+            "error: no backup dir — pass --backup-dir, set PEMR_BACKUP_DIR, or set "
+            "[paths].backup_dir in config.toml (see config.example.toml)"
+        )
+    return backup_dir
 
 
 def _resolve_retention(args: argparse.Namespace) -> tuple[int, int]:
@@ -121,7 +175,12 @@ def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    # The one command allowed to create a database - and only with --create. Without it
+    # `migrate` applies migrations to an existing database and nothing else (issue #55).
+    db_path = _resolve_db_path(args)
+    if not db.database_exists(db_path) and not args.create:
+        raise SystemExit(_no_database_message(db_path))
+    conn = db.connect(db_path)
     try:
         applied = db.migrate(conn, args.migrations_dir or db.DEFAULT_MIGRATIONS_DIR)
     finally:
@@ -135,7 +194,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_add(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.add_person(
@@ -157,7 +216,7 @@ def _cmd_person_add(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_list(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         people = persons.list_people(conn, include_inactive=args.all_people)
     finally:
@@ -180,7 +239,7 @@ def _print_person(person) -> None:
 
 
 def _cmd_person_show(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         person = persons.get_person(conn, args.slug)
     finally:
@@ -207,7 +266,7 @@ def _cmd_person_edit(args: argparse.Namespace) -> int:
     if args.notes is not None:
         fields["notes"] = args.notes
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.update_person(conn, args.slug, **fields)
@@ -224,7 +283,7 @@ def _cmd_person_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_deactivate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.deactivate_person(conn, args.slug)
@@ -238,7 +297,7 @@ def _cmd_person_deactivate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_reactivate(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.reactivate_person(conn, args.slug)
@@ -252,7 +311,7 @@ def _cmd_person_reactivate(args: argparse.Namespace) -> int:
 
 
 def _cmd_person_remove(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             person = persons.remove_person(conn, args.slug)
@@ -268,6 +327,201 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# document recovery (list / edit / reassign / rm) - issue #54
+# --------------------------------------------------------------------------- #
+
+def _with_document_conn(args: argparse.Namespace, work):
+    """Open the DB, run ``work(conn)``, translating every friendly `document`
+    failure mode (un-migrated DB, unknown id/slug, refusal) into rc=1 on stderr.
+
+    Goes through the :func:`_connect_db` gate like every other read/write command
+    (issue #55): a missing database is refused here too, rather than being created
+    on connect. `db.NotMigratedError` below still covers the distinct case of a
+    database file that exists but has no schema.
+    """
+    conn = _connect_db(args)
+    try:
+        try:
+            return work(conn)
+        except db.NotMigratedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (
+            documents.DocumentNotFoundError,
+            documents.OpenConflictsError,
+            documents.DictionaryDriftError,
+            documents.ReassignCollisionError,
+            persons.PersonNotFoundError,
+        ) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_document_list(args: argparse.Namespace) -> int:
+    def work(conn):
+        docs = documents.list_documents(conn, args.person)
+        if args.json:
+            _print_json(docs)
+            return 0
+        if not docs:
+            print("no documents yet - `pemr ingest <file> --person <slug>`")
+            return 0
+        for d in docs:
+            print(
+                f"#{d['document_id']:<5} {_fmt(d['doc_date']):11} "
+                f"{_fmt(d['category']):12} {_fmt(d['provider']):22} "
+                f"{_fmt(d['person']):16} {d['sha256'][:12]}  {d['record_count']} rec"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_edit(args: argparse.Namespace) -> int:
+    # A flag left unset is None -> not part of the update; an explicit empty string
+    # (e.g. --category "") clears that column (documents.py), same as `person edit`.
+    fields: dict[str, str] = {}
+    if args.doc_date is not None:
+        fields["doc_date"] = args.doc_date
+    if args.category is not None:
+        fields["category"] = args.category
+    if args.provider is not None:
+        fields["provider"] = args.provider
+
+    def work(conn):
+        doc = documents.edit_document(conn, args.document_id, **fields)
+        if args.json:
+            _print_json(doc)
+            return 0
+        for key in ("document_id", "person", "doc_date", "category", "provider",
+                    "source_path", "ingested_at", "record_count"):
+            print(f"{key:14} {_fmt(doc[key])}")
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_reassign(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        report = documents.reassign_document(
+            conn, args.document_id, args.person, dictionary, apply=args.apply
+        )
+        if args.json:
+            _print_json({
+                "document_id": report.document_id,
+                "from": report.from_slug,
+                "to": report.to_slug,
+                "applied": report.applied,
+                "unchanged": report.unchanged,
+                "target_inactive": report.target_inactive,
+                "counts": report.counts,
+                "moved": [
+                    {
+                        "record_type": c.record_type,
+                        "row_id": c.row_id,
+                        "label": c.label,
+                        "old_key": c.old_key,
+                        "new_key": c.new_key,
+                    }
+                    for c in report.changes
+                ],
+            })
+            return 0
+        if report.unchanged:
+            print(
+                f"document #{report.document_id} is already owned by "
+                f"'{report.to_slug}' - nothing to do"
+            )
+            return 0
+        print(
+            f"document #{report.document_id}: {_fmt(report.from_slug) or '(none)'} "
+            f"-> {report.to_slug}"
+        )
+        for c in report.changes:
+            print(f"  {c.record_type} #{c.row_id}  {c.label}")
+        if report.target_inactive:
+            print(f"note: '{report.to_slug}' is deactivated (records still move)")
+        if report.applied:
+            print(f"reassigned {len(report.changes)} record(s)")
+        else:
+            print(
+                f"dry run: {len(report.changes)} record(s) would move - "
+                "re-run with --apply (back up first: `pemr backup`)"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_rm(args: argparse.Namespace) -> int:
+    # The sources dir is only needed to delete the blob; keeping it (the default)
+    # must not require configured paths.
+    sources_dir = _resolve_sources_dir(args) if args.purge_blob else None
+
+    def work(conn):
+        report = documents.remove_document(
+            conn, args.document_id, sources_dir=sources_dir,
+            purge_blob=args.purge_blob, apply=args.apply,
+        )
+        if args.json:
+            _print_json({
+                "document_id": report.document_id,
+                "person": report.person_slug,
+                "sha256": report.sha256,
+                "applied": report.applied,
+                "records": report.records,
+                "record_count": report.record_count,
+                "conflicts_deleted": report.conflicts_deleted,
+                "conflicts_anchored": report.conflicts_anchored,
+                "conflicts_detached": report.conflicts_detached,
+                "blob_path": report.blob_path,
+                "blob_purged": report.blob_purged,
+            })
+            return 0
+        print(
+            f"document #{report.document_id}  {_fmt(report.person_slug)}  "
+            f"{report.sha256[:12]}"
+        )
+        for record_type, count in report.records.items():
+            if count:
+                print(f"  {record_type}: {count} row(s)")
+        print(f"  records: {report.record_count} total")
+        if report.conflicts_deleted:
+            print(f"  conflicts deleted (open): {report.conflicts_deleted}")
+        if report.conflicts_anchored:
+            print(
+                "  conflicts deleted (staged against these records): "
+                f"{report.conflicts_anchored}"
+            )
+        if report.conflicts_detached:
+            print(f"  conflicts detached (resolved): {report.conflicts_detached}")
+        if not args.purge_blob:
+            print(f"  blob kept: {report.blob_path}")
+        elif report.blob_purged:
+            print(f"  blob deleted: {report.blob_path}")
+        elif report.applied:
+            print(f"  blob already gone: {report.blob_path}")
+        else:
+            print(f"  blob would be deleted: {report.blob_path}")
+        if report.applied:
+            print(f"removed document #{report.document_id}")
+        else:
+            print(
+                "dry run: nothing was deleted - re-run with --apply "
+                "(back up first: `pemr backup`)"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     ocr_text = None
     if getattr(args, "ocr_text_file", None):
@@ -278,7 +532,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
             return 1
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             result = ingest.ingest_document(
@@ -333,7 +587,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
         print(f"error: {args.json} is not valid JSON: {exc}", file=sys.stderr)
         return 1
 
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         try:
@@ -363,7 +617,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
 
 
 def _cmd_rekey(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         try:
@@ -413,7 +667,7 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
 
 
 def _cmd_review_conflicts(args: argparse.Namespace) -> int:
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             if args.resolve is not None:
@@ -475,7 +729,7 @@ def _fmt(value: object) -> str:
 def _with_conn_person(args: argparse.Namespace, work):
     """Open the DB, run ``work(conn)``, translating the two friendly failure modes
     (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             return work(conn)
@@ -629,7 +883,7 @@ def _emit_markdown(markdown: str, out: str | None) -> int:
 def _render_with_conn(args: argparse.Namespace, work) -> int:
     """Open the DB, run ``work(conn)``, translating render's friendly failures
     (un-migrated DB, unknown person slug, unknown appointment id) into rc=1 stderr."""
-    conn = db.connect(_resolve_db_path(args))
+    conn = _connect_db(args)
     try:
         try:
             return work(conn)
@@ -673,9 +927,56 @@ def _cmd_render_journal(args: argparse.Namespace) -> int:
 # Phase 6: backup (VACUUM INTO snapshot + rotation)
 # --------------------------------------------------------------------------- #
 
+def _backup_source_problem(db_path: Path) -> str | None:
+    """None if ``db_path`` is a real archive, else the refusal to print.
+
+    Returns text rather than raising so `backup` keeps its established rc=1 shape.
+
+    Issue #55: `backup.snapshot` only checks that the file *exists*, so a zero-byte or
+    schema-less `pemr.db` used to produce a structurally valid (and therefore
+    integrity-clean) 4 KB snapshot at rc=0 - which then became a legitimate rotation
+    candidate and could prune the real snapshots. That is the exact chain the issue's
+    drill describes: an empty archive becomes a valid backup source and eats the
+    backups. The `migrate` gate closed the route that manufactured the empty database;
+    this closes every other route into it.
+
+    Deliberately not inside `backup.snapshot`: `pemr restore --force` snapshots the
+    live database as a rescue copy precisely when that database may be damaged, and
+    banking a damaged database is still better than discarding it.
+    """
+    if not db.database_exists(db_path):
+        return _no_database_message(db_path)
+    # A bare sqlite3 connection, not db.connect: this must not flip journal_mode on a
+    # database it is about to refuse, and a file that will not read at all is not this
+    # function's story to tell - backup.snapshot reports the real sqlite error.
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        migrated = db.is_migrated(conn)
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    if migrated:
+        return None
+    return (
+        f"error: {db_path} has no pemr schema - refusing to snapshot it\n"
+        "a snapshot of an empty database is worthless, and rotation could prune your "
+        "real snapshots to keep it.\n"
+        "  - restoring after data loss?  pemr restore latest\n"
+        "  - starting a new archive?     pemr migrate --create"
+    )
+
+
 def _cmd_backup(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args)
     backup_dir = _resolve_backup_dir(args)
+    problem = _backup_source_problem(db_path)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     try:
         snap, size = backup.snapshot(db_path, backup_dir)
     except backup.BackupError as exc:
@@ -711,6 +1012,77 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Issue #55: restore (the other direction) + verify (DB + blob health)
+# --------------------------------------------------------------------------- #
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    try:
+        result = restore.restore(
+            args.snapshot,
+            db_path,
+            backup_dir=_resolve_backup_dir_optional(args),
+            sources_dir=_resolve_sources_dir_optional(args),
+            migrations_dir=args.migrations_dir,
+            force=args.force,
+        )
+    except restore.RestoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    report = result.report
+    if args.json:
+        _print_json({
+            "snapshot": str(result.snapshot),
+            "database": str(result.db_path),
+            "rescue": str(result.rescue) if result.rescue else None,
+            "cleared_sidecars": [str(p) for p in result.cleared_sidecars],
+            "applied_migrations": result.applied_migrations,
+            "report": report.as_dict() if report else None,
+        })
+        return 0
+
+    if result.rescue:
+        print(f"rescue copy of the previous database: {result.rescue}")
+    for sidecar in result.cleared_sidecars:
+        print(f"cleared stale sidecar {sidecar.name}")
+    print(f"restored {result.db_path} from {result.snapshot}")
+    if result.applied_migrations:
+        for name in result.applied_migrations:
+            print(f"applied {name}")
+    else:
+        print("migrations up to date")
+    if report is not None:
+        for line in verify.format_report(report):
+            print(line)
+        if not report.ok:
+            # Blob problems are a warning, not a failure: the database restore
+            # genuinely succeeded, and `sources/` may simply be mid-sync.
+            print(
+                "warning: the database restored, but the checks above found problems",
+                file=sys.stderr,
+            )
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    conn = _connect_db(args)
+    try:
+        report = verify.verify_report(conn, _resolve_sources_dir_optional(args))
+    finally:
+        conn.close()
+    # Both modes share the exit code: `--json` is what a monitoring cron picks, and a
+    # verification command that reports success on a failed verification is worse than
+    # useless there (the `ok` field is not what scripts check).
+    if args.json:
+        _print_json(report.as_dict())
+    else:
+        for line in verify.format_report(report):
+            print(line)
+    return 0 if report.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pemr", description="Personal EMR engine - SQLite is truth."
@@ -720,9 +1092,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="path to config.toml (default ./config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_migrate = sub.add_parser("migrate", help="apply pending migrations")
+    p_migrate = sub.add_parser(
+        "migrate", help="apply pending migrations to an existing database"
+    )
     p_migrate.add_argument(
         "--migrations-dir", help="override migrations directory (mainly for tests)"
+    )
+    p_migrate.add_argument(
+        "--create", action="store_true",
+        help="bootstrap a brand-new empty database (required when none exists)",
     )
     p_migrate.set_defaults(func=_cmd_migrate)
 
@@ -777,6 +1155,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_remove.add_argument("slug")
     p_remove.set_defaults(func=_cmd_person_remove)
+
+    # --- document recovery (misfiled document escape hatch, issue #54) ----
+    p_document = sub.add_parser(
+        "document", help="inspect and recover misfiled documents"
+    )
+    document_sub = p_document.add_subparsers(dest="document_command", required=True)
+
+    d_list = document_sub.add_parser(
+        "list", help="list ingested documents, newest first"
+    )
+    d_list.add_argument("--person", help="owner slug; omit to list every person's")
+    d_list.add_argument("--json", action="store_true", help="machine-readable output")
+    d_list.set_defaults(func=_cmd_document_list)
+
+    d_edit = document_sub.add_parser(
+        "edit", help="correct a document's date/category/provider (partial)"
+    )
+    d_edit.add_argument("document_id", type=int, metavar="ID")
+    d_edit.add_argument("--doc-date", dest="doc_date", help='pass "" to clear')
+    d_edit.add_argument("--category", help='pass "" to clear')
+    d_edit.add_argument("--provider", help='pass "" to clear')
+    d_edit.add_argument("--json", action="store_true", help="machine-readable output")
+    d_edit.set_defaults(func=_cmd_document_edit)
+
+    d_reassign = document_sub.add_parser(
+        "reassign",
+        help="move a document and its records to another person (dry run by default)",
+    )
+    d_reassign.add_argument("document_id", type=int, metavar="ID")
+    d_reassign.add_argument("--person", required=True, help="new owner slug")
+    d_reassign.add_argument(
+        "--apply", action="store_true", help="write the move (default: report only)"
+    )
+    d_reassign.add_argument(
+        "--dictionary", help="synonym dictionary TOML (overrides default)"
+    )
+    d_reassign.add_argument("--json", action="store_true", help="machine-readable output")
+    d_reassign.set_defaults(func=_cmd_document_reassign)
+
+    d_rm = document_sub.add_parser(
+        "rm",
+        help="delete a document and its records (dry run by default)",
+    )
+    d_rm.add_argument("document_id", type=int, metavar="ID")
+    d_rm.add_argument(
+        "--apply", action="store_true", help="write the delete (default: report only)"
+    )
+    d_rm.add_argument(
+        "--purge-blob", dest="purge_blob", action="store_true",
+        help="also delete the stored scan (irreversible; kept by default)",
+    )
+    d_rm.add_argument("--sources", help="sources blob dir (overrides config)")
+    d_rm.add_argument("--json", action="store_true", help="machine-readable output")
+    d_rm.set_defaults(func=_cmd_document_rm)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
@@ -935,6 +1367,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backup.add_argument("--json", action="store_true", help="machine-readable output")
     p_backup.set_defaults(func=_cmd_backup)
+
+    # --- issue #55: restore + verify --------------------------------------
+    p_restore = sub.add_parser(
+        "restore",
+        help="install a backup snapshot over the live database (then migrate + verify)",
+    )
+    p_restore.add_argument(
+        "snapshot",
+        help="snapshot path, a bare filename inside the backup dir, or 'latest'",
+    )
+    p_restore.add_argument(
+        "--force", action="store_true",
+        help="allow replacing an existing database (a pemr-prerestore-*.sqlite "
+             "rescue copy is taken first)",
+    )
+    p_restore.add_argument(
+        "--backup-dir", dest="backup_dir",
+        help="where snapshots live (overrides PEMR_BACKUP_DIR / [paths].backup_dir)",
+    )
+    p_restore.add_argument("--sources", help="sources blob dir (overrides config)")
+    p_restore.add_argument(
+        "--migrations-dir", help="override migrations directory (mainly for tests)"
+    )
+    p_restore.add_argument("--json", action="store_true", help="machine-readable output")
+    p_restore.set_defaults(func=_cmd_restore)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="integrity + migrations + row counts + source blob resolution (read-only)",
+    )
+    p_verify.add_argument("--sources", help="sources blob dir (overrides config)")
+    p_verify.add_argument("--json", action="store_true", help="machine-readable output")
+    p_verify.set_defaults(func=_cmd_verify)
 
     return parser
 

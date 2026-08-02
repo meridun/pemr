@@ -23,13 +23,13 @@ def _assert_console_safe(text: str) -> None:
 @pytest.fixture()
 def ready(tmp_path):
     """Migrated DB + a person, ready for ingest."""
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
     return tmp_path
 
 
 def test_empty_person_list_is_console_safe(tmp_path, capsys):
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     capsys.readouterr()
     assert _run(tmp_path, "person", "list") == 0
     out = capsys.readouterr().out
@@ -89,7 +89,8 @@ def test_conflict_note_is_console_safe(ready, capsys):
     _assert_console_safe(out)
 
 
-def test_unmigrated_error_is_console_safe(tmp_path, capsys):
+def test_unmigrated_error_is_console_safe(tmp_path, capsys, unmigrated_db):
+    unmigrated_db(tmp_path / "cli.db")  # exists, no schema (issue #55 gate is earlier)
     scan = tmp_path / "s.txt"
     scan.write_bytes(b"x")
     assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
@@ -97,6 +98,30 @@ def test_unmigrated_error_is_console_safe(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "not migrated" in err
     _assert_console_safe(err)
+
+
+def test_missing_database_message_is_console_safe(tmp_path):
+    # The issue #55 refusal is what a panicking user reads first; it must not garble.
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, "person", "list")
+    _assert_console_safe(str(exc.value))
+    assert "no database at" in str(exc.value)
+
+
+def test_restore_and_verify_output_is_console_safe(tmp_path, capsys):
+    src = tmp_path / "src"
+    assert cli.main(["--db", str(src / "cli.db"), "migrate", "--create"]) == 0
+    backups = tmp_path / "backups"
+    assert cli.main(["--db", str(src / "cli.db"), "backup",
+                     "--backup-dir", str(backups)]) == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "restore", "latest", "--backup-dir", str(backups)) == 0
+    captured = capsys.readouterr()
+    _assert_console_safe(captured.out)
+    _assert_console_safe(captured.err)
+    capsys.readouterr()
+    _run(tmp_path, "verify")
+    _assert_console_safe(capsys.readouterr().out)
 
 
 def test_unknown_slug_error_is_console_safe(ready, capsys):
