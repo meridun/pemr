@@ -66,7 +66,16 @@ def _dictionary() -> dict[str, str]:
 
 
 def _connect() -> sqlite3.Connection:
-    return db.connect(_db_path())
+    """Same missing-database gate the CLI applies, raised as a tool error (issue #55).
+
+    Both front doors must give the same answer: neither may silently create an empty
+    archive over a database that has gone missing. The message is shared verbatim with
+    ``cli._connect_db``; only the exception type differs (a server must not SystemExit).
+    """
+    path = _db_path()
+    if not db.database_exists(path):
+        raise ToolError(cli._no_database_message(path))
+    return db.connect(path)
 
 
 def _friendly(exc: Exception) -> ToolError:
