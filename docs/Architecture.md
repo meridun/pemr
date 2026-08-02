@@ -268,6 +268,18 @@ stamped `resolved`, silently discarding the staged value. If nothing is left in 
 at all, `keep incoming` **refuses** rather than reporting a success that wrote nothing;
 `keep both` still admits the staged row, at occurrence 0.
 
+The stored `conflict.dedup_key` is also only the *current* base while the dictionary holds
+still: `rekey` rewrites keys on the record tables and does not touch the `conflict` table,
+so a dictionary edit made while a conflict is open strands it on a base no row carries.
+Resolutions therefore **re-derive** the base from the conflict's own payload under the
+current dictionary (`review-conflicts --dictionary`, mirroring `rekey`) and only fall back
+to the stored key when the derived base has no rows — i.e. when the dictionary changed but
+`rekey` has not run yet, where the stored rows are still the live family. Numbering an
+admitted row on a stale base instead would give it a key not derivable from its own
+columns, which collides the family on the next `rekey` and — because `rekey` is
+all-or-nothing across every table — blocks every later dictionary edit, `document reassign`
+included.
+
 **Intra-payload collisions are rejected, not staged.** Two rows in *one* submission that
 derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
 the identity and the recovery path. A conflict whose "existing" side was inserted
@@ -318,7 +330,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
-pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]]
+pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default

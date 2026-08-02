@@ -544,6 +544,20 @@ def count_occurrences(conn: sqlite3.Connection, record_type: str, base: str) -> 
     return int(row["n"])
 
 
+def conflict_occurrences(
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None = None,
+) -> int:
+    """Family size for a conflict's identity, resolved the same way a resolution
+    resolves it (:func:`_conflict_family`) — a conflict staged before a dictionary
+    edit carries a key no row still holds, and counting on it reads 0 for a family
+    that exists."""
+    if conflict["record_type"] not in FIELD_SPECS:
+        return 0
+    return len(_conflict_family(conn, conflict, dictionary)[1])
+
+
 def _insert_record(
     conn: sqlite3.Connection,
     record_type: str,
@@ -619,13 +633,16 @@ class ResolveResult:
     *admitted* row for ``keep='both'``, the *overwritten* one for
     ``keep='incoming'``. ``keep='existing'`` writes nothing, so it leaves them
     unset. ``dedup_key`` is that row's key (which for an occurrence >= 1 row is
-    *not* the conflict's key — see :func:`_anchor_row`).
+    *not* the conflict's key — see :func:`_anchor_row`); ``dedup_base`` is the
+    family it joined, re-derived under the current dictionary rather than taken
+    from the conflict (see :func:`_derive_base`).
     """
     kept: str
     record_type: str = ""
     row_id: int | None = None
     occurrence: int | None = None
     dedup_key: str | None = None
+    dedup_base: str | None = None
     no_op: bool = False          # keep-both that matched an existing sibling
 
 
@@ -637,6 +654,7 @@ def resolve_conflict(
     conflict_id: int,
     keep: str,
     note: str | None = None,
+    dictionary: dict[str, str] | None = None,
 ) -> ResolveResult:
     """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row),
     'incoming' (overwrite the stored record's payload fields with the incoming row) or
@@ -653,6 +671,11 @@ def resolve_conflict(
     idempotent by payload: if a sibling already carries that exact payload (two
     conflicts staged from one submission, both resolved 'both') nothing is inserted
     and the resolution records the no-op.
+
+    ``dictionary`` is the *current* synonym dictionary. Both writing resolutions
+    re-derive the conflict's identity family through it rather than trusting the
+    key frozen on the conflict row (:func:`_derive_base`) — pass the same dictionary
+    the caller would pass to :func:`commit_extraction` / :func:`rekey`.
     """
     db.require_migrated(conn)
     if keep not in KEEP_CHOICES:
@@ -668,18 +691,16 @@ def resolve_conflict(
 
     record_type = row["record_type"]
     if keep == "both":
-        result = _plan_keep_both(conn, row)
+        result = _plan_keep_both(conn, row, dictionary)
     elif keep == "incoming":
         # Resolve the target *before* the transaction: a family with no rows left
         # can no longer be overwritten, and that must refuse rather than resolve.
-        anchor = _anchor_row(
-            conn, record_type, row["dedup_key"], int(row["conflict_id"])
-        )
+        anchor = _anchor_row(conn, row, dictionary)
         result = ResolveResult(
             kept=keep, record_type=record_type,
             row_id=int(anchor[f"{record_type}_id"]),
             occurrence=int(anchor["dedup_occurrence"]),
-            dedup_key=anchor["dedup_key"],
+            dedup_key=anchor["dedup_key"], dedup_base=anchor["dedup_base"],
         )
     else:
         result = ResolveResult(
@@ -697,7 +718,7 @@ def resolve_conflict(
             result.row_id = _insert_record(
                 conn, record_type, json.loads(row["incoming_json"]),
                 row["person_id"], row["document_id"],
-                row["dedup_key"], result.occurrence or 0,
+                result.dedup_base or row["dedup_key"], result.occurrence or 0,
             )
         resolution = _resolution_text(result) + (f": {note}" if note else "")
         conn.execute(
@@ -721,30 +742,98 @@ def _resolution_text(result: ResolveResult) -> str:
     )
 
 
+def _derive_base(
+    conflict: sqlite3.Row, dictionary: dict[str, str] | None
+) -> str:
+    """The ``dedup_base`` this conflict's identity hashes to under the *current*
+    dictionary.
+
+    ``conflict["dedup_key"]`` is only the live base while the dictionary is
+    unchanged: ``rekey`` rewrites the record tables' keys and leaves the ``conflict``
+    table alone, so a dictionary edit made while a conflict sits open strands that
+    conflict on a base no row carries. Re-deriving from the payload is what keeps a
+    resolution landing in the live family instead of minting an underivable key
+    (which would wedge every later ``rekey``).
+
+    Falls back to the stored key when the payload cannot produce one (no
+    ``person_id``, unparseable JSON, unknown type) — those cases are refused, or
+    handled, further along by the callers.
+    """
+    if conflict["person_id"] is None:
+        return conflict["dedup_key"]
+    try:
+        incoming = json.loads(conflict["incoming_json"])
+        if not isinstance(incoming, dict):
+            return conflict["dedup_key"]
+        return dedup_key(
+            conflict["record_type"], incoming, int(conflict["person_id"]), dictionary
+        )
+    except (ValueError, TypeError):     # includes ValidationError, JSONDecodeError
+        return conflict["dedup_key"]
+
+
+def _conflict_family(
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None,
+) -> tuple[str, list[sqlite3.Row]]:
+    """``(base, rows)`` — the identity family a resolution of this conflict acts on.
+
+    The re-derived base wins whenever it has rows: that is the post-``rekey`` world,
+    and the whole point of deriving. When it is empty and differs from the staged
+    key, the record rows have *not* been rekeyed yet and still sit under the staged
+    key; staying with them keeps an admitted sibling in the same family, so a later
+    ``rekey`` moves the whole family together instead of colliding two rows onto one
+    key.
+    """
+    record_type = conflict["record_type"]
+    base = _derive_base(conflict, dictionary)
+    family = load_family(conn, record_type, base)
+    if family or base == conflict["dedup_key"]:
+        return base, family
+    stale = load_family(conn, record_type, conflict["dedup_key"])
+    if stale:
+        return conflict["dedup_key"], stale
+    return base, []
+
+
 def _anchor_row(
-    conn: sqlite3.Connection, record_type: str, base: str, conflict_id: int
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None,
 ) -> sqlite3.Row:
     """The stored row a conflict is anchored to: occurrence 0, or the lowest
     surviving occurrence of its identity family.
 
-    A conflict's ``dedup_key`` is always the family *base*, never the anchor row's
+    A conflict's ``dedup_key`` is always a family *base*, never the anchor row's
     own key once occurrence 0 is gone (an occurrence >= 1 row keys on
     ``hash(base|n)``). So resolutions must reach the row through the family, by
     primary key - targeting ``WHERE dedup_key = <conflict key>`` matches nothing in
     an orphaned family and would report success while writing nothing.
     """
-    family = load_family(conn, record_type, base)
+    base, family = _conflict_family(conn, conflict, dictionary)
     if not family:
+        drifted = ""
+        if base != conflict["dedup_key"]:
+            drifted = (
+                " (the dictionary also changed since it was staged, so its key was "
+                "re-derived; neither key has rows)"
+            )
         raise ValueError(
-            f"conflict {conflict_id} has no stored {record_type} row left to "
-            "overwrite - every occurrence of that identity was removed after the "
-            "conflict was staged. Resolve with keep 'both' to admit the incoming "
-            "row as a new record instead."
+            f"conflict {conflict['conflict_id']} has no stored "
+            f"{conflict['record_type']} row left to overwrite - every occurrence of "
+            f"that identity was removed after the conflict was staged{drifted}. "
+            "Resolve with keep 'both' to admit the incoming row as a new record "
+            "instead."
         )
     return family[0]
 
 
-def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveResult:
+def _plan_keep_both(
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None,
+) -> ResolveResult:
     """Validate + number the row a ``keep='both'`` resolution would admit.
 
     Everything that can refuse the resolution happens here, before the transaction
@@ -760,8 +849,7 @@ def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveR
             "incoming row as a new record"
         )
 
-    base = conflict["dedup_key"]
-    family = load_family(conn, record_type, base)
+    base, family = _conflict_family(conn, conflict, dictionary)
     pk = f"{record_type}_id"
     twin = next((f for f in family if _rows_equal(record_type, f, incoming)), None)
     if twin is not None:
@@ -770,7 +858,7 @@ def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveR
         return ResolveResult(
             kept="both", record_type=record_type, row_id=int(twin[pk]),
             occurrence=int(twin["dedup_occurrence"]),
-            dedup_key=twin["dedup_key"], no_op=True,
+            dedup_key=twin["dedup_key"], dedup_base=twin["dedup_base"], no_op=True,
         )
 
     # Occurrence numbers are monotonic over the family and never reused, so a removed
@@ -778,7 +866,7 @@ def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveR
     occurrence = max((int(f["dedup_occurrence"]) for f in family), default=-1) + 1
     return ResolveResult(
         kept="both", record_type=record_type, occurrence=occurrence,
-        dedup_key=occurrence_key(base, occurrence),
+        dedup_key=occurrence_key(base, occurrence), dedup_base=base,
     )
 
 
