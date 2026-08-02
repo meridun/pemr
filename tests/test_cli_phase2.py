@@ -131,6 +131,38 @@ def test_review_conflicts_listing_shows_occurrences_and_the_both_hint(ready, cap
     assert out.isascii()
 
 
+def test_keep_both_after_a_rekey_does_not_wedge_rekey(ready, capsys):
+    """The audit repro: a dictionary edit + `rekey --apply` while a conflict is open
+    leaves the conflict on a stale key. Resolving `--keep both` off that key inserted a
+    row whose key no longer derives from its own columns, which made every later `rekey`
+    - for every table - fail with a collision and left `document reassign` with no exit.
+    """
+    tmp_path = ready
+    _stage_repeat_draw(tmp_path, capsys)
+    dictionary = tmp_path / "dict.toml"
+    dictionary.write_text('[synonyms]\n"glucose" = "glucose, plasma"\n', encoding="utf-8")
+
+    assert _run(tmp_path, "rekey", "--apply", "--dictionary", str(dictionary)) == 0
+    assert "rekeyed 1 row(s)" in capsys.readouterr().out
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both",
+                "--dictionary", str(dictionary)) == 0
+    assert "occurrence 1" in capsys.readouterr().out      # joined the live family
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(dictionary)) == 0
+    assert "all dedup keys already match" in capsys.readouterr().out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lab_result ORDER BY lab_result_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [r["value_num"] for r in rows] == [95, 148]
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]
+
+
 def test_commit_extraction_rejects_an_intra_payload_collision(ready, capsys):
     tmp_path = ready
     scan = tmp_path / "g.txt"

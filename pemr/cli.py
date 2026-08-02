@@ -670,9 +670,14 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
     conn = _connect_db(args)
     try:
         try:
+            # Resolutions re-derive the conflict's identity family under the current
+            # dictionary; a conflict staged before a dictionary edit carries a key no
+            # row still holds (issue #58).
+            dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
             if args.resolve is not None:
                 result = dedup.resolve_conflict(
-                    conn, args.resolve, keep=args.keep, note=args.note
+                    conn, args.resolve, keep=args.keep, note=args.note,
+                    dictionary=dictionary,
                 )
                 print(f"resolved conflict #{args.resolve} ({_resolved_as(result)})")
                 return 0
@@ -683,9 +688,7 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
             # minimum a reviewer needs to tell "re-commit of an already-admitted draw"
             # from "genuine third draw" (richer rendering is issue #59).
             occurrences = {
-                row["conflict_id"]: dedup.count_occurrences(
-                    conn, row["record_type"], row["dedup_key"]
-                )
+                row["conflict_id"]: dedup.conflict_occurrences(conn, row, dictionary)
                 for row in conflicts
             }
         except db.NotMigratedError as exc:
@@ -1295,6 +1298,11 @@ def build_parser() -> argparse.ArgumentParser:
              "cannot timestamp). Default existing",
     )
     p_review.add_argument("--note", help="optional resolution note")
+    p_review.add_argument(
+        "--dictionary",
+        help="synonym dictionary TOML (overrides default); a resolution re-derives "
+             "the conflict's identity through it",
+    )
     p_review.add_argument(
         "--all", action="store_true", help="list resolved conflicts too"
     )

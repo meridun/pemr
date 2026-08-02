@@ -433,9 +433,10 @@ def remove_document(
     landed and their document is going away), resolved ones keep their audit trail
     with ``document_id`` nulled out. Open conflicts *anchored to* a row this document
     owns (:func:`_conflicts_anchored_to`) are deleted too and counted separately — the
-    row they were staged against is going away, so they cannot be resolved either way,
-    and leaving them would make a later `keep incoming` discard the staged value in
-    silence. Every count is in the dry-run report: the blast radius is the safety
+    row they were staged against is going away, so leaving them would strand a conflict
+    whose only remaining resolution is `keep both` (`keep incoming` refuses loudly once
+    the family is empty — :func:`dedup._anchor_row`). Every count is in the dry-run
+    report: the blast radius is the safety
     mechanism here, so it has to be truthful.
 
     The scan under ``sources_dir`` is **kept** unless ``purge_blob`` is set — it is the

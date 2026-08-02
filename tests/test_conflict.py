@@ -349,6 +349,95 @@ def test_keep_existing_still_resolves_an_empty_family(conn, orphaned_family):
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 0
 
 
+# --- dictionary drift: a conflict's stored key is not the live base -----------
+#
+# `rekey` rewrites dedup_key/dedup_base on the record tables and does not touch the
+# `conflict` table, so a dictionary edit made while a conflict is open strands it on a
+# key no row carries. Resolutions must re-derive the base from the payload: numbering a
+# keep-both row on the stale key inserts a row whose key is not derivable from its own
+# columns, which wedges `rekey` (and therefore `document reassign`) for the whole DB.
+
+_RENAMED = {"glucose": "glucose, plasma"}
+
+
+@pytest.fixture()
+def drifted(conn, repeat_draw):
+    """The `repeat_draw` conflict, with the dictionary changed and `rekey` applied
+    underneath it: the stored row moved to a new base, the conflict did not."""
+    report = dedup.rekey(conn, _RENAMED, apply=True)
+    assert report.applied and len(report.changes) == 1
+    conflict = dedup.list_conflicts(conn)[0]
+    stored = conn.execute("SELECT * FROM lab_result").fetchone()
+    # The premise: the conflict's key is stale, nothing carries it any more.
+    assert conflict["dedup_key"] != stored["dedup_base"]
+    return conflict["conflict_id"]
+
+
+def test_keep_both_after_rekey_joins_the_live_family(conn, drifted):
+    """Regression: the admitted row used to land at the stale base as occurrence 0,
+    forking the identity and making both rows recompute to one key."""
+    result = dedup.resolve_conflict(conn, drifted, keep="both", dictionary=_RENAMED)
+
+    rows = conn.execute("SELECT * FROM lab_result ORDER BY lab_result_id").fetchall()
+    assert [r["value_num"] for r in rows] == [95.0, 148.0]
+    assert [r["dedup_occurrence"] for r in rows] == [0, 1]
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]     # one family, not two
+    assert (result.occurrence, result.dedup_key) == (1, rows[1]["dedup_key"])
+
+
+def test_rekey_still_works_after_a_drifted_keep_both(conn, drifted):
+    """The wedge itself: an underivable key made `rekey` raise a collision on every
+    later dictionary edit, for every table, with no CLI way out."""
+    dedup.resolve_conflict(conn, drifted, keep="both", dictionary=_RENAMED)
+
+    assert dedup.rekey(conn, _RENAMED).changes == []          # already canonical
+    later = dedup.rekey(conn, {"glucose": "glu"}, apply=True)  # a further edit
+    assert len(later.changes) == 2                             # family moves together
+    rows = conn.execute("SELECT * FROM lab_result ORDER BY lab_result_id").fetchall()
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]
+    assert rows[0]["dedup_key"] != rows[1]["dedup_key"]
+
+
+def test_keep_incoming_after_rekey_overwrites_the_live_row(conn, drifted):
+    """`keep incoming` refused a drifted conflict outright (empty family at the stale
+    key) and pointed the operator at the broken keep-both path."""
+    result = dedup.resolve_conflict(conn, drifted, keep="incoming", dictionary=_RENAMED)
+
+    rows = conn.execute("SELECT * FROM lab_result").fetchall()
+    assert len(rows) == 1 and rows[0]["value_num"] == 148.0
+    assert result.row_id == rows[0]["lab_result_id"]
+
+
+def test_conflict_occurrences_counts_the_live_family(conn, drifted):
+    """The CLI/MCP listing hint read 0 occurrences for a family that exists."""
+    conflict = dedup.list_conflicts(conn)[0]
+    assert dedup.conflict_occurrences(conn, conflict, _RENAMED) == 1
+    dedup.resolve_conflict(conn, drifted, keep="both", dictionary=_RENAMED)
+    staged_again = dedup.commit_extraction(
+        conn, _doc(conn, "draw-6"),
+        {"lab_result": [_glucose(210, "third draw")]}, _RENAMED,
+    )
+    assert staged_again.counts["conflict"] == 1
+    assert dedup.conflict_occurrences(
+        conn, dedup.list_conflicts(conn)[0], _RENAMED
+    ) == 2
+
+
+def test_keep_both_before_rekey_stays_with_the_stored_family(conn, repeat_draw):
+    """Dictionary edited but `rekey` not yet run: the stored rows still carry the
+    staged key, so the admitted sibling must join *them* — splitting it off onto the
+    freshly derived base would collide the two the moment `rekey` runs."""
+    result = dedup.resolve_conflict(
+        conn, repeat_draw, keep="both", dictionary=_RENAMED
+    )
+    assert result.occurrence == 1
+
+    rows = conn.execute("SELECT * FROM lab_result ORDER BY lab_result_id").fetchall()
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]
+    report = dedup.rekey(conn, _RENAMED, apply=True)           # no collision
+    assert len(report.changes) == 2
+
+
 def test_keep_existing_and_incoming_still_return_a_result(conn, staged):
     """Source compatibility: the return type changed from None, but the older
     resolutions still add no row."""

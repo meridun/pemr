@@ -253,7 +253,9 @@ def review_conflicts(
             )
         merged_note = f"signoff: {signoff.strip()}" + (f" — {note}" if note else "")
         try:
-            result = _dedup.resolve_conflict(conn, resolve, keep=keep, note=merged_note)
+            result = _dedup.resolve_conflict(
+                conn, resolve, keep=keep, note=merged_note, dictionary=_dictionary()
+            )
         # ValueError covers ValidationError, raised when a keep-both payload no longer
         # validates as a row.
         except (db.NotMigratedError, ValueError) as exc:
@@ -270,11 +272,10 @@ def review_conflicts(
 
     try:
         rows = _dedup.list_conflicts(conn, status=None if all else "open")
+        dictionary = _dictionary()
         return [
             dict(r) | {
-                "occurrences": _dedup.count_occurrences(
-                    conn, r["record_type"], r["dedup_key"]
-                )
+                "occurrences": _dedup.conflict_occurrences(conn, r, dictionary)
             }
             for r in rows
         ]
