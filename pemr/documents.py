@@ -94,6 +94,41 @@ def _record_counts(conn: sqlite3.Connection, document_id: int) -> dict[str, int]
     return counts
 
 
+def _conflicts_cited_by(conn: sqlite3.Connection, document_id: int) -> list[int]:
+    """Open conflicts this document *raised* — its incoming row lost the collision."""
+    return [
+        int(row["conflict_id"])
+        for row in conn.execute(
+            "SELECT conflict_id FROM conflict WHERE document_id = ? AND status = 'open' "
+            "ORDER BY conflict_id",
+            (document_id,),
+        ).fetchall()
+    ]
+
+
+def _conflicts_anchored_to(conn: sqlite3.Connection, document_id: int) -> list[int]:
+    """Open conflicts staged *against* rows this document owns.
+
+    A conflict has two ends. ``conflict.document_id`` names the document whose
+    **incoming** row collided; ``conflict.dedup_key`` anchors it to the **stored**
+    row — which a *different* document usually created. Only the first end is
+    reachable from ``document_id``, so removing or reassigning the owner of the
+    stored row silently orphans the anchor: a later `keep incoming` resolution runs
+    ``UPDATE ... WHERE dedup_key = ?`` (:func:`dedup._overwrite_record`), matches
+    zero rows, and stamps the conflict ``resolved`` while discarding the staged
+    value with rc 0. Both `rm` and `reassign` therefore have to see this end too.
+    """
+    ids: list[int] = []
+    for record_type in dedup.KNOWN_TYPES:
+        rows = conn.execute(
+            "SELECT conflict_id FROM conflict WHERE status = 'open' AND record_type = ? "
+            f"AND dedup_key IN (SELECT dedup_key FROM {record_type} WHERE document_id = ?)",
+            (record_type, document_id),
+        ).fetchall()
+        ids.extend(int(row["conflict_id"]) for row in rows)
+    return sorted(ids)
+
+
 def _document_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     """One document as a JSON-safe dict. ``ocr_text`` is deliberately replaced by
     ``has_ocr_text`` — a full document transcription has no business in list output."""
@@ -228,10 +263,13 @@ def reassign_document(
     Dry-run by default: pass ``apply=True`` to write. Three refusals, all before any
     write, all leaving the database untouched:
 
-    * **open conflicts** citing this document (:class:`OpenConflictsError`) — such a
-      conflict pairs an incoming row from this document against a stored row owned by
-      the *old* person; resolving it after a move would write data into records the
-      document no longer owns. Resolve them first (`pemr review-conflicts`).
+    * **open conflicts** at either end of this document (:class:`OpenConflictsError`).
+      One *raised* by it pairs an incoming row from this document against a stored row
+      owned by the *old* person; resolving it after a move would write data into
+      records the document no longer owns. One *anchored to* a row this document owns
+      (staged by some other document — see :func:`_conflicts_anchored_to`) would have
+      its ``dedup_key`` re-derived out from under it, and resolve to nothing. Resolve
+      them first (`pemr review-conflicts`).
     * **dictionary drift** (:class:`DictionaryDriftError`) — a stored key that does not
       match its recompute under the current dictionary means a reassign would silently
       perform a `rekey` too. Run `pemr rekey --apply` first; reassign changes ownership
@@ -259,17 +297,18 @@ def reassign_document(
         report.applied = apply
         return report
 
-    open_conflicts = conn.execute(
-        "SELECT conflict_id FROM conflict WHERE document_id = ? AND status = 'open' "
-        "ORDER BY conflict_id",
-        (document_id,),
-    ).fetchall()
+    open_conflicts = sorted(
+        set(_conflicts_cited_by(conn, document_id))
+        | set(_conflicts_anchored_to(conn, document_id))
+    )
     if open_conflicts:
-        ids = ", ".join(f"#{row['conflict_id']}" for row in open_conflicts)
+        ids = ", ".join(f"#{cid}" for cid in open_conflicts)
         raise OpenConflictsError(
             f"document {document_id} has open conflict(s) {ids} staged against "
-            f"'{from_slug}'; resolving one after the move would write this document's "
-            "data into records it no longer owns. Resolve them first with "
+            f"'{from_slug}' - raised by this document, or anchored to a row it owns. "
+            "Resolving one after the move would write this document's data into "
+            "records it no longer owns, or target a dedup_key the move re-derives "
+            "(silently discarding the staged value). Resolve them first with "
             "`pemr review-conflicts`; nothing was written"
         )
 
@@ -345,9 +384,13 @@ class RemoveReport:
     sha256: str
     source_path: str
     records: dict[str, int] = field(default_factory=dict)
-    conflicts_deleted: int = 0      # open conflicts, removed with the document
+    conflicts_deleted: int = 0      # open conflicts raised by this document
+    conflicts_anchored: int = 0     # open conflicts staged against its rows (also deleted)
     conflicts_detached: int = 0     # resolved conflicts, document_id nulled
-    blob_path: str = ""             # absolute when a sources dir is known
+    # Absolute when a ``sources_dir`` was passed, else the store-relative
+    # `sources/<shard>/<sha><ext>` form `pemr ingest` echoes. The CLI only resolves a
+    # sources dir for `--purge-blob`, so its `blob kept:` line is always the latter.
+    blob_path: str = ""
     blob_purged: bool = False
     applied: bool = False
 
@@ -374,7 +417,12 @@ def remove_document(
 
     Conflicts citing the document: open ones are deleted (their incoming rows never
     landed and their document is going away), resolved ones keep their audit trail
-    with ``document_id`` nulled out. Both counts are reported.
+    with ``document_id`` nulled out. Open conflicts *anchored to* a row this document
+    owns (:func:`_conflicts_anchored_to`) are deleted too and counted separately — the
+    row they were staged against is going away, so they cannot be resolved either way,
+    and leaving them would make a later `keep incoming` discard the staged value in
+    silence. Every count is in the dry-run report: the blast radius is the safety
+    mechanism here, so it has to be truthful.
 
     The scan under ``sources_dir`` is **kept** unless ``purge_blob`` is set — it is the
     one thing here that cannot be regenerated, and an orphan blob is harmless
@@ -401,10 +449,13 @@ def remove_document(
         # `sources/<shard>/<sha>.<ext>` form `pemr ingest` echoes.
         blob_path=str(blob) if blob is not None else f"sources/{doc['source_path']}",
     )
-    report.conflicts_deleted = int(conn.execute(
-        "SELECT COUNT(*) AS n FROM conflict WHERE document_id = ? AND status = 'open'",
-        (document_id,),
-    ).fetchone()["n"])
+    cited = set(_conflicts_cited_by(conn, document_id))
+    # Rows are about to be deleted, so a conflict anchored to one can no longer be
+    # resolved either way; it goes with them. Counted separately because it is the
+    # surprising half of the blast radius (its `document_id` names another document).
+    anchored = set(_conflicts_anchored_to(conn, document_id)) - cited
+    report.conflicts_deleted = len(cited)
+    report.conflicts_anchored = len(anchored)
     report.conflicts_detached = int(conn.execute(
         "SELECT COUNT(*) AS n FROM conflict WHERE document_id = ? AND status != 'open'",
         (document_id,),
@@ -414,10 +465,13 @@ def remove_document(
         # Children first: foreign_keys=ON with NO ACTION means the document DELETE
         # raises while anything still references it. record_fts is trigger-maintained.
         with conn:
-            conn.execute(
-                "DELETE FROM conflict WHERE document_id = ? AND status = 'open'",
-                (document_id,),
-            )
+            doomed = sorted(cited | anchored)
+            if doomed:
+                placeholders = ", ".join("?" for _ in doomed)
+                conn.execute(
+                    f"DELETE FROM conflict WHERE conflict_id IN ({placeholders})",
+                    doomed,
+                )
             conn.execute(
                 "UPDATE conflict SET document_id = NULL WHERE document_id = ?",
                 (document_id,),
@@ -430,11 +484,12 @@ def remove_document(
                 "DELETE FROM document WHERE document_id = ?", (document_id,)
             )
         if purge_blob and blob is not None:
+            existed = blob.exists()     # don't claim a delete that never happened
             blob.unlink(missing_ok=True)
             try:
                 blob.parent.rmdir()   # drop the 2-char shard dir once it is empty
             except OSError:
                 pass                  # not empty (or gone) - leave it alone
-            report.blob_purged = True
+            report.blob_purged = existed
     report.applied = apply
     return report

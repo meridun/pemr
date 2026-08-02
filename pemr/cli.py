@@ -416,6 +416,7 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
                 "records": report.records,
                 "record_count": report.record_count,
                 "conflicts_deleted": report.conflicts_deleted,
+                "conflicts_anchored": report.conflicts_anchored,
                 "conflicts_detached": report.conflicts_detached,
                 "blob_path": report.blob_path,
                 "blob_purged": report.blob_purged,
@@ -431,14 +432,21 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
         print(f"  records: {report.record_count} total")
         if report.conflicts_deleted:
             print(f"  conflicts deleted (open): {report.conflicts_deleted}")
+        if report.conflicts_anchored:
+            print(
+                "  conflicts deleted (staged against these records): "
+                f"{report.conflicts_anchored}"
+            )
         if report.conflicts_detached:
             print(f"  conflicts detached (resolved): {report.conflicts_detached}")
-        if report.blob_purged:
-            print(f"  blob deleted: {report.blob_path}")
-        elif args.purge_blob:
-            print(f"  blob would be deleted: {report.blob_path}")
-        else:
+        if not args.purge_blob:
             print(f"  blob kept: {report.blob_path}")
+        elif report.blob_purged:
+            print(f"  blob deleted: {report.blob_path}")
+        elif report.applied:
+            print(f"  blob already gone: {report.blob_path}")
+        else:
+            print(f"  blob would be deleted: {report.blob_path}")
         if report.applied:
             print(f"removed document #{report.document_id}")
         else:
