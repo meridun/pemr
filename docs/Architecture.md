@@ -272,13 +272,17 @@ The stored `conflict.dedup_key` is also only the *current* base while the dictio
 still: `rekey` rewrites keys on the record tables and does not touch the `conflict` table,
 so a dictionary edit made while a conflict is open strands it on a base no row carries.
 Resolutions therefore **re-derive** the base from the conflict's own payload under the
-current dictionary (`review-conflicts --dictionary`, mirroring `rekey`) and only fall back
-to the stored key when the derived base has no rows — i.e. when the dictionary changed but
-`rekey` has not run yet, where the stored rows are still the live family. Numbering an
-admitted row on a stale base instead would give it a key not derivable from its own
-columns, which collides the family on the next `rekey` and — because `rekey` is
-all-or-nothing across every table — blocks every later dictionary edit, `document reassign`
-included.
+current dictionary (`review-conflicts --dictionary`, mirroring `rekey`) — but the *staged*
+key still wins whenever it has rows, and the re-derived base is used only when it does not.
+The staged key names the family the conflict was actually staged against; the re-derivation
+exists only for the case where `rekey` has already moved that family off it. Preferring the
+derived base would misfire on a dictionary edit that **fuses two identities**: the derived
+base then holds a different, pre-existing family, and the resolution would overwrite (or
+join) an unrelated record while the conflict's own row went untouched — and `rekey` refuses
+to run in that state, so the database stays there. Conversely, numbering an admitted row on
+a stale base that no row carries would give it a key not derivable from its own columns,
+which collides the family on the next `rekey` and — because `rekey` is all-or-nothing across
+every table — blocks every later dictionary edit, `document reassign` included.
 
 **Intra-payload collisions are rejected, not staged.** Two rows in *one* submission that
 derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
