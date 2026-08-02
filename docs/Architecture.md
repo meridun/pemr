@@ -270,6 +270,10 @@ pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve ...]
+pemr document list [--person <slug>]                     # newest first; omit --person for everyone
+pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
+pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
+pemr document rm <id> [--apply] [--purge-blob]           # delete a document + records; dry run by default
 pemr query labs --person jane --test hba1c --since 2023-01-01
 pemr query meds --person jane --active
 pemr query timeline --person jane --since 2024-01-01     # merged event stream
