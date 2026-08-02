@@ -174,12 +174,65 @@ def test_unusable_name_never_produces_a_false_suspect(full_name):
     in `unverified`, never `suspect`, or every document would refuse."""
     person = Person(person_id=9, slug="short", full_name=full_name)
     assert ingest.name_tokens(full_name) == []
+    # An anchor is present and nobody matched, but we could never have recognised
+    # this person by name, so their absence is ignorance rather than evidence.
     check = ingest.check_owner("Patient: Jane Doe  DOB: 03/14/1962", person, [person])
-    assert check.verdict == "suspect"  # anchor present, nobody matched
-    # ...but with no anchor, absence of a name signal is not evidence:
+    assert check.verdict == "unverified"
+    assert check.blocks is False
+    # ...and with no anchor either, likewise:
     assert ingest.check_owner("routine bloodwork", person, [person]).verdict == (
         "unverified"
     )
+
+
+def test_unusable_name_with_a_dob_is_not_blocked_by_a_dobless_document():
+    """Most documents don't print a DOB; its absence is not evidence of a misfile.
+
+    Regression for the "Michael Vu" case: a two-letter surname erases the name
+    signal, and refusing every DOB-less document would make `ingest` unusable
+    without --force for anyone with a short name.
+    """
+    vu = Person(person_id=9, slug="michael-vu", full_name="Michael Vu", dob="1990-09-09")
+    correctly_named = ingest.check_owner(
+        "Patient: VU, MICHAEL   chest x-ray, two views", vu, [vu]
+    )
+    assert correctly_named.verdict == "unverified"
+    assert correctly_named.blocks is False
+    # the DOB still carries them to a positive verdict when it *is* printed
+    assert ingest.check_owner(
+        "Patient: VU, MICHAEL   DOB: 09/09/1990", vu, [vu]
+    ).verdict == "match"
+
+
+def test_unusable_name_still_bounces_off_another_roster_person():
+    """No name signal weakens `suspect`, not `mismatch`: affirmative evidence that the
+    text names *someone else on the roster* still blocks."""
+    vu = Person(person_id=9, slug="michael-vu", full_name="Michael Vu")
+    check = ingest.check_owner("Patient: DOE, JANE A   DOB: 03/14/1962", vu, [vu, JANE])
+    assert check.verdict == "mismatch"
+    assert check.matched_slug == "jane-doe"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Patient: DOE, JOHN Q   DOB: 23/7/1981",   # day-first, unpadded
+        "Patient: DOE, JOHN Q   DOB: 13/7/1981",
+        "Patient: DOE, JOHN Q   accession 13/7/1981x",
+        "Patient: DOE, JOHN Q   DOB: 03/07/19810",  # trailing digit
+    ],
+)
+def test_dob_needs_digit_boundaries(text):
+    """A candidate rendering that is merely a *substring* of a longer digit run is not
+    a DOB match — otherwise a day-first `23/7/1981` silently verifies a 1981-03-07
+    person and the document is misfiled with an `owner verified` line to reassure."""
+    mike = Person(
+        person_id=9, slug="alex-carter", full_name="Alex Carter",
+        dob="1981-03-07",
+    )
+    check = ingest.check_owner(text, mike, [mike])
+    assert check.verdict == "suspect"
+    assert check.matched_slug is None
 
 
 def test_partial_precision_dob_is_not_a_signal():

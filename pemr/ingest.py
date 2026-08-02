@@ -245,8 +245,14 @@ def _person_matches(person: Person, raw: str, normalized: str) -> bool:
     tokens = name_tokens(person.full_name)
     if tokens and all(f" {tok} " in normalized for tok in tokens):
         return True
-    lowered = raw.lower()
-    return any(cand.lower() in lowered for cand in dob_candidates(person.dob))
+    return any(
+        # Digit boundaries, not a bare substring: without them the unpadded
+        # `M/D/YYYY` rendering is a *tail* of the day-first form, so `23/7/1981`
+        # would "match" a 1981-03-07 person — a silent misfile, the exact failure
+        # this check exists to prevent. Same guard kills accession-number tails.
+        re.search(rf"(?<![0-9]){re.escape(cand)}(?![0-9])", raw, re.IGNORECASE)
+        for cand in dob_candidates(person.dob)
+    )
 
 
 def _evidence(raw: str) -> str | None:
@@ -287,7 +293,15 @@ def check_owner(
             )
 
     evidence = _evidence(text)
-    if evidence is not None:
+    # `suspect` means "this document names somebody, and it isn't you" — a conclusion
+    # only available when we could have recognised the claimed person by name in the
+    # first place. With no usable name signal (a two-letter surname, a mononym), the
+    # claimed person's absence is ignorance, not evidence, so blocking here would
+    # refuse *every* anchored document for them and train the human to pass --force
+    # reflexively. A DOB doesn't rescue it either: most documents simply don't print
+    # one, so its absence proves nothing. `mismatch` above is untouched — affirmative
+    # evidence pointing at another roster person still blocks.
+    if evidence is not None and name_tokens(claimed.full_name):
         return OwnerCheck(verdict="suspect", evidence=evidence)
     return OwnerCheck(verdict="unverified")
 
