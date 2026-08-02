@@ -779,22 +779,33 @@ def _conflict_family(
 ) -> tuple[str, list[sqlite3.Row]]:
     """``(base, rows)`` — the identity family a resolution of this conflict acts on.
 
-    The re-derived base wins whenever it has rows: that is the post-``rekey`` world,
-    and the whole point of deriving. When it is empty and differs from the staged
-    key, the record rows have *not* been rekeyed yet and still sit under the staged
-    key; staying with them keeps an admitted sibling in the same family, so a later
-    ``rekey`` moves the whole family together instead of colliding two rows onto one
-    key.
+    **The staged key wins whenever it still has rows.** ``conflict["dedup_key"]``
+    names the family the conflict was actually staged against, so preferring it is
+    correct by construction. Re-derivation (:func:`_derive_base`) is only needed for
+    the case it was added for — ``rekey`` having moved that family off the staged key
+    — so it applies only when the staged key is empty.
+
+    Preferring the derived base instead would be wrong whenever the derived base
+    holds a *different, pre-existing* family, which is exactly what a dictionary edit
+    that fuses two identities produces (and ``rekey`` refuses to run in that state, so
+    the database stays there): the resolution would overwrite, or join, an unrelated
+    record. The five states this covers:
+
+    * no drift — derived base == staged key, same family either way;
+    * drift with ``rekey`` applied — staged key empty, fall through to the live family;
+    * drift without ``rekey`` — staged key still has the rows, stay with them so a
+      later ``rekey`` moves the whole family together instead of colliding two rows;
+    * fusing drift — staged key still has the rows, so the conflict's own anchor wins
+      over the unrelated family sitting on the derived base;
+    * family fully removed — both empty, and :func:`_anchor_row` refuses.
     """
     record_type = conflict["record_type"]
     base = _derive_base(conflict, dictionary)
-    family = load_family(conn, record_type, base)
-    if family or base == conflict["dedup_key"]:
-        return base, family
-    stale = load_family(conn, record_type, conflict["dedup_key"])
-    if stale:
-        return conflict["dedup_key"], stale
-    return base, []
+    if base != conflict["dedup_key"]:
+        staged = load_family(conn, record_type, conflict["dedup_key"])
+        if staged:
+            return conflict["dedup_key"], staged
+    return base, load_family(conn, record_type, base)
 
 
 def _anchor_row(
@@ -988,7 +999,8 @@ def _overwrite_record(
 
     Primary key, not ``dedup_key``: see :func:`_anchor_row`. A zero-row UPDATE is an
     error, never a silent success - it would discard the incoming row while the
-    conflict is marked resolved.
+    conflict is marked resolved. The guard only catches *no* row, not the *wrong*
+    row; picking the right one is :func:`_conflict_family`'s job.
     """
     assignments = ["document_id = ?"]
     values: list[object] = [document_id]

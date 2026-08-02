@@ -438,6 +438,85 @@ def test_keep_both_before_rekey_stays_with_the_stored_family(conn, repeat_draw):
     assert len(report.changes) == 2
 
 
+# --- fusing drift: the derived base holds someone *else's* family --------------
+#
+# A dictionary edit that maps two distinct analytes onto one canonical name puts an
+# unrelated, pre-existing family on the base a conflict re-derives to. `rekey` refuses
+# to run in that state, so the database stays there. The conflict's own staged key must
+# win whenever it still has rows, or a resolution acts on the wrong record.
+
+_FUSED = {"a1c": "hba1c"}
+
+
+def _named(test_name, value):
+    return {"test_name": test_name, "collected_at": "2026-01-02", "value_num": value}
+
+
+@pytest.fixture()
+def fused(conn):
+    """Two distinct identities — `a1c` (one row) and `hba1c` (two occurrences) — plus
+    an open conflict staged against the *a1c* row, under a dictionary that fuses the
+    two names. The families are deliberately different sizes so every assertion below
+    names which one was read."""
+    dedup.commit_extraction(conn, _doc(conn, "fuse-a"),
+                            {"lab_result": [_named("a1c", 5.7)]})
+    dedup.commit_extraction(conn, _doc(conn, "fuse-b"),
+                            {"lab_result": [_named("hba1c", 9.9)]})
+    dedup.commit_extraction(conn, _doc(conn, "fuse-c"),
+                            {"lab_result": [_named("hba1c", 10.4)]})
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"],
+                           keep="both")               # hba1c family: occurrences 0, 1
+    summary = dedup.commit_extraction(conn, _doc(conn, "fuse-d"),
+                                      {"lab_result": [_named("a1c", 6.2)]})
+    assert summary.counts["conflict"] == 1
+
+    conflict = dedup.list_conflicts(conn)[0]
+    a1c, hba1c = conn.execute(
+        "SELECT * FROM lab_result ORDER BY lab_result_id"
+    ).fetchall()[:2]
+    # The premise: under _FUSED the conflict re-derives onto the *hba1c* family's base,
+    # while its own staged key still names the a1c row.
+    assert conflict["dedup_key"] == a1c["dedup_base"] != hba1c["dedup_base"]
+    assert dedup._derive_base(conflict, _FUSED) == hba1c["dedup_base"]
+    with pytest.raises(dedup.RekeyCollisionError):
+        dedup.rekey(conn, _FUSED)          # the state itself: rekey cannot clear it
+    return conflict["conflict_id"]
+
+
+def test_keep_incoming_under_fusing_drift_overwrites_the_conflicts_own_row(conn, fused):
+    """Regression: preferring the re-derived base overwrote an unrelated `hba1c`
+    result — destroying a real value and reprovenancing it — while the row the operator
+    asked to overwrite stayed untouched, all at rc 0."""
+    result = dedup.resolve_conflict(conn, fused, keep="incoming", dictionary=_FUSED)
+
+    rows = conn.execute("SELECT * FROM lab_result ORDER BY lab_result_id").fetchall()
+    assert [(r["test_name"], r["value_num"]) for r in rows] == [
+        ("a1c", 6.2), ("hba1c", 9.9), ("hba1c", 10.4),
+    ]
+    assert result.row_id == rows[0]["lab_result_id"]
+    assert [r["document_id"] for r in rows[1:]] == [2, 3]   # bystanders' provenance
+
+
+def test_keep_both_under_fusing_drift_joins_the_staged_family(conn, fused):
+    """The admitted repeat belongs to the identity the conflict was staged against,
+    not to the unrelated family the fused name points at."""
+    result = dedup.resolve_conflict(conn, fused, keep="both", dictionary=_FUSED)
+
+    rows = conn.execute("SELECT * FROM lab_result ORDER BY lab_result_id").fetchall()
+    assert len(rows) == 4
+    a1c, hba1c, admitted = rows[0], rows[1], rows[3]
+    assert admitted["dedup_base"] == a1c["dedup_base"] != hba1c["dedup_base"]
+    assert (result.occurrence, admitted["dedup_occurrence"]) == (1, 1)
+    assert [r["value_num"] for r in rows[1:3]] == [9.9, 10.4]     # untouched
+
+
+def test_conflict_occurrences_under_fusing_drift_counts_the_staged_family(conn, fused):
+    """The listing hint counted the unrelated family (2) instead of the conflict's
+    own (1)."""
+    conflict = dedup.list_conflicts(conn)[0]
+    assert dedup.conflict_occurrences(conn, conflict, _FUSED) == 1
+
+
 def test_keep_existing_and_incoming_still_return_a_result(conn, staged):
     """Source compatibility: the return type changed from None, but the older
     resolutions still add no row."""
