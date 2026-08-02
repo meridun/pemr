@@ -258,6 +258,16 @@ commit of an already-admitted draw from forking again. `dedup_base` is denormali
 purpose: the family is one indexed lookup instead of probing `hash(base|1)`, `hash(base|2)`
 … which breaks on holes when a sibling is removed.
 
+**A conflict's key is the family base, not a row's key.** `conflict.dedup_key` always
+holds the `dedup_base`, and the conflict is anchored to the family's lowest surviving
+occurrence. Resolutions therefore address that row by **primary key** — never by
+`WHERE dedup_key = conflict.dedup_key`. Once occurrence 0 is gone (`document rm` or
+`document reassign` of the document that owned it) the anchor's own key is
+`hash(base | n)`, so a key-targeted write would match nothing while the conflict was
+stamped `resolved`, silently discarding the staged value. If nothing is left in the family
+at all, `keep incoming` **refuses** rather than reporting a success that wrote nothing;
+`keep both` still admits the staged row, at occurrence 0.
+
 **Intra-payload collisions are rejected, not staged.** Two rows in *one* submission that
 derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
 the identity and the recovery path. A conflict whose "existing" side was inserted
