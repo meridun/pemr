@@ -41,7 +41,12 @@ _SIDECAR_SUFFIXES = ("-wal", "-shm")
 
 
 class RestoreError(RuntimeError):
-    """A restore could not be performed. The live database is left as it was."""
+    """A restore could not be performed.
+
+    Every failure path up to and including the install leaves the live database
+    exactly as it was. The single exception is a stale sidecar that will not delete
+    *after* a successful install; that message says so explicitly and names the file.
+    """
 
 
 @dataclass
@@ -134,6 +139,24 @@ def _sidecars(db_path: Path) -> list[Path]:
     return [db_path.with_name(db_path.name + suffix) for suffix in _SIDECAR_SUFFIXES]
 
 
+def _rescue_name(rescue_dir: Path, now: datetime) -> str:
+    """A free rescue filename, still outside :data:`backup._SNAPSHOT_RE`.
+
+    ``backup.snapshot(name=...)`` deliberately has no collision fallback, so two
+    ``restore --force`` runs inside one wall-clock second would otherwise abort with
+    "could not take a rescue copy" - fail-safe, but mid-incident that reads as the
+    restore mechanism itself being broken. The ``-2``/``-3`` suffix keeps the name off
+    the rotation pattern just as the second-precision stamp does.
+    """
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    candidate = f"{RESCUE_PREFIX}{stamp}.sqlite"
+    counter = 2
+    while (rescue_dir / candidate).exists():
+        candidate = f"{RESCUE_PREFIX}{stamp}-{counter}.sqlite"
+        counter += 1
+    return candidate
+
+
 def restore(
     snapshot_spec: str,
     db_path: str | Path,
@@ -173,20 +196,21 @@ def restore(
         # Rescue copies land next to the other snapshots; if no backup dir is
         # configured, the snapshot's own directory is the obvious fallback.
         rescue_dir = Path(backup_dir) if backup_dir is not None else snapshot.parent
-        stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
         try:
             rescue, _ = backup.snapshot(
-                db_path, rescue_dir, name=f"{RESCUE_PREFIX}{stamp}.sqlite"
+                db_path, rescue_dir, name=_rescue_name(rescue_dir, now or datetime.now())
             )
         except backup.BackupError as exc:
             raise RestoreError(
-                f"aborted: could not take a rescue copy of {db_path}: {exc}"
+                f"aborted before touching {db_path}: no rescue copy of it could be "
+                f"written to {rescue_dir}: {exc}. The live database is unchanged - "
+                "move it aside and re-run (restoring onto an absent database needs no "
+                "--force)."
             ) from exc
         result.rescue = rescue
 
-    # 4/5. Stage the copy first, then clear sidecars and swap it in atomically.
-    # Staging before any deletion means a failed copy destroys nothing; os.replace on
-    # the same filesystem means a crash mid-install never leaves a half-written DB.
+    # 4. Stage the copy first: a failed copy then destroys nothing (under the reverse
+    # order a copy failure would leave the operator with no live database at all).
     tmp = db_path.with_name(db_path.name + ".restore-tmp")
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,17 +220,33 @@ def restore(
     except OSError as exc:
         raise RestoreError(f"cannot stage {snapshot} next to {db_path}: {exc}") from exc
 
+    # 5. Install atomically - same filesystem, so a crash mid-install can never leave
+    # a half-written database in place.
     try:
-        for sidecar in _sidecars(db_path):
-            if sidecar.exists():
-                sidecar.unlink()
-                result.cleared_sidecars.append(sidecar)
         os.replace(tmp, db_path)
     except OSError as exc:
         backup._unlink_quietly(tmp)
         raise RestoreError(f"cannot install {snapshot} as {db_path}: {exc}") from exc
 
-    # 6/7. Migrate forward (a snapshot older than the code is the normal case), then
+    # 6. Only now clear the sidecars. A stale `-wal` holds committed-but-uncheckpointed
+    # transactions, so deleting it on a path that then fails to install would be the
+    # one way this code loses data; doing it after the swap makes "every abort leaves
+    # the live database as it was" true by construction. Nothing opens the database in
+    # between, so SQLite never sees the restored file next to a foreign WAL.
+    for sidecar in _sidecars(db_path):
+        if not sidecar.exists():
+            continue
+        try:
+            sidecar.unlink()
+        except OSError as exc:
+            raise RestoreError(
+                f"restored {db_path} from {snapshot}, but the stale sidecar "
+                f"{sidecar.name} could not be removed: {exc}. Delete it by hand before "
+                "opening the database - SQLite may otherwise replay it over the restore."
+            ) from exc
+        result.cleared_sidecars.append(sidecar)
+
+    # 7/8. Migrate forward (a snapshot older than the code is the normal case), then
     # report on what landed.
     conn = db.connect(db_path)
     try:

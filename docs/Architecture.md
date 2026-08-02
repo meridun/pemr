@@ -371,22 +371,30 @@ and a command is testable (§5, "the tested engine"):
 3. **Rescue copy.** With `--force`, the current database is snapshotted to
    `pemr-prerestore-YYYYMMDD-HHMMSS.sqlite` *before* anything is overwritten; if that
    fails, the restore aborts. Restore is therefore non-destructive by construction.
-4. **Clear the sidecars.** `pemr.db-wal` / `pemr.db-shm` are deleted, so SQLite cannot
-   replay a stale WAL over the restored file.
-5. **Install atomically.** Staged as `pemr.db.restore-tmp` in the destination directory,
-   then `os.replace`d — a crash mid-install never leaves a half-written database.
+4. **Install atomically.** Staged as `pemr.db.restore-tmp` in the destination directory,
+   then `os.replace`d — a crash mid-install never leaves a half-written database, and a
+   failed *copy* has destroyed nothing.
+5. **Clear the sidecars**, and only now. `pemr.db-wal` / `pemr.db-shm` are deleted, so
+   SQLite cannot replay a stale WAL over the restored file. Deliberately after the
+   install rather than before: a stale `-wal` holds committed-but-uncheckpointed
+   transactions, so deleting it on a path that then failed to install would be the one
+   way this command could lose data. Nothing opens the database in between.
 6. **Migrate.** A snapshot older than the code is the *normal* case; making the operator
    remember this step is exactly the trap.
 7. **Verify.** Prints the `pemr verify` report: integrity, migrations, per-table row
    counts, and blob resolution.
+
+Every abort path up to and including step 4 leaves the live database exactly as it was.
 
 `pemr verify` runs step 7 on its own, any time. Blob checking is exact rather than
 heuristic — `document` stores both `sha256` and a relative content-addressed
 `source_path`, so verify resolves `sources_dir/source_path`, re-hashes, and reports
 *missing* separately from *mismatched* (a corrupted blob is a different problem from an
 unsynced one). Blob problems are a **warning at rc=0** during restore: the database
-restore genuinely succeeded, and `sources/` may simply be mid-sync. `verify` reports,
-it never repairs.
+restore genuinely succeeded, and `sources/` may simply be mid-sync. Standalone `pemr
+verify` is the opposite — it exits **1** whenever the report lists a problem, in `--json`
+mode exactly as in console mode, because `--json` is the mode a monitoring job picks and
+the exit code is what such a job checks. `verify` reports, it never repairs.
 
 **`migrate` will not create a database.** Before this existed, a user whose `pemr.db`
 had vanished was told `run pemr migrate first` by every read command — and following
@@ -396,6 +404,15 @@ next `pemr backup` snapshotted it and rotation could prune the real snapshots. `
 now refuses when there is no database (or a zero-byte one) and points at
 `pemr restore latest`; `pemr migrate --create` is the explicit bootstrap for a genuinely
 new archive.
+
+**And an empty database is not a backup source.** Closing the `migrate` route above only
+closed the first link of that chain — a zero-byte or schema-less `pemr.db` arriving any
+other way (an interrupted copy, cloud-sync debris, `type nul > pemr.db`) would still have
+been snapshotted happily, because `VACUUM INTO` on an empty file produces a structurally
+valid, integrity-clean 4 KB database that rotation then treats as the newest snapshot of
+the day. `pemr backup` therefore refuses a database that does not exist, is zero bytes,
+or has no pemr schema, *before* writing anything — so rotation is never reached and the
+real snapshots survive.
 
 ### What backups do not protect you from
 

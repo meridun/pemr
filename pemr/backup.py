@@ -74,7 +74,14 @@ def integrity_check(path: str | Path) -> str:
 
     A file that will not even open as SQLite reports the sqlite error text, so callers
     have a single string to test against ``"ok"``.
+
+    A path that does not exist is a failure, not ``"ok"``: ``sqlite3.connect`` creates
+    eagerly and an empty database passes ``integrity_check``, so without this guard the
+    function would answer "healthy" *and* leave behind the zero-byte debris that
+    :func:`pemr.db.database_exists` exists to reject.
     """
+    if not Path(path).is_file():
+        return f"no such file: {path}"
     try:
         conn = sqlite3.connect(path)
         try:
