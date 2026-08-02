@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, mcp_server, persons
+from pemr import __version__, db, dedup, mcp_server, persons
 
 REPO = Path(__file__).resolve().parent.parent
 DICT_PATH = REPO / "data" / "dictionary.example.toml"
@@ -340,3 +340,15 @@ def test_registered_tool_names_equal_contract():
     server = mcp_server.build_server()
     registered = {t.name for t in server._tool_manager.list_tools()}
     assert registered == set(mcp_server.TOOL_NAMES)
+
+
+def test_server_info_advertises_pemr_version():
+    """`serverInfo` must report pemr's version, not the `mcp` SDK's (#60).
+
+    Asserted on the initialize options the server actually puts on the wire, so this
+    also catches an SDK change to how the version is resolved.
+    """
+    pytest.importorskip("mcp")
+    opts = mcp_server.build_server()._mcp_server.create_initialization_options()
+    assert opts.server_name == "pemr"
+    assert opts.server_version == __version__
