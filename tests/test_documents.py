@@ -471,7 +471,7 @@ def _run(tmp_path, *argv):
 @pytest.fixture()
 def cli_ready(tmp_path):
     """Migrated DB, two people, one ingested+committed document owned by jane."""
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane") == 0
     assert _run(tmp_path, "person", "add", "--slug", "john-doe", "--name", "John") == 0
     scan = tmp_path / "scan.txt"
@@ -487,7 +487,7 @@ def cli_ready(tmp_path):
 
 
 def test_cli_document_list_empty(tmp_path, capsys):
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     capsys.readouterr()
     assert _run(tmp_path, "document", "list") == 0
     assert "no documents yet" in capsys.readouterr().out

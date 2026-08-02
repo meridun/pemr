@@ -20,7 +20,7 @@ def _run(tmp_path, *argv):
 @pytest.fixture()
 def ready(tmp_path):
     """Migrated DB + jane with a med, an abnormal lab and one upcoming appointment."""
-    assert _run(tmp_path, "migrate") == 0
+    assert _run(tmp_path, "migrate", "--create") == 0
     assert _run(tmp_path, "person", "add", "--slug", "jane-doe",
                 "--name", "Jane Doe", "--dob", "1980-01-01") == 0
     conn = db.connect(tmp_path / "cli.db")
@@ -88,7 +88,9 @@ def test_render_unknown_appointment_is_friendly_rc1(ready, capsys):
     assert "99999" in capsys.readouterr().err
 
 
-def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys):
+def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
+    # Schema-less DB file, not an absent one - see issue #55's missing-database gate.
+    unmigrated_db(tmp_path / "cli.db")
     rc = _run(tmp_path, "render", "summary", "--person", "jane-doe")
     assert rc == 1
     assert "migrate" in capsys.readouterr().err
