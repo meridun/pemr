@@ -36,7 +36,11 @@ ALL_MIGRATIONS = [
     "002_conflict.sql",
     "003_fts.sql",
     "004_person_deactivate.sql",
+    "005_dedup_occurrence.sql",
 ]
+
+# Every record table carries the occurrence-family columns (migration 005).
+RECORD_TABLES = ("lab_result", "medication", "procedure", "appointment", "observation")
 
 
 def test_migrate_creates_all_tables(conn):
@@ -65,6 +69,25 @@ def test_person_has_deactivated_at_column(conn):
     db.migrate(conn)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(person)").fetchall()}
     assert "deactivated_at" in cols
+
+
+def test_record_tables_have_occurrence_columns(conn):
+    db.migrate(conn)
+    for table in RECORD_TABLES:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        assert {"dedup_base", "dedup_occurrence"} <= cols, table
+
+
+def test_occurrence_defaults_to_zero_for_a_bare_insert(conn):
+    """A row written without naming the column is occurrence 0 - the pre-005 shape."""
+    db.migrate(conn)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO lab_result (person_id, test_name, collected_at, dedup_key) "
+        "VALUES (1, 'hba1c', '2026-01-01', 'k1')"
+    )
+    row = conn.execute("SELECT dedup_occurrence FROM lab_result").fetchone()
+    assert row["dedup_occurrence"] == 0
 
 
 def test_multi_statement_migration_rolls_back_partial_ddl(conn, tmp_path):

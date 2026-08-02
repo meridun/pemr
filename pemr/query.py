@@ -132,7 +132,9 @@ def query_labs(
     if since:
         sql += " AND date(collected_at) >= date(?)"
         params.append(since)
-    sql += " ORDER BY collected_at, test_name"
+    # Row id breaks same-timestamp ties: `--keep both` admits a second draw under the
+    # same date, and "later row id = later point" keeps the order deterministic.
+    sql += " ORDER BY collected_at, test_name, lab_result_id"
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     if test:
         target = norm(test, dictionary)

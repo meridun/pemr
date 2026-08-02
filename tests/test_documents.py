@@ -278,12 +278,15 @@ def test_reassign_refused_when_another_document_conflicts_with_its_rows(seeded):
 
 
 def test_reassign_refusal_lists_a_two_ended_conflict_once(seeded):
-    """A conflict raised by *and* anchored to the same document (two colliding rows in
-    one extraction) appears once in the refusal, not twice."""
+    """A conflict raised by *and* anchored to the same document (a re-commit against the
+    same document collides with the row it already produced) appears once in the
+    refusal, not twice."""
     conn = seeded["conn"]
     other = _insert_document(conn, seeded["jane"].person_id, "dd99")
-    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+    dedup.commit_extraction(conn, other, {"lab_result": [
         {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 88},
+    ]})
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
         {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 99},
     ]})
     assert summary.counts["conflict"] == 1
@@ -291,6 +294,37 @@ def test_reassign_refusal_lists_a_two_ended_conflict_once(seeded):
     with pytest.raises(documents.OpenConflictsError) as exc:
         documents.reassign_document(conn, other, "john-doe", apply=True)
     assert str(exc.value).count("#1") == 1
+
+
+def test_reassign_moves_a_keep_both_family_intact(seeded):
+    """A row admitted by `review-conflicts --keep both` is occurrence >0 of its family:
+    its key hashes the base together with that stored occurrence, so a move has to carry
+    the occurrence (else the recompute reads as dictionary drift) and re-derive both
+    dedup_key and dedup_base under the new owner."""
+    conn = seeded["conn"]
+    doc = _insert_document(conn, seeded["john"].person_id, "ff77ee88")
+    draw = {"test_name": "glucose", "collected_at": "2024-04-01"}
+    dedup.commit_extraction(conn, doc, {"lab_result": [draw | {"value_num": 95}]})
+    dedup.commit_extraction(conn, doc, {"lab_result": [draw | {"value_num": 148}]})
+    conflict_id = dedup.list_conflicts(conn)[0]["conflict_id"]
+    dedup.resolve_conflict(conn, conflict_id, keep="both")
+
+    report = documents.reassign_document(conn, doc, "jane-doe", apply=True)
+    assert len(report.changes) == 2
+
+    rows = conn.execute(
+        "SELECT * FROM lab_result WHERE test_name = 'glucose' ORDER BY lab_result_id"
+    ).fetchall()
+    assert [r["person_id"] for r in rows] == [seeded["jane"].person_id] * 2
+    assert [r["dedup_occurrence"] for r in rows] == [0, 1]
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]      # family stayed together
+    assert rows[0]["dedup_key"] == rows[0]["dedup_base"]       # occurrence 0
+    assert rows[1]["dedup_key"] == dedup.occurrence_key(rows[1]["dedup_base"], 1)
+    # Keys are Jane's now, and the family still dedups a re-commit of the admitted draw.
+    summary = dedup.commit_extraction(
+        conn, seeded["doc"], {"lab_result": [draw | {"value_num": 148}]}
+    )
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
 
 
 def test_reassign_refused_on_dictionary_drift(seeded):
@@ -393,8 +427,10 @@ def test_rm_counts_a_two_ended_conflict_once(seeded):
     only, and deleted exactly once."""
     conn = seeded["conn"]
     other = _insert_document(conn, seeded["jane"].person_id, "dd99")
-    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+    dedup.commit_extraction(conn, other, {"lab_result": [
         {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 88},
+    ]})
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
         {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 99},
     ]})
     assert summary.counts["conflict"] == 1

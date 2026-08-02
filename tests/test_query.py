@@ -385,6 +385,22 @@ def test_trends_distinct_intraday_times_are_not_a_tie(seeded):
     assert t["latest"] == 5.4 and t["latest_tie"] == 1
 
 
+def test_query_labs_same_date_siblings_order_by_row_id(seeded):
+    """`--keep both` (#58) admits a second draw under the same date, so
+    `collected_at, test_name` no longer totally orders lab rows. Row id breaks the
+    tie: the later-admitted sibling reads as the later point."""
+    first = _insert_lab(seeded, "jane-doe", test_name="Glucose", value_num=95.0,
+                        unit="mg/dL", collected_at="2024-04-01")
+    second = _insert_lab(seeded, "jane-doe", test_name="Glucose", value_num=148.0,
+                         unit="mg/dL", collected_at="2024-04-01")
+    same_day = [
+        r for r in query.query_labs(seeded, "jane-doe")
+        if r["collected_at"] == "2024-04-01"
+    ]
+    assert [r["lab_result_id"] for r in same_day] == [first, second]
+    assert [r["value_num"] for r in same_day] == [95.0, 148.0]
+
+
 # --- error surfaces -----------------------------------------------------------
 
 def test_unknown_person_raises(seeded):

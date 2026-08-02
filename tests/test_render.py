@@ -191,6 +191,24 @@ def test_summary_abnormal_lab_selection(seeded):
     assert section.index("Glucose") < section.index("LDL")
 
 
+def test_summary_same_date_lab_siblings_order_by_row_id(seeded):
+    """A `--keep both` sibling (#58) shares its date with the row it was admitted
+    beside, so newest-first ordering needs a row-id tiebreak to stay deterministic:
+    the later-admitted row reads as the later point."""
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(seeded, _doc(seeded, "jane-doe"), {"lab_result": [
+        {"test_name": "Glucose, fasting", "collected_at": "2026-01-01",
+         "value_num": 320, "unit": "mg/dL", "ref_high": 100},
+    ]}, d)
+    conflict_id = dedup.list_conflicts(seeded)[0]["conflict_id"]
+    admitted = dedup.resolve_conflict(seeded, conflict_id, keep="both")
+    assert admitted.occurrence == 1
+
+    md = render.render_summary(seeded, "jane-doe", dictionary=d)
+    section = md.split("## Recent Abnormal Labs")[1].split("##")[0]
+    assert section.index("320.0") < section.index("200.0")
+
+
 def test_summary_upcoming_and_open_appointments(seeded):
     md = render.render_summary(seeded, "jane-doe")
     section = md.split("## Upcoming / Open Appointments")[1]
