@@ -5,6 +5,7 @@ abnormal-lab selection, latest-vitals pick, brief scoping, journal ordering + pr
 footnotes, ASCII output (cp1252/cp437 console lesson), and the read-only guarantee
 (no row-count change after any render)."""
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,35 @@ def test_summary_active_meds_only(seeded):
     md = render.render_summary(seeded, "jane-doe")
     assert "Metformin 500mg BID (since 2024-02-01)" in md
     assert "Lisinopril" not in md  # ended med excluded from the active list
+
+
+def _seed_expired_active_course(conn):
+    """A finished 2024 antibiotic course transcribed with status='active' (issue #57)."""
+    dedup.commit_extraction(conn, _doc(conn, "jane-doe"), {
+        "medication": [
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-01-01", "ended_on": "2024-01-10", "status": "active"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def test_summary_excludes_expired_course_labelled_active(seeded):
+    """Issue #57: a stale 'active' label must not keep a 2024 course in the summary --
+    and `now` has to reach the currency test, not just the generated-at stamp."""
+    _seed_expired_active_course(seeded)
+    md = render.render_summary(seeded, "jane-doe", now=datetime(2026, 8, 2, 9, 30))
+    assert "Amoxicillin" not in md
+    assert "Metformin" in md  # control: genuinely current med still listed
+
+
+def test_brief_excludes_expired_course_labelled_active(seeded):
+    """Same for the brief -- the document actually handed to a clinician (issue #57)."""
+    _seed_expired_active_course(seeded)
+    md = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), now=datetime(2026, 8, 2, 9, 30)
+    )
+    assert "Amoxicillin" not in md
+    assert "Metformin" in md
 
 
 def test_summary_conditions_and_allergies(seeded):
