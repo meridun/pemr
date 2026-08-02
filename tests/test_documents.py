@@ -248,6 +248,51 @@ def test_reassign_refused_while_a_conflict_is_open(seeded):
     assert "review-conflicts" in str(exc.value)
 
 
+def test_reassign_refused_when_another_document_conflicts_with_its_rows(seeded):
+    """A conflict has two ends. ``conflict.document_id`` names the document whose
+    *incoming* row lost; the ``dedup_key`` anchors it to the *stored* row, which a
+    different document owns. Reassigning that owner re-derives the key out from under
+    the conflict, and a later `keep incoming` then writes nothing, silently (#54 audit).
+    """
+    conn = seeded["conn"]
+    other = _insert_document(conn, seeded["jane"].person_id, "ee55")
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 7.4,
+         "unit": "%"},
+    ]})
+    assert summary.counts["conflict"] == 1
+    # The conflict cites `other`, NOT the document being moved - that is the point.
+    assert conn.execute(
+        "SELECT document_id FROM conflict WHERE conflict_id = 1"
+    ).fetchone()["document_id"] == other
+
+    with pytest.raises(documents.OpenConflictsError) as exc:
+        documents.reassign_document(conn, seeded["doc"], "john-doe", apply=True)
+    assert "#1" in str(exc.value) and "review-conflicts" in str(exc.value)
+    assert conn.execute(
+        "SELECT person_id FROM document WHERE document_id = ?", (seeded["doc"],)
+    ).fetchone()["person_id"] == seeded["jane"].person_id
+    assert [r["person_id"] for r in conn.execute(
+        "SELECT person_id FROM lab_result"
+    ).fetchall()] == [seeded["jane"].person_id]
+
+
+def test_reassign_refusal_lists_a_two_ended_conflict_once(seeded):
+    """A conflict raised by *and* anchored to the same document (two colliding rows in
+    one extraction) appears once in the refusal, not twice."""
+    conn = seeded["conn"]
+    other = _insert_document(conn, seeded["jane"].person_id, "dd99")
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 88},
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 99},
+    ]})
+    assert summary.counts["conflict"] == 1
+
+    with pytest.raises(documents.OpenConflictsError) as exc:
+        documents.reassign_document(conn, other, "john-doe", apply=True)
+    assert str(exc.value).count("#1") == 1
+
+
 def test_reassign_refused_on_dictionary_drift(seeded):
     conn = seeded["conn"]
     # Keys were committed with no dictionary; this one renames the stored analyte,
@@ -319,6 +364,46 @@ def test_rm_deletes_open_conflicts_and_detaches_resolved_ones(seeded):
     ).fetchone()["n"] == 0
 
 
+def test_rm_reports_and_deletes_conflicts_staged_against_its_rows(seeded):
+    """The blast radius is `rm`'s only safety mechanism (dry run by default, no
+    --yes), so it has to count the conflicts anchored to the rows being destroyed -
+    not just the ones this document raised (#54 audit)."""
+    conn = seeded["conn"]
+    other = _insert_document(conn, seeded["jane"].person_id, "ee55")
+    dedup.commit_extraction(conn, other, {"lab_result": [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 7.4},
+    ]})
+
+    dry = documents.remove_document(conn, seeded["doc"])
+    assert (dry.conflicts_deleted, dry.conflicts_anchored) == (0, 1)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM conflict WHERE status = 'open'"
+    ).fetchone()["n"] == 1          # dry run wrote nothing
+
+    applied = documents.remove_document(conn, seeded["doc"], apply=True)
+    assert (applied.conflicts_deleted, applied.conflicts_anchored) == (0, 1)
+    assert conn.execute("SELECT COUNT(*) AS n FROM conflict").fetchone()["n"] == 0
+    # ...so the orphaned conflict can no longer resolve to a silent no-op.
+    with pytest.raises(ValueError):
+        dedup.resolve_conflict(conn, 1, keep="incoming")
+
+
+def test_rm_counts_a_two_ended_conflict_once(seeded):
+    """Raised by and anchored to the same document: counted on the `document_id` side
+    only, and deleted exactly once."""
+    conn = seeded["conn"]
+    other = _insert_document(conn, seeded["jane"].person_id, "dd99")
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 88},
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 99},
+    ]})
+    assert summary.counts["conflict"] == 1
+
+    report = documents.remove_document(conn, other, apply=True)
+    assert (report.conflicts_deleted, report.conflicts_anchored) == (1, 0)
+    assert conn.execute("SELECT COUNT(*) AS n FROM conflict").fetchone()["n"] == 0
+
+
 def test_rm_keeps_the_blob_by_default(seeded, tmp_path):
     conn = seeded["conn"]
     sources = tmp_path / "sources"
@@ -353,6 +438,17 @@ def test_rm_purge_blob_unlinks_the_scan(seeded, tmp_path):
     assert report.blob_purged is True
     assert not blob.exists()
     assert not blob.parent.exists()      # empty shard dir cleaned up
+
+
+def test_rm_purge_blob_does_not_claim_a_delete_that_never_happened(seeded, tmp_path):
+    """`unlink(missing_ok=True)` on an already-missing blob is fine, but reporting it
+    as deleted is not (#54 audit, non-blocking item 3)."""
+    conn = seeded["conn"]
+    report = documents.remove_document(
+        conn, seeded["doc"], sources_dir=tmp_path / "sources",
+        purge_blob=True, apply=True,
+    )
+    assert report.applied is True and report.blob_purged is False
 
 
 def test_rm_purge_blob_without_a_sources_dir_is_refused(seeded):
@@ -484,6 +580,45 @@ def test_cli_document_rm_purge_blob(cli_ready, capsys):
                 "--sources", str(sources)) == 0
     assert "blob deleted" in capsys.readouterr().out
     assert not blobs[0].exists()
+
+
+def test_cli_document_rm_reports_conflicts_staged_against_its_rows(cli_ready, capsys):
+    scan2 = cli_ready / "scan2.txt"
+    scan2.write_bytes(b"hba1c 7.4 percent")
+    assert _run(cli_ready, "ingest", str(scan2), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources"),
+                "--ocr-text-file", str(scan2)) == 0
+    payload = cli_ready / "extract2.json"
+    payload.write_text(json.dumps({"lab_result": [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 7.4,
+         "unit": "%"},
+    ]}), encoding="utf-8")
+    assert _run(cli_ready, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "rm", "1") == 0
+    out = capsys.readouterr().out
+    assert "conflicts deleted (staged against these records): 1" in out
+    assert out.isascii(), repr(out)
+    out.encode("cp437")
+
+    # reassign refuses the same case rather than deleting anything.
+    assert _run(cli_ready, "document", "reassign", "1", "--person", "john-doe",
+                "--apply") == 1
+    assert "review-conflicts" in capsys.readouterr().err
+
+
+def test_cli_document_rm_purge_blob_already_gone(cli_ready, capsys):
+    sources = cli_ready / "sources"
+    for blob in [p for p in sources.rglob("*") if p.is_file()]:
+        blob.unlink()
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "rm", "1", "--apply", "--purge-blob",
+                "--sources", str(sources)) == 0
+    out = capsys.readouterr().out
+    assert "blob already gone" in out and "blob deleted" not in out
+    assert out.isascii(), repr(out)
 
 
 def test_cli_document_rm_unknown_id_fails(cli_ready, capsys):
