@@ -404,6 +404,16 @@ def test_verify_json_and_skipped_blob_pass(tmp_path, capsys, monkeypatch):
     assert payload["migrations"]
 
 
+def test_verify_on_unmigrated_db_is_not_ok(tmp_path, capsys, unmigrated_db):
+    """A schema-less file is a real problem, even though integrity_check says ok."""
+    db_path = unmigrated_db(tmp_path / "pemr.db")
+    capsys.readouterr()
+    rc = _run(db_path, "verify", "--sources", str(tmp_path / "sources"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no schema applied" in out
+
+
 def test_verify_report_caps_displayed_problems(tmp_path):
     report = verify.VerifyReport(integrity="ok")
     report.problems = [f"problem {i}" for i in range(verify.PROBLEM_DISPLAY_LIMIT + 5)]

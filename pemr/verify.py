@@ -57,12 +57,14 @@ class VerifyReport:
 
     @property
     def ok(self) -> bool:
-        """True when nothing needs a human: schema intact and every blob resolved."""
-        return (
-            self.integrity == "ok"
-            and self.blobs_missing == 0
-            and self.blobs_mismatched == 0
-        )
+        """True when nothing needs a human.
+
+        Every failure this module knows about appends to :attr:`problems` - failed
+        integrity, an un-migrated database, a missing or mismatched blob - so that list
+        is the single source of truth. A *skipped* blob pass is deliberately not a
+        problem: unconfigured or mid-sync `sources/` must not fail a restore.
+        """
+        return not self.problems
 
     def as_dict(self) -> dict:
         return {
