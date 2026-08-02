@@ -397,7 +397,9 @@ def remove_document(
         sha256=doc["sha256"],
         source_path=doc["source_path"],
         records=_record_counts(conn, document_id),
-        blob_path=str(blob) if blob is not None else doc["source_path"],
+        # No sources dir configured -> report the store-relative path, the same
+        # `sources/<shard>/<sha>.<ext>` form `pemr ingest` echoes.
+        blob_path=str(blob) if blob is not None else f"sources/{doc['source_path']}",
     )
     report.conflicts_deleted = int(conn.execute(
         "SELECT COUNT(*) AS n FROM conflict WHERE document_id = ? AND status = 'open'",
