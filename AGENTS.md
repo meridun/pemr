@@ -153,6 +153,10 @@ Agents never resolve staged conflicts silently.
 - The listing reports `occurrences` — how many rows already sit under that identity. More than one
   means a repeat was admitted before, so check whether the incoming row is a re-read of one of them
   before proposing anything.
+- `keep incoming` overwrites the stored row the conflict is anchored to. If every row under that
+  identity was removed in the meantime (the source document was deleted or reassigned), it is
+  **refused** — never silently applied to nothing. Report the refusal to the human; `keep both`
+  admits the staged row as a fresh record if they want the value kept.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
   that is an extraction error, not a conflict. Re-read the source for collection times; if there
   genuinely are none, submit them separately and ask the human about `keep both`.

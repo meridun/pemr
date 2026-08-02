@@ -113,10 +113,17 @@ def _conflicts_anchored_to(conn: sqlite3.Connection, document_id: int) -> list[i
     **incoming** row collided; ``conflict.dedup_key`` anchors it to the **stored**
     row — which a *different* document usually created. Only the first end is
     reachable from ``document_id``, so removing or reassigning the owner of the
-    stored row silently orphans the anchor: a later `keep incoming` resolution runs
-    ``UPDATE ... WHERE dedup_key = ?`` (:func:`dedup._overwrite_record`), matches
-    zero rows, and stamps the conflict ``resolved`` while discarding the staged
-    value with rc 0. Both `rm` and `reassign` therefore have to see this end too.
+    stored row orphans the anchor and leaves a conflict that `keep incoming` can no
+    longer resolve. Both `rm` and `reassign` therefore have to see this end too.
+
+    Matching on ``dedup_key`` finds the anchor exactly while occurrence 0 is alive,
+    which is every family a conflict is normally staged against
+    (:func:`dedup._stage_conflict` anchors to ``family[0]``). It misses the residual
+    case where occurrence 0 is already gone and the anchor is an occurrence >= 1
+    sibling, whose key is ``hash(base|n)`` rather than the base: that document can
+    still be removed without a warning. The consequence is bounded — a later
+    `keep incoming` refuses loudly rather than discarding the staged value
+    (:func:`dedup._anchor_row`), and `keep both` still admits it.
     """
     ids: list[int] = []
     for record_type in dedup.KNOWN_TYPES:
@@ -269,8 +276,8 @@ def reassign_document(
       owned by the *old* person; resolving it after a move would write data into
       records the document no longer owns. One *anchored to* a row this document owns
       (staged by some other document — see :func:`_conflicts_anchored_to`) would have
-      its ``dedup_key`` re-derived out from under it, and resolve to nothing. Resolve
-      them first (`pemr review-conflicts`).
+      its ``dedup_key`` re-derived out from under it, leaving nothing to resolve
+      against. Resolve them first (`pemr review-conflicts`).
     * **dictionary drift** (:class:`DictionaryDriftError`) — a stored key that does not
       match its recompute under the current dictionary means a reassign would silently
       perform a `rekey` too. Run `pemr rekey --apply` first; reassign changes ownership
@@ -309,7 +316,7 @@ def reassign_document(
             f"'{from_slug}' - raised by this document, or anchored to a row it owns. "
             "Resolving one after the move would write this document's data into "
             "records it no longer owns, or target a dedup_key the move re-derives "
-            "(silently discarding the staged value). Resolve them first with "
+            "(leaving the staged value unresolvable). Resolve them first with "
             "`pemr review-conflicts`; nothing was written"
         )
 

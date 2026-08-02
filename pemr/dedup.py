@@ -615,9 +615,11 @@ def list_conflicts(
 class ResolveResult:
     """Outcome of :func:`resolve_conflict`.
 
-    ``row_id``/``occurrence`` describe the *admitted* row and are set only for
-    ``keep='both'``; the other resolutions choose between rows rather than adding
-    one. ``dedup_key`` is the key of the row the resolution landed on.
+    ``row_id``/``occurrence`` describe the row the resolution landed on: the
+    *admitted* row for ``keep='both'``, the *overwritten* one for
+    ``keep='incoming'``. ``keep='existing'`` writes nothing, so it leaves them
+    unset. ``dedup_key`` is that row's key (which for an occurrence >= 1 row is
+    *not* the conflict's key — see :func:`_anchor_row`).
     """
     kept: str
     record_type: str = ""
@@ -665,19 +667,31 @@ def resolve_conflict(
         raise ValueError(f"conflict {conflict_id} is already {row['status']}")
 
     record_type = row["record_type"]
-    result = (
-        _plan_keep_both(conn, row) if keep == "both"
-        else ResolveResult(
+    if keep == "both":
+        result = _plan_keep_both(conn, row)
+    elif keep == "incoming":
+        # Resolve the target *before* the transaction: a family with no rows left
+        # can no longer be overwritten, and that must refuse rather than resolve.
+        anchor = _anchor_row(
+            conn, record_type, row["dedup_key"], int(row["conflict_id"])
+        )
+        result = ResolveResult(
+            kept=keep, record_type=record_type,
+            row_id=int(anchor[f"{record_type}_id"]),
+            occurrence=int(anchor["dedup_occurrence"]),
+            dedup_key=anchor["dedup_key"],
+        )
+    else:
+        result = ResolveResult(
             kept=keep, record_type=record_type, dedup_key=row["dedup_key"]
         )
-    )
     resolved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     with conn:
         if keep == "incoming":
             incoming = json.loads(row["incoming_json"])
             _overwrite_record(
-                conn, record_type, row["dedup_key"], row["document_id"], incoming
+                conn, record_type, int(result.row_id), row["document_id"], incoming
             )
         elif keep == "both" and not result.no_op:
             result.row_id = _insert_record(
@@ -705,6 +719,29 @@ def _resolution_text(result: ResolveResult) -> str:
         f"keep-both -> {result.record_type} #{result.row_id} "
         f"occurrence={result.occurrence} key={(result.dedup_key or '')[:12]}..."
     )
+
+
+def _anchor_row(
+    conn: sqlite3.Connection, record_type: str, base: str, conflict_id: int
+) -> sqlite3.Row:
+    """The stored row a conflict is anchored to: occurrence 0, or the lowest
+    surviving occurrence of its identity family.
+
+    A conflict's ``dedup_key`` is always the family *base*, never the anchor row's
+    own key once occurrence 0 is gone (an occurrence >= 1 row keys on
+    ``hash(base|n)``). So resolutions must reach the row through the family, by
+    primary key - targeting ``WHERE dedup_key = <conflict key>`` matches nothing in
+    an orphaned family and would report success while writing nothing.
+    """
+    family = load_family(conn, record_type, base)
+    if not family:
+        raise ValueError(
+            f"conflict {conflict_id} has no stored {record_type} row left to "
+            "overwrite - every occurrence of that identity was removed after the "
+            "conflict was staged. Resolve with keep 'both' to admit the incoming "
+            "row as a new record instead."
+        )
+    return family[0]
 
 
 def _plan_keep_both(conn: sqlite3.Connection, conflict: sqlite3.Row) -> ResolveResult:
@@ -855,17 +892,29 @@ def rekey(
 def _overwrite_record(
     conn: sqlite3.Connection,
     record_type: str,
-    key: str,
+    row_id: int,
     document_id: int | None,
     incoming: dict,
 ) -> None:
+    """Overwrite one stored row's payload columns, addressed by primary key.
+
+    Primary key, not ``dedup_key``: see :func:`_anchor_row`. A zero-row UPDATE is an
+    error, never a silent success - it would discard the incoming row while the
+    conflict is marked resolved.
+    """
     assignments = ["document_id = ?"]
     values: list[object] = [document_id]
     for name in _COMPARE_FIELDS[record_type]:
         assignments.append(f"{name} = ?")
         values.append(incoming.get(name))
-    values.append(key)
-    conn.execute(
-        f"UPDATE {record_type} SET {', '.join(assignments)} WHERE dedup_key = ?",
+    values.append(row_id)
+    cur = conn.execute(
+        f"UPDATE {record_type} SET {', '.join(assignments)} "
+        f"WHERE {record_type}_id = ?",
         values,
     )
+    if cur.rowcount != 1:
+        raise ValueError(
+            f"keep-incoming matched no {record_type} row (id {row_id}) - refusing to "
+            "resolve the conflict, the incoming row would have been discarded"
+        )

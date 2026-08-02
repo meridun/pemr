@@ -254,6 +254,101 @@ def test_keep_both_works_for_observation_rows(conn):
     )] == ["left", "right"]
 
 
+# --- orphaned families: the conflict key is the base, not the anchor's key ----
+
+def _drop_occurrence(conn, occurrence):
+    """Remove one sibling the way `document rm --apply` would (its owning document
+    went away), leaving a hole in the family."""
+    conn.execute("DELETE FROM lab_result WHERE dedup_occurrence = ?", (occurrence,))
+    conn.commit()
+
+
+@pytest.fixture()
+def orphaned_family(conn, repeat_draw):
+    """A family whose occurrence 0 is gone, with a fresh conflict staged against the
+    surviving occurrence-1 sibling.
+
+    The conflict's ``dedup_key`` is the family *base*; the anchor row's own key is
+    ``hash(base|1)``. Any resolution addressing the row by the conflict's key matches
+    nothing here.
+    """
+    dedup.resolve_conflict(conn, repeat_draw, keep="both")
+    _drop_occurrence(conn, 0)
+    summary = dedup.commit_extraction(
+        conn, _doc(conn, "draw-5"), {"lab_result": [_glucose(210, "third draw")]}
+    )
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    conflict = dedup.list_conflicts(conn)[0]
+    survivor = conn.execute("SELECT * FROM lab_result").fetchone()
+    # The premise of the regression: key-targeted writes cannot find this row.
+    assert conflict["dedup_key"] == survivor["dedup_base"] != survivor["dedup_key"]
+    return conflict["conflict_id"]
+
+
+def test_keep_incoming_overwrites_the_anchor_when_occurrence_zero_is_gone(
+    conn, orphaned_family
+):
+    """Regression: keep-incoming used to UPDATE ... WHERE dedup_key = <conflict key>,
+    which matches zero rows once occurrence 0 is gone - the conflict was stamped
+    `resolved` and the incoming value silently vanished."""
+    result = dedup.resolve_conflict(conn, orphaned_family, keep="incoming")
+
+    rows = conn.execute("SELECT * FROM lab_result").fetchall()
+    assert len(rows) == 1                       # overwrite, not insert
+    assert rows[0]["value_num"] == 210.0        # the staged value actually landed
+    assert rows[0]["dedup_occurrence"] == 1     # on the surviving sibling
+    assert (result.kept, result.row_id) == ("incoming", rows[0]["lab_result_id"])
+    assert (result.occurrence, result.dedup_key) == (1, rows[0]["dedup_key"])
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (orphaned_family,)
+    ).fetchone()["status"] == "resolved"
+
+
+def test_keep_both_still_admits_into_an_orphaned_family(conn, orphaned_family):
+    """The other half of the shape: max(occurrence)+1 already handled the hole, and
+    must keep doing so."""
+    result = dedup.resolve_conflict(conn, orphaned_family, keep="both")
+    assert result.occurrence == 2
+    assert [(r["dedup_occurrence"], r["value_num"]) for r in conn.execute(
+        "SELECT * FROM lab_result ORDER BY lab_result_id"
+    )] == [(1, 148.0), (2, 210.0)]
+
+
+def test_keep_incoming_refuses_when_the_family_is_empty(conn, orphaned_family):
+    """Nothing left to overwrite is a refusal, never a reported success: resolving
+    would otherwise discard the staged value with rc 0."""
+    _drop_occurrence(conn, 1)
+    with pytest.raises(ValueError, match="no stored lab_result row left"):
+        dedup.resolve_conflict(conn, orphaned_family, keep="incoming")
+    row = conn.execute(
+        "SELECT * FROM conflict WHERE conflict_id=?", (orphaned_family,)
+    ).fetchone()
+    assert (row["status"], row["resolved_at"]) == ("open", None)
+
+
+def test_empty_family_refusal_names_the_keep_both_recovery(conn, orphaned_family):
+    """The refusal is a dead end unless it points somewhere: keep-both admits the row
+    at occurrence 0 and is the operator's way out."""
+    _drop_occurrence(conn, 1)
+    with pytest.raises(ValueError) as exc:
+        dedup.resolve_conflict(conn, orphaned_family, keep="incoming")
+    assert "keep 'both'" in str(exc.value)
+    assert str(exc.value).isascii()          # printed by the CLI (issue #23)
+
+    result = dedup.resolve_conflict(conn, orphaned_family, keep="both")
+    assert (result.occurrence, result.no_op) == (0, False)
+    assert conn.execute("SELECT value_num FROM lab_result").fetchone()["value_num"] == 210.0
+
+
+def test_keep_existing_still_resolves_an_empty_family(conn, orphaned_family):
+    """keep-existing drops the incoming row by design, so it stays a legal resolution
+    even with nothing stored - it writes nothing either way."""
+    _drop_occurrence(conn, 1)
+    result = dedup.resolve_conflict(conn, orphaned_family, keep="existing")
+    assert result.kept == "existing"
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 0
+
+
 def test_keep_existing_and_incoming_still_return_a_result(conn, staged):
     """Source compatibility: the return type changed from None, but the older
     resolutions still add no row."""
