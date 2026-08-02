@@ -30,7 +30,7 @@ from typing import Any
 
 # Engine modules are underscore-aliased so the public tool named `query` (and any future
 # tool sharing a module name) can't shadow the module it delegates to.
-from . import cli, db
+from . import __version__, cli, db
 from . import dedup as _dedup
 from . import ingest as _ingest
 from . import persons as _persons
@@ -374,6 +374,14 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         ) from exc
 
     server = FastMCP("pemr")
+
+    # `serverInfo.version` — what a client UI shows the human. FastMCP takes no
+    # `version=` argument, and the low-level server it wraps falls back to the *SDK's*
+    # own package version, so an unset version advertises e.g. "pemr 1.28.1" (the `mcp`
+    # release) instead of pemr's — wrong, ahead of the real version, and useless for
+    # diagnosing a version mismatch (#60). The attribute is read at initialize time, so
+    # setting it after construction is equivalent to a constructor argument.
+    server._mcp_server.version = __version__
 
     def _run(fn, /, **kwargs):
         conn = _connect()
