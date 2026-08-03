@@ -133,7 +133,7 @@ def test_show_unknown_document_raises(conn):
 def test_show_carries_the_full_stable_record_key_set(seeded):
     view = documents.get_document_view(seeded["conn"], seeded["doc"])
     assert set(view["records"]) == set(dedup.KNOWN_TYPES)
-    assert view["record_count"] == 5
+    assert view["record_count"] == _SEEDED_ROWS
     assert "ocr_text" not in view
     assert view["has_ocr_text"] is True
     assert view["ocr_text_chars"] == len("scan text")
@@ -252,7 +252,7 @@ def test_set_text_leaves_records_and_keys_untouched(seeded):
         for r in conn.execute("SELECT * FROM lab_result").fetchall()
     ]
     assert before == after
-    assert documents.get_document_view(conn, seeded["doc"])["record_count"] == 5
+    assert documents.get_document_view(conn, seeded["doc"])["record_count"] == _SEEDED_ROWS
 
 
 # --- edit -------------------------------------------------------------------
@@ -468,7 +468,7 @@ def test_reassign_moves_a_keep_both_family_intact(seeded):
     summary = dedup.commit_extraction(
         conn, seeded["doc"], {"lab_result": [draw | {"value_num": 148}]}
     )
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
 
 
 def test_reassign_refused_on_dictionary_drift(seeded):
@@ -699,7 +699,7 @@ def test_cli_document_show(cli_ready, capsys):
     assert "document_id    1" in out
     assert "person         jane-doe" in out
     # Total plus the non-zero per-type breakdown only (zeros are a --json concern).
-    assert "records        5  (" in out and "lab_result 1" in out
+    assert f"records        {_SEEDED_ROWS}  (" in out and "lab_result 1" in out
     assert "procedure 0" not in out
     assert "has_ocr_text   yes (" in out
     assert "conflicts      none" in out
@@ -867,7 +867,7 @@ def test_cli_document_set_text_leaves_records_untouched(cli_ready, capsys):
                 "--ocr-text-file", str(text)) == 0
     capsys.readouterr()
     assert _run(cli_ready, "document", "show", "1", "--json") == 0
-    assert json.loads(capsys.readouterr().out)["record_count"] == 5
+    assert json.loads(capsys.readouterr().out)["record_count"] == _SEEDED_ROWS
     assert _run(cli_ready, "query", "labs", "--person", "jane-doe") == 0
     assert "HbA1c" in capsys.readouterr().out
 

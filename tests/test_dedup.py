@@ -269,7 +269,7 @@ def test_commit_inserts_new_rows(conn):
     doc = _make_document(conn)
     d = dedup.load_dictionary(DICT_PATH)
     summary = dedup.commit_extraction(conn, doc, {"lab_result": [_lab(5.7)]}, d)
-    assert summary.counts == {"new": 1, "duplicate": 0, "conflict": 0}
+    assert summary.counts == {"new": 1, "duplicate": 0, "enriched": 0, "conflict": 0}
     row = conn.execute("SELECT * FROM lab_result").fetchone()
     assert row["test_name"] == "HbA1c" and row["value_num"] == 5.7
 
@@ -298,7 +298,7 @@ def test_differing_value_stages_conflict(conn):
     # same person/analyte/date (the dedup key) but a corrected value -> conflict.
     # The value is no longer in the key, so this fires regardless of magnitude.
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [_lab(6.2)]}, d)
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     # original row untouched, no second lab row inserted
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
     assert conn.execute("SELECT value_num FROM lab_result").fetchone()["value_num"] == 5.7
@@ -317,7 +317,7 @@ def test_unit_casing_difference_is_duplicate_not_conflict(conn):
           "unit": "mg/dL"}
     dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
 
 
@@ -343,9 +343,11 @@ def test_real_corpus_overlap_dedups_not_splits(conn):
         for i, (_report, csv) in enumerate(_CORPUS_VARIANTS)
     ]
     s1 = dedup.commit_extraction(conn, doc_report, {"lab_result": report_rows}, d)
-    assert s1.counts == {"new": len(_CORPUS_VARIANTS), "duplicate": 0, "conflict": 0}
+    assert s1.counts == {
+        "new": len(_CORPUS_VARIANTS), "duplicate": 0, "enriched": 0, "conflict": 0}
     s2 = dedup.commit_extraction(conn, doc_csv, {"lab_result": csv_rows}, d)
-    assert s2.counts == {"new": 0, "duplicate": len(_CORPUS_VARIANTS), "conflict": 0}
+    assert s2.counts == {
+        "new": 0, "duplicate": len(_CORPUS_VARIANTS), "enriched": 0, "conflict": 0}
     # One row per analyte, not two — the split-series / double-count damage is gone.
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] \
         == len(_CORPUS_VARIANTS)
@@ -362,7 +364,7 @@ def test_corrected_value_still_conflicts_after_normalization(conn):
           "value_num": 13.4, "unit": "G/DL"}  # same draw, corrected value
     dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
 
 
 def test_far_apart_correction_conflicts_not_duplicates(conn):
@@ -378,7 +380,7 @@ def test_far_apart_correction_conflicts_not_duplicates(conn):
           "unit": "mg/dL"}  # OCR re-read of the *same* draw, wildly different value
     dedup.commit_extraction(conn, doc1, {"lab_result": [r1]}, d)
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [r2]}, d)
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
 
 
@@ -394,7 +396,7 @@ def test_serial_same_day_draws_are_distinct_rows(conn):
          "unit": "mg/dL"},
     ]
     summary = dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
-    assert summary.counts == {"new": 2, "duplicate": 0, "conflict": 0}
+    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
 
 
@@ -410,7 +412,7 @@ def test_observation_correction_conflicts_not_duplicates(conn):
           "value_num": 155}  # re-read of the same measurement, corrected value
     dedup.commit_extraction(conn, doc1, {"observation": [o1]}, d)
     summary = dedup.commit_extraction(conn, doc2, {"observation": [o2]}, d)
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 1
 
 
@@ -425,7 +427,7 @@ def test_serial_same_day_observations_are_distinct_rows(conn):
          "value_num": 138},
     ]
     summary = dedup.commit_extraction(conn, doc, {"observation": rows}, d)
-    assert summary.counts == {"new": 2, "duplicate": 0, "conflict": 0}
+    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 2
 
 
@@ -457,7 +459,7 @@ def test_intra_payload_identical_rows_still_report_duplicate(conn):
     doc = _make_document(conn)
     row = {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95}
     summary = dedup.commit_extraction(conn, doc, {"lab_result": [dict(row), dict(row)]})
-    assert summary.counts == {"new": 1, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 1, "duplicate": 1, "enriched": 0, "conflict": 0}
 
 
 def test_intra_payload_collision_checked_per_record_type(conn):
@@ -526,7 +528,7 @@ def test_migration_005_preserves_pre_existing_keys(tmp_path):
         # And the pre-005 row still dedups against a fresh commit of the same fact.
         doc = _make_document(conn)
         summary = dedup.commit_extraction(conn, doc, {"lab_result": [row]})
-        assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+        assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
     finally:
         conn.close()
 
@@ -623,7 +625,7 @@ def test_rekey_apply_restores_dedup_for_a_renamed_analyte(conn):
 
     doc2 = _make_document(conn)
     summary = dedup.commit_extraction(conn, doc2, {"lab_result": [row]}, d_new)
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
 
 
@@ -738,7 +740,7 @@ def test_allergy_key_is_date_free(conn):
         {"substance": "Penicillin", "reaction": "rash", "noted_on": "2010-01-01"}]})
     summary = _commit(conn, {"allergy": [
         {"substance": "penicillin", "reaction": "rash", "noted_on": "2021-06-01"}]})
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 1
 
 
@@ -750,7 +752,7 @@ def test_condition_family_history_does_not_collide_with_the_patients_own(conn):
         {"name": "Type 2 Diabetes", "status": "family-history", "relation": "mother"},
         {"name": "Type 2 Diabetes", "status": "family-history", "relation": "father"},
     ]})
-    assert summary.counts == {"new": 3, "duplicate": 0, "conflict": 0}
+    assert summary.counts == {"new": 3, "duplicate": 0, "enriched": 0, "conflict": 0}
 
 
 def test_condition_lifecycle_change_stages_a_conflict(conn):
@@ -759,7 +761,7 @@ def test_condition_lifecycle_change_stages_a_conflict(conn):
     _commit(conn, {"condition": [{"name": "Anemia", "status": "active"}]})
     summary = _commit(conn, {"condition": [
         {"name": "Anemia", "status": "resolved", "resolved_on": "2025-09-01"}]})
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
 
     conflict_id = dedup.list_conflicts(conn)[0]["conflict_id"]
     dedup.resolve_conflict(conn, conflict_id, keep="incoming")
@@ -773,11 +775,115 @@ def test_sparse_types_do_not_conflict_on_an_omitted_field(conn):
     _commit(conn, {"allergy": [
         {"substance": "Sulfa", "reaction": "hives", "criticality": "high"}]})
     summary = _commit(conn, {"allergy": [{"substance": "Sulfa"}]})
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
     # ... but a stated disagreement still conflicts.
     summary = _commit(conn, {"allergy": [
         {"substance": "Sulfa", "reaction": "anaphylaxis"}]})
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
+
+
+def test_a_stated_field_over_a_stored_null_enriches_rather_than_dedups(conn):
+    """The other half of the sparse rule: silence is only silence in the *incoming*
+    direction. A later document supplying criticality/reaction the record lacks is new
+    information with nothing to adjudicate - fill the NULLs, don't drop the row."""
+    _commit(conn, {"allergy": [{"substance": "Bee sting"}]})
+    summary = _commit(conn, {"allergy": [
+        {"substance": "Bee sting", "criticality": "high", "reaction": "anaphylaxis",
+         "noted_on": "2024-07-07"}]})
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 1, "conflict": 0}
+    row = conn.execute("SELECT * FROM allergy").fetchone()
+    assert (row["criticality"], row["reaction"], row["noted_on"]) == (
+        "high", "anaphylaxis", "2024-07-07")
+    assert summary.enriched == [("allergy", row["allergy_id"])]
+    # Re-stating exactly what is now stored is a plain duplicate again.
+    summary = _commit(conn, {"allergy": [
+        {"substance": "Bee sting", "criticality": "high", "reaction": "anaphylaxis",
+         "noted_on": "2024-07-07"}]})
+    assert summary.counts["duplicate"] == 1 and summary.counts["enriched"] == 0
+
+
+def test_enrichment_fills_only_nulls_and_never_launders_a_disagreement(conn):
+    """A stated value must never overwrite a stored one on the quiet path - that is
+    still a conflict, even when the same row also has a NULL the document could fill."""
+    _commit(conn, {"condition": [{"name": "Chickenpox", "status": "history"}]})
+    summary = _commit(conn, {"condition": [
+        {"name": "Chickenpox", "status": "active", "onset_on": "1988-03-01"}]})
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
+    row = conn.execute("SELECT * FROM condition").fetchone()
+    assert (row["status"], row["onset_on"]) == ("history", None)
+
+
+def test_a_terser_row_later_in_one_submission_does_not_undo_an_enrichment(conn):
+    """Both directions inside a single batch: the detailed row enriches the terse one,
+    and a third terse row after it is still just a duplicate."""
+    summary = _commit(conn, {"condition": [
+        {"name": "Anemia", "status": "active"},
+        {"name": "Anemia", "status": "active", "note": "iron deficiency",
+         "onset_on": "2019-02-01"},
+        {"name": "Anemia", "status": "active"},
+    ]})
+    assert summary.counts == {"new": 1, "duplicate": 1, "enriched": 1, "conflict": 0}
+    row = conn.execute("SELECT * FROM condition").fetchone()
+    assert (row["note"], row["onset_on"]) == ("iron deficiency", "2019-02-01")
+
+
+def test_keep_incoming_on_a_sparse_type_keeps_fields_the_document_did_not_state(conn):
+    """Adjudicating one field must not erase the rest of a standing fact's payload:
+    the incoming document not repeating `reaction` means "didn't say", here too."""
+    _commit(conn, {"allergy": [
+        {"substance": "Penicillin", "reaction": "anaphylaxis", "criticality": "high",
+         "noted_on": "2010-05-05"}]})
+    summary = _commit(conn, {"allergy": [
+        {"substance": "Penicillin", "criticality": "low"}]})
+    assert summary.counts["conflict"] == 1
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"],
+                           keep="incoming")
+    row = conn.execute("SELECT * FROM allergy").fetchone()
+    assert (row["criticality"], row["reaction"], row["noted_on"]) == (
+        "low", "anaphylaxis", "2010-05-05")
+
+
+def test_keep_incoming_still_clears_an_unstated_field_on_a_dated_type(conn):
+    """Scoped to sparse types: for a lab draw an unstated field IS a clearing, and
+    keep-incoming keeps its documented overwrite-the-row semantics."""
+    _commit(conn, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95,
+         "unit": "mg/dL", "flag": "H"}]})
+    _commit(conn, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 101}]})
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"],
+                           keep="incoming")
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert (row["value_num"], row["unit"], row["flag"]) == (101, None, None)
+
+
+def test_keep_both_no_op_fills_what_the_sibling_was_missing(conn):
+    """A strictly-thinner sibling "matches" the staged payload under the sparse
+    comparison, so keep-both is still a no-op - but it must not swallow the fields the
+    payload adds on its way to that no-op."""
+    # occ0 is Latex/hives; two later documents both stage a "rash" conflict against it,
+    # one of them also stating criticality.
+    _commit(conn, {"allergy": [{"substance": "Latex", "reaction": "hives"}]})
+    _commit(conn, {"allergy": [
+        {"substance": "Latex", "reaction": "rash", "criticality": "high"}]})
+    _commit(conn, {"allergy": [{"substance": "Latex", "reaction": "rash"}]})
+    staged = {
+        ("criticality" in c["incoming_json"]): c["conflict_id"]
+        for c in dedup.list_conflicts(conn)
+    }
+    rich, thin = staged[True], staged[False]
+    # The thin one is admitted first, so the rich one now matches a sibling missing
+    # criticality.
+    dedup.resolve_conflict(conn, thin, keep="both")
+    result = dedup.resolve_conflict(conn, rich, keep="both")
+    assert result.no_op is True and result.gains == {"criticality": "high"}
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 2
+    admitted = conn.execute(
+        "SELECT * FROM allergy WHERE allergy_id = ?", (result.row_id,)
+    ).fetchone()
+    assert (admitted["reaction"], admitted["criticality"]) == ("rash", "high")
+    assert "filled criticality" in dedup.list_conflicts(
+        conn, status="resolved")[0]["resolution"]
 
 
 def test_labs_keep_the_strict_comparison(conn):
@@ -846,4 +952,4 @@ def test_rekey_rederives_a_carried_forward_migration_key(conn):
     assert row["dedup_key"] == change.new_key and row["dedup_base"] == change.new_key
     # ... and now a fresh commit of the same allergy dedups instead of forking.
     summary = _commit(conn, {"allergy": [{"substance": "Penicillin", "reaction": "rash"}]})
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}

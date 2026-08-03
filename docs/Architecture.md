@@ -247,6 +247,16 @@ duplicate-vs-conflict comparison differs by record type (`dedup._SPARSE_TYPES`).
 `subject` discriminator is a correctness fix, not a nicety: without it a patient's
 diabetes and her mother's derive one key and silently merge.
 
+That reading is asymmetric by design. Treating a *stored* NULL as silence too would make the
+common terse-then-detailed document sequence lossy: the second document's `criticality` would
+count as a duplicate and be dropped, with no conflict to catch it. So a field the incoming row
+states over a stored NULL is a **gain** — no competing value, nothing to adjudicate — and fills
+the stored row in place, reported as `enriched` (a fourth commit bucket beside
+new/duplicate/conflict). A stated value never overwrites a stored one on that path, so
+enrichment cannot launder a disagreement into a silent overwrite. The same reading governs
+`keep incoming` on these types: it writes the fields the incoming row states and leaves the
+rest as stored, so a one-field adjudication doesn't erase the row's other payload.
+
 `norm()` = lowercase, trim, collapse whitespace, map synonyms via an **analyte/name
 dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` → one
 canonical `hba1c`. The dictionary is the one place fuzzy naming gets pinned down
@@ -358,7 +368,7 @@ inbox/scan.pdf
       matching the record schemas (lab_result[], medication[], observation[]...)
   → pemr commit-extraction --document <id> --json extracted.json
       5. validate JSON against schema (types, required fields)
-      6. compute dedup_keys; split into {new, duplicate, conflict}
+      6. compute dedup_keys; split into {new, duplicate, enriched, conflict}
       7. insert new; report the rest
   → pemr review-conflicts   (if any)
 ```

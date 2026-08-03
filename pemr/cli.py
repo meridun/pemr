@@ -762,7 +762,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
     c = summary.counts
     print(
         f"committed: {c['new']} new, {c['duplicate']} duplicate, "
-        f"{c['conflict']} conflict"
+        f"{c['enriched']} enriched, {c['conflict']} conflict"
     )
     if summary.conflict:
         print(
