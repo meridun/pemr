@@ -14,6 +14,12 @@ agent can't subtly get wrong:
 analyte/name dictionary (``data/dictionary.toml``) so ``A1c`` / ``HbA1c`` /
 ``Hemoglobin A1c`` collapse to one canonical token — the one place fuzzy naming
 gets pinned down deterministically.
+
+``key_token()`` is the *identity* form of that name: the canonical token plus any
+**meaningful** parenthetical qualifier (``albumin (spep)``), so two genuinely
+distinct assays of one analyte off one draw keep distinct keys (issue #71).
+``norm()`` remains the *family* form (``albumin`` for both) and is what analyte
+listings match on.
 """
 
 from __future__ import annotations
@@ -98,7 +104,9 @@ DATE_FIELDS: dict[str, frozenset[str]] = {
 }
 
 _WS = re.compile(r"\s+")
-_PAREN = re.compile(r"\([^)]*\)")
+# Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
+# bare analyte stem) and yields its contents (`findall`, giving the candidate qualifier).
+_PAREN = re.compile(r"\(([^)]*)\)")
 
 # A date value is accepted at one of three precisions, each a lexically-sortable ISO
 # prefix (so `_date_only` slicing, timeline sort and every `ORDER BY <datecol>` keep
@@ -185,25 +193,90 @@ def _collapse(value: str) -> str:
 
 
 def _strip_qualifiers(value: str) -> str:
-    """Drop parenthetical qualifiers (``(SPEP)``, ``(HGB)``, ``(calculated)``) that
-    label a value's method/source without changing *which analyte it is*, then
-    re-collapse whitespace. Applied inside :func:`norm` so real-report spellings like
-    ``Hemoglobin (HGB)`` or ``M-Spike (SPEP)`` reduce to their bare analyte name and
-    the dictionary only has to carry the minimal spelling, not every parenthesized
-    variant a lab happens to print."""
+    """Drop parenthetical qualifiers (``(SPEP)``, ``(HGB)``, ``(calculated)``) to leave
+    the bare analyte *stem*, then re-collapse whitespace. The stem is what
+    :func:`identity` looks up in the dictionary, so the dictionary only has to carry
+    the minimal spelling, not every parenthesized variant a lab happens to print."""
     return _WS.sub(" ", _PAREN.sub(" ", value)).strip()
 
 
-def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
-    """Normalize a free-text field: lowercase, trim, collapse whitespace (underscores
-    count as whitespace), strip parenthetical qualifiers, then map synonyms through
-    the dictionary. ``None`` -> ``""`` (deterministic key part)."""
+def _qualifier_text(value: str) -> str:
+    """The concatenated contents of ``value``'s parentheticals (``""`` when there are
+    none). ``"albumin (spep)"`` -> ``"spep"``; multiple groups join with a space."""
+    return _WS.sub(" ", " ".join(_PAREN.findall(value))).strip()
+
+
+def identity(
+    value: object, dictionary: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """``(canonical, qualifier)`` — the analyte family and, when the name carries a
+    *meaningful* parenthetical, the assay that distinguishes it within that family.
+
+    A parenthetical is meaningful **unless proven otherwise**, which is the deliberate
+    inversion behind issue #71. Collapsing two distinct assays (a CMP ``Albumin`` and an
+    SPEP ``Albumin (SPEP)`` off one draw) is lossy and near-silent — one row stores, the
+    other stages as a conflict. Over-splitting is visible and non-lossy: two parallel
+    series, repaired by one dictionary line plus ``pemr rekey``. Default to the
+    recoverable failure.
+
+    Three rules on ``full = _collapse(value)`` (parentheses preserved), in order:
+
+    1. **A declared full label wins.** ``dictionary["m-spike (spep)"]`` is the human
+       saying "this exact parenthesized label *is* that analyte" -> no qualifier. This
+       needs no schema change: ``[synonyms]`` keys may simply contain parentheses.
+    2. **A redundant alias is noise, with zero curation.** When the parenthetical maps
+       to the same canonical token as the stem — ``Hemoglobin (HGB)``, ``Hematocrit
+       (HCT)``, ``Platelet Count (PLT)`` — it is just another spelling of the stem, so
+       it drops out with no dictionary entry of its own.
+    3. **Everything else is meaningful** and becomes the qualifier, mapped through the
+       dictionary so ``(SPEP)`` and ``(Serum Protein Electrophoresis)`` agree.
+    """
     if value is None:
-        return ""
-    collapsed = _strip_qualifiers(_collapse(str(value)))
-    if dictionary:
-        return dictionary.get(collapsed, collapsed)
-    return collapsed
+        return "", ""
+    full = _collapse(str(value))
+    if dictionary and full in dictionary:
+        return dictionary[full], ""
+    stem = _strip_qualifiers(full)
+    canonical = dictionary.get(stem, stem) if dictionary else stem
+    inner = _qualifier_text(full)
+    if not inner:
+        return canonical, ""
+    qualifier = dictionary.get(inner, inner) if dictionary else inner
+    if qualifier == canonical:
+        return canonical, ""
+    return canonical, qualifier
+
+
+def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
+    """Normalize a free-text field to its **analyte family** token: lowercase, trim,
+    collapse whitespace (underscores count as whitespace), drop parenthetical
+    qualifiers, then map synonyms through the dictionary. ``None`` -> ``""``
+    (deterministic key part).
+
+    This is the *family* form — ``Albumin`` and ``Albumin (SPEP)`` both normalize to
+    ``albumin`` — which is what analyte listings (``pemr labs --test``) match on so a
+    listing shows the whole family. Dedup keys and numeric series use the finer
+    :func:`key_token` instead.
+    """
+    return identity(value, dictionary)[0]
+
+
+def key_token(value: object, dictionary: dict[str, str] | None = None) -> str:
+    """The **dedup identity** token for a name: :func:`norm`'s canonical token, plus a
+    meaningful qualifier in parentheses when :func:`identity` finds one.
+
+    ``"albumin"`` / ``"albumin (spep)"``. Folded into the existing key part rather than
+    appended as a new one, deliberately: a fourth hash part would change ``"a|b|c"`` to
+    ``"a|b||c"`` and move the key of *every* stored row. Folding leaves every unqualified
+    row's ``dedup_key`` bit-identical, so ``pemr rekey`` moves only the rows this bug
+    actually affects.
+    """
+    canonical, qualifier = identity(value, dictionary)
+    if not qualifier:
+        return canonical
+    if not canonical:
+        return qualifier      # degenerate "(SPEP)"-only name: the qualifier is the name
+    return f"{canonical} ({qualifier})"
 
 
 def _date_only(value: object) -> str:
@@ -242,12 +315,22 @@ def _key_parts(
 
     Kept separate from the hashing so an error message can name *why* two rows
     collide (see :func:`identity_label`) instead of quoting a bare hash.
+
+    Analyte-style names — ``lab_result.test_name`` and ``observation.key`` — key on
+    :func:`key_token`, so a meaningful assay qualifier stays part of the identity
+    (issue #71). Everything else keys on :func:`norm`: medication / procedure /
+    appointment names already carry dose / date / provider in the key, and their
+    parentheticals are usually brand or descriptive (``Insulin (Lantus)``) rather than a
+    second measurement of one thing.
     """
     def n(field_name: str) -> str:
         return norm(row.get(field_name), dictionary)
 
+    def kt(field_name: str) -> str:
+        return key_token(row.get(field_name), dictionary)
+
     if record_type == "lab_result":
-        return [person_id, n("test_name"), _norm_ts(row.get("collected_at"))]
+        return [person_id, kt("test_name"), _norm_ts(row.get("collected_at"))]
     if record_type == "medication":
         return [person_id, n("name"), _collapse(str(row.get("dose") or "")),
                 _date_only(row.get("started_on"))]
@@ -256,7 +339,7 @@ def _key_parts(
     if record_type == "appointment":
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
-        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), n("key")]
+        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), kt("key")]
     raise ValidationError(f"unknown record type: {record_type}")  # guarded by validate()
 
 

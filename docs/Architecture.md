@@ -197,17 +197,34 @@ Each typed/observation row computes a deterministic `dedup_key` from normalized 
 so the *same clinical fact* extracted from two different documents collapses to one row.
 
 ```
-lab_result.dedup_key   = hash(person_id | norm(test_name) | collected_at)
+lab_result.dedup_key   = hash(person_id | key_token(test_name) | collected_at)
 medication.dedup_key    = hash(person_id | norm(name) | dose | started_on)
 procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
-observation.dedup_key   = hash(person_id | obs_type | observed_at | key)
+observation.dedup_key   = hash(person_id | obs_type | observed_at | key_token(key))
 ```
 
-`norm()` = lowercase, trim, collapse whitespace, map synonyms via an **analyte/name
-dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` → one
-canonical `hba1c`. The dictionary is the one place fuzzy naming gets pinned down
-deterministically; agents propose additions, you approve.
+`norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
+synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
+`HbA1c`, `Hemoglobin A1c` → one canonical `hba1c`. The dictionary is the one place fuzzy
+naming gets pinned down deterministically; agents propose additions, you approve.
+
+`key_token()` is the finer **identity** form used by the two analyte-named key parts: the
+canonical token plus a *meaningful* parenthetical qualifier, `albumin (spep)`. A
+parenthetical is meaningful unless the dictionary says otherwise (issue #71) — the
+asymmetry is deliberate, since collapsing two assays is lossy and near-silent while
+over-splitting is visible and repaired by one dictionary line plus `pemr rekey`. Two
+escapes keep the common cases quiet: a parenthetical that maps to the same canonical
+token as its stem is dropped with no entry at all (`Hemoglobin (HGB)` → `hemoglobin`),
+and anything else can be declared noise with a full parenthesized key
+(`"m-spike (spep)" = "m_spike"`). The qualifier is *folded into* the existing key part
+rather than appended as a new one, so unqualified rows keep byte-identical keys and a
+rekey moves only the rows the split affects.
+
+The `norm()`/`key_token()` split is visible in the read layer too: `pemr labs --test
+albumin` matches on `norm()` and lists the whole analyte family, while `pemr trends`
+matches on `key_token()` so a numeric series never interleaves two assays — and reports
+the rows it excluded on that basis (`other_assays`) instead of dropping them silently.
 
 **A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
@@ -216,6 +233,17 @@ every stored key under the current dictionary (dry-run by default, `--apply` to 
 values and provenance untouched). It aborts whole if two rows would recompute to one key —
 that means the new synonym fuses two distinct facts, e.g. a CMP `ALB` and an SPEP `Albumin`
 off the same draw, and the fix belongs in the dictionary rather than the data.
+
+`rekey` is also the whole **migration for the issue-#71 key change**, and it is safe by
+construction: a qualifier can only *add* precision, so two rows can never fuse and
+`RekeyCollisionError` is unreachable from that change alone. Procedure: `pemr rekey`
+(dry-run) → read the moved labels → for any that should have stayed collapsed, add a full
+parenthesized synonym key → re-run the dry-run → `pemr rekey --apply`. Rows whose names
+carry no parenthetical do not move at all (the qualifier is folded into the existing key
+part), so a database with no qualified names reports zero changes. Note that `document
+reassign` refuses on `DictionaryDriftError` until the rekey is applied — it recomputes
+keys through the same function, so it sees the drift first. Rekeying does **not** recover
+a value already lost to a pre-fix collision: that needs the source document re-extracted.
 
 The **measured value is deliberately *not* in the key** — temporal identity carries the
 draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
@@ -536,7 +564,11 @@ it's the best possible dedup/extraction test corpus.
   starter `data/dictionary.example.toml` now carries CMP/CBC panel codes, serum free
   light chains and SPEP naming variants; `norm()` additionally strips parenthetical
   qualifiers (`(HGB)`, `(SPEP)`, `(calculated)`) and compares units case-insensitively
-  so the dictionary only needs bare canonical spellings.
+  so the dictionary only needs bare canonical spellings. **Amended (issue #71):**
+  stripping is right for `norm()` (the analyte family) but was wrong for the *key* — it
+  collided a CMP `Albumin` with an SPEP `Albumin (SPEP)`. Keys now use `key_token()`,
+  which keeps a parenthetical unless it is a redundant alias of its stem or the
+  dictionary declares it noise via a full parenthesized key (§3).
 - **FTS**: ~~SQLite FTS5 is plenty; confirm you don't need semantic/vector search over
   notes (could add a sidecar later).~~ **Resolved (phase 3):** plain SQLite FTS5, no
   vector sidecar. `migrations/003_fts.sql` adds a standalone `record_fts` index over
