@@ -353,3 +353,49 @@ def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
     assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
     err = capsys.readouterr().err
     assert "same dedup_key" in err and "nothing was written" in err
+
+
+def _stage_pre_006(tmp_path):
+    """Copy every migration below 006 into a staging dir (leaving 006 pending)."""
+    import shutil
+
+    staged = tmp_path / "pre006"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "006":
+            shutil.copy(path, staged / path.name)
+    return staged
+
+
+def test_migrate_prints_the_rekey_followup_when_006_moves_rows(tmp_path, capsys):
+    """Migration 006 carries the old observation dedup keys forward (SQL cannot compute
+    the new sha256 ones), so `migrate` has to name the follow-up or a re-commit of an
+    already-stored allergy/condition silently forks a second row (issue #63)."""
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane-doe', 'Jane')")
+    conn.execute(
+        "INSERT INTO observation (person_id, obs_type, key, dedup_key, dedup_base) "
+        "VALUES (1, 'allergy', 'Penicillin', 'k1', 'k1')"
+    )
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+
+    assert _run(tmp_path, "migrate") == 0
+    out = capsys.readouterr().out
+    assert "applied 006_condition_allergy.sql" in out
+    assert "note: run `pemr rekey --apply`" in out and "1 allergy/condition row" in out
+    # ... and it is not repeated on a no-op re-run.
+    assert _run(tmp_path, "migrate") == 0
+    assert capsys.readouterr().out.strip() == "up to date"
+
+
+def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
+    """Nothing moved, nothing to rekey - a note nobody must act on trains people to
+    skip notes."""
+    assert _run(tmp_path, "migrate", "--create") == 0
+    out = capsys.readouterr().out
+    assert "applied 006_condition_allergy.sql" in out
+    assert "note:" not in out

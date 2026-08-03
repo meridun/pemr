@@ -174,6 +174,30 @@ def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
     return _DEFAULT_DICTIONARY if _DEFAULT_DICTIONARY.is_file() else None
 
 
+def _migration_followups(conn: sqlite3.Connection, applied: list[str]) -> list[str]:
+    """Manual follow-ups the just-applied migrations leave behind.
+
+    006 moves allergy/condition rows out of `observation` carrying their OLD dedup keys
+    (the new ones are sha256 over dictionary-normalized fields, which SQL cannot compute),
+    so until `rekey` re-derives them a re-commit of an already-stored allergy/condition
+    inserts a second row instead of deduping. Saying so here makes it impossible to miss
+    (issue #63) -- but only when rows actually moved: on a fresh `--create` there is
+    nothing to rekey, and a note nobody has to act on trains people to skip notes.
+    """
+    notes: list[str] = []
+    if "006_condition_allergy.sql" in applied:
+        moved = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM allergy) + (SELECT COUNT(*) FROM condition) "
+            "AS n"
+        ).fetchone()["n"]
+        if moved:
+            notes.append(
+                f"run `pemr rekey --apply` to re-derive dedup keys for the {moved} "
+                "allergy/condition row(s) migrated out of `observation`"
+            )
+    return notes
+
+
 def _cmd_migrate(args: argparse.Namespace) -> int:
     # The one command allowed to create a database - and only with --create. Without it
     # `migrate` applies migrations to an existing database and nothing else (issue #55).
@@ -183,11 +207,14 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     conn = db.connect(db_path)
     try:
         applied = db.migrate(conn, args.migrations_dir or db.DEFAULT_MIGRATIONS_DIR)
+        followups = _migration_followups(conn, applied)
     finally:
         conn.close()
     if applied:
         for name in applied:
             print(f"applied {name}")
+        for note in followups:
+            print(f"note: {note}")
     else:
         print("up to date")
     return 0

@@ -16,7 +16,7 @@ DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.exampl
 
 _TABLES = (
     "person", "document", "lab_result", "medication", "procedure",
-    "appointment", "observation", "conflict",
+    "appointment", "observation", "condition", "allergy", "conflict",
 )
 
 
@@ -98,12 +98,22 @@ def seeded(tmp_path):
              "value_num": 118, "unit": "mmHg"},                                   # latest wins
             {"obs_type": "vital", "key": "weight", "observed_at": "2026-01-01",
              "value_num": 80, "unit": "kg"},
-            {"obs_type": "condition", "key": "Type 2 Diabetes", "observed_at": "2024-01-01"},
-            {"obs_type": "allergy", "key": "Penicillin", "value_text": "rash",
-             "observed_at": "2010-01-01"},
             {"obs_type": "order", "key": "cervical collar", "value_text": "Dr. Smith, ortho",
              "observed_at": "2026-02-01"},                                        # DME order
             {"obs_type": "order", "key": "outpatient physical therapy"},          # bare item, no detail
+        ],
+        "condition": [
+            {"name": "Type 2 Diabetes", "status": "active", "onset_on": "2024-01-01",
+             "note": "diet-controlled"},
+            {"name": "Appendicitis", "status": "resolved", "onset_on": "2015-03-01",
+             "resolved_on": "2015-03-08"},
+            {"name": "Chickenpox", "status": "history"},
+            {"name": "Type 2 Diabetes", "status": "family-history",
+             "relation": "mother"},        # same disease as the active row: distinct subject
+        ],
+        "allergy": [
+            {"substance": "Penicillin", "reaction": "rash", "noted_on": "2010-01-01"},
+            {"substance": "Sulfa", "reaction": "anaphylaxis", "criticality": "high"},
         ],
     }, d)
 
@@ -132,7 +142,8 @@ def test_summary_header_is_self_identifying(seeded):
     assert "DOB: 1980-01-01" in md
     assert "Generated:" in md
     # source row counts so a stale export identifies itself
-    assert "labs=4" in md and "medications=2" in md and "observations=7" in md
+    assert "labs=4" in md and "medications=2" in md and "observations=5" in md
+    assert "conditions=4" in md and "allergies=2" in md
 
 
 def test_summary_active_meds_only(seeded):
@@ -170,10 +181,28 @@ def test_brief_excludes_expired_course_labelled_active(seeded):
     assert "Metformin" in md
 
 
-def test_summary_conditions_and_allergies(seeded):
+def test_summary_splits_conditions_by_status(seeded):
+    """The single Conditions section became three, one per `condition.status` bucket
+    (issue #63) -- an active problem, a past one and a relative's must never read alike."""
     md = render.render_summary(seeded, "jane-doe")
-    assert "## Conditions" in md and "Type 2 Diabetes" in md
-    assert "## Allergies" in md and "Penicillin - rash" in md
+    active = md.split("## Active Problems")[1].split("\n## ")[0]
+    past = md.split("## Past Medical History")[1].split("\n## ")[0]
+    family = md.split("## Family History")[1].split("\n## ")[0]
+
+    assert "- Type 2 Diabetes  (since 2024-01-01) - diet-controlled" in active
+    assert "Appendicitis" not in active and "mother" not in active
+    assert "- Appendicitis  (since 2015-03-01)  (resolved 2015-03-08)" in past
+    assert "- Chickenpox" in past                 # history: no dates given
+    assert "- mother: Type 2 Diabetes" in family  # the relative's, never the patient's
+
+
+def test_summary_allergies_are_typed_rows_high_criticality_first(seeded):
+    md = render.render_summary(seeded, "jane-doe")
+    section = md.split("## Allergies")[1].split("\n## ")[0]
+    assert "- Sulfa [HIGH] - anaphylaxis" in section
+    assert "- Penicillin - rash  (noted 2010-01-01)" in section
+    # criticality='high' outranks alphabetical order: it must survive a skim
+    assert section.index("Sulfa") < section.index("Penicillin")
 
 
 def test_summary_orders_and_referrals(seeded):
@@ -264,7 +293,10 @@ def test_summary_empty_sections_are_explicit(seeded):
     empty-state note (an absent section must not read as an overlooked one)."""
     md = render.render_summary(seeded, "john-doe")
     assert "## Active Medications" in md and "_none recorded_" in md
-    assert "## Conditions" in md
+    for section in ("## Active Problems", "## Past Medical History",
+                    "## Family History", "## Allergies"):
+        assert section in md
+        assert "_none recorded_" in md.split(section)[1].split("\n## ")[0]
     assert "## Orders & Referrals" in md
     order_section = md.split("## Orders & Referrals")[1].split("##")[0]
     assert "_none recorded_" in order_section  # no orders -> explicit empty state
@@ -344,6 +376,34 @@ def test_brief_open_conflict_warning(seeded):
 def test_brief_unknown_appointment_raises(seeded):
     with pytest.raises(render.AppointmentNotFoundError):
         render.render_brief(seeded, 99999)
+
+
+def test_brief_surfaces_allergies_and_active_problems(seeded):
+    """A brief handed to a clinician that omits allergies is a safety gap - and after
+    migration 006 the generic observation loop no longer carries them (issue #63)."""
+    md = render.render_brief(seeded, _upcoming_appt_id(seeded))
+    allergies = md.split("## Allergies")[1].split("\n## ")[0]
+    problems = md.split("## Active Problems")[1].split("\n## ")[0]
+    assert "- Sulfa [HIGH] - anaphylaxis" in allergies
+    assert "- Penicillin - rash" in allergies
+    assert "Type 2 Diabetes" in problems
+    assert "Appendicitis" not in problems      # resolved: not an active problem
+    assert "mother" not in problems            # a relative's dx is never the patient's
+    # placement: before the generic context section, above the fold for a walk-in
+    assert md.index("## Allergies") < md.index("## Procedures & Observations")
+
+
+def test_brief_empty_allergy_section_is_explicit(seeded):
+    """John has no allergies: the section must still render with an empty-state note
+    rather than vanish (an absent Allergies section reads as 'none checked')."""
+    aid = seeded.execute(
+        "INSERT INTO appointment (person_id, scheduled_for, provider, dedup_key, "
+        "dedup_base) SELECT person_id, '2099-05-01', 'Dr. Nobody', 'k-appt-j', "
+        "'k-appt-j' FROM person WHERE slug='john-doe'"
+    ).lastrowid
+    seeded.commit()
+    md = render.render_brief(seeded, aid)
+    assert "_none recorded_" in md.split("## Allergies")[1].split("\n## ")[0]
 
 
 # --- journal ------------------------------------------------------------------
