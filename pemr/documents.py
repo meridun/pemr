@@ -1,4 +1,4 @@
-"""Document recovery — `pemr document list|edit|reassign|rm`.
+"""Document recovery — `pemr document list|show|edit|reassign|rm|set-text`.
 
 The escape hatch for a misfiled document (issue #54). Once `ingest` +
 `commit-extraction` have run against the wrong person (or with the wrong
@@ -6,19 +6,27 @@ doc-date/category), the rows are otherwise stuck: `person remove` correctly
 refuses once a person has records, and hand-editing SQLite means hand-fixing
 ``dedup_key`` and the FTS index too.
 
-Four operations, mirroring `persons.py` in shape:
+Six operations, mirroring `persons.py` in shape:
 
     * ``list_documents``   — what is on file, with the blast-radius record count
+    * ``get_document_view``— one document in detail: the list fields plus the
+      open-conflict ids and the ``ocr_text`` size (issue #62)
     * ``edit_document``    — correct doc_date/category/provider (no key impact)
     * ``reassign_document``— right document, wrong owner: move the document and
       every attached row, re-deriving each ``dedup_key`` (``person_id`` is part
       of every key — see :func:`dedup.dedup_key`)
     * ``remove_document``  — wrong file entirely: cascade-delete the attached
       rows, then the document
+    * ``set_document_text``— attach/replace ``ocr_text`` after ingest, the one
+      thing only `ingest` could do before (issue #62)
 
 Safety idiom (matching `pemr rekey`): ``reassign`` and ``rm`` are **dry-run by
-default**; ``apply=True`` writes. ``record_fts`` needs no explicit maintenance —
-migration 003's AFTER UPDATE/DELETE triggers on each base table keep it in sync.
+default**; ``apply=True`` writes. ``edit`` and ``set_document_text`` are not —
+a single-row, non-cascading, key-neutral write has no blast radius for a dry run
+to report, so it goes direct (``set_document_text`` guards the one surprising
+case, an overwrite, with ``force`` instead). ``record_fts`` needs no explicit
+maintenance — migration 003's AFTER UPDATE/DELETE triggers on each base table
+keep it in sync, which is exactly how a new ``ocr_text`` becomes findable.
 
 Single-provenance semantics: ``document_id`` is a row's sole owner. A fact a
 second document also attests leaves no trace in the schema (``commit_extraction``
@@ -50,6 +58,10 @@ class OpenConflictsError(ValueError):
 
 class DictionaryDriftError(ValueError):
     """Stored keys no longer match the current dictionary; `pemr rekey` comes first."""
+
+
+class OcrTextPresentError(ValueError):
+    """`set-text` refused: the document already has ``ocr_text`` and ``force`` was off."""
 
 
 # Editable via `document edit`. None of these feed a dedup_key (keys are built from
@@ -184,10 +196,84 @@ def list_documents(
     return [_document_view(conn, row) for row in rows]
 
 
+def _show_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """The :func:`_document_view` fields plus the two `document show` extras.
+
+    Deliberately *not* folded into :func:`_document_view`: ``conflicts_open`` costs a
+    per-record-type scan, which is a cheap one-off here and an N+1 across
+    :func:`list_documents`. Keeping the split also leaves `list`'s output and JSON shape
+    byte-identical to what issue #54 shipped.
+    """
+    view = _document_view(conn, row)
+    view["ocr_text_chars"] = len(row["ocr_text"] or "")
+    # Both ends of the conflict graph — the same union `reassign` refuses on, so `show`
+    # works as its pre-flight (see :func:`_conflicts_anchored_to`).
+    view["conflicts_open"] = sorted(
+        set(_conflicts_cited_by(conn, row["document_id"]))
+        | set(_conflicts_anchored_to(conn, row["document_id"]))
+    )
+    return view
+
+
 def get_document_view(conn: sqlite3.Connection, document_id: int) -> dict:
-    """One document in the :func:`list_documents` shape."""
+    """One document in the :func:`list_documents` shape, plus ``ocr_text_chars`` and
+    ``conflicts_open``. ``ocr_text`` itself stays out — see :func:`get_document_text`."""
     db.require_migrated(conn)
-    return _document_view(conn, _require_document(conn, document_id))
+    return _show_view(conn, _require_document(conn, document_id))
+
+
+def get_document_text(conn: sqlite3.Connection, document_id: int) -> str:
+    """The stored ``ocr_text`` verbatim, ``""`` when unset.
+
+    The read half of :func:`set_document_text`: without it there is no way to see what
+    a ``force=True`` replace is about to discard.
+    """
+    db.require_migrated(conn)
+    return _require_document(conn, document_id)["ocr_text"] or ""
+
+
+def set_document_text(
+    conn: sqlite3.Connection,
+    document_id: int,
+    text: str,
+    *,
+    force: bool = False,
+) -> dict:
+    """Attach or replace a document's ``ocr_text`` after ingest (`pemr document set-text`).
+
+    Closes the gap that made an ingest without text unrecoverable: `ingest` returns early
+    on a layer-1 content-hash hit and writes nothing, so re-ingesting the same file cannot
+    supply the text a first pass missed. ``record_fts`` follows automatically — migration
+    003's ``record_fts_document_au`` trigger delete+reinserts the FTS row from
+    ``NEW.ocr_text``, so the document becomes visible to `pemr find` with no explicit
+    reindex (and a replace stops matching the old text).
+
+    The stored value is ``text.strip()``, matching :func:`ingest.ingest_document`.
+
+    Raises :class:`DocumentNotFoundError` (unknown id), :class:`OcrTextPresentError` (the
+    column is already populated and ``force`` is off — replacing a transcription is not
+    cheaply undoable, so the surprising case is refused rather than silently applied), and
+    ``ValueError`` for empty/whitespace-only text. There is deliberately no path to *clear*
+    ``ocr_text``: that only removes FTS visibility, while an empty input is far more likely
+    a wrong or truncated file.
+    """
+    db.require_migrated(conn)
+    row = _require_document(conn, document_id)
+    stored = (text or "").strip()
+    if not stored:
+        raise ValueError("text is empty - nothing to store; ocr_text unchanged")
+    existing = row["ocr_text"] or ""
+    if existing and not force:
+        raise OcrTextPresentError(
+            f"document {document_id} already has ocr_text ({len(existing)} chars) - "
+            "pass --force to replace it; nothing was written"
+        )
+    with conn:
+        conn.execute(
+            "UPDATE document SET ocr_text = ? WHERE document_id = ?",
+            (stored, document_id),
+        )
+    return _show_view(conn, _require_document(conn, document_id))
 
 
 def edit_document(
