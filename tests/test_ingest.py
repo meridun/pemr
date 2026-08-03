@@ -454,12 +454,79 @@ def test_extract_text_reads_xlsx(conn, tmp_path, sources):
     assert result.document.ocr_text == "test\tvalue\nsodium\t140"
 
 
-def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys):
+def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys, monkeypatch):
+    monkeypatch.setattr(ingest, "run_ocr", lambda _: None)   # tesseract declines
     src = _make_file(tmp_path, "thread.msg", b"\xd0\xcf\x11\xe0 outlook")
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
     assert result.status == "new"          # the document still lands
     assert result.document.ocr_text is None
     assert "--ocr-text-file" in capsys.readouterr().err
+
+
+# --- routing boundary (issue #66 verify bounce) --------------------------------
+# `ocr=True` used to hand *every* file to tesseract. An image-suffix allowlist silently
+# dropped `.jfif`/`.jpe`/extension-less scans out of `find`, so anything without a native
+# route must still reach `run_ocr`.
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["alpha.jfif", "beta.jpe", "gamma_noext", "delta.JPG", "scan.pdf", "thread.msg"],
+)
+def test_suffixes_without_a_native_route_still_reach_tesseract(
+    conn, tmp_path, sources, monkeypatch, name
+):
+    seen: list[str] = []
+
+    def fake_run_ocr(path):
+        seen.append(str(path))
+        return "Ferritin 201 nanograms"
+
+    monkeypatch.setattr(ingest, "run_ocr", fake_run_ocr)
+    src = _make_file(tmp_path, name, b"\x89PNG pretend scan")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "Ferritin 201 nanograms"
+
+
+@pytest.mark.parametrize("maker", ["csv", "txt", "docx", "xlsx"])
+def test_natively_extracted_suffixes_never_shell_out(
+    conn, tmp_path, sources, monkeypatch, maker
+):
+    def boom(path):  # pragma: no cover - the assertion is that this never runs
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", boom)
+    if maker == "docx":
+        src = _make_docx(tmp_path, paragraphs=("sodium 140",))
+    elif maker == "xlsx":
+        src = _make_xlsx(tmp_path)
+    else:
+        src = _make_file(tmp_path, f"labs.{maker}", b"test,value\nsodium,140\n")
+    assert ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).ocr_text_populated
+
+
+def test_xlsx_bad_shared_string_index_only_loses_that_cell(conn, tmp_path, sources):
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    src = tmp_path / "badidx.xlsx"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            f'<sst xmlns="{ns}"><si><t>ferritin</t></si></sst>',
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            f'<worksheet xmlns="{ns}"><sheetData>'
+            '<row><c t="s"><v>0</v></c><c t="s"><v>notanint</v></c>'
+            '<c t="s"><v>0</v></c></row>'
+            "</sheetData></worksheet>",
+        )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    # bad cell blank, the rest of the workbook survives
+    assert result.document.ocr_text == "ferritin\t\tferritin"
 
 
 def test_malformed_docx_degrades_instead_of_losing_the_document(

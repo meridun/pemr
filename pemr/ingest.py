@@ -150,13 +150,6 @@ def run_ocr(path: str | Path) -> str | None:
 
 _PLAINTEXT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".json", ".log"})
 
-# What tesseract can actually read. Everything else with no native branch below gets
-# the "no extractor" note rather than a doomed subprocess.
-_OCR_SUFFIXES = frozenset({
-    ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
-    ".jp2", ".pnm", ".ppm", ".pgm", ".pbm",
-})
-
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
@@ -191,7 +184,11 @@ def _cell_text(cell: ET.Element, shared: list[str]) -> str:
         value = cell.find(f"{_SHEET_NS}v")
         if value is None or not (value.text or "").strip():
             return ""
-        index = int(value.text)
+        try:
+            index = int(value.text)
+        except ValueError:
+            # One malformed shared-string index must not discard the whole workbook.
+            return ""
         return shared[index] if 0 <= index < len(shared) else ""
     if kind == "inlineStr":
         return _xml_text(cell, f"{_SHEET_NS}t")
@@ -200,7 +197,9 @@ def _cell_text(cell: ET.Element, shared: list[str]) -> str:
 
 
 def _extract_xlsx(path: Path) -> str:
-    """`.xlsx` cell text: one line per row, tab-separated, sheets in workbook order."""
+    """`.xlsx` cell text: one line per row, tab-separated, sheets in sheet-file
+    numeric order (`sheet2.xml` before `sheet10.xml`); true workbook order lives in
+    `xl/workbook.xml` and is not worth a second parse for full-text purposes."""
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
         shared: list[str] = []
@@ -226,19 +225,22 @@ def _extract_xlsx(path: Path) -> str:
 
 
 def extract_text(path: str | Path) -> str | None:
-    """Best-effort document text by file type; ``None`` when there is no route.
+    """Best-effort document text by file type; ``None`` when nothing could be read.
 
-    Dispatches on suffix: plaintext-ish formats are read directly, `.docx`/`.xlsx` are
-    unzipped and their OOXML parsed with the stdlib, images and PDFs go to
-    :func:`run_ocr` (tesseract). Anything else — `.rtf`, `.msg`, `.doc` — returns
-    ``None`` with a stderr note; transcribe those yourself and pass `--ocr-text-file`.
+    Dispatches on suffix: plaintext-ish formats are read directly and `.docx`/`.xlsx`
+    are unzipped and their OOXML parsed with the stdlib. **Everything else falls
+    through to :func:`run_ocr`** (tesseract) — the same thing `ocr=True` did before
+    this dispatcher existed. Deliberately not a suffix allowlist: image extensions
+    vary far too widely (`.jfif`, `.jpe`, extension-less scans) for one to be safe,
+    and silently skipping a scan that used to OCR is the worse failure — it drops the
+    document out of `find` with no signal. When tesseract declines (absent, failed, or
+    no text — e.g. `.rtf`, `.msg`, `.doc`) the caller gets ``None`` plus a stderr note
+    pointing at `--ocr-text-file`.
 
     Never raises: a malformed `.docx` must not cost you the document.
     """
     src = Path(path)
     suffix = src.suffix.lower()
-    if suffix in _OCR_SUFFIXES:
-        return run_ocr(src)
     try:
         if suffix in _PLAINTEXT_SUFFIXES:
             # utf-8-sig eats a BOM; errors="replace" keeps a legacy-encoded file
@@ -249,13 +251,16 @@ def extract_text(path: str | Path) -> str | None:
         elif suffix == ".xlsx":
             text = _extract_xlsx(src)
         else:
-            print(
-                f"note: --ocr requested but there is no text extractor for "
-                f"'{suffix or src.name}'; storing document without ocr_text. "
-                f"Transcribe it and pass --ocr-text-file <path>.",
-                file=sys.stderr,
-            )
-            return None
+            ocr_text = run_ocr(src)
+            if ocr_text is None:
+                # run_ocr already said *why* it declined; add what to do about it.
+                print(
+                    f"note: no text could be extracted from {src.name}; "
+                    f"storing document without ocr_text. Transcribe it and pass "
+                    f"--ocr-text-file <path>.",
+                    file=sys.stderr,
+                )
+            return ocr_text
     except _EXTRACT_ERRORS as exc:
         print(
             f"note: text extraction failed for {src.name} ({exc}); "

@@ -134,8 +134,9 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
   beats tesseract on messy scans.
 - **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
   It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
-  `.docx`/`.xlsx` parsed from their OOXML, images and PDFs through tesseract. `.rtf`, `.msg`,
-  `.doc` and PDF text layers have no route: transcribe those yourself.
+  `.docx`/`.xlsx` parsed from their OOXML, everything else (images, PDFs, unknown suffixes)
+  through tesseract. `.rtf`, `.msg`, `.doc` and PDF text layers have no working route:
+  you get a stderr note, and must transcribe those yourself.
 - **Pointer stubs are refused.** A `.gsheet`/`.gdoc` from a synced Drive folder is a ~1 KB JSON
   link, not the document; `ingest` fails pre-write. Export it from Drive and ingest the export.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
