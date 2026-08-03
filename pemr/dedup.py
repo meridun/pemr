@@ -77,6 +77,24 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
         "value_text": (str, False),
         "unit": (str, False),
     },
+    # Promoted out of `observation` by migration 006 (issue #63): both carry fields the
+    # generic shape has no legal home for (two dates on a resolved problem; an allergy's
+    # machine-readable criticality) and both need a subject discriminator in the key so a
+    # relative's diagnosis never dedups into the patient's own problem list.
+    "allergy": {
+        "substance": (str, True),
+        "reaction": (str, False),
+        "criticality": (str, False),
+        "noted_on": (str, False),
+    },
+    "condition": {
+        "name": (str, True),
+        "status": (str, True),
+        "onset_on": (str, False),
+        "resolved_on": (str, False),
+        "relation": (str, False),
+        "note": (str, False),
+    },
 }
 
 KNOWN_TYPES = tuple(FIELD_SPECS)
@@ -95,6 +113,22 @@ DATE_FIELDS: dict[str, frozenset[str]] = {
     "procedure": frozenset({"performed_on"}),
     "appointment": frozenset({"scheduled_for"}),
     "observation": frozenset({"observed_at"}),
+    "allergy": frozenset({"noted_on"}),
+    "condition": frozenset({"onset_on", "resolved_on"}),
+}
+
+# Closed vocabularies per record type, enforced by validate_row right after the
+# DATE_FIELDS check. Only fields the read layer *branches on* belong here: a typo'd
+# `condition.status='inactive'` would vanish from every rendered section rather than
+# show up wrong, which is the failure mode worth a hard reject. Membership is tested on
+# :func:`enum_token` (case/space/underscore/hyphen-insensitive) but the **verbatim**
+# value is stored, mirroring how `_norm_unit` compares case-insensitively while display
+# casing survives.
+ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
+    "allergy": {"criticality": frozenset({"high", "low", "unable-to-assess"})},
+    "condition": {
+        "status": frozenset({"active", "resolved", "history", "family-history"})
+    },
 }
 
 _WS = re.compile(r"\s+")
@@ -206,6 +240,21 @@ def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
     return collapsed
 
 
+def enum_token(value: object) -> str:
+    """Canonical comparison form of an :data:`ENUM_FIELDS` value.
+
+    Case-, space-, underscore- and hyphen-insensitive: ``"Unable to Assess"``,
+    ``"unable_to_assess"`` and ``"unable-to-assess"`` all reduce to
+    ``unable-to-assess``, so a source's own casing/punctuation validates while the
+    verbatim value is what gets stored. Also the comparison the read layer uses when it
+    branches on a stored ``status`` (render sections, timeline) — reading the raw column
+    would miss a row stored as ``"Family History"``.
+    """
+    if value is None:
+        return ""
+    return _collapse(str(value)).replace(" ", "-")
+
+
 def _date_only(value: object) -> str:
     """Date portion of an ISO datetime/date string ('2026-01-02T09:00' -> '2026-01-02')."""
     if value is None:
@@ -257,7 +306,28 @@ def _key_parts(
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
         return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), n("key")]
+    # allergy/condition are DATE-FREE by design: they are standing facts restated on
+    # every document with inconsistent or absent dates, so a date in the key would fork
+    # one allergy into one row per document. The dates are payload, and a disagreement
+    # in them stages a conflict (issue #63 design).
+    if record_type == "allergy":
+        return [person_id, n("substance")]
+    if record_type == "condition":
+        return [person_id, n("name"), _condition_subject(row, dictionary)]
     raise ValidationError(f"unknown record type: {record_type}")  # guarded by validate()
+
+
+def _condition_subject(row: dict, dictionary: dict[str, str] | None = None) -> str:
+    """Whose condition this is — the discriminator that keeps a relative's diagnosis out
+    of the patient's own problem list.
+
+    ``self`` for every status but ``family-history``, which keys on the relative instead
+    (``family:mother``). Two relatives with the same disease therefore stay distinct rows,
+    and neither collides with the patient's.
+    """
+    if enum_token(row.get("status")) != "family-history":
+        return "self"
+    return "family:" + norm(row.get("relation"), dictionary)
 
 
 def identity_label(
@@ -338,6 +408,12 @@ def validate_row(record_type: str, row: object) -> None:
                 f"(YYYY-MM) or full (YYYY-MM-DD) precision, or a full-date ISO "
                 f"timestamp, got {value!r}"
             )
+        allowed = ENUM_FIELDS.get(record_type, {}).get(name)
+        if allowed is not None and enum_token(value) not in allowed:
+            raise ValidationError(
+                f"{record_type}.{name}: expected one of "
+                f"{', '.join(sorted(allowed))}, got {value!r}"
+            )
 
 
 def _type_names(types: object) -> str:
@@ -379,7 +455,19 @@ _COMPARE_FIELDS: dict[str, list[str]] = {
     "procedure": ["provider", "outcome"],
     "appointment": ["specialty", "reason", "summary"],
     "observation": ["value_num", "value_text", "unit"],
+    "allergy": ["reaction", "criticality", "noted_on"],
+    "condition": ["status", "onset_on", "resolved_on", "relation", "note"],
 }
+
+# Types whose rows are standing facts restated across documents: a missing incoming
+# field means "this document didn't say", not "the value was cleared", so a one-sided
+# None is NOT a disagreement (issue #63). Without this, re-ingesting next year's health
+# summary — which reprints the same 8 allergies but omits criticality — would stage 8
+# conflicts that mean nothing. Present-and-different still always conflicts, and
+# `condition.status` is required so a lifecycle change (active -> resolved) is never
+# skipped. For the date-keyed types (labs, meds ...) a cleared field IS news, so they
+# keep the strict comparison.
+_SPARSE_TYPES = frozenset({"allergy", "condition"})
 
 
 def _stored_fields(record_type: str, row_map: dict) -> dict:
@@ -403,10 +491,14 @@ def _rows_equal(
     ``existing`` is a stored row (or, in the pass-1 intra-payload check, an earlier
     row of the same submission)."""
     existing_map = dict(existing)
+    sparse = record_type in _SPARSE_TYPES
     for name in _COMPARE_FIELDS[record_type]:
         ev = existing_map.get(name)
         iv = incoming.get(name)
         if ev is None and iv is None:
+            continue
+        # Standing facts: one side simply not stating a field is silence, not a change.
+        if sparse and (ev is None or iv is None):
             continue
         # Unit strings are compared case-insensitively so casing variants across
         # documents don't stage a spurious conflict.
@@ -885,8 +977,10 @@ def _rekey_label(record_type: str, row: sqlite3.Row) -> str:
     """Short human identifier for a row in `pemr rekey` output ("CL", "Metformin")."""
     if record_type == "lab_result":
         return row["test_name"] or ""
-    if record_type in ("medication", "procedure"):
+    if record_type in ("medication", "procedure", "condition"):
         return row["name"] or ""
+    if record_type == "allergy":
+        return row["substance"] or ""
     if record_type == "appointment":
         return " ".join(p for p in (row["provider"], row["scheduled_for"]) if p)
     return " ".join(p for p in (row["obs_type"], row["key"]) if p)  # observation

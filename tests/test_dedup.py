@@ -494,7 +494,9 @@ def test_migration_005_preserves_pre_existing_keys(tmp_path):
     staged = tmp_path / "migrations"
     staged.mkdir()
     all_migrations = sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql"))
-    pre_005 = [p for p in all_migrations if not p.name.startswith("005_")]
+    # Everything numbered below 005 - later migrations build ON the occurrence columns,
+    # so they cannot stand in for the pre-005 shape.
+    pre_005 = [p for p in all_migrations if p.name < "005"]
     for path in pre_005:
         shutil.copy(path, staged / path.name)
 
@@ -514,7 +516,7 @@ def test_migration_005_preserves_pre_existing_keys(tmp_path):
 
         for path in all_migrations:
             shutil.copy(path, staged / path.name)
-        assert db.migrate(conn, staged) == ["005_dedup_occurrence.sql"]
+        assert "005_dedup_occurrence.sql" in db.migrate(conn, staged)
 
         stored = conn.execute("SELECT * FROM lab_result").fetchone()
         assert stored["dedup_key"] == legacy_key      # no key churn
@@ -682,6 +684,8 @@ def test_rekey_covers_every_record_type(conn):
         "procedure": [{"name": "Colonoscopy", "performed_on": "2025-06-01"}],
         "appointment": [{"scheduled_for": "2026-03-01", "provider": "Dr. Smith"}],
         "observation": [{"obs_type": "vital", "key": "bp", "observed_at": "2026-01-02"}],
+        "allergy": [{"substance": "Penicillin", "reaction": "rash"}],
+        "condition": [{"name": "Type 2 Diabetes", "status": "active"}],
     })
     report = dedup.rekey(conn, None)
     assert report.scanned == {t: 1 for t in dedup.KNOWN_TYPES}
@@ -717,3 +721,129 @@ def test_rekey_moves_dedup_base_with_the_key(conn):
     dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"), apply=True)
     row = conn.execute("SELECT * FROM lab_result").fetchone()
     assert row["dedup_base"] == row["dedup_key"]   # occurrence 0: base IS the key
+
+
+# --- allergy / condition typed rows (issue #63) -------------------------------
+
+def _commit(conn, records, doc=None, dictionary=None):
+    return dedup.commit_extraction(
+        conn, doc if doc is not None else _make_document(conn), records, dictionary
+    )
+
+
+def test_allergy_key_is_date_free(conn):
+    """Allergies are standing facts restated on every document with inconsistent dates,
+    so the same allergen collapses to ONE row however the dates differ."""
+    _commit(conn, {"allergy": [
+        {"substance": "Penicillin", "reaction": "rash", "noted_on": "2010-01-01"}]})
+    summary = _commit(conn, {"allergy": [
+        {"substance": "penicillin", "reaction": "rash", "noted_on": "2021-06-01"}]})
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 1
+
+
+def test_condition_family_history_does_not_collide_with_the_patients_own(conn):
+    """The clinical-safety defect the typed table exists to fix: under the old
+    observation key, the patient's diabetes and her mother's deduped into one row."""
+    summary = _commit(conn, {"condition": [
+        {"name": "Type 2 Diabetes", "status": "active"},
+        {"name": "Type 2 Diabetes", "status": "family-history", "relation": "mother"},
+        {"name": "Type 2 Diabetes", "status": "family-history", "relation": "father"},
+    ]})
+    assert summary.counts == {"new": 3, "duplicate": 0, "conflict": 0}
+
+
+def test_condition_lifecycle_change_stages_a_conflict(conn):
+    """active -> resolved keeps the same key (the date is payload), so the change is a
+    conflict for a human rather than a silent second problem-list entry."""
+    _commit(conn, {"condition": [{"name": "Anemia", "status": "active"}]})
+    summary = _commit(conn, {"condition": [
+        {"name": "Anemia", "status": "resolved", "resolved_on": "2025-09-01"}]})
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+
+    conflict_id = dedup.list_conflicts(conn)[0]["conflict_id"]
+    dedup.resolve_conflict(conn, conflict_id, keep="incoming")
+    row = conn.execute("SELECT * FROM condition").fetchone()
+    assert (row["status"], row["resolved_on"]) == ("resolved", "2025-09-01")
+
+
+def test_sparse_types_do_not_conflict_on_an_omitted_field(conn):
+    """A document that simply doesn't restate criticality means "didn't say", not
+    "cleared" - otherwise re-ingesting next year's summary stages a conflict per allergy."""
+    _commit(conn, {"allergy": [
+        {"substance": "Sulfa", "reaction": "hives", "criticality": "high"}]})
+    summary = _commit(conn, {"allergy": [{"substance": "Sulfa"}]})
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    # ... but a stated disagreement still conflicts.
+    summary = _commit(conn, {"allergy": [
+        {"substance": "Sulfa", "reaction": "anaphylaxis"}]})
+    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+
+
+def test_labs_keep_the_strict_comparison(conn):
+    """The sparse rule is scoped to standing facts: for a dated lab draw a cleared unit
+    is still news, so a one-sided None must stay a conflict."""
+    _commit(conn, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95,
+         "unit": "mg/dL"}]})
+    summary = _commit(conn, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95}]})
+    assert summary.counts["conflict"] == 1
+
+
+def test_condition_status_is_required_and_enum_checked(conn):
+    with pytest.raises(dedup.ValidationError, match="missing required field 'status'"):
+        dedup.validate_row("condition", {"name": "Anemia"})
+    with pytest.raises(dedup.ValidationError, match="active, family-history"):
+        dedup.validate_row("condition", {"name": "Anemia", "status": "inactive"})
+
+
+def test_enum_values_are_matched_leniently_but_stored_verbatim(conn):
+    """A source's own casing/punctuation validates; the column keeps what it wrote."""
+    dedup.validate_row(
+        "allergy", {"substance": "Latex", "criticality": "Unable to Assess"})
+    _commit(conn, {"condition": [{"name": "Asthma", "status": "Family_History",
+                                  "relation": "Mother"}]})
+    row = conn.execute("SELECT * FROM condition").fetchone()
+    assert row["status"] == "Family_History"        # verbatim
+    # ... and it still keys as family history, so it never joins the patient's own list.
+    summary = _commit(conn, {"condition": [{"name": "Asthma", "status": "active"}]})
+    assert summary.counts["new"] == 1
+
+
+def test_allergy_criticality_is_optional_but_checked(conn):
+    dedup.validate_row("allergy", {"substance": "Latex"})              # no raise
+    with pytest.raises(dedup.ValidationError, match="high, low"):
+        dedup.validate_row("allergy", {"substance": "Latex", "criticality": "severe"})
+
+
+def test_new_types_have_date_validation(conn):
+    with pytest.raises(dedup.ValidationError, match="expected ISO date"):
+        dedup.validate_row("allergy", {"substance": "Latex", "noted_on": "06/15/2026"})
+    with pytest.raises(dedup.ValidationError, match="expected ISO date"):
+        dedup.validate_row(
+            "condition", {"name": "Anemia", "status": "active", "resolved_on": "soon"})
+
+
+def test_rekey_rederives_a_carried_forward_migration_key(conn):
+    """Migration 006 moves rows carrying their OLD observation key (SQL can't compute
+    sha256 over normalized fields); `pemr rekey --apply` is what re-derives them, and it
+    must name the row by substance/name rather than blowing up on `obs_type`."""
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    conn.execute(
+        "INSERT INTO allergy (person_id, substance, reaction, dedup_key, dedup_base) "
+        "VALUES (?, 'Penicillin', 'rash', 'legacy-obs-key', 'legacy-obs-key')", (pid,))
+    conn.commit()
+
+    report = dedup.rekey(conn, None)
+    change = next(c for c in report.changes if c.record_type == "allergy")
+    assert change.old_key == "legacy-obs-key"
+    assert change.label == "Penicillin"
+    assert change.new_key == dedup.dedup_key("allergy", {"substance": "Penicillin"}, pid)
+
+    dedup.rekey(conn, None, apply=True)
+    row = conn.execute("SELECT * FROM allergy").fetchone()
+    assert row["dedup_key"] == change.new_key and row["dedup_base"] == change.new_key
+    # ... and now a fresh commit of the same allergy dedups instead of forking.
+    summary = _commit(conn, {"allergy": [{"substance": "Penicillin", "reaction": "rash"}]})
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
