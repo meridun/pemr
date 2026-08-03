@@ -330,9 +330,11 @@ Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text 
 from instead of re-reading the source every time. It extracts by whatever route the file
 type allows, all stdlib (the engine has no runtime dependencies):
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
-parsed, images and PDFs through `tesseract` (a soft dependency). Anything else —
-`.rtf`, `.msg`, `.doc`, a PDF text layer — needs a third-party parser and is deliberately
-out: transcribe it yourself and pass `--ocr-text-file`. Extraction is best-effort and
+parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
+allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Formats
+tesseract can't read — `.rtf`, `.msg`, `.doc`, a PDF text layer — need a third-party
+parser and are deliberately out: you get a stderr note telling you to transcribe it
+yourself and pass `--ocr-text-file`. Extraction is best-effort and
 never fatal; a malformed file costs you the text, not the document. `--ocr tesseract` is
 a retained alias for `--ocr auto`.
 

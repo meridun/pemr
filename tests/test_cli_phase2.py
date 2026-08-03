@@ -412,7 +412,10 @@ def test_ocr_tesseract_is_an_alias_for_auto(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
-def test_unextractable_format_still_ingests_with_a_note(ready, capsys):
+def test_unextractable_format_still_ingests_with_a_note(ready, capsys, monkeypatch):
+    from pemr import ingest as ingest_mod
+
+    monkeypatch.setattr(ingest_mod, "run_ocr", lambda _: None)   # tesseract declines
     tmp_path = ready
     msg = tmp_path / "thread.msg"
     msg.write_bytes(b"\xd0\xcf\x11\xe0 outlook message")
@@ -420,5 +423,22 @@ def test_unextractable_format_still_ingests_with_a_note(ready, capsys):
     assert _run(tmp_path, "ingest", str(msg), "--person", "jane-doe",
                 "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
     err = capsys.readouterr().err
-    assert "no text extractor" in err
+    assert "no text could be extracted" in err
     assert "--ocr-text-file" in err
+    assert "no ocr_text stored" in err
+
+
+def test_ocr_auto_still_ocrs_an_unlisted_image_suffix(ready, capsys, monkeypatch):
+    """`.jfif` has no native route and must reach tesseract, not be skipped."""
+    from pemr import ingest as ingest_mod
+
+    monkeypatch.setattr(ingest_mod, "run_ocr", lambda _: "Ferritin 201 nanograms")
+    tmp_path = ready
+    img = tmp_path / "alpha.jfif"
+    img.write_bytes(b"\xff\xd8\xff\xe0 jpeg bytes")
+
+    assert _run(tmp_path, "ingest", str(img), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    assert "no ocr_text stored" not in capsys.readouterr().err
+    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
+    assert "#1" in capsys.readouterr().out
