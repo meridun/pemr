@@ -18,7 +18,8 @@ refusal is a clean no-op) when the text affirmatively points somewhere else. See
 Issue #69 adds a second entry point, :func:`ingest_study_dir`: a DICOM study
 *directory* becomes one document whose blob is a canonical zip of its slices (see
 :mod:`pemr.study`). It reuses every rail above — same person lookup, same layer-1
-dedup on the content hash, same content-addressed store, same insert.
+dedup on the content hash, same content-addressed store, same insert, and the same
+owner check, fed by the study's ``PatientName``/``PatientBirthDate`` header tags.
 """
 
 from __future__ import annotations
@@ -313,6 +314,21 @@ def check_owner(
     return OwnerCheck(verdict="unverified")
 
 
+def _strongest_check(checks: Sequence[OwnerCheck]) -> OwnerCheck:
+    """The verdict to act on when more than one identity signal was checked.
+
+    A study has two (the DICOM header tags and any caller-supplied transcription),
+    and they are independent, so the ordering is by consequence: anything blocking
+    wins — refusing on *any* evidence of a misfile is the whole point of the check —
+    then an affirmative match, then ignorance.
+    """
+    for verdict in ("mismatch", "suspect", "match"):
+        for check in checks:
+            if check.verdict == verdict:
+                return check
+    return OwnerCheck(verdict="unverified")
+
+
 def refusal_message(
     check: OwnerCheck, claimed: Person, roster: Sequence[Person]
 ) -> str:
@@ -552,10 +568,14 @@ def ingest_study_dir(
       visible to `find` instead of being an untitled row. An agent that transcribed
       the accompanying radiology report should pass that text instead.
 
-    The owner check runs only against **caller-supplied** text. Checking our own
-    derived summary would be meaningless (it carries no patient identity) and worse
-    than meaningless if a series description happened to trip an identity anchor —
-    a spurious refusal of a study nobody could fix without ``force``.
+    The issue-#61 owner check runs against two independent signals: the study's own
+    ``PatientName``/``PatientBirthDate`` header tags (:func:`pemr.study.identity_text`)
+    and any caller-supplied text, with the more consequential verdict winning. It is
+    never run against our *derived summary*, which would be meaningless (engine
+    output carries no patient identity) and worse than meaningless if a
+    ``StudyDescription`` like "PATIENT POSITIONING" tripped the identity anchor —
+    a spurious refusal of a study nobody could fix without ``force``. The refusal
+    point is pre-write **and** pre-pack, so a refused study costs nothing.
     """
     db.require_migrated(conn)
 
@@ -607,10 +627,11 @@ def ingest_study_dir(
     text = supplied or _study.summary_text(scan, metadata)
 
     roster = _roster(conn)
-    owner_check = (
-        check_owner(supplied, person, roster) if supplied
-        else OwnerCheck(verdict="unverified")
-    )
+    owner_check = _strongest_check([
+        check_owner(candidate, person, roster)
+        for candidate in (_study.identity_text(metadata), supplied)
+        if candidate
+    ])
     if owner_check.blocks and not force:
         # Pre-write *and* pre-pack: a refusal costs nothing and leaves nothing.
         raise OwnerMismatchError(

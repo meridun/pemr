@@ -24,7 +24,12 @@ Two properties carry the design:
   field that would otherwise vary (entry order, compression, timestamps, host
   system, file mode) is pinned below.
 
-Metadata is read with a **minimal stdlib parser** for five tags. The project has zero
+Metadata is read with a **minimal stdlib parser** for seven tags — five descriptive
+ones that seed the derived summary, plus patient name and birth date, which are
+verification input for the issue-#61 owner check and are never stored. Every length
+the file declares is bounded before it is used: a scratched disc's corrupt length
+field is otherwise an unbounded allocation, and an untrusted element length is
+otherwise text spliced straight into `document.ocr_text`. The project has zero
 runtime dependencies (`pyproject.toml`) and `pydicom` would be the first, so it is
 refused rather than deferred; the reader is best-effort in exactly the way
 :func:`pemr.ingest.run_ocr` is — any parse failure yields no metadata and never
@@ -48,6 +53,7 @@ __all__ = [
     "StudyMetadata",
     "StudyScan",
     "human_bytes",
+    "identity_text",
     "is_dicom_file",
     "pack_study",
     "read_metadata",
@@ -224,6 +230,8 @@ _TAG_STUDY_DATE = (0x0008, 0x0020)
 _TAG_MODALITY = (0x0008, 0x0060)
 _TAG_STUDY_DESCRIPTION = (0x0008, 0x1030)
 _TAG_SERIES_DESCRIPTION = (0x0008, 0x103E)
+_TAG_PATIENT_NAME = (0x0010, 0x0010)
+_TAG_PATIENT_BIRTH_DATE = (0x0010, 0x0030)
 _TAG_STUDY_UID = (0x0020, 0x000D)
 _TAG_TRANSFER_SYNTAX = (0x0002, 0x0010)
 
@@ -232,10 +240,12 @@ _WANTED = frozenset({
     _TAG_MODALITY,
     _TAG_STUDY_DESCRIPTION,
     _TAG_SERIES_DESCRIPTION,
+    _TAG_PATIENT_NAME,
+    _TAG_PATIENT_BIRTH_DATE,
     _TAG_STUDY_UID,
 })
 
-# All five wanted tags are short-form string VRs (DA/CS/LO/UI), so no VR dictionary
+# Every wanted tag is a short-form string VR (DA/CS/LO/UI/PN), so no VR dictionary
 # is needed to read them under Implicit VR — only the length encoding differs.
 # Stop as soon as the element stream passes their groups: elements are in ascending
 # tag order, and group 0xFFFE (item delimiters) trips the same guard.
@@ -261,11 +271,23 @@ _ENCAPSULATED_PREFIX = "1.2.840.10008.1.2.4."
 #: bailing out beats reading a gigabyte per slice.
 _MAX_HEADER_SCAN = 1 << 20  # 1 MiB
 
+#: Hard cap on a single tag value. The length prefix in the file is untrusted, and
+#: every value we read has a VR maximum far below this (``DA`` 8, ``CS`` 16, ``LO``
+#: 64, ``UI`` 64, ``PN`` 64 per component) — so a longer one is corruption or hostile
+#: input, not data. Without the cap a file could declare a ~1 MiB
+#: ``StudyDescription`` and have it spliced verbatim into `document.ocr_text`, i.e.
+#: into the FTS index and into an agent's context as if it were record text.
+_MAX_TAG_CHARS = 128
+
 
 def _clean(raw: bytes) -> str | None:
-    """DICOM string value → trimmed text, or None when it carries nothing."""
+    """DICOM string value → trimmed text (capped), or None when it carries nothing.
+
+    Truncation happens *before* the decode, which latin-1 makes exact: it is a
+    1-byte-per-character codec, so a byte cap and a character cap are the same cap.
+    """
     try:
-        text = raw.decode("latin-1")
+        text = raw[:_MAX_TAG_CHARS].decode("latin-1")
     except (UnicodeDecodeError, AttributeError):  # pragma: no cover - latin-1 total
         return None
     text = text.replace("\x00", "").strip()
@@ -334,7 +356,7 @@ def _parse_elements(
 
 
 def _read_tags(path: Path) -> dict[tuple[int, int], str | None]:
-    """Read the five study tags from one DICOM file. Empty dict on any problem."""
+    """Read the wanted tags from one DICOM file. Empty dict on any problem."""
     try:
         with open(path, "rb") as fh:
             if fh.read(_DICM_OFFSET + 4)[_DICM_OFFSET:] != _DICM_MAGIC:
@@ -348,6 +370,14 @@ def _read_tags(path: Path) -> dict[tuple[int, int], str | None]:
             if (group, element) != (0x0002, 0x0000) or vr != b"UL" or short_len != 4:
                 return {}
             (meta_length,) = struct.unpack_from("<I", head, 8)
+            # Untrusted 32-bit length. `read(n)` allocates `n` up front and only
+            # then shrinks, so a corrupt group length — four wrong bytes, optical
+            # media's ordinary failure mode — would commit up to 4 GiB per slice
+            # read, and the resulting `MemoryError` is not an `OSError`, so it
+            # would escape this function and abort an ingest this module promises
+            # never to fail. Bounded by the same cap as the dataset scan.
+            if meta_length > _MAX_HEADER_SCAN:
+                return {}
             meta = fh.read(meta_length)
             syntax = _parse_elements(
                 meta, explicit=True, wanted=frozenset({_TAG_TRANSFER_SYNTAX})
@@ -358,7 +388,10 @@ def _read_tags(path: Path) -> dict[tuple[int, int], str | None]:
             return _parse_elements(
                 fh.read(_MAX_HEADER_SCAN), explicit=explicit, wanted=_WANTED
             )
-    except (OSError, struct.error):
+    except (OSError, struct.error, MemoryError):
+        # `MemoryError` is deliberate and is *not* an `OSError`: the length bound
+        # above is the fix, this is the backstop that keeps the "never fails the
+        # ingest" contract true even if some other allocation path is found.
         return {}
 
 
@@ -388,6 +421,12 @@ class StudyMetadata:
     study_description: str | None = None
     study_uid: str | None = None
     series: tuple[Series, ...] = ()
+    #: Patient identity, read purely so the issue-#61 owner check has something to
+    #: verify a study against (see :func:`identity_text`). **Verification input, not
+    #: stored text** — :func:`summary_text` never emits these, so they do not reach
+    #: `document.ocr_text`, the FTS index, or an agent's context.
+    patient_name: str | None = None   # raw DICOM PN, e.g. "DOE^JANE^"
+    patient_birth_date: str | None = None  # ISO YYYY-MM-DD
 
 
 def _metadata_sources(scan: StudyScan) -> list[str]:
@@ -435,7 +474,36 @@ def read_metadata(scan: StudyScan) -> StudyMetadata:
         study_description=head.get(_TAG_STUDY_DESCRIPTION),
         study_uid=head.get(_TAG_STUDY_UID),
         series=tuple(series),
+        patient_name=head.get(_TAG_PATIENT_NAME),
+        patient_birth_date=_iso_date(head.get(_TAG_PATIENT_BIRTH_DATE)),
     )
+
+
+def identity_text(metadata: StudyMetadata) -> str | None:
+    """Patient identity from the study header, for :func:`pemr.ingest.check_owner`.
+
+    A 2,000-slice binary folder is the one document type a human cannot eyeball, so
+    `pemr ingest D:\\DICOM --person jane-doe` on the *spouse's* disc is the realistic
+    misfile — and without this the study path would be the only ingest door in the
+    system with no owner verification at all (issue #69 audit, finding B3).
+
+    The output is shaped for the existing check rather than a new one: the
+    ``Patient:``/``DOB:`` labels are what :func:`pemr.ingest.check_owner` recognises
+    as an identity anchor, ``normalize_text`` already reduces DICOM's ``DOE^JANE^``
+    to ``doe jane``, and the DOB is emitted in the ISO form ``dob_candidates``
+    renders. Returns None when the header carries neither tag — no signal, so the
+    verdict stays ``unverified`` rather than becoming a spurious refusal.
+
+    This is *more* reliable than the file path's input, not less: a structured tag
+    beats fuzzy OCR, so the false-``suspect`` worry that shaped ``check_owner``
+    barely applies here.
+    """
+    lines = []
+    if metadata.patient_name:
+        lines.append(f"Patient: {metadata.patient_name}")
+    if metadata.patient_birth_date:
+        lines.append(f"DOB: {metadata.patient_birth_date}")
+    return "\n".join(lines) or None
 
 
 #: Cap on the per-series lines in the summary: enough to characterise a study,

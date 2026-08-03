@@ -145,7 +145,10 @@ slice counts), so `ocr_text_populated` is already true and the study is findable
 not the contract met: if the disc or the portal carries the **radiology report**, transcribe it and
 pass it as `ocr_text` — it replaces the summary and is the only text that carries findings. The
 report often ships as a PDF beside the slices; it is not packed into the study (the engine names
-what it dropped), so ingest it as its own document too.
+what it dropped), so ingest it as its own document too. Owner verification below applies to
+studies as well, but reads the disc's own `PatientName`/`PatientBirthDate` header tags — *not*
+the derived summary, which is engine output and names nobody. Those tags are never stored, so
+they will not appear in `document_show` text or `find` hits.
 
 **Owner verification.** Because you supply the text, you are the primary consumer of the
 ingest-time owner check: it scans that text for the claimed person's name/DOB and returns

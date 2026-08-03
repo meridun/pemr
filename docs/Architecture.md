@@ -355,10 +355,21 @@ hashing the bytes rather than a manifest). Studies over 4 GiB need `--allow-larg
 
 `doc_date` (from `StudyDate`), `category` (`imaging`), and `ocr_text` (a short derived
 summary: modality, date, per-series slice counts) are **defaults only** — anything the
-caller passes wins. Header tags are read by a minimal stdlib parser for five tags,
-best-effort like `run_ocr`: the zero-runtime-dependency rule (`pyproject.toml`) rules out
-`pydicom`, and any parse failure yields no metadata rather than a failed ingest. Per-slice
-rows, pixel decoding, and thumbnails are out of scope.
+caller passes wins. Header tags are read by a minimal stdlib parser, best-effort like
+`run_ocr`: the zero-runtime-dependency rule (`pyproject.toml`) rules out `pydicom`, and any
+parse failure yields no metadata rather than a failed ingest. Every length the file declares
+is bounded before it is used, since a scratched disc's corrupt length field is otherwise an
+unbounded allocation and a value spliced straight into `ocr_text`. Per-slice rows, pixel
+decoding, and thumbnails are out of scope.
+
+The step-2 owner check applies here too, and reads `PatientName`/`PatientBirthDate` from the
+header rather than the derived summary — engine output carries no patient identity, and a
+`StudyDescription` like "PATIENT POSITIONING" would trip the identity anchor into a spurious
+refusal. Caller-supplied text is checked as well; the more consequential verdict wins, and
+the refusal point is pre-pack, so a refused study costs nothing. **The identity tags are
+verification input only** — they are never written to `ocr_text`, so they never reach the
+FTS index or an agent's context. This matters most here: a 2,000-slice binary folder is the
+one document type a human cannot eyeball to catch a misfile.
 
 ---
 
