@@ -989,6 +989,20 @@ def _cmd_find(args: argparse.Namespace) -> int:
     return _with_conn_person(args, work)
 
 
+def _print_other_assays(result: dict) -> None:
+    """Disclose same-analyte rows `trends` excluded as a different assay (issue #71).
+
+    Without this the split is invisible: an SPEP albumin series would just be missing
+    from a CMP albumin trend with no hint it exists. Each token is printed ready to
+    paste back as ``--test``."""
+    others = result.get("other_assays") or []
+    if not others:
+        return
+    count = result.get("other_assay_count", 0)
+    tokens = "  ".join(f'--test "{t}"' for t in others)
+    print(f"  note   {count} more row(s) of this analyte under another assay: {tokens}")
+
+
 def _cmd_trends(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
@@ -998,6 +1012,7 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             return 0
         if result["count"] == 0:
             print(f"no numeric results for '{result['test']}'")
+            _print_other_assays(result)
             return 0
         unit = f" {result['unit']}" if result["unit"] else ""
         print(f"{result['test']}  ({result['count']} point(s))")
@@ -1013,6 +1028,7 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             print("  slope  n/a (need >=2 distinct dates)")
         else:
             print(f"  slope  {result['slope_per_day']:+.4g}{unit}/day")
+        _print_other_assays(result)
         return 0
 
     return _with_conn_person(args, work)
