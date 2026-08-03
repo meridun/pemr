@@ -152,10 +152,13 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 *different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
 `unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
-**refuse the ingest** before anything is written. `suspect` applies to prose only — your
-transcription or a tesseract pass — never to natively-extracted `.csv`/`.docx`/`.xlsx`/`.json`,
-where `Patient`/`DOB`/`MRN` are column labels rather than an identity header. `mismatch` holds
-on every route.
+**refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
+the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
+— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set — because in a
+structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
+route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
+with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /
+`--ocr-text-file` (the default path above) and keep the check. `mismatch` holds on every route.
 
 - On a refusal, the agent MUST surface the verdict and the `evidence` snippet to the human and get
   an **explicit go-ahead** before retrying with `force=true`. Never force on your own judgment.

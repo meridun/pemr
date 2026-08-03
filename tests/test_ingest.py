@@ -601,6 +601,27 @@ def test_structured_headers_do_not_refuse_the_ingest(conn, tmp_path, sources, ki
     assert result.ocr_text_populated
 
 
+@pytest.mark.parametrize("name", ["transcript.txt", "note.md", "panel.tsv", "app.log"])
+def test_plaintext_suffixes_are_route_scoped_too(conn, tmp_path, sources, name):
+    """The scope line is the *route*, not how prose-like the suffix is: a foreign
+    identity header in a natively-read `.txt`/`.md`/`.tsv`/`.log` yields `unverified`,
+    not `suspect`. Not a regression — before native extraction these went to tesseract,
+    which declined, so there was no text and no check either — but it is the behavior
+    `AGENTS.md` §3 documents, so pin it rather than let it drift silently."""
+    _seed_roster(conn)
+    src = _make_file(
+        tmp_path, name, b"MERCY LABS\nPatient: SMITH, KAREN\nDOB: 09/09/1971\n"
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "unverified"
+    assert result.status == "new"
+    # ...and the protective half still fires on the same route.
+    other = _make_file(tmp_path, f"other-{name}", b"Patient: ROE, ROBERT ALAN\n")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, other, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+
+
 def test_structured_text_still_refuses_another_roster_person(conn, tmp_path, sources):
     """The half of #61 that actually protects against a misfile is untouched: an
     affirmative match on a different roster person blocks on the native route too."""
@@ -647,3 +668,30 @@ def test_oversized_extraction_degrades_instead_of_reading_it(
     assert result.status == "new"           # the document still lands
     assert result.document.ocr_text is None
     assert "extraction cap" in capsys.readouterr().err
+
+
+def test_extraction_cap_is_one_budget_shared_across_the_archive(
+    conn, tmp_path, sources, capsys, monkeypatch
+):
+    """Many members, none individually over the cap, must not add up past it — the
+    per-member check alone would let a 40-sheet workbook spend the budget 40 times."""
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    def sheet(text):
+        return (f'<worksheet xmlns="{ns}"><sheetData><row>'
+                f'<c t="inlineStr"><is><t>{text}</t></is></c>'
+                "</row></sheetData></worksheet>")
+    src = tmp_path / "many.xlsx"
+    members = ("xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml")
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr(members[0], sheet("a" * 200))
+        zf.writestr(members[1], sheet("b" * 200))
+    with zipfile.ZipFile(src) as zf:
+        sizes = [zf.getinfo(name).file_size for name in members]
+    assert ingest.extract_text(src) is not None   # fine under the real cap
+
+    # A cap each member clears on its own, but the pair does not.
+    monkeypatch.setattr(ingest, "_MAX_EXTRACT_BYTES", max(sizes))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.document.ocr_text is None
+    assert "sheet2.xml" in capsys.readouterr().err
