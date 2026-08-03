@@ -192,9 +192,11 @@ def ingest_document(
     ``mismatch``/``suspect`` verdict refuses the ingest pre-write — per ``AGENTS.md``
     §3, surface the verdict and its evidence to the human and get an explicit
     go-ahead before retrying with ``force=true``. ``suspect`` (a patient-identity
-    header naming nobody on the roster) applies to your transcription or a tesseract
-    pass only, never to natively-extracted CSV/OOXML/JSON, where those words are
-    column labels; ``mismatch`` holds on every route.
+    header naming nobody on the roster) is scoped by route: it applies to the text you
+    supply and to a tesseract pass, never to anything ``ocr=true`` extracts natively
+    (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``), where
+    those words are column labels — so pass your transcription as ``ocr_text`` rather
+    than saving it to a ``.txt`` and re-reading that. ``mismatch`` holds on every route.
     """
     try:
         sources_dir = cli._resolve_sources_dir(_ARGS)

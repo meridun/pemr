@@ -343,11 +343,17 @@ surface (a small `.docx` can declare a gigabyte of `word/document.xml`). `--ocr 
 is a retained alias for `--ocr auto`.
 
 Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
-only to prose — an agent transcription or a tesseract pass. In natively-extracted
-`.csv`/`.docx`/`.xlsx`/`.json`, `Patient`/`DOB`/`MRN` are column labels and field keys, and
-counting them as an identity header refuses ordinary lab exports as belonging to a
-stranger. `mismatch` — an affirmative name/DOB match on a *different* roster person — is
-the half that actually prevents misfiling, and it blocks on every route.
+only to an agent transcription or a tesseract pass, never to natively-extracted text —
+the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set. In a structured export
+`Patient`/`DOB`/`MRN` are column labels and field keys, and counting them as an identity
+header refuses ordinary lab exports as belonging to a stranger. The line is the *route*
+rather than how prose-like the format is, because the route is what the extractor actually
+knows; the cost is that a prose transcript saved as `.txt` and ingested with `--ocr auto`
+loses the anchor check too. That is no worse than before native extraction existed (such a
+file went to tesseract, which declined, so there was no text and no check either), and the
+`--ocr-text-file` path keeps full coverage. `mismatch` — an affirmative name/DOB match on a
+*different* roster person — is the half that actually prevents misfiling, and it blocks on
+every route.
 
 ---
 
