@@ -1,4 +1,5 @@
-"""Misfiled-document recovery: `pemr document list|edit|reassign|rm` (issue #54).
+"""Misfiled-document recovery: `pemr document list|edit|reassign|rm` (issue #54),
+plus `document show` and `document set-text` (issue #62).
 
 Covers the module surface (pemr/documents.py) and the CLI wiring, in the shape
 test_persons.py uses for the `person` group.
@@ -119,6 +120,139 @@ def test_list_replaces_ocr_text_with_a_flag(seeded):
     view = documents.list_documents(seeded["conn"])[0]
     assert "ocr_text" not in view
     assert view["has_ocr_text"] is True
+
+
+# --- show (get_document_view / get_document_text) ---------------------------
+
+
+def test_show_unknown_document_raises(conn):
+    with pytest.raises(documents.DocumentNotFoundError):
+        documents.get_document_view(conn, 999)
+
+
+def test_show_carries_the_full_stable_record_key_set(seeded):
+    view = documents.get_document_view(seeded["conn"], seeded["doc"])
+    assert set(view["records"]) == set(dedup.KNOWN_TYPES)
+    assert view["record_count"] == 5
+    assert "ocr_text" not in view
+    assert view["has_ocr_text"] is True
+    assert view["ocr_text_chars"] == len("scan text")
+
+
+def test_show_reports_no_conflicts_by_default(seeded):
+    assert documents.get_document_view(
+        seeded["conn"], seeded["doc"]
+    )["conflicts_open"] == []
+
+
+def test_show_reports_conflicts_at_both_ends(seeded):
+    """`show` is the pre-flight for `reassign`/`rm`, so it must union the same two ends
+    those two refuse on: conflicts *raised by* the document and conflicts *anchored to*
+    a row it owns (staged by some other document)."""
+    conn = seeded["conn"]
+    other = _insert_document(conn, seeded["jane"].person_id, "ee55")
+    summary = dedup.commit_extraction(conn, other, {"lab_result": [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 7.4,
+         "unit": "%"},
+    ]})
+    assert summary.counts["conflict"] == 1
+    # Raised by `other`...
+    assert documents.get_document_view(conn, other)["conflicts_open"] == [1]
+    # ...and anchored to the row the seeded document owns.
+    assert documents.get_document_view(conn, seeded["doc"])["conflicts_open"] == [1]
+
+
+def test_show_view_does_not_change_the_list_view(seeded):
+    """Regression guard for the `_document_view` / `_show_view` split: `list`'s shape is
+    what issue #54 shipped and must stay byte-identical."""
+    listed = documents.list_documents(seeded["conn"])[0]
+    assert "conflicts_open" not in listed
+    assert "ocr_text_chars" not in listed
+    shown = documents.get_document_view(seeded["conn"], seeded["doc"])
+    assert {k: v for k, v in shown.items() if k in listed} == listed
+
+
+def test_get_document_text_returns_the_stored_text(seeded):
+    assert documents.get_document_text(seeded["conn"], seeded["doc"]) == "scan text"
+
+
+def test_get_document_text_is_empty_when_unset(conn):
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    assert documents.get_document_text(conn, doc) == ""
+    assert documents.get_document_view(conn, doc)["ocr_text_chars"] == 0
+
+
+# --- set-text ---------------------------------------------------------------
+
+
+def _fts_text(conn, document_id):
+    row = conn.execute(
+        "SELECT text FROM record_fts WHERE source_table = 'document' AND source_id = ?",
+        (document_id,),
+    ).fetchone()
+    return row["text"] if row is not None else None
+
+
+def test_set_text_fills_an_empty_document_and_reindexes_fts(conn):
+    """No explicit FTS maintenance: migration 003's AFTER UPDATE trigger on `document`
+    delete+reinserts the row from NEW.ocr_text, which is what makes `find` see it."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    view = documents.set_document_text(conn, doc, "  cholesterol panel  ")
+    assert view["has_ocr_text"] is True
+    assert view["ocr_text_chars"] == len("cholesterol panel")   # stored stripped
+    assert documents.get_document_text(conn, doc) == "cholesterol panel"
+    assert _fts_text(conn, doc) == "cholesterol panel"
+
+
+def test_set_text_refuses_a_populated_document_without_force(seeded):
+    conn = seeded["conn"]
+    with pytest.raises(documents.OcrTextPresentError) as exc:
+        documents.set_document_text(conn, seeded["doc"], "replacement")
+    assert "--force" in str(exc.value) and "nothing was written" in str(exc.value)
+    assert documents.get_document_text(conn, seeded["doc"]) == "scan text"
+
+
+def test_set_text_force_replaces_and_drops_the_old_fts_row(seeded):
+    conn = seeded["conn"]
+    documents.set_document_text(conn, seeded["doc"], "replacement text", force=True)
+    assert documents.get_document_text(conn, seeded["doc"]) == "replacement text"
+    # Exactly one FTS row for the document, carrying only the new text - proves the
+    # trigger's delete+insert rather than an accumulating insert.
+    rows = conn.execute(
+        "SELECT text FROM record_fts WHERE source_table = 'document' AND source_id = ?",
+        (seeded["doc"],),
+    ).fetchall()
+    assert [r["text"] for r in rows] == ["replacement text"]
+
+
+def test_set_text_refuses_empty_text(seeded):
+    conn = seeded["conn"]
+    for empty in ("", "   \n\t "):
+        with pytest.raises(ValueError):
+            documents.set_document_text(conn, seeded["doc"], empty, force=True)
+    assert documents.get_document_text(conn, seeded["doc"]) == "scan text"
+
+
+def test_set_text_unknown_document_raises(conn):
+    with pytest.raises(documents.DocumentNotFoundError):
+        documents.set_document_text(conn, 999, "text")
+
+
+def test_set_text_leaves_records_and_keys_untouched(seeded):
+    conn = seeded["conn"]
+    before = [
+        (r["lab_result_id"], r["dedup_key"], r["person_id"])
+        for r in conn.execute("SELECT * FROM lab_result").fetchall()
+    ]
+    documents.set_document_text(conn, seeded["doc"], "brand new text", force=True)
+    after = [
+        (r["lab_result_id"], r["dedup_key"], r["person_id"])
+        for r in conn.execute("SELECT * FROM lab_result").fetchall()
+    ]
+    assert before == after
+    assert documents.get_document_view(conn, seeded["doc"])["record_count"] == 5
 
 
 # --- edit -------------------------------------------------------------------
@@ -558,6 +692,186 @@ def test_cli_document_list_unknown_person_fails(cli_ready, capsys):
     assert "no person with slug" in capsys.readouterr().err
 
 
+def test_cli_document_show(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1") == 0
+    out = capsys.readouterr().out
+    assert "document_id    1" in out
+    assert "person         jane-doe" in out
+    # Total plus the non-zero per-type breakdown only (zeros are a --json concern).
+    assert "records        5  (" in out and "lab_result 1" in out
+    assert "procedure 0" not in out
+    assert "has_ocr_text   yes (" in out
+    assert "conflicts      none" in out
+
+
+def test_cli_document_show_json_keeps_the_stable_shape(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload["records"]) == set(dedup.KNOWN_TYPES)
+    assert payload["conflicts_open"] == []
+    assert payload["has_ocr_text"] is True
+    assert payload["ocr_text_chars"] > 0
+    assert "ocr_text" not in payload
+
+
+def test_cli_document_show_reports_open_conflicts(cli_ready, capsys):
+    scan2 = cli_ready / "scan2.txt"
+    scan2.write_bytes(b"hba1c 7.4 percent")
+    assert _run(cli_ready, "ingest", str(scan2), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources"),
+                "--ocr-text-file", str(scan2)) == 0
+    payload = cli_ready / "extract2.json"
+    payload.write_text(json.dumps({"lab_result": [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02", "value_num": 7.4,
+         "unit": "%"},
+    ]}), encoding="utf-8")
+    assert _run(cli_ready, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1") == 0
+    out = capsys.readouterr().out
+    assert "conflicts      #1 open - resolve with `pemr review-conflicts`" in out
+    assert out.isascii(), repr(out)
+
+
+def test_cli_document_show_text_dumps_the_transcription(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    captured = capsys.readouterr()
+    assert captured.out == "hba1c 5.7 percent\n"
+    assert captured.err == ""
+
+
+def test_cli_document_show_text_on_an_empty_document_notes_and_succeeds(
+    cli_ready, capsys
+):
+    scan2 = cli_ready / "scan2.txt"
+    scan2.write_bytes(b"no text supplied")
+    assert _run(cli_ready, "ingest", str(scan2), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources")) == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "2", "--text") == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "has no ocr_text stored" in captured.err
+
+
+def test_cli_document_show_json_and_text_are_mutually_exclusive(cli_ready):
+    with pytest.raises(SystemExit) as exc:
+        _run(cli_ready, "document", "show", "1", "--json", "--text")
+    assert exc.value.code == 2
+
+
+def test_cli_document_show_unknown_id_fails(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "999") == 1
+    assert "no document with id" in capsys.readouterr().err
+
+
+def test_cli_document_set_text_fills_an_empty_document_and_find_sees_it(
+    cli_ready, capsys
+):
+    scan2 = cli_ready / "scan2.txt"
+    scan2.write_bytes(b"no text supplied at ingest")
+    assert _run(cli_ready, "ingest", str(scan2), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources")) == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "find", "--person", "jane-doe", "pericarditis") == 0
+    assert "pericarditis" not in capsys.readouterr().out
+
+    text = cli_ready / "transcript.txt"
+    text.write_text("acute pericarditis noted on review", encoding="utf-8")
+    assert _run(cli_ready, "document", "set-text", "2",
+                "--ocr-text-file", str(text)) == 0
+    out = capsys.readouterr().out
+    assert "set ocr_text on document #2: 34 chars (was empty)" in out
+    assert "has_ocr_text   yes (34 chars)" in out
+
+    # No explicit reindex anywhere: the FTS trigger did it.
+    assert _run(cli_ready, "find", "--person", "jane-doe", "pericarditis") == 0
+    assert "pericarditis" in capsys.readouterr().out.lower()
+
+
+def test_cli_document_set_text_refuses_a_populated_document(cli_ready, capsys):
+    text = cli_ready / "transcript.txt"
+    text.write_text("replacement transcription", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1",
+                "--ocr-text-file", str(text)) == 1
+    err = capsys.readouterr().err
+    assert "already has ocr_text" in err and "--force" in err
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
+def test_cli_document_set_text_force_replaces_and_moves_the_index(cli_ready, capsys):
+    text = cli_ready / "transcript.txt"
+    text.write_text("replacement transcription", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 0
+    out = capsys.readouterr().out
+    assert "set ocr_text on document #1: 25 chars (replaced 17 chars)" in out
+
+    assert _run(cli_ready, "find", "--person", "jane-doe", "replacement") == 0
+    assert "replacement" in capsys.readouterr().out.lower()
+    # The old text is gone from the index, not merely shadowed by the new row.
+    assert _run(cli_ready, "find", "--person", "jane-doe", "percent") == 0
+    assert "document" not in capsys.readouterr().out.lower()
+
+
+def test_cli_document_set_text_json(cli_ready, capsys):
+    text = cli_ready / "transcript.txt"
+    text.write_text("replacement transcription", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr_text_chars"] == 25
+    assert payload["has_ocr_text"] is True
+    assert "ocr_text" not in payload
+
+
+def test_cli_document_set_text_rejects_an_empty_file(cli_ready, capsys):
+    text = cli_ready / "empty.txt"
+    text.write_text("   \n", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 1
+    assert "is empty - nothing to store" in capsys.readouterr().err
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
+def test_cli_document_set_text_unreadable_path_and_unknown_id_fail(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1",
+                "--ocr-text-file", str(cli_ready / "nope.txt")) == 1
+    assert "cannot read" in capsys.readouterr().err
+
+    text = cli_ready / "transcript.txt"
+    text.write_text("some text", encoding="utf-8")
+    assert _run(cli_ready, "document", "set-text", "999",
+                "--ocr-text-file", str(text)) == 1
+    assert "no document with id" in capsys.readouterr().err
+
+
+def test_cli_document_set_text_leaves_records_untouched(cli_ready, capsys):
+    text = cli_ready / "transcript.txt"
+    text.write_text("replacement transcription", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["record_count"] == 5
+    assert _run(cli_ready, "query", "labs", "--person", "jane-doe") == 0
+    assert "HbA1c" in capsys.readouterr().out
+
+
 def test_cli_document_edit(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "document", "edit", "1", "--category", "imaging") == 0
@@ -678,6 +992,7 @@ def test_cli_document_output_is_console_safe(cli_ready, capsys):
     capsys.readouterr()
     for argv in (
         ("document", "list"),
+        ("document", "show", "1"),
         ("document", "reassign", "1", "--person", "john-doe"),
         ("document", "rm", "1"),
     ):
