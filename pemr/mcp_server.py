@@ -13,8 +13,9 @@ Design (issue #12, settled in its design comment):
   :func:`build_server` / :func:`main` (the stdio entry point) require it, imported lazily.
 * **Read/write separation** is declared via MCP ``readOnlyHint`` annotations in
   :func:`build_server`. The read-only tools here never write; the write tools
-  (``person_add``, ``ingest``, ``commit_extraction``, and ``review_conflicts`` *with* a
-  resolution) are the only ones that mutate.
+  (``person_add``, ``person_edit``, ``ingest``, ``commit_extraction``,
+  ``document_set_text``, and ``review_conflicts`` *with* a resolution) are the only ones
+  that mutate.
 
 Run it: ``python -m pemr.mcp_server`` (stdio transport). Config/db resolution is env +
 ``config.toml`` (``PEMR_DB`` / ``PEMR_CONFIG`` / ``[paths]``) — identical to the CLI with
@@ -32,6 +33,7 @@ from typing import Any
 # tool sharing a module name) can't shadow the module it delegates to.
 from . import __version__, cli, db
 from . import dedup as _dedup
+from . import documents as _documents
 from . import ingest as _ingest
 from . import persons as _persons
 from . import query as _query
@@ -219,6 +221,34 @@ def commit_extraction(
     }
 
 
+def document_set_text(
+    conn: sqlite3.Connection, *, document_id: int, text: str
+) -> dict[str, Any]:
+    """[write] Attach a document's text (``ocr_text``) after ingest. Mirrors
+    ``pemr document set-text``.
+
+    This is **ingest completion**, not misfiling recovery: ``AGENTS.md`` §3 makes a
+    populated ``ocr_text`` an obligation, and ``ingest`` returns early on a layer-1
+    content-hash hit — so an agent that missed the text on the first pass cannot fix it by
+    re-ingesting. This tool is the remediation. The document becomes visible to ``find``
+    immediately (FTS is trigger-maintained).
+
+    Deliberately narrower than the CLI: there is **no ``force``**. Filling an empty
+    ``ocr_text`` is an agent action; replacing an existing transcription is a human one at
+    the CLI (``pemr document set-text <id> --ocr-text-file <path> --force``), because it
+    discards work that is not cheaply re-derived. Refused with an explanatory error when
+    the column is already populated.
+
+    The rest of the ``document`` group (``list``/``show``/``edit``/``reassign``/``rm``) is
+    CLI-only by design — recovery is a human escape hatch.
+    """
+    try:
+        return _documents.set_document_text(conn, document_id, text)
+    # DocumentNotFoundError and OcrTextPresentError are both ValueError subclasses.
+    except (db.NotMigratedError, ValueError) as exc:
+        raise _friendly(exc) from exc
+
+
 # --- conflicts (read to list; write only with a signed-off resolution) ------
 
 def review_conflicts(
@@ -379,7 +409,8 @@ READ_ONLY_TOOLS = (
     "render_summary", "render_brief", "render_journal",
 )
 WRITE_TOOLS = (
-    "person_add", "person_edit", "ingest", "commit_extraction", "review_conflicts",
+    "person_add", "person_edit", "ingest", "commit_extraction", "document_set_text",
+    "review_conflicts",
 )
 TOOL_NAMES = READ_ONLY_TOOLS + WRITE_TOOLS
 
@@ -487,6 +518,10 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     @server.tool(name="commit_extraction", annotations=rw)
     def commit_extraction_tool(document_id: int, records: dict) -> dict:
         return _run(commit_extraction, document_id=document_id, records=records)
+
+    @server.tool(name="document_set_text", annotations=rw)
+    def document_set_text_tool(document_id: int, text: str) -> dict:
+        return _run(document_set_text, document_id=document_id, text=text)
 
     @server.tool(name="review_conflicts", annotations=rw)
     def review_conflicts_tool(resolve: int | None = None, keep: str = "existing",

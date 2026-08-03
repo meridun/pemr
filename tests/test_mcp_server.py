@@ -194,6 +194,46 @@ def test_commit_extraction_via_wrapper(seeded, tmp_path, monkeypatch):
     assert out["counts"]["new"] == 1
 
 
+# --- document_set_text (ingest completion, issue #62) -----------------------
+
+
+def test_document_set_text_fills_an_empty_ocr_text(seeded):
+    doc = _doc(seeded, "jane-doe", ocr=None)
+    out = mcp_server.document_set_text(
+        seeded, document_id=doc, text="thyroid panel within range"
+    )
+    assert out["has_ocr_text"] is True
+    assert out["ocr_text_chars"] == len("thyroid panel within range")
+    assert "ocr_text" not in out
+    # FTS is trigger-maintained, so `find` sees it with no reindex.
+    assert mcp_server.find(seeded, query_text="thyroid", person="jane-doe")
+
+
+def test_document_set_text_refuses_a_populated_document(seeded):
+    doc = _doc(seeded, "jane-doe", ocr="the original transcription")
+    with pytest.raises(mcp_server.ToolError, match="already has ocr_text"):
+        mcp_server.document_set_text(seeded, document_id=doc, text="replacement")
+    assert seeded.execute(
+        "SELECT ocr_text FROM document WHERE document_id = ?", (doc,)
+    ).fetchone()["ocr_text"] == "the original transcription"
+
+
+def test_document_set_text_exposes_no_force_parameter():
+    """Replacing an existing transcription is a human-at-the-CLI action; the tool must
+    not hand an agent that lever (AGENTS.md write-tool list)."""
+    import inspect
+
+    assert "force" not in inspect.signature(mcp_server.document_set_text).parameters
+
+
+def test_document_set_text_unknown_id_and_empty_text_raise(seeded):
+    with pytest.raises(mcp_server.ToolError, match="no document with id"):
+        mcp_server.document_set_text(seeded, document_id=999, text="text")
+    doc = _doc(seeded, "jane-doe", ocr=None)
+    with pytest.raises(mcp_server.ToolError, match="empty"):
+        mcp_server.document_set_text(seeded, document_id=doc, text="   ")
+
+
 def test_review_conflicts_lists_and_requires_signoff(seeded, tmp_path, monkeypatch):
     monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
     # Stage a conflict: same lab key (person+test+date+rounded value) with a differing unit.
