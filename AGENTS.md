@@ -150,6 +150,11 @@ carrying a diagnosis or an allergy MUST commit these rows:
   `penicillin: anaphylaxis`, or `active` -> `resolved`) stages a **conflict** for human
   adjudication (§5); a field the new document simply doesn't mention is silence, not a change, and
   never conflicts. Do not "helpfully" restate a value the source omitted.
+- Silence only reads that way in one direction. A field the new document **does** state over a
+  stored NULL is new information with nothing to adjudicate: it fills the stored row in place and
+  the commit reports it as `enriched` rather than `duplicate`. So emit every field the source
+  states even for an allergen or problem you know is already on file — a terse first document
+  followed by a detailed one is the normal case, and this is what makes the detail land.
 
 ### 4. OCR text at ingest
 
@@ -204,6 +209,11 @@ Agents never resolve staged conflicts silently.
   identity was removed in the meantime (the source document was deleted or reassigned), it is
   **refused** — never silently applied to nothing. Report the refusal to the human; `keep both`
   admits the staged row as a fresh record if they want the value kept.
+- On the standing-fact types (§3) `keep incoming` overwrites only the fields the incoming row
+  actually states — an unstated field there means "this document didn't say", so adjudicating one
+  disagreement (`criticality: high` vs `low`) does not also erase a `reaction` the incoming
+  document simply didn't repeat. On the dated types an unstated field IS a clearing and is written
+  as one.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
   that is an extraction error, not a conflict. Re-read the source for collection times; if there
   genuinely are none, submit them separately and ask the human about `keep both`.
