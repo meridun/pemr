@@ -309,8 +309,8 @@ inbox/scan.pdf
          not the document); pre-hash, so a refusal writes nothing
       1. hash bytes; if known → report duplicate, stop
       2. resolve document text (agent-supplied, or --ocr), then verify the owner:
-         text naming a different roster person, or a patient-identity header
-         naming nobody on the roster → refuse pre-write (--force overrides)
+         text naming a different roster person, or — in prose only — a patient-
+         identity header naming nobody → refuse pre-write (--force overrides)
       3. move blob → sources/<sha>/<sha>.pdf   (immutable)
       4. insert document row (category/provider left null for now)
   → AGENT step (vision): read the source, emit proposed rows as JSON
@@ -332,11 +332,22 @@ type allows, all stdlib (the engine has no runtime dependencies):
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
 parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
 allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Formats
-tesseract can't read — `.rtf`, `.msg`, `.doc`, a PDF text layer — need a third-party
-parser and are deliberately out: you get a stderr note telling you to transcribe it
-yourself and pass `--ocr-text-file`. Extraction is best-effort and
-never fatal; a malformed file costs you the text, not the document. `--ocr tesseract` is
-a retained alias for `--ocr auto`.
+tesseract can't read need a third-party parser and are deliberately out: `.rtf`, `.msg`,
+`.doc`, and **`.pdf` in any form** — tesseract 5 does not accept PDF input at all, so a
+scanned PDF is no better off than a text-layer one. For those you get a stderr note
+telling you to transcribe it yourself and pass `--ocr-text-file` (or rasterize the PDF to
+an image first). Extraction is best-effort and never fatal; a malformed file costs you the
+text, not the document. It is capped at 32 MiB per file — `ocr_text` is mirrored into the
+FTS index, so an unbounded read is both a database-size problem and a decompression-bomb
+surface (a small `.docx` can declare a gigabyte of `word/document.xml`). `--ocr tesseract`
+is a retained alias for `--ocr auto`.
+
+Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
+only to prose — an agent transcription or a tesseract pass. In natively-extracted
+`.csv`/`.docx`/`.xlsx`/`.json`, `Patient`/`DOB`/`MRN` are column labels and field keys, and
+counting them as an identity header refuses ordinary lab exports as belonging to a
+stranger. `mismatch` — an affirmative name/DOB match on a *different* roster person — is
+the half that actually prevents misfiling, and it blocks on every route.
 
 ---
 
