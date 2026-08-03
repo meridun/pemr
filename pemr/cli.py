@@ -699,19 +699,31 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
     conn = _connect_db(args)
     try:
         try:
+            # Resolutions re-derive the conflict's identity family under the current
+            # dictionary; a conflict staged before a dictionary edit carries a key no
+            # row still holds (issue #58).
+            dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
             if args.resolve is not None:
-                dedup.resolve_conflict(
-                    conn, args.resolve, keep=args.keep, note=args.note
+                result = dedup.resolve_conflict(
+                    conn, args.resolve, keep=args.keep, note=args.note,
+                    dictionary=dictionary,
                 )
-                print(f"resolved conflict #{args.resolve} (keep-{args.keep})")
+                print(f"resolved conflict #{args.resolve} ({_resolved_as(result)})")
                 return 0
             conflicts = dedup.list_conflicts(
                 conn, status=None if args.all else "open"
             )
+            # Family size per conflict, read before the connection closes: it is the
+            # minimum a reviewer needs to tell "re-commit of an already-admitted draw"
+            # from "genuine third draw" (richer rendering is issue #59).
+            occurrences = {
+                row["conflict_id"]: dedup.conflict_occurrences(conn, row, dictionary)
+                for row in conflicts
+            }
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except ValueError as exc:
+        except ValueError as exc:   # includes ValidationError from a keep-both payload
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
@@ -727,11 +739,29 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
         )
         print(f"    existing: {row['existing_json']}")
         print(f"    incoming: {row['incoming_json']}")
+        count = occurrences.get(row["conflict_id"], 0)
+        if count > 1:
+            print(f"    occurrences: {count} rows already stored under this key")
     print(
-        "\nresolve: `pemr review-conflicts --resolve <id> --keep existing|incoming "
-        "[--note ...]`"
+        "\nresolve: `pemr review-conflicts --resolve <id> --keep "
+        "existing|incoming|both [--note ...]`"
     )
     return 0
+
+
+def _resolved_as(result: dedup.ResolveResult) -> str:
+    """How a resolution reports itself on the success line."""
+    if result.kept != "both":
+        return f"keep-{result.kept}"
+    if result.no_op:
+        return (
+            f"keep-both, no-op: already stored as {result.record_type} "
+            f"#{result.row_id}"
+        )
+    return (
+        f"keep-both -> {result.record_type} #{result.row_id}, "
+        f"occurrence {result.occurrence}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -739,7 +769,7 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 # Internal columns never emitted in --json (unstable / not part of the contract).
-_HIDDEN_FIELDS = ("dedup_key",)
+_HIDDEN_FIELDS = dedup.INTERNAL_COLUMNS
 
 
 def _clean(row: dict) -> dict:
@@ -1295,10 +1325,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolve", type=int, metavar="CONFLICT_ID", help="resolve one conflict"
     )
     p_review.add_argument(
-        "--keep", choices=["existing", "incoming"], default="existing",
-        help="on --resolve: keep stored row or overwrite with incoming (default existing)",
+        "--keep", choices=list(dedup.KEEP_CHOICES), default="existing",
+        help="on --resolve: keep the stored row, overwrite it with the incoming one, "
+             "or 'both' = admit the incoming row alongside the stored one as a new "
+             "occurrence of the same identity (use for a genuine repeat the source "
+             "cannot timestamp). Default existing",
     )
     p_review.add_argument("--note", help="optional resolution note")
+    p_review.add_argument(
+        "--dictionary",
+        help="synonym dictionary TOML (overrides default); a resolution re-derives "
+             "the conflict's identity through it",
+    )
     p_review.add_argument(
         "--all", action="store_true", help="list resolved conflicts too"
     )

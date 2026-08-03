@@ -140,8 +140,10 @@ def _latest_vitals(
 
 def _abnormal_labs(conn: sqlite3.Connection, person_id: int) -> list[dict]:
     rows = conn.execute(
+        # lab_result_id DESC breaks same-timestamp ties (a `--keep both` sibling shares
+        # its date): newest-first ordering treats the later row id as the later point.
         "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name",
+        "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
         (person_id,),
     ).fetchall()
     return [dict(r) for r in rows if _is_abnormal(r)]
@@ -174,6 +176,24 @@ def _row_counts(conn: sqlite3.Connection, person_id: int) -> dict[str, int]:
             f"SELECT COUNT(*) AS n FROM {table} WHERE person_id = ?", (person_id,)
         ).fetchone()["n"]
     return counts
+
+
+def _open_conflict_lines(conn: sqlite3.Connection, person_id: int) -> list[str]:
+    """Bullet lines for this person's open (unresolved) conflicts.
+
+    Shared by the summary and the brief: a staged correction means "a value in this
+    record is disputed and the corrected one is not committed yet", so every rendered
+    view that a reader treats as current has to say so (issue #59)."""
+    rows = conn.execute(
+        "SELECT * FROM conflict WHERE person_id = ? AND status = 'open' "
+        "ORDER BY conflict_id",
+        (person_id,),
+    ).fetchall()
+    return [
+        f"- conflict #{c['conflict_id']} ({c['record_type']}) - resolve with "
+        "`pemr review-conflicts`"
+        for c in rows
+    ]
 
 
 def _appt_who(row: sqlite3.Row | dict) -> str:
@@ -211,8 +231,13 @@ def render_summary(
     now: datetime | None = None,
 ) -> str:
     """Markdown master summary for a person: active meds, conditions, allergies, latest
-    vitals, recent abnormal labs, upcoming/open appointments -- with a self-identifying
-    header (name, DOB, generated-at, source row counts). Read-only.
+    vitals, recent abnormal labs, upcoming/open appointments, and any open conflicts --
+    with a self-identifying header (name, DOB, generated-at, source row counts).
+    Read-only.
+
+    The summary is the document read *between* appointments, so an open conflict has to
+    surface here too: without it a staged correction is invisible and the summary prints
+    the stale value with no hint that a corrected one is pending (issue #59).
 
     Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
     person_id = query.resolve_person_id(conn, slug)
@@ -233,7 +258,7 @@ def render_summary(
         f"observations={counts['observation']}\n"
     )
 
-    meds = query.query_meds(conn, slug, active=True)
+    meds = query.query_meds(conn, slug, active=True, now=now)
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
@@ -285,6 +310,9 @@ def render_summary(
         _section("Latest Vitals", vital_lines),
         _section("Recent Abnormal Labs", lab_lines, empty="_none flagged_"),
         _section("Upcoming / Open Appointments", appt_lines),
+        _section(
+            "Open Conflicts", _open_conflict_lines(conn, person_id), empty="_none_"
+        ),
     ]
     return "\n".join(parts).rstrip() + "\n"
 
@@ -333,7 +361,7 @@ def render_brief(
         f"- Reason: {appt['reason'] or '(none given)'}",
     ])
 
-    meds = query.query_meds(conn, person["slug"], active=True)
+    meds = query.query_meds(conn, person["slug"], active=True, now=now)
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
@@ -349,7 +377,7 @@ def render_brief(
     # reference interval), which SQL can't express, so the cut happens here.
     lab_rows = conn.execute(
         "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name",
+        "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
         (person_id,),
     ).fetchall()
     draw_rank = {
@@ -394,16 +422,7 @@ def render_brief(
             f"- {_date_part(o['observed_at']) or '(undated)'}  {detail}{val}"
         )
 
-    open_conflicts = conn.execute(
-        "SELECT * FROM conflict WHERE person_id = ? AND status = 'open' "
-        "ORDER BY conflict_id",
-        (person_id,),
-    ).fetchall()
-    conflict_lines = [
-        f"- conflict #{c['conflict_id']} ({c['record_type']}) - resolve with "
-        "`pemr review-conflicts`"
-        for c in open_conflicts
-    ]
+    conflict_lines = _open_conflict_lines(conn, person_id)
 
     interaction = _section(
         "Medication Interaction Review",

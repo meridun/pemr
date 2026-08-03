@@ -14,9 +14,10 @@ Python over the candidate rows rather than in SQL.
 
 from __future__ import annotations
 
+import calendar
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 
 from . import db
 from .dedup import norm
@@ -40,18 +41,54 @@ def _row_get(row: sqlite3.Row | dict, key: str) -> object:
         return None
 
 
-def med_is_current(row: sqlite3.Row | dict) -> bool:
-    """True when a medication is still current: no end date *and* no terminal status.
+def _end_of_period(value: object) -> date | None:
+    """Last day covered by an ``ended_on``, or ``None`` when it can't be parsed.
 
-    An explicit ``status='active'`` always counts as current (even alongside an end
-    date). A terminal status (:data:`TERMINAL_MED_STATUSES`) ends the course even when
-    no ``ended_on`` was extracted — the contradiction behind issue #21, where a
-    ``completed`` med with a null ``ended_on`` rendered as ``(current)``."""
+    ``ended_on`` is stored at year (``2024``), month (``2024-01``) or full precision
+    (``2024-01-01``, possibly as a timestamp) — see ``dedup.DATE_FIELDS``. A coarse
+    date is widened to the **end** of the period it names (``2024`` -> ``2024-12-31``),
+    so a course only counts as over once every day it could have covered is past. That
+    direction is deliberate: dropping a med the record may still cover is the worse
+    error in a document handed to a clinician.
+    """
+    text = str(value).strip().replace("T", " ").split(" ")[0]
+    parts = text.split("-")
+    try:
+        if len(parts) == 1:
+            return date(int(parts[0]), 12, 31)
+        if len(parts) == 2:
+            year, month = int(parts[0]), int(parts[1])
+            return date(year, month, calendar.monthrange(year, month)[1])
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, TypeError):
+        return None
+
+
+def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> bool:
+    """True when a medication is still current: the course hasn't ended and no terminal
+    status ended it.
+
+    A past ``ended_on`` ends the course whatever the ``status`` says (issue #57):
+    printed med lists head a section "Active", so a faithful extraction of a 2024 visit
+    note carries ``status='active'`` on a finished ten-day antibiotic course, and that
+    stale label must not outrank an explicit end date. ``status='active'`` wins only
+    when ``ended_on`` is absent, still in the future, or unparseable (the prior-auth
+    case: approved *through* a future date). Any other end date still ends the course
+    as before — only ``status='active'`` overrides a future one.
+
+    A terminal status (:data:`TERMINAL_MED_STATUSES`) ends the course even when no
+    ``ended_on`` was extracted — the contradiction behind issue #21, where a
+    ``completed`` med with a null ``ended_on`` rendered as ``(current)``.
+
+    ``now`` is injectable for deterministic tests/renders, like the ``render`` layer's.
+    """
     status = str(_row_get(row, "status") or "").strip().lower()
-    if status == "active":
-        return True
-    if _row_get(row, "ended_on"):
-        return False
+    ended_on = _row_get(row, "ended_on")
+    if ended_on:
+        end = _end_of_period(ended_on)
+        if end is not None and end < (now or datetime.now()).date():
+            return False
+        return status == "active"
     return status not in TERMINAL_MED_STATUSES
 
 
@@ -95,7 +132,9 @@ def query_labs(
     if since:
         sql += " AND date(collected_at) >= date(?)"
         params.append(since)
-    sql += " ORDER BY collected_at, test_name"
+    # Row id breaks same-timestamp ties: `--keep both` admits a second draw under the
+    # same date, and "later row id = later point" keeps the order deterministic.
+    sql += " ORDER BY collected_at, test_name, lab_result_id"
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     if test:
         target = norm(test, dictionary)
@@ -104,18 +143,25 @@ def query_labs(
 
 
 def query_meds(
-    conn: sqlite3.Connection, slug: str, active: bool = False
+    conn: sqlite3.Connection,
+    slug: str,
+    active: bool = False,
+    *,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Medications for a person. ``active`` keeps only current ones — no end date and
-    no terminal status, or an explicit ``status='active'`` (Architecture.md §5). A
-    terminal status (completed/stopped/discontinued) ends the course even without an
-    ``ended_on``, so such rows are excluded from ``active`` (issue #21)."""
+    no terminal status, or a still-future end date with ``status='active'``
+    (Architecture.md §5, :func:`med_is_current`). A terminal status
+    (completed/stopped/discontinued) ends the course even without an ``ended_on``
+    (issue #21), and a *past* ``ended_on`` ends it even under ``status='active'``
+    (issue #57), so both are excluded from ``active``. ``now`` is injectable so the
+    render layer's deterministic clock reaches the currency test."""
     person_id = resolve_person_id(conn, slug)
     sql = ("SELECT * FROM medication WHERE person_id = ? "
            "ORDER BY (started_on IS NULL), started_on, name")
     rows = [dict(r) for r in conn.execute(sql, (person_id,)).fetchall()]
     if active:
-        rows = [r for r in rows if med_is_current(r)]
+        rows = [r for r in rows if med_is_current(r, now=now)]
     return rows
 
 
