@@ -1,6 +1,7 @@
 """End-to-end CLI wiring for phase 2: ingest -> commit-extraction -> review-conflicts."""
 
 import json
+import zipfile
 
 import pytest
 
@@ -353,3 +354,71 @@ def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
     assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
     err = capsys.readouterr().err
     assert "same dedup_key" in err and "nothing was written" in err
+
+
+# --- intake formats at the CLI (issue #66) ------------------------------------
+
+def test_ingest_refuses_a_google_drive_pointer_stub(ready, capsys):
+    tmp_path = ready
+    stub = tmp_path / "budget.gsheet"
+    stub.write_text(json.dumps({
+        "url": "https://docs.google.com/spreadsheets/d/1AbC_dEf/edit?usp=drivesdk",
+        "doc_id": "1AbC_dEf",
+        "email": "someone@example.com",
+    }), encoding="utf-8")
+
+    rc = _run(tmp_path, "ingest", str(stub), "--person", "jane-doe",
+              "--sources", str(tmp_path / "sources"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "pointer stub" in err
+    assert "Export it from Drive" in err
+    assert not _document_id(tmp_path)  # pre-write refusal: nothing landed
+
+
+def test_ocr_auto_makes_a_docx_findable(ready, capsys):
+    tmp_path = ready
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    doc = tmp_path / "visit.docx"
+    with zipfile.ZipFile(doc, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(
+            "word/document.xml",
+            f'<w:document xmlns:w="{ns}"><w:body>'
+            "<w:p><w:r><w:t>total cholesterol 188</w:t></w:r></w:p>"
+            "</w:body></w:document>",
+        )
+
+    assert _run(tmp_path, "ingest", str(doc), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out
+    assert "no ocr_text stored" not in out.err
+
+    assert _run(tmp_path, "find", "--person", "jane-doe", "cholesterol") == 0
+    assert "#1" in capsys.readouterr().out
+
+
+def test_ocr_tesseract_is_an_alias_for_auto(ready, capsys):
+    """The old spelling keeps working — it selects the same extraction dispatcher."""
+    tmp_path = ready
+    csv = tmp_path / "labs.csv"
+    csv.write_text("test,value\nferritin,68\n", encoding="utf-8")
+
+    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "tesseract") == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
+    assert "#1" in capsys.readouterr().out
+
+
+def test_unextractable_format_still_ingests_with_a_note(ready, capsys):
+    tmp_path = ready
+    msg = tmp_path / "thread.msg"
+    msg.write_bytes(b"\xd0\xcf\x11\xe0 outlook message")
+
+    assert _run(tmp_path, "ingest", str(msg), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    err = capsys.readouterr().err
+    assert "no text extractor" in err
+    assert "--ocr-text-file" in err

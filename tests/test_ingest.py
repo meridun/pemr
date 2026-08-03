@@ -1,6 +1,8 @@
 """Document ingest: hashing, content-addressed blob store, layer-1 dedup."""
 
+import json
 import sqlite3
+import zipfile
 
 import pytest
 
@@ -107,9 +109,10 @@ def test_failed_insert_does_not_orphan_blob(conn, tmp_path, sources):
 
 def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch, capsys):
     monkeypatch.setattr(ingest.shutil, "which", lambda _: None)
-    result = ingest.ingest_document(
-        conn, _make_file(tmp_path), "jane-doe", sources, ocr=True
-    )
+    # a scan (image suffix) is the tesseract branch of ingest.extract_text; text and
+    # OOXML suffixes are read natively and never reach the binary.
+    scan = _make_file(tmp_path, "scan.png", b"\x89PNG not really")
+    result = ingest.ingest_document(conn, scan, "jane-doe", sources, ocr=True)
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "tesseract" in capsys.readouterr().err
@@ -327,3 +330,151 @@ def test_layer1_duplicate_is_unaffected_by_mismatching_text(conn, tmp_path, sour
     assert again.status == "duplicate"
     assert again.document.document_id == first.document.document_id
     assert again.owner_check is None  # nothing written -> nothing checked
+
+
+# --- intake formats (issue #66) -----------------------------------------------
+#
+# Two guards, both stdlib-only: Google Drive pointer stubs are refused pre-write, and
+# `ocr=True` extracts text natively for the formats that allow it.
+
+_STUB = {
+    "url": "https://docs.google.com/spreadsheets/d/1AbC_dEf/edit?usp=drivesdk",
+    "doc_id": "1AbC_dEf",
+    "email": "someone@example.com",
+    "resource_id": "spreadsheet:1AbC_dEf",
+}
+
+
+def _make_stub(tmp_path, name="budget.gsheet", payload=None):
+    p = tmp_path / name
+    p.write_text(json.dumps(_STUB if payload is None else payload), encoding="utf-8")
+    return p
+
+
+def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
+    body = "".join(
+        f"<w:p><w:r><w:t>{part}</w:t></w:r></w:p>" for part in paragraphs
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+        f'2006/main"><w:body>{body}</w:body></w:document>'
+    )
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", document)
+    return p
+
+
+def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "140"))):
+    strings: list[str] = []
+    for row in rows:
+        for cell in row:
+            if cell not in strings:
+                strings.append(cell)
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    shared = (
+        f'<sst xmlns="{ns}">'
+        + "".join(f"<si><t>{s}</t></si>" for s in strings)
+        + "</sst>"
+    )
+    body = "".join(
+        "<row>"
+        + "".join(f'<c t="s"><v>{strings.index(cell)}</v></c>' for cell in row)
+        + "</row>"
+        for row in rows
+    )
+    sheet = f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("xl/sharedStrings.xml", shared)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+    return p
+
+
+def test_pointer_stub_is_refused_pre_write(conn, tmp_path, sources):
+    stub = _make_stub(tmp_path)
+    with pytest.raises(ingest.IngestError) as excinfo:
+        ingest.ingest_document(conn, stub, "jane-doe", sources)
+    message = str(excinfo.value)
+    assert "pointer stub" in message
+    assert "Export it from Drive" in message  # names the fix
+    # pre-write: no blob and no row
+    assert not sources.exists()
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_pointer_guard_is_conjunctive_so_a_real_file_still_ingests(
+    conn, tmp_path, sources
+):
+    # a genuine spreadsheet that merely carries a `.gsheet` name: right suffix, but
+    # too big and not JSON -> not a stub.
+    real = _make_file(tmp_path, "real.gsheet", b"PK\x03\x04" + b"\xff" * 20_000)
+    result = ingest.ingest_document(conn, real, "jane-doe", sources)
+    assert result.status == "new"
+
+
+@pytest.mark.parametrize(
+    "name, payload",
+    [
+        ("notes.txt", _STUB),                       # wrong suffix
+        ("x.gsheet", {"url": "https://example.com/x"}),   # wrong host
+        ("x.gsheet", {"doc_id": "abc"}),            # older shape, missing `email`
+        ("x.gsheet", ["not", "an", "object"]),      # JSON, but not an object
+    ],
+)
+def test_pointer_guard_does_not_fire(conn, tmp_path, sources, name, payload):
+    src = _make_stub(tmp_path, name, payload)
+    assert not ingest.is_pointer_stub(src)
+    assert ingest.ingest_document(conn, src, "jane-doe", sources).status == "new"
+
+
+def test_pointer_guard_ignores_unparseable_files(tmp_path):
+    assert not ingest.is_pointer_stub(_make_file(tmp_path, "b.gsheet", b"\xff\xfe\x00"))
+
+
+def test_extract_text_reads_plaintext_formats(conn, tmp_path, sources):
+    src = _make_file(tmp_path, "labs.csv", "test,value\r\nsodium,140\n".encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.ocr_text_populated
+    assert "sodium,140" in result.document.ocr_text
+
+
+def test_extract_text_reads_docx(conn, tmp_path, sources):
+    src = _make_docx(tmp_path, paragraphs=("Visit summary", "HbA1c 5.7 percent"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Visit summary\nHbA1c 5.7 percent"
+
+
+def test_extract_text_reads_xlsx(conn, tmp_path, sources):
+    src = _make_xlsx(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "test\tvalue\nsodium\t140"
+
+
+def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys):
+    src = _make_file(tmp_path, "thread.msg", b"\xd0\xcf\x11\xe0 outlook")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"          # the document still lands
+    assert result.document.ocr_text is None
+    assert "--ocr-text-file" in capsys.readouterr().err
+
+
+def test_malformed_docx_degrades_instead_of_losing_the_document(
+    conn, tmp_path, sources, capsys
+):
+    src = _make_file(tmp_path, "broken.docx", b"not a zip at all")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.document.ocr_text is None
+    assert "extraction failed" in capsys.readouterr().err
+
+
+def test_supplied_ocr_text_still_beats_extraction(conn, tmp_path, sources):
+    src = _make_docx(tmp_path, paragraphs=("extracted body",))
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True, ocr_text="agent transcription"
+    )
+    assert result.document.ocr_text == "agent transcription"
