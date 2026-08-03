@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sqlite3
 import sys
 import tomllib
@@ -726,7 +727,8 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except dedup.ValidationError as exc:
+        except (dedup.ValidationError, dedup.DictionaryDriftError) as exc:
+            # Drift is a refusal, not a crash: the message names the rekey to run.
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
@@ -994,12 +996,17 @@ def _print_other_assays(result: dict) -> None:
 
     Without this the split is invisible: an SPEP albumin series would just be missing
     from a CMP albumin trend with no hint it exists. Each token is printed ready to
-    paste back as ``--test``."""
+    paste back as ``--test``.
+
+    Quoted with :func:`shlex.quote`, not an f-string's own ``"``: the token descends
+    from ``test_name``, i.e. untrusted document text, and this is the one place in the
+    read path that renders such text as a command the user is invited to run. A name
+    carrying a ``"`` would otherwise close the quote and leave the remainder live."""
     others = result.get("other_assays") or []
     if not others:
         return
     count = result.get("other_assay_count", 0)
-    tokens = "  ".join(f'--test "{t}"' for t in others)
+    tokens = "  ".join(f"--test {shlex.quote(t)}" for t in others)
     print(f"  note   {count} more row(s) of this analyte under another assay: {tokens}")
 
 

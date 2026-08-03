@@ -297,6 +297,22 @@ def find(conn: sqlite3.Connection, slug: str | None, query: str) -> list[dict]:
 # Trends
 # --------------------------------------------------------------------------- #
 
+def _loose(token: str) -> str:
+    """Compare-only spelling of a ``key_token``, underscore-insensitive.
+
+    A dictionary's *canonical value* may contain underscores (``vitamin_d_25oh``,
+    ``bilirubin_total``, ``m_spike``) while ``dedup._collapse`` turns ``_`` into a
+    space on the way **in** — so a token :func:`trends` prints, and offers as a
+    paste-ready ``--test``, does not survive the round trip: re-deriving it yields
+    ``vitamin d 25oh (25-oh)``, which matches nothing. Comparing both sides through
+    this makes the disclosed token actually findable.
+
+    Read-path only — no ``dedup_key`` is derived from it. The most it can do is treat
+    two spellings of one canonical name as one series, which is what they are.
+    """
+    return token.replace("_", " ")
+
+
 def _ordinal(value: object) -> int | None:
     try:
         return date.fromisoformat(_date_part(value)).toordinal()
@@ -339,12 +355,13 @@ def trends(
     interleaves a CMP albumin with an SPEP albumin is a wrong chart, the same class of
     harm as the dedup collision this splits apart. Rows of the *same* analyte family
     excluded by a differing qualifier are therefore **disclosed, not dropped** —
-    ``other_assays`` lists their key tokens (each usable verbatim as ``--test``) and
-    ``other_assay_count`` counts the numeric rows behind them.
+    ``other_assays`` lists their key tokens (each usable verbatim as ``--test``, via
+    :func:`_loose` — a canonical value may carry underscores that a re-derivation
+    cannot reproduce) and ``other_assay_count`` counts the numeric rows behind them.
     """
     person_id = resolve_person_id(conn, slug)
-    target = key_token(test, dictionary)
-    family = norm(test, dictionary)
+    target = _loose(key_token(test, dictionary))
+    family = _loose(norm(test, dictionary))
     rows = conn.execute(
         "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
         "WHERE person_id = ? AND value_num IS NOT NULL "
@@ -353,15 +370,19 @@ def trends(
     ).fetchall()
     matched = []
     others: dict[str, int] = {}
+    matched_token = ""
     for r in rows:
         token = key_token(r["test_name"], dictionary)
-        if token == target:
+        if _loose(token) == target:
             matched.append(r)
-        elif norm(r["test_name"], dictionary) == family:
+            # Echo the stored spelling rather than whatever the caller typed, so a
+            # pasted `other_assays` token comes back labelled the way it was disclosed.
+            matched_token = matched_token or token
+        elif _loose(norm(r["test_name"], dictionary)) == family:
             others[token] = others.get(token, 0) + 1
 
     result: dict = {
-        "test": target,
+        "test": matched_token or target,
         "count": len(matched),
         "unit": None,
         "min": None,
