@@ -442,3 +442,22 @@ def test_ocr_auto_still_ocrs_an_unlisted_image_suffix(ready, capsys, monkeypatch
     assert "no ocr_text stored" not in capsys.readouterr().err
     assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
     assert "#1" in capsys.readouterr().out
+
+
+def test_lab_export_with_a_patient_column_is_not_refused(ready, capsys):
+    """A `Patient ID` column header is a schema, not an identity claim: making the CSV
+    readable must not make it unfilable (issue #66 audit bounce)."""
+    tmp_path = ready
+    csv = tmp_path / "labs.csv"
+    csv.write_text(
+        "Patient ID,Test,Value,Unit\n1043,Glucose,98,mg/dL\n", encoding="utf-8"
+    )
+
+    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out
+    assert "owner verification failed" not in out.err
+
+    assert _run(tmp_path, "find", "--person", "jane-doe", "glucose") == 0
+    assert "#1" in capsys.readouterr().out

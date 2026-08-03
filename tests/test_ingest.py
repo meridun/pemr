@@ -545,3 +545,105 @@ def test_supplied_ocr_text_still_beats_extraction(conn, tmp_path, sources):
         conn, src, "jane-doe", sources, ocr=True, ocr_text="agent transcription"
     )
     assert result.document.ocr_text == "agent transcription"
+
+
+# --- structured text vs. the #61 identity anchor (issue #66 audit bounce) -------
+#
+# Native extraction made text available for `.csv`/`.docx`/`.xlsx`/`.json`, and that text
+# flows into the owner check. `_ANCHOR` was tuned for scanned headers where `Patient:`
+# precedes a printed name; in a lab export those same words are *column labels*, so
+# trusting them refused files that ingested fine before this issue. The anchor→`suspect`
+# inference is therefore route-scoped; `match`/`mismatch` are not.
+
+
+_HEADER_ROW = "Patient ID,Test,Value,Unit\n1043,Glucose,98,mg/dL\n"
+
+
+def test_check_owner_anchor_trust_is_route_scoped():
+    text = "Patient: SMITH, JANE A    DOB: 03/14/1900"
+    assert ingest.check_owner(text, JANE, ROSTER).verdict == "suspect"
+    assert ingest.check_owner(
+        text, JANE, ROSTER, trust_anchors=False
+    ).verdict == "unverified"
+
+
+@pytest.mark.parametrize(
+    "text, verdict, matched",
+    [
+        ("Patient: DOE, JANE   DOB: 03/14/1962", "match", "jane-doe"),
+        ("Patient: ROE, ROBERT ALAN", "mismatch", "bob-roe"),
+    ],
+)
+def test_affirmative_verdicts_survive_untrusted_anchors(text, verdict, matched):
+    """Only `suspect` is route-scoped: an actual name/DOB is evidence on any route."""
+    check = ingest.check_owner(text, JANE, ROSTER, trust_anchors=False)
+    assert check.verdict == verdict
+    assert check.matched_slug == matched
+
+
+@pytest.mark.parametrize("kind", ["csv", "docx", "xlsx", "json"])
+def test_structured_headers_do_not_refuse_the_ingest(conn, tmp_path, sources, kind):
+    """A `Patient ID` column (or a `patient` JSON key) is a schema, not an identity
+    claim — these all ingested exit-0 before native extraction existed and must still."""
+    _seed_roster(conn)
+    if kind == "docx":
+        src = _make_docx(tmp_path, paragraphs=("Patient chart summary", "Ferritin 201"))
+    elif kind == "xlsx":
+        src = _make_xlsx(tmp_path, rows=(("Patient ID", "Test"), ("1043", "Glucose")))
+    elif kind == "json":
+        src = _make_file(tmp_path, "export.json", b'{"patient": 1043, "dob": null}')
+    else:
+        src = _make_file(tmp_path, "labs.csv", _HEADER_ROW.encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.owner_check.verdict == "unverified"
+    assert result.owner_check.blocks is False
+    assert result.ocr_text_populated
+
+
+def test_structured_text_still_refuses_another_roster_person(conn, tmp_path, sources):
+    """The half of #61 that actually protects against a misfile is untouched: an
+    affirmative match on a different roster person blocks on the native route too."""
+    _seed_roster(conn)
+    src = _make_docx(tmp_path, paragraphs=("Patient: ROE, ROBERT ALAN", "Ferritin 201"))
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "bob-roe"
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_ocr_route_still_produces_suspect(conn, tmp_path, sources, monkeypatch):
+    """Scoping the anchor to prose must not disarm #61 on the route it was built for."""
+    _seed_roster(conn)
+    monkeypatch.setattr(
+        ingest, "run_ocr", lambda _: "Patient: SMITH, KAREN    DOB: 09/09/1971"
+    )
+    src = _make_file(tmp_path, "scan.png", b"\x89PNG pretend scan")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "suspect"
+
+
+# --- extraction size cap (issue #66 audit) -------------------------------------
+#
+# `ocr_text` lands in the row *and* the FTS index, so an unbounded read is a DB-size
+# problem and a decompression-bomb surface (a small `.docx` can declare a ~1 GB
+# `word/document.xml`). Over the cap degrades like any other extraction failure.
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt"])
+def test_oversized_extraction_degrades_instead_of_reading_it(
+    conn, tmp_path, sources, capsys, monkeypatch, kind
+):
+    monkeypatch.setattr(ingest, "_MAX_EXTRACT_BYTES", 16)
+    if kind == "docx":
+        src = _make_docx(tmp_path, paragraphs=("a" * 500,))
+    elif kind == "xlsx":
+        src = _make_xlsx(tmp_path)
+    else:
+        src = _make_file(tmp_path, "big.txt", b"x" * 500)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"           # the document still lands
+    assert result.document.ocr_text is None
+    assert "extraction cap" in capsys.readouterr().err

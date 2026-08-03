@@ -35,7 +35,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from . import db
@@ -162,16 +162,49 @@ _EXTRACT_ERRORS = (
 
 _SHEET_NUM = re.compile(r"(\d+)")
 
+# Ceiling on how much text one file may contribute. `ocr_text` is stored in the row
+# *and* mirrored into the FTS index, so an unbounded read is both a DB-size problem
+# (a 106 MB log grew the database to 226 MB) and a decompression-bomb surface: a 917 KB
+# `.docx` whose `word/document.xml` inflates to ~1 GB is trivial to build, and
+# `MemoryError` is not something the best-effort handler below can honestly promise to
+# absorb. 32 MiB is far past any real medical document and far below hurting anything.
+_MAX_EXTRACT_BYTES = 32 * 1024 * 1024
+
 
 def _xml_text(node: ET.Element, tag: str) -> str:
     """Concatenated text of every ``tag`` descendant (OOXML splits runs arbitrarily)."""
     return "".join(child.text or "" for child in node.iter(tag))
 
 
+def _member_reader(zf: zipfile.ZipFile) -> Callable[[str], bytes]:
+    """Bounded member reader sharing one uncompressed-size budget across the archive.
+
+    `ZipInfo.file_size` is the *declared* uncompressed size, so the check costs no
+    read; `ZipExtFile` never yields more than that many bytes, so a lying header can
+    only under-deliver. Over budget raises `ValueError`, which the caller's
+    best-effort handler turns into the usual "no ocr_text" note.
+    """
+    remaining = _MAX_EXTRACT_BYTES
+
+    def read(name: str) -> bytes:
+        nonlocal remaining
+        size = zf.getinfo(name).file_size
+        if size > remaining:
+            raise ValueError(
+                f"{name} expands to {size} bytes, past the "
+                f"{_MAX_EXTRACT_BYTES}-byte extraction cap"
+            )
+        remaining -= size
+        return zf.read(name)
+
+    return read
+
+
 def _extract_docx(path: Path) -> str:
     """`.docx` body text: concat `w:t` runs, one line per `w:p` paragraph."""
     with zipfile.ZipFile(path) as zf:
-        root = ET.fromstring(zf.read("word/document.xml"))
+        read_member = _member_reader(zf)
+        root = ET.fromstring(read_member("word/document.xml"))
     return "\n".join(
         _xml_text(para, f"{_WORD_NS}t") for para in root.iter(f"{_WORD_NS}p")
     )
@@ -201,10 +234,11 @@ def _extract_xlsx(path: Path) -> str:
     numeric order (`sheet2.xml` before `sheet10.xml`); true workbook order lives in
     `xl/workbook.xml` and is not worth a second parse for full-text purposes."""
     with zipfile.ZipFile(path) as zf:
+        read_member = _member_reader(zf)
         names = zf.namelist()
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            root = ET.fromstring(read_member("xl/sharedStrings.xml"))
             shared = [
                 _xml_text(si, f"{_SHEET_NS}t") for si in root.iter(f"{_SHEET_NS}si")
             ]
@@ -216,7 +250,7 @@ def _extract_xlsx(path: Path) -> str:
         )
         lines: list[str] = []
         for name in sheets:
-            root = ET.fromstring(zf.read(name))
+            root = ET.fromstring(read_member(name))
             for row in root.iter(f"{_SHEET_NS}row"):
                 lines.append("\t".join(
                     _cell_text(cell, shared) for cell in row.iter(f"{_SHEET_NS}c")
@@ -224,18 +258,23 @@ def _extract_xlsx(path: Path) -> str:
     return "\n".join(lines)
 
 
-def extract_text(path: str | Path) -> str | None:
-    """Best-effort document text by file type; ``None`` when nothing could be read.
+def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
+    """:func:`extract_text` plus the **route** that produced the text.
 
     Dispatches on suffix: plaintext-ish formats are read directly and `.docx`/`.xlsx`
-    are unzipped and their OOXML parsed with the stdlib. **Everything else falls
-    through to :func:`run_ocr`** (tesseract) — the same thing `ocr=True` did before
-    this dispatcher existed. Deliberately not a suffix allowlist: image extensions
-    vary far too widely (`.jfif`, `.jpe`, extension-less scans) for one to be safe,
-    and silently skipping a scan that used to OCR is the worse failure — it drops the
-    document out of `find` with no signal. When tesseract declines (absent, failed, or
-    no text — e.g. `.rtf`, `.msg`, `.doc`) the caller gets ``None`` plus a stderr note
-    pointing at `--ocr-text-file`.
+    are unzipped and their OOXML parsed with the stdlib (route ``"native"``).
+    **Everything else falls through to :func:`run_ocr`** (route ``"ocr"``) — the same
+    thing `ocr=True` did before this dispatcher existed. Deliberately not a suffix
+    allowlist: image extensions vary far too widely (`.jfif`, `.jpe`, extension-less
+    scans) for one to be safe, and silently skipping a scan that used to OCR is the
+    worse failure — it drops the document out of `find` with no signal. When tesseract
+    declines (absent, failed, or no text — e.g. `.pdf`, `.rtf`, `.msg`, `.doc`) the
+    caller gets ``None`` plus a stderr note pointing at `--ocr-text-file`.
+
+    The route matters to the caller because the #61 owner check reads identity
+    *anchors* (`Patient`, `DOB`, `MRN`) as "this document names somebody". That
+    inference holds for a scanned or transcribed page and not for a spreadsheet,
+    where those words are column labels — see ``trust_anchors`` on :func:`check_owner`.
 
     Never raises: a malformed `.docx` must not cost you the document.
     """
@@ -243,6 +282,11 @@ def extract_text(path: str | Path) -> str | None:
     suffix = src.suffix.lower()
     try:
         if suffix in _PLAINTEXT_SUFFIXES:
+            size = src.stat().st_size
+            if size > _MAX_EXTRACT_BYTES:
+                raise ValueError(
+                    f"{size} bytes, past the {_MAX_EXTRACT_BYTES}-byte extraction cap"
+                )
             # utf-8-sig eats a BOM; errors="replace" keeps a legacy-encoded file
             # usable rather than losing it entirely (same trade as run_ocr's decode).
             text = src.read_text(encoding="utf-8-sig", errors="replace")
@@ -260,16 +304,25 @@ def extract_text(path: str | Path) -> str | None:
                     f"--ocr-text-file <path>.",
                     file=sys.stderr,
                 )
-            return ocr_text
+            return ocr_text, "ocr"
     except _EXTRACT_ERRORS as exc:
         print(
             f"note: text extraction failed for {src.name} ({exc}); "
             "storing without ocr_text",
             file=sys.stderr,
         )
-        return None
+        return None, "native"
     text = text.strip()
-    return text or None
+    return (text or None), "native"
+
+
+def extract_text(path: str | Path) -> str | None:
+    """Best-effort document text by file type; ``None`` when nothing could be read.
+
+    Route-blind convenience wrapper over :func:`extract_text_routed`, which is what
+    :func:`ingest_document` calls.
+    """
+    return extract_text_routed(path)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -377,7 +430,8 @@ class OwnerCheck:
     * ``mismatch`` — a *different* roster person matched and the claimed one did not.
     * ``suspect`` — the text carries a patient-identity anchor but names nobody on
       the roster. This is the case that actually happened (a legible ``Patient:`` /
-      ``DOB:`` header for someone who is not on the roster at all).
+      ``DOB:`` header for someone who is not on the roster at all). Only reachable
+      for transcribed/OCR'd text — see ``trust_anchors`` on :func:`check_owner`.
     * ``unverified`` — no text, or text with no identity anchor and no matches.
     """
 
@@ -474,9 +528,22 @@ def _evidence(raw: str) -> str | None:
 
 
 def check_owner(
-    text: str | None, claimed: Person, roster: Sequence[Person]
+    text: str | None,
+    claimed: Person,
+    roster: Sequence[Person],
+    *,
+    trust_anchors: bool = True,
 ) -> OwnerCheck:
-    """Does ``text`` look like it belongs to ``claimed``? See :class:`OwnerCheck`."""
+    """Does ``text`` look like it belongs to ``claimed``? See :class:`OwnerCheck`.
+
+    ``trust_anchors=False`` says the text is **structured**, not prose — a CSV, a
+    spreadsheet, a JSON export — where ``Patient``/``DOB``/``MRN`` are column labels
+    and field keys rather than a printed identity header. `_ANCHOR` was tuned for
+    scanned document headers and does not transfer: counting a `Patient ID,Test,Value`
+    header row as "this document names somebody" refuses an ordinary lab export as
+    belonging to a stranger. Only the ``suspect`` inference is suppressed;
+    ``match``/``mismatch`` are affirmative name/DOB evidence and hold on every route.
+    """
     if not text or not text.strip():
         return OwnerCheck(verdict="unverified")
 
@@ -505,7 +572,7 @@ def check_owner(
     # reflexively. A DOB doesn't rescue it either: most documents simply don't print
     # one, so its absence proves nothing. `mismatch` above is untouched — affirmative
     # evidence pointing at another roster person still blocks.
-    if evidence is not None and name_tokens(claimed.full_name):
+    if trust_anchors and evidence is not None and name_tokens(claimed.full_name):
         return OwnerCheck(verdict="suspect", evidence=evidence)
     return OwnerCheck(verdict="unverified")
 
@@ -590,14 +657,18 @@ def ingest_document(
 
     ``ocr_text`` is caller-supplied document text (the agent's own transcription —
     the `AGENTS.md` default path, which beats tesseract on messy scans). When
-    provided it wins; otherwise ``ocr=True`` runs a best-effort :func:`extract_text`
-    pass (native for text/OOXML, tesseract for images and PDFs — issue #66).
+    provided it wins; otherwise ``ocr=True`` runs a best-effort
+    :func:`extract_text_routed` pass (native for text/OOXML, tesseract for everything
+    else — issue #66).
     An empty/whitespace-only string is treated as absent. Populating text here
     is what makes a document findable via FTS (`find`), so it is a warning-not-error
     when it ends up empty — see :attr:`IngestResult.ocr_text_populated`.
 
-    When text is available it is also checked against the claimed owner (issue #61).
-    A blocking verdict raises :class:`OwnerMismatchError` **before** anything is
+    When text is available it is also checked against the claimed owner (issue #61),
+    with the identity-anchor (``suspect``) half of that check applied only to prose —
+    transcribed or OCR'd text, not natively-extracted CSV/OOXML/JSON, whose
+    ``Patient``/``DOB`` tokens are column labels. A blocking verdict raises
+    :class:`OwnerMismatchError` **before** anything is
     written, so a refused ingest is a clean no-op and ``force=True`` is the whole
     recovery. The verdict rides back on :attr:`IngestResult.owner_check` so callers
     report it without a second pass.
@@ -627,10 +698,21 @@ def ingest_document(
     # Resolve the text *before* the blob copy so the owner check is pre-write. OCR
     # runs on `src` rather than the copied blob — identical bytes, same result.
     supplied = ocr_text.strip() if ocr_text else None
-    ocr_text = supplied or (extract_text(src) if ocr else None)
+    if supplied:
+        # An agent transcription is prose off the page: anchors mean what they say.
+        ocr_text, route = supplied, "ocr"
+    elif ocr:
+        ocr_text, route = extract_text_routed(src)
+    else:
+        ocr_text, route = None, "ocr"  # no text at all; the route is moot
 
     roster = _roster(conn)
-    owner_check = check_owner(ocr_text, person, roster)
+    # Natively-extracted text (CSV/OOXML/JSON) is structured, so a `Patient ID` column
+    # header is not an identity claim — trusting anchors there refuses ordinary lab
+    # exports as belonging to a stranger. `mismatch` still blocks on every route.
+    owner_check = check_owner(
+        ocr_text, person, roster, trust_anchors=(route != "native")
+    )
     if owner_check.blocks and not force:
         raise OwnerMismatchError(
             refusal_message(owner_check, person, roster), owner_check
