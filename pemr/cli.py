@@ -670,7 +670,9 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
                 doc_date=args.doc_date,
                 category=args.category,
                 provider=args.provider,
-                ocr=(args.ocr == "tesseract"),
+                # `tesseract` is a retained alias for `auto`: both mean "extract by
+                # whatever route this file type allows" (ingest.extract_text).
+                ocr=(args.ocr is not None),
                 ocr_text=ocr_text,
                 force=args.force,
             )
@@ -698,7 +700,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     if not result.ocr_text_populated:
         print(
             "note: no ocr_text stored - `find` (full-text search) will not see this "
-            "document. Supply --ocr-text-file <path> or --ocr tesseract.",
+            "document. Supply --ocr-text-file <path> or --ocr auto.",
             file=sys.stderr,
         )
     print(f"next: extract, then `pemr commit-extraction --document {doc.document_id} --json <file>`")
@@ -1410,7 +1412,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--category", help="labs|imaging|visit-note|rx|vaccine|...")
     p_ingest.add_argument("--provider")
     p_ingest.add_argument(
-        "--ocr", choices=["tesseract"], help="pre-fill ocr_text (soft dependency)"
+        "--ocr",
+        choices=["auto", "tesseract"],
+        help="pre-fill ocr_text: text/.docx/.xlsx read natively, images/PDF via "
+             "tesseract (soft dependency). 'tesseract' is an alias for 'auto'",
     )
     p_ingest.add_argument(
         "--ocr-text-file",

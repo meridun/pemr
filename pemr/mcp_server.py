@@ -178,7 +178,12 @@ def ingest_document(
 
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
-    contract without a follow-up read.
+    contract without a follow-up read. ``ocr=true`` is the fallback: it extracts by
+    whatever route the file type allows (plaintext/`.docx`/`.xlsx` natively, images and
+    PDFs via tesseract), and stores nothing when there is no route.
+
+    A Google Drive pointer stub (``.gsheet``/``.gdoc`` — a ~1 KB JSON link, not the
+    document) is refused pre-write; the fix is to export it from Drive first.
 
     When text is present it is checked against the claimed owner; the verdict comes
     back as ``owner_check`` (``null`` on a duplicate, which is never checked). A

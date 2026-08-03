@@ -305,6 +305,8 @@ point, so `trends` deltas and "latest value" stay deterministic.
 ```
 inbox/scan.pdf
   → pemr ingest inbox/scan.pdf --person jane-doe
+      0. refuse Google Drive pointer stubs (`.gsheet`/`.gdoc` — a ~1 KB JSON link,
+         not the document); pre-hash, so a refusal writes nothing
       1. hash bytes; if known → report duplicate, stop
       2. resolve document text (agent-supplied, or --ocr), then verify the owner:
          text naming a different roster person, or a patient-identity header
@@ -324,8 +326,15 @@ Division of labor: **the LLM only does the fuzzy vision-to-structure step.** Has
 validation, dedup, insertion, conflict detection are all deterministic Python the agent
 can't get subtly wrong. That's the whole point of lifting them out.
 
-Optional `--ocr tesseract` flag pre-fills `document.ocr_text` when scans are flat images,
-giving the agent text to work from instead of re-reading pixels every time.
+Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text to work
+from instead of re-reading the source every time. It extracts by whatever route the file
+type allows, all stdlib (the engine has no runtime dependencies):
+`.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
+parsed, images and PDFs through `tesseract` (a soft dependency). Anything else —
+`.rtf`, `.msg`, `.doc`, a PDF text layer — needs a third-party parser and is deliberately
+out: transcribe it yourself and pass `--ocr-text-file`. Extraction is best-effort and
+never fatal; a malformed file costs you the text, not the document. `--ocr tesseract` is
+a retained alias for `--ocr auto`.
 
 ---
 
@@ -335,7 +344,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
-pemr ingest <file> --person <slug> [--ocr tesseract] [--force]   # --force: skip owner verification
+pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone

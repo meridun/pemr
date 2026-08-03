@@ -14,20 +14,29 @@ Issue #61 adds a pre-write **owner check**: when document text is available, it 
 scanned for the claimed person's name/DOB and the ingest is refused (pre-write, so a
 refusal is a clean no-op) when the text affirmatively points somewhere else. See
 :func:`check_owner`.
+
+Issue #66 adds two intake-format guards, both stdlib-only (the engine has no runtime
+dependencies): a pre-write refusal of Google Drive **pointer stubs** (see
+:func:`is_pointer_stub`) and a text-extraction dispatcher (:func:`extract_text`) so
+`.txt`/`.docx`/`.xlsx` and friends become findable instead of landing as opaque blobs.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import subprocess
 import sqlite3
 import sys
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlsplit
 
 from . import db
 from .models import Document, Person
@@ -126,6 +135,196 @@ def run_ocr(path: str | Path) -> str | None:
         return None
     text = proc.stdout.strip()
     return text or None
+
+
+# --------------------------------------------------------------------------- #
+# Text extraction (issue #66) — `ocr=True` means "extract text by whatever route
+# this file type allows", not "shell out to tesseract". `run_ocr` keeps its name and
+# its tesseract semantics and becomes the image/PDF branch of the dispatcher below.
+#
+# Hard constraint: **zero new dependencies.** Everything here is stdlib, which is what
+# draws the scope line — `.rtf`, `.msg`, `.doc` and PDF *text-layer* extraction all
+# need a third-party parser and stay out, covered by the agent transcription path
+# (`--ocr-text-file`) that `AGENTS.md` §3 already makes the default.
+# --------------------------------------------------------------------------- #
+
+_PLAINTEXT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".json", ".log"})
+
+# What tesseract can actually read. Everything else with no native branch below gets
+# the "no extractor" note rather than a doomed subprocess.
+_OCR_SUFFIXES = frozenset({
+    ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
+    ".jp2", ".pnm", ".ppm", ".pgm", ".pbm",
+})
+
+_WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+# Errors an OOXML/plaintext read can legitimately produce on a malformed or truncated
+# file. Extraction is best-effort: any of these degrades to "no ocr_text", never a lost
+# document — the same contract `run_ocr` already has for a missing tesseract.
+_EXTRACT_ERRORS = (
+    OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile, ET.ParseError,
+)
+
+_SHEET_NUM = re.compile(r"(\d+)")
+
+
+def _xml_text(node: ET.Element, tag: str) -> str:
+    """Concatenated text of every ``tag`` descendant (OOXML splits runs arbitrarily)."""
+    return "".join(child.text or "" for child in node.iter(tag))
+
+
+def _extract_docx(path: Path) -> str:
+    """`.docx` body text: concat `w:t` runs, one line per `w:p` paragraph."""
+    with zipfile.ZipFile(path) as zf:
+        root = ET.fromstring(zf.read("word/document.xml"))
+    return "\n".join(
+        _xml_text(para, f"{_WORD_NS}t") for para in root.iter(f"{_WORD_NS}p")
+    )
+
+
+def _cell_text(cell: ET.Element, shared: list[str]) -> str:
+    """One `.xlsx` cell: shared-string lookup, inline string, or the literal value."""
+    kind = cell.get("t")
+    if kind == "s":
+        value = cell.find(f"{_SHEET_NS}v")
+        if value is None or not (value.text or "").strip():
+            return ""
+        index = int(value.text)
+        return shared[index] if 0 <= index < len(shared) else ""
+    if kind == "inlineStr":
+        return _xml_text(cell, f"{_SHEET_NS}t")
+    value = cell.find(f"{_SHEET_NS}v")
+    return (value.text or "") if value is not None else ""
+
+
+def _extract_xlsx(path: Path) -> str:
+    """`.xlsx` cell text: one line per row, tab-separated, sheets in workbook order."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            shared = [
+                _xml_text(si, f"{_SHEET_NS}t") for si in root.iter(f"{_SHEET_NS}si")
+            ]
+        sheets = sorted(
+            (n for n in names
+             if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")),
+            # sheet2.xml before sheet10.xml — lexicographic order would invert them.
+            key=lambda n: [int(part) for part in _SHEET_NUM.findall(n)] or [0],
+        )
+        lines: list[str] = []
+        for name in sheets:
+            root = ET.fromstring(zf.read(name))
+            for row in root.iter(f"{_SHEET_NS}row"):
+                lines.append("\t".join(
+                    _cell_text(cell, shared) for cell in row.iter(f"{_SHEET_NS}c")
+                ))
+    return "\n".join(lines)
+
+
+def extract_text(path: str | Path) -> str | None:
+    """Best-effort document text by file type; ``None`` when there is no route.
+
+    Dispatches on suffix: plaintext-ish formats are read directly, `.docx`/`.xlsx` are
+    unzipped and their OOXML parsed with the stdlib, images and PDFs go to
+    :func:`run_ocr` (tesseract). Anything else — `.rtf`, `.msg`, `.doc` — returns
+    ``None`` with a stderr note; transcribe those yourself and pass `--ocr-text-file`.
+
+    Never raises: a malformed `.docx` must not cost you the document.
+    """
+    src = Path(path)
+    suffix = src.suffix.lower()
+    if suffix in _OCR_SUFFIXES:
+        return run_ocr(src)
+    try:
+        if suffix in _PLAINTEXT_SUFFIXES:
+            # utf-8-sig eats a BOM; errors="replace" keeps a legacy-encoded file
+            # usable rather than losing it entirely (same trade as run_ocr's decode).
+            text = src.read_text(encoding="utf-8-sig", errors="replace")
+        elif suffix == ".docx":
+            text = _extract_docx(src)
+        elif suffix == ".xlsx":
+            text = _extract_xlsx(src)
+        else:
+            print(
+                f"note: --ocr requested but there is no text extractor for "
+                f"'{suffix or src.name}'; storing document without ocr_text. "
+                f"Transcribe it and pass --ocr-text-file <path>.",
+                file=sys.stderr,
+            )
+            return None
+    except _EXTRACT_ERRORS as exc:
+        print(
+            f"note: text extraction failed for {src.name} ({exc}); "
+            "storing without ocr_text",
+            file=sys.stderr,
+        )
+        return None
+    text = text.strip()
+    return text or None
+
+
+# --------------------------------------------------------------------------- #
+# Google Drive pointer stubs (issue #66).
+#
+# A `.gsheet`/`.gdoc` in a synced Drive folder is a ~1 KB JSON link, not the document.
+# Storing it produces a permanently useless blob plus a `document` row that looks
+# legitimate. Detection is **conjunctive** so a real spreadsheet that merely got a
+# `.gsheet` name is still ingested normally.
+# --------------------------------------------------------------------------- #
+
+_POINTER_SUFFIXES = frozenset({
+    ".gdoc", ".gsheet", ".gslides", ".gdraw", ".gform", ".gsite",
+    ".gtable", ".gjam", ".glink", ".gmap", ".gscript",
+})
+_POINTER_MAX_BYTES = 16 * 1024
+_POINTER_HOSTS = frozenset({"docs.google.com", "drive.google.com"})
+
+
+def is_pointer_stub(path: str | Path) -> bool:
+    """Whether ``path`` is a Google Drive pointer stub rather than a document.
+
+    All of: a Google-native suffix, ≤16 KiB, parses as a JSON **object**, and carries
+    either a ``url`` on a Google Docs/Drive host or the older ``doc_id`` + ``email``
+    stub shape. Never raises — an unreadable/undecodable file is simply "not a stub"
+    and continues down the normal ingest path.
+    """
+    src = Path(path)
+    if src.suffix.lower() not in _POINTER_SUFFIXES:
+        return False
+    try:
+        if src.stat().st_size > _POINTER_MAX_BYTES:
+            return False
+        payload = json.loads(src.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):  # UnicodeDecodeError/JSONDecodeError ⊂ ValueError
+        return False
+    if not isinstance(payload, dict):
+        return False
+    url = payload.get("url")
+    if isinstance(url, str):
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host in _POINTER_HOSTS:
+            return True
+    return isinstance(payload.get("doc_id"), str) and isinstance(
+        payload.get("email"), str
+    )
+
+
+def pointer_stub_message(path: str | Path) -> str:
+    """Refusal text naming the fix (export from Drive, ingest the export)."""
+    name = Path(path).name
+    return (
+        f"`{name}` is a Google Drive pointer stub (a ~1 KB JSON link), not the "
+        "document itself.\n"
+        "  Export it from Drive (File > Download > PDF/XLSX) and ingest the export.\n"
+        "  Nothing was ingested."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -381,10 +580,14 @@ def ingest_document(
     status "duplicate" and nothing is written. Otherwise the blob is copied into
     the immutable content-addressed store and a new `document` row is inserted.
 
+    A Google Drive pointer stub is refused up front (issue #66) — before hashing, so
+    nothing is written and there is nothing to clean up. See :func:`is_pointer_stub`.
+
     ``ocr_text`` is caller-supplied document text (the agent's own transcription —
     the `AGENTS.md` default path, which beats tesseract on messy scans). When
-    provided it wins; otherwise ``ocr=True`` falls back to a best-effort tesseract
-    pass. An empty/whitespace-only string is treated as absent. Populating text here
+    provided it wins; otherwise ``ocr=True`` runs a best-effort :func:`extract_text`
+    pass (native for text/OOXML, tesseract for images and PDFs — issue #66).
+    An empty/whitespace-only string is treated as absent. Populating text here
     is what makes a document findable via FTS (`find`), so it is a warning-not-error
     when it ends up empty — see :attr:`IngestResult.ocr_text_populated`.
 
@@ -400,6 +603,12 @@ def ingest_document(
     if not src.is_file():
         raise IngestError(f"file not found: {src}")
 
+    # Pre-hash, pre-write: a refused pointer stub leaves no blob and no row. There is
+    # deliberately no --force escape hatch — the stub bytes are never the thing you
+    # want in the record, and renaming the file clears the (conjunctive) guard.
+    if is_pointer_stub(src):
+        raise IngestError(pointer_stub_message(src))
+
     person = _person_for_slug(conn, person_slug)
     sha = hash_file(src)
 
@@ -413,7 +622,7 @@ def ingest_document(
     # Resolve the text *before* the blob copy so the owner check is pre-write. OCR
     # runs on `src` rather than the copied blob — identical bytes, same result.
     supplied = ocr_text.strip() if ocr_text else None
-    ocr_text = supplied or (run_ocr(src) if ocr else None)
+    ocr_text = supplied or (extract_text(src) if ocr else None)
 
     roster = _roster(conn)
     owner_check = check_owner(ocr_text, person, roster)
