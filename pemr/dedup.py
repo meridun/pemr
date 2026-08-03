@@ -107,6 +107,9 @@ _WS = re.compile(r"\s+")
 # Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
 # bare analyte stem) and yields its contents (`findall`, giving the candidate qualifier).
 _PAREN = re.compile(r"\(([^)]*)\)")
+# Padding just inside a parenthesis, squeezed out by _collapse so `M-Spike ( SPEP )`
+# is the same label as `M-Spike (SPEP)` (and so hits the same dictionary entry).
+_PAREN_PAD = re.compile(r"\(\s+|\s+\)")
 
 # A date value is accepted at one of three precisions, each a lexically-sortable ISO
 # prefix (so `_date_only` slicing, timeline sort and every `ORDER BY <datecol>` keep
@@ -123,6 +126,15 @@ _ISO_YEAR_RE = re.compile(r"\d{4}")
 
 class ValidationError(ValueError):
     """Raised when the extraction JSON violates a record schema."""
+
+
+class DictionaryDriftError(ValueError):
+    """Stored keys no longer match the current dictionary; `pemr rekey` comes first.
+
+    Defined here rather than in :mod:`pemr.documents` because both the write paths
+    that can be corrupted by drift — `document reassign` and `commit-extraction` —
+    have to raise it, and only this module is importable from both.
+    """
 
 
 def _is_iso_date(value: str) -> bool:
@@ -187,9 +199,17 @@ def load_dictionary(path: str | Path | None) -> dict[str, str]:
 
 
 def _collapse(value: str) -> str:
-    # Underscores count as separators: machine-generated keys like
-    # "blood_pressure" must collapse to the same token as "Blood Pressure".
-    return _WS.sub(" ", value.strip().lower().replace("_", " "))
+    """Case/whitespace-normalized spelling of a free-text name.
+
+    Underscores count as separators: machine-generated keys like ``blood_pressure``
+    must collapse to the same token as ``Blood Pressure``. Trimming happens *after*
+    that substitution — a leading/trailing ``_`` becomes whitespace, and a stray edge
+    space would otherwise defeat :func:`identity`'s declared-full-label lookup
+    (``"_m-spike (spep)"`` must still find the ``"m-spike (spep)"`` entry). Padding
+    just inside a parenthesis is squeezed out for the same reason.
+    """
+    collapsed = _WS.sub(" ", value.lower().replace("_", " ")).strip()
+    return _PAREN_PAD.sub(lambda m: m.group(0).strip(), collapsed)
 
 
 def _strip_qualifiers(value: str) -> str:
@@ -506,6 +526,54 @@ def _rows_equal(
     return True
 
 
+def _assert_no_key_drift(
+    conn: sqlite3.Connection,
+    record_type: str,
+    rows: list,
+    person_id: int,
+    dictionary: dict[str, str] | None,
+) -> None:
+    """Refuse a commit that would fork a fact already stored under a **stale** key.
+
+    A ``dedup_key`` is frozen at commit time, so once the current dictionary (or the
+    key derivation itself — issue #71 gave every parenthesized analyte name a new key)
+    disagrees with what a stored row carries, layer-2 dedup silently misses: the same
+    fact lands a *second* time, reported as ``new``, with no duplicate/conflict signal
+    for anyone to notice. `pemr rekey --apply` is the fix, but nothing used to make the
+    user run it before their next ingest — this is what does.
+
+    Deliberately *narrow*: it fires only when a stored row recomputes onto an identity
+    this submission also derives, so an unrelated drifted row elsewhere in the database
+    never blocks an ingest. `document reassign` carries the equivalent guard
+    (:class:`DictionaryDriftError` there too), for the same reason.
+    """
+    bases = {dedup_key(record_type, row, person_id, dictionary) for row in rows}
+    if not bases:
+        return
+    pk = f"{record_type}_id"
+    stored = conn.execute(
+        f"SELECT * FROM {record_type} WHERE person_id = ?", (person_id,)
+    ).fetchall()
+    for row in stored:
+        payload = {name: row[name] for name in FIELD_SPECS[record_type]}
+        # An admitted repeat (`--keep both`) keys on hash(base|occurrence), so the
+        # recompute has to carry the stored occurrence or every sibling reads as drift.
+        occurrence = int(row["dedup_occurrence"] or 0)
+        base = dedup_key(record_type, payload, person_id, dictionary)
+        if base not in bases:
+            continue
+        if occurrence_key(base, occurrence) != row["dedup_key"]:
+            raise DictionaryDriftError(
+                f"{record_type}: {pk} {row[pk]} "
+                f"({_rekey_label(record_type, row)!r}) is stored under a dedup_key "
+                "that no longer matches the current dictionary, and this submission "
+                "derives that same identity - committing now would file the fact a "
+                "second time instead of deduping (or staging a conflict) against the "
+                "stored row. Run `pemr rekey --apply` first, then retry; nothing was "
+                "written"
+            )
+
+
 def commit_extraction(
     conn: sqlite3.Connection,
     document_id: int,
@@ -568,6 +636,9 @@ def commit_extraction(
                     "timestamp, commit them in separate submissions and resolve the "
                     "conflict with `--keep both`"
                 )
+        # Still pass 1 (nothing written yet): a stored row whose frozen key no longer
+        # matches its recompute would be missed by pass 2's dedup, forking the fact.
+        _assert_no_key_drift(conn, record_type, rows, person_id, dictionary)
 
     summary = CommitSummary()
     detected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1011,9 +1082,15 @@ def rekey(
     edit. Values, provenance and row ids are untouched — only ``dedup_key`` moves.
 
     Dry-run by default: pass ``apply=True`` to write. If two rows in a table recompute
-    to the same key the new dictionary would merge two distinct facts (typically two
-    methods for one analyte off one draw), so nothing is written and
-    :class:`RekeyCollisionError` is raised — fix the dictionary, not the data.
+    to the same key nothing is written and :class:`RekeyCollisionError` is raised, with
+    a message that names which of the two causes it is:
+
+    * the rows carry *different* payloads — the dictionary would merge two distinct
+      facts (typically two methods for one analyte off one draw): fix the dictionary;
+    * the rows carry the *same* payload — one fact was filed twice, once under a
+      pre-drift key, so it is the data that needs fixing. :func:`_assert_no_key_drift`
+      refuses the ingest that would create this state, so it should only be reachable
+      in a database that drifted before that guard existed.
     """
     db.require_migrated(conn)
     report = RekeyReport(applied=False)
@@ -1032,6 +1109,21 @@ def rekey(
             key = occurrence_key(base, occurrence)
             clash = seen.get(key)
             if clash is not None:
+                if _rows_equal(record_type, clash, payload):
+                    # Same payload, two keys: not a dictionary fault at all - one fact
+                    # was filed twice, once under a pre-drift key and once under the
+                    # current one. Say so, because "fix the dictionary" is exactly the
+                    # wrong advice here (`_assert_no_key_drift` now stops new ingests
+                    # from reaching this state).
+                    raise RekeyCollisionError(
+                        f"{record_type}: {pk} {row[pk]} and {pk} {clash[pk]} "
+                        f"({_rekey_label(record_type, row)!r}) hold the SAME fact "
+                        "under two dedup_keys - it was filed a second time by an "
+                        "ingest that ran against drifted keys before this rekey. The "
+                        "dictionary is fine; the data is doubled. Drop the duplicate "
+                        "(`pemr document rm` on the document that re-filed it, or "
+                        "resolve it by hand) and re-run; nothing was written"
+                    )
                 raise RekeyCollisionError(
                     f"{record_type}: {pk} {row[pk]} "
                     f"({_rekey_label(record_type, row)!r}) and {pk} {clash[pk]} "

@@ -2,6 +2,7 @@
 human + --json output, empty-result rc=0 messages, unknown-slug rc=1."""
 
 import json
+import shlex
 import uuid
 
 import pytest
@@ -209,6 +210,45 @@ def test_trends_same_timestamp_tie_disclosed(ready, capsys):
     latest = next(line for line in out.splitlines() if "latest" in line)
     assert "5.2" in latest  # deterministic higher-id pick
     assert "(1 of 2 at this timestamp)" in latest
+
+
+def test_trends_other_assay_note_pastes_back_and_finds_the_rows(ready, capsys):
+    """Issue #71 regression: the disclosure note prints a `--test` token as a command
+    to paste, but for any analyte whose *canonical* value carries underscores
+    (`vitamin_d_25oh`) that token could not be re-derived -- pasting it returned zero
+    rows AND zero disclosure, walking the user into a silent dead end for exactly the
+    rows the note exists to keep findable.
+
+    Driven through argv (split with shlex, the way a shell would split the printed
+    command) so both halves are covered: the quoting and the re-derivation."""
+    for value, collected in ((31.0, "2025-01-01"), (28.0, "2026-01-01")):
+        _seed_lab(ready, "jane-doe", test_name="Vitamin D", value_num=value,
+                  unit="ng/mL", collected_at=collected)
+    _seed_lab(ready, "jane-doe", test_name="Vitamin D (25-OH)", value_num=44.0,
+              unit="ng/mL", collected_at="2025-01-01")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "vitamin d",
+                *DICT_ARG) == 0
+    note = next(l for l in capsys.readouterr().out.splitlines() if "another assay" in l)
+    assert "1 more row(s)" in note
+    # Exactly what the user would paste, split the way their shell splits it.
+    pasted = shlex.split(note.split("another assay: ", 1)[1])
+    assert pasted[0] == "--test" and len(pasted) == 2
+
+    assert _run(ready, "trends", "--person", "jane-doe", *pasted, *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "(1 point(s))" in out and "44" in out
+    assert "2 more row(s)" in out          # the reciprocal disclosure still works
+
+
+def test_other_assay_note_quotes_an_injectable_token(capsys):
+    """The token descends from `test_name`, i.e. untrusted document text, and is
+    printed as a command the user is invited to run. A `\"` in it must not close the
+    quote and leave the remainder of the name live in their shell."""
+    hostile = 'albumin (spep" ; rm -rf ~ #)'
+    cli._print_other_assays({"other_assays": [hostile], "other_assay_count": 1})
+    note = capsys.readouterr().out.strip()
+    assert shlex.split(note.split("another assay: ", 1)[1]) == ["--test", hostile]
 
 
 def test_empty_results_are_clean_rc0(ready, capsys):

@@ -230,9 +230,20 @@ the rows it excluded on that basis (`other_assays`) instead of dropping them sil
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
 in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` re-derives
 every stored key under the current dictionary (dry-run by default, `--apply` to write,
-values and provenance untouched). It aborts whole if two rows would recompute to one key —
-that means the new synonym fuses two distinct facts, e.g. a CMP `ALB` and an SPEP `Albumin`
-off the same draw, and the fix belongs in the dictionary rather than the data.
+values and provenance untouched). It aborts whole if two rows would recompute to one key,
+and the message names which of the two causes it is: *different* payloads mean the new
+synonym fuses two distinct facts (e.g. a CMP `ALB` and an SPEP `Albumin` off one draw) and
+the fix belongs in the dictionary; *identical* payloads mean one fact was filed twice, once
+under a pre-drift key, and the fix belongs in the data.
+
+**Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
+applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
+fact would land a *second* row reported as `new` — no duplicate, no conflict, no signal at
+all — and then wedge `rekey` on the collision it had just created. `commit-extraction`
+therefore raises `DictionaryDriftError` when a stored row recomputes onto an identity the
+submission also derives while carrying a different stored key; the message names the `pemr
+rekey --apply` to run. The check is deliberately narrow — unrelated drift elsewhere in the
+database is a maintenance chore, not a reason to refuse an ingest.
 
 `rekey` is also the whole **migration for the issue-#71 key change**, and it is safe by
 construction: a qualifier can only *add* precision, so two rows can never fuse and
@@ -240,9 +251,9 @@ construction: a qualifier can only *add* precision, so two rows can never fuse a
 (dry-run) → read the moved labels → for any that should have stayed collapsed, add a full
 parenthesized synonym key → re-run the dry-run → `pemr rekey --apply`. Rows whose names
 carry no parenthetical do not move at all (the qualifier is folded into the existing key
-part), so a database with no qualified names reports zero changes. Note that `document
-reassign` refuses on `DictionaryDriftError` until the rekey is applied — it recomputes
-keys through the same function, so it sees the drift first. Rekeying does **not** recover
+part), so a database with no qualified names reports zero changes. Both other write paths
+refuse until the rekey is applied — `document reassign` and `commit-extraction` recompute
+keys through the same function, so they see the drift first. Rekeying does **not** recover
 a value already lost to a pre-fix collision: that needs the source document re-extracted.
 
 The **measured value is deliberately *not* in the key** — temporal identity carries the

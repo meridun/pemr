@@ -117,6 +117,16 @@ def test_key_token_honors_a_declared_full_label():
     assert dedup.key_token("Creatinine (calculated)", d) == "creatinine"
 
 
+def test_declared_full_label_tolerates_edge_underscores_and_paren_padding():
+    """Rule 1 matches the *collapsed* label, so the collapse has to be total: a
+    leading/trailing `_` (which becomes whitespace) or padding inside the parentheses
+    used to miss the declared entry and over-split a label the human already settled."""
+    d = dedup.load_dictionary(DICT_PATH)
+    for sloppy in ("_m-spike (spep)", "M-Spike ( SPEP )", "  m-spike (spep)_",
+                   "M-SPIKE  (  spep  )"):
+        assert dedup.key_token(sloppy, d) == "m_spike", sloppy
+
+
 def test_key_token_maps_the_qualifier_through_the_dictionary():
     # Two spellings of one assay tag agree, so they do not fork the series.
     d = {"albumin": "albumin", "serum protein electrophoresis": "spep"}
@@ -890,3 +900,91 @@ def test_rekey_moves_dedup_base_with_the_key(conn):
     dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"), apply=True)
     row = conn.execute("SELECT * FROM lab_result").fetchone()
     assert row["dedup_base"] == row["dedup_key"]   # occurrence 0: base IS the key
+
+
+# --- ingest-before-rekey drift guard ------------------------------------------
+
+def test_commit_refuses_an_ingest_against_a_drifted_key(conn):
+    """The migration hazard behind issue #71: a stored row whose frozen key predates
+    the current dictionary is invisible to layer-2 dedup, so re-filing that same fact
+    used to land a SECOND row reported as `new` -- no duplicate, no conflict, no signal
+    at all -- and then wedged `rekey` on the collision it had just created. Refuse the
+    commit instead, naming the rekey that fixes it."""
+    doc = _make_document(conn)
+    row = {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}
+    dedup.commit_extraction(conn, doc, {"lab_result": [row]}, None)
+    d_new = _rekey_dict(zzt="zonulin_test")       # the stored key is now stale
+
+    with pytest.raises(dedup.DictionaryDriftError, match="rekey --apply"):
+        dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [row]}, d_new)
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+    # And the named remedy actually clears it: after the rekey the same submission
+    # dedups against the stored row instead of forking it.
+    dedup.rekey(conn, d_new, apply=True)
+    summary = dedup.commit_extraction(
+        conn, _make_document(conn), {"lab_result": [row]}, d_new
+    )
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+def test_commit_drift_guard_ignores_an_unrelated_drifted_row(conn):
+    """Deliberately narrow: drift somewhere else in the database is a `rekey` chore,
+    not a reason to refuse an unrelated ingest."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}]}, None)
+    d_new = _rekey_dict(zzt="zonulin_test")       # ZZT's stored key is stale
+
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95}]}, d_new)
+    assert summary.counts == {"new": 1, "duplicate": 0, "conflict": 0}
+
+
+def test_commit_drift_guard_accepts_a_keep_both_sibling(conn):
+    """An admitted repeat keys on hash(base|occurrence); if the guard recomputed at
+    occurrence 0 it would read every sibling as drift and refuse every later ingest."""
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95}]}, d)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148}]}, d)
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"], keep="both")
+
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148}]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+
+
+def test_rekey_names_a_doubled_fact_instead_of_blaming_the_dictionary(conn):
+    """A database that drifted *before* the guard existed can still hold one fact under
+    two keys. "The dictionary maps two distinct facts onto one canonical name" is then
+    exactly the wrong diagnosis -- the dictionary is fine and the data is doubled."""
+    doc = _make_document(conn)
+    row = {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95}
+    dedup.commit_extraction(conn, doc, {"lab_result": [row]}, None)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    # The pre-guard state, built directly: the same fact filed again under a stale key.
+    dedup._insert_record(conn, "lab_result", row, pid, doc, "stale-base-0000")
+    conn.commit()
+
+    with pytest.raises(dedup.RekeyCollisionError, match="SAME fact"):
+        dedup.rekey(conn, None)
+    # Still all-or-nothing, and the dry-run wrote nothing either.
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM lab_result WHERE dedup_key = 'stale-base-0000'"
+    ).fetchone()["n"] == 1
+
+
+def test_rekey_still_blames_the_dictionary_when_it_fuses_distinct_facts(conn):
+    """The other cause keeps its own message: two *different* payloads recomputing onto
+    one key really is a dictionary that merges distinct facts."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    with pytest.raises(dedup.RekeyCollisionError, match="two distinct facts"):
+        dedup.rekey(conn, _rekey_dict(alb="albumin"))

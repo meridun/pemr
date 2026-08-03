@@ -395,6 +395,31 @@ def test_trends_unrelated_analytes_are_not_reported_as_other_assays(albumin_assa
     assert t["count"] == 3 and t["other_assays"] == [] and t["other_assay_count"] == 0
 
 
+def test_trends_disclosed_token_round_trips_over_an_underscore_canonical(seeded):
+    """The disclosure is only worth anything if its token can be fed straight back in.
+    A canonical value may contain underscores (`vitamin_d_25oh`) that `_collapse` turns
+    back into spaces on the way in, so a strict comparison made the printed token a
+    dead end -- zero rows *and* zero disclosure. `albumin` (the fixture above) has no
+    underscore, which is why the suite could not see this."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="vitamin D panel")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Vitamin D", "collected_at": "2025-01-01", "value_num": 31},
+        {"test_name": "Vitamin D", "collected_at": "2026-01-01", "value_num": 28},
+        {"test_name": "Vitamin D (25-OH)", "collected_at": "2025-01-01", "value_num": 44},
+    ]}, d)
+
+    t = query.trends(seeded, "jane-doe", "vitamin d", dictionary=d)
+    assert t["count"] == 2 and t["other_assay_count"] == 1
+    token = t["other_assays"][0]
+    assert "_" in token                       # the spelling that used to be a dead end
+
+    back = query.trends(seeded, "jane-doe", token, dictionary=d)
+    assert back["count"] == 1 and back["latest"] == 44
+    assert back["test"] == token              # echoed as disclosed, not as re-derived
+    assert back["other_assays"] == [t["test"]] and back["other_assay_count"] == 2
+
+
 def _insert_lab(conn, slug, **cols):
     """Insert a lab_result row directly (bypassing dedup) to simulate the #20
     same-timestamp duplicate-row state. Returns the new lab_result_id."""
