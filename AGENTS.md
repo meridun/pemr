@@ -51,6 +51,10 @@ Write tools (mutate the DB; the only tools that do):
   clear a nullable field).
 - `ingest` — hash + blob-store + layer-1 dedup a document.
 - `commit_extraction` — validate + dedup + commit extracted rows for a document.
+- `document_set_text` — attach a document's text (`ocr_text`) after ingest, when the ingest itself
+  didn't carry it (see §3). Fills an empty `ocr_text` only; **replacing** an existing transcription
+  is a human action at the CLI (`pemr document set-text <id> --ocr-text-file <path> --force`), so
+  the tool takes no `force` and refuses a populated document.
 - `review_conflicts` — lists conflicts read-only; **writes only when given a `resolve` id**, and
   then only with human sign-off (see below).
 
@@ -132,6 +136,8 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
+- **Remediation:** call `document_set_text(document_id, text)`. Re-ingesting will not work — the
+  layer-1 content hash matches, so `ingest` returns the existing document and writes nothing.
 
 **Owner verification.** Because you supply the text, you are the primary consumer of the
 ingest-time owner check: it scans that text for the claimed person's name/DOB and returns
