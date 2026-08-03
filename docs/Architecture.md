@@ -336,9 +336,11 @@ pemr ingest <file> --person <slug> [--ocr tesseract]
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
+pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
 pemr document rm <id> [--apply] [--purge-blob]           # delete a document + records; dry run by default
+pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
 pemr query labs --person jane --test hba1c --since 2023-01-01
 pemr query meds --person jane --active
 pemr query timeline --person jane --since 2024-01-01     # merged event stream
@@ -370,14 +372,15 @@ under a PEP 660 editable install); see issue #22.
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
 `trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
-`ingest`, `commit_extraction`, `review_conflicts` (resolution gated on human sign-off). Each returns the
+`ingest`, `commit_extraction`, `document_set_text` (fills an empty `ocr_text` only — the `--force`
+replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). Each returns the
 same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
 calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`
 annotations expose the read/write split to the client.
 
 `AGENTS.md` documents this contract so any agent (Cowork, Claude Code, local) knows to
 **call tools, not reinvent** — and specifically: never write to the DB except through
-`commit_extraction`/`person_add`/`person_edit`/`ingest`; always `ingest` (with `ocr_text` populated) before
+`commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
 ---
