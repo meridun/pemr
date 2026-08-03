@@ -179,6 +179,31 @@ def test_ingest_with_agent_ocr_text(seeded, tmp_path, monkeypatch):
     assert out["status"] == "new"
     assert out["ocr_text_populated"] is True
     assert out["document"]["ocr_text"].startswith("Sodium")
+    # issue #61: the owner verdict rides back on every ingest. No identity anchor in a
+    # bare lab line -> "unverified", which proceeds.
+    assert out["owner_check"]["verdict"] == "unverified"
+
+
+def test_ingest_refuses_a_mismatched_owner(seeded, tmp_path, monkeypatch):
+    """Issue #61 via MCP: a blocking verdict surfaces as a ToolError, and `force`
+    is the documented (human-signed-off) override."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    scan = tmp_path / "someone-else.txt"
+    scan.write_bytes(b"not her record")
+    header = "Patient: SMITH, KAREN A    DOB: 09/09/1971"
+
+    with pytest.raises(mcp_server.ToolError, match="owner verification failed"):
+        mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe",
+                                   ocr_text=header)
+    assert seeded.execute(
+        "SELECT COUNT(*) FROM document WHERE source_path != 'aa/x.pdf'"
+    ).fetchone()[0] == 0
+
+    out = mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe",
+                                     ocr_text=header, force=True)
+    assert out["status"] == "new"
+    assert out["owner_check"]["verdict"] == "suspect"
+    assert "SMITH, KAREN A" in out["owner_check"]["evidence"]
 
 
 def test_commit_extraction_via_wrapper(seeded, tmp_path, monkeypatch):

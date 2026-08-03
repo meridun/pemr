@@ -522,6 +522,33 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
     return _with_document_conn(args, work)
 
 
+def _report_owner_check(
+    check: "ingest.OwnerCheck | None", person_slug: str, document_id: int
+) -> None:
+    """Print the issue-#61 owner-verification verdict for a successful ingest.
+
+    A blocking verdict only reaches here when the human passed ``--force`` (otherwise
+    `ingest_document` raised pre-write), so that branch points at the undo path.
+    """
+    if check is None:  # duplicate path: nothing written, nothing checked
+        return
+    if check.verdict == "match":
+        print(f"owner verified: matched '{person_slug}' in document text")
+    elif check.blocks:
+        print(
+            f"warning: owner verification was overridden with --force "
+            f"(verdict: {check.verdict}). Filed under '{person_slug}' anyway; undo "
+            f"with `pemr document reassign {document_id} --person <slug> --apply`.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "note: owner not verified - no document text available (or no patient "
+            f"identity found in it). Filed under '{person_slug}' on your say-so.",
+            file=sys.stderr,
+        )
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     ocr_text = None
     if getattr(args, "ocr_text_file", None):
@@ -545,6 +572,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
                 provider=args.provider,
                 ocr=(args.ocr == "tesseract"),
                 ocr_text=ocr_text,
+                force=args.force,
             )
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -566,6 +594,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         f"ingested document #{doc.document_id} (sha256 {doc.sha256[:12]}...) "
         f"-> sources/{doc.source_path}"
     )
+    _report_owner_check(result.owner_check, args.person, doc.document_id)
     if not result.ocr_text_populated:
         print(
             "note: no ocr_text stored - `find` (full-text search) will not see this "
@@ -1256,6 +1285,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ocr-text-file",
         dest="ocr_text_file",
         help="file of agent-supplied document text to store as ocr_text (wins over --ocr)",
+    )
+    p_ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="ingest even if the document text does not name --person",
     )
     p_ingest.set_defaults(func=_cmd_ingest)
 

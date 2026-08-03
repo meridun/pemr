@@ -133,6 +133,20 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
 
+**Owner verification.** Because you supply the text, you are the primary consumer of the
+ingest-time owner check: it scans that text for the claimed person's name/DOB and returns
+`owner_check: {verdict, matched_slug, evidence}` — `match`, `mismatch` (the text names a
+*different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
+`unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
+carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
+**refuse the ingest** before anything is written.
+
+- On a refusal, the agent MUST surface the verdict and the `evidence` snippet to the human and get
+  an **explicit go-ahead** before retrying with `force=true`. Never force on your own judgment.
+- Unlike §4 conflict resolution, this is not mechanically gated on a `signoff` param. The
+  asymmetry is deliberate: a wrongly-forced ingest is recoverable (`pemr document reassign`),
+  whereas a wrongly-resolved conflict destroys the losing value.
+
 ### 4. Conflict discipline
 
 Agents never resolve staged conflicts silently.
