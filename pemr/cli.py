@@ -329,6 +329,7 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- #
 # document recovery (list / edit / reassign / rm) - issue #54
+# plus per-document detail + post-ingest text (show / set-text) - issue #62
 # --------------------------------------------------------------------------- #
 
 def _with_document_conn(args: argparse.Namespace, work):
@@ -352,6 +353,7 @@ def _with_document_conn(args: argparse.Namespace, work):
             documents.OpenConflictsError,
             documents.DictionaryDriftError,
             documents.ReassignCollisionError,
+            documents.OcrTextPresentError,
             persons.PersonNotFoundError,
         ) as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -378,6 +380,104 @@ def _cmd_document_list(args: argparse.Namespace) -> int:
                 f"{_fmt(d['category']):12} {_fmt(d['provider']):22} "
                 f"{_fmt(d['person']):16} {d['sha256'][:12]}  {d['record_count']} rec"
             )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _print_document_show(doc: dict) -> None:
+    """The aligned key/value detail block shared by `document show` and `set-text`.
+
+    The per-type `records` breakdown elides zeros for a human; ``--json`` keeps the full
+    stable ``_record_counts`` key set (`documents.py` commits to that for machine
+    consumers). Only static ASCII here — issue #23's console-safety convention.
+    """
+    counts = doc["records"]
+    breakdown = ", ".join(f"{name} {n}" for name, n in counts.items() if n)
+    records = f"{doc['record_count']}" + (f"  ({breakdown})" if breakdown else "")
+    chars = doc["ocr_text_chars"]
+    conflicts = (
+        ", ".join(f"#{cid}" for cid in doc["conflicts_open"])
+        + " open - resolve with `pemr review-conflicts`"
+        if doc["conflicts_open"]
+        else "none"
+    )
+    fields = [
+        ("document_id", doc["document_id"]),
+        ("person", _fmt(doc["person"])),
+        ("doc_date", _fmt(doc["doc_date"])),
+        ("category", _fmt(doc["category"])),
+        ("provider", _fmt(doc["provider"])),
+        ("sha256", f"{doc['sha256'][:12]}..."),
+        ("source_path", _fmt(doc["source_path"])),
+        ("ingested_at", _fmt(doc["ingested_at"])),
+        ("has_ocr_text", f"yes ({chars} chars)" if doc["has_ocr_text"] else "no"),
+        ("records", records),
+        ("conflicts", conflicts),
+    ]
+    for key, value in fields:
+        print(f"{key:14} {value}")
+
+
+def _cmd_document_show(args: argparse.Namespace) -> int:
+    def work(conn):
+        if args.text:
+            # Raw dump, nothing else, so `document show 7 --text > doc.txt` works like the
+            # `render ... > exports/...` redirect contract. This is the only CLI read path
+            # for ocr_text, which is what makes `set-text --force` reviewable.
+            text = documents.get_document_text(conn, args.document_id)
+            if not text:
+                print(
+                    f"note: document #{args.document_id} has no ocr_text stored",
+                    file=sys.stderr,
+                )
+                return 0
+            print(text)
+            return 0
+        doc = documents.get_document_view(conn, args.document_id)
+        if args.json:
+            _print_json(doc)
+            return 0
+        _print_document_show(doc)
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_set_text(args: argparse.Namespace) -> int:
+    try:
+        with open(args.ocr_text_file, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
+        return 1
+
+    def work(conn):
+        # Read first: the before-size feeds the status line, and resolving the id here
+        # means an unknown id outranks an empty file in the error the human sees.
+        before = documents.get_document_view(conn, args.document_id)
+        if not text.strip():
+            # documents.set_document_text guards this too (so MCP gets it); repeated here
+            # only to name the offending path, which the engine never sees.
+            raise ValueError(
+                f"{args.ocr_text_file} is empty - nothing to store; ocr_text unchanged"
+            )
+        doc = documents.set_document_text(
+            conn, args.document_id, text, force=args.force
+        )
+        if args.json:
+            _print_json(doc)
+            return 0
+        was = (
+            f"replaced {before['ocr_text_chars']} chars"
+            if before["has_ocr_text"]
+            else "was empty"
+        )
+        print(
+            f"set ocr_text on document #{doc['document_id']}: "
+            f"{doc['ocr_text_chars']} chars ({was})"
+        )
+        _print_document_show(doc)
         return 0
 
     return _with_document_conn(args, work)
@@ -1227,6 +1327,37 @@ def build_parser() -> argparse.ArgumentParser:
     d_list.add_argument("--person", help="owner slug; omit to list every person's")
     d_list.add_argument("--json", action="store_true", help="machine-readable output")
     d_list.set_defaults(func=_cmd_document_list)
+
+    # --- per-document detail + post-ingest text (issue #62) ---------------
+    d_show = document_sub.add_parser(
+        "show", help="one document's metadata, record counts and open conflicts"
+    )
+    d_show.add_argument("document_id", type=int, metavar="ID")
+    # Mutually exclusive: --json is the metadata view, --text is the raw transcription.
+    d_show_out = d_show.add_mutually_exclusive_group()
+    d_show_out.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
+    d_show_out.add_argument(
+        "--text", action="store_true",
+        help="dump the stored ocr_text to stdout and nothing else",
+    )
+    d_show.set_defaults(func=_cmd_document_show)
+
+    d_set_text = document_sub.add_parser(
+        "set-text", help="attach or replace a document's ocr_text after ingest"
+    )
+    d_set_text.add_argument("document_id", type=int, metavar="ID")
+    d_set_text.add_argument(
+        "--ocr-text-file", dest="ocr_text_file", required=True,
+        help="file of document text to store as ocr_text (same flag as `ingest`)",
+    )
+    d_set_text.add_argument(
+        "--force", action="store_true",
+        help="replace existing ocr_text (refused without this)",
+    )
+    d_set_text.add_argument("--json", action="store_true", help="machine-readable output")
+    d_set_text.set_defaults(func=_cmd_document_set_text)
 
     d_edit = document_sub.add_parser(
         "edit", help="correct a document's date/category/provider (partial)"
