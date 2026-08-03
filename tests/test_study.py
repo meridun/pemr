@@ -7,6 +7,7 @@ neither reviewable nor greppable.
 
 import json
 import struct
+import tracemalloc
 import zipfile
 
 import pytest
@@ -44,9 +45,17 @@ def dicom_bytes(
     modality: str | None = "CT",
     study_description: str | None = "CT ABDOMEN PELVIS",
     series_description: str | None = "AXIAL 2.0",
+    patient_name: str | None = None,
+    patient_birth_date: str | None = None,
     study_uid: str | None = "1.2.840.113619.2.55.3.1",
+    meta_length: int | None = None,
 ) -> bytes:
-    """A minimal valid Part 10 file carrying (only) the tags this engine reads."""
+    """A minimal valid Part 10 file carrying (only) the tags this engine reads.
+
+    ``meta_length`` overrides the ``(0002,0000)`` group-length element with a value
+    that does not describe the file — the corruption the reader must survive without
+    allocating on it (issue #69 audit B1).
+    """
     meta = _explicit(0x0002, 0x0010, b"UI", _pad(transfer_syntax, "\x00"))
     explicit = transfer_syntax != IMPLICIT_VR_LE
 
@@ -61,30 +70,33 @@ def dicom_bytes(
         element(0x0008, 0x0060, b"CS", modality),
         element(0x0008, 0x1030, b"LO", study_description),
         element(0x0008, 0x103E, b"LO", series_description),
+        element(0x0010, 0x0010, b"PN", patient_name),
+        element(0x0010, 0x0030, b"DA", patient_birth_date),
         element(0x0020, 0x000D, b"UI", study_uid, "\x00"),
         # A blob of pixel data, so the "stop before the payload" path is exercised.
         (_explicit(0x7FE0, 0x0010, b"OW", b"\x00" * 16) if explicit
          else _implicit(0x7FE0, 0x0010, b"\x00" * 16)),
     ])
+    declared = len(meta) if meta_length is None else meta_length
     return (
         b"\x00" * 128
         + b"DICM"
-        + _explicit(0x0002, 0x0000, b"UL", struct.pack("<I", len(meta)))
+        + _explicit(0x0002, 0x0000, b"UL", struct.pack("<I", declared))
         + meta
         + dataset
     )
 
 
-def make_study(root, *, series=("SER1",), slices=2, viewer=True, report=True):
+def make_study(root, *, series=("SER1",), slices=2, viewer=True, report=True, **tags):
     """A burned-disc-shaped tree: DICOMDIR + slice dirs + a Windows viewer payload."""
     root.mkdir(parents=True, exist_ok=True)
-    (root / "DICOMDIR").write_bytes(dicom_bytes(series_description=None))
+    (root / "DICOMDIR").write_bytes(dicom_bytes(series_description=None, **tags))
     for name in series:
         directory = root / name
         directory.mkdir(exist_ok=True)
         for slice_no in range(slices):
             (directory / f"IM{slice_no:06d}").write_bytes(
-                dicom_bytes(series_description=f"{name} SERIES")
+                dicom_bytes(series_description=f"{name} SERIES", **tags)
             )
     if viewer:
         (root / "VIEWER.EXE").write_bytes(b"MZ" + b"\x90" * 64)
@@ -229,6 +241,77 @@ def test_read_metadata_never_raises_on_bad_input(tmp_path, content):
     assert meta.study_date is None  # junk/unsupported => no metadata, no exception
 
 
+def test_read_metadata_ignores_a_bogus_meta_group_length(tmp_path):
+    """Issue #69 audit B1: the file's declared meta length must not size a read.
+
+    `BufferedReader.read(n)` allocates `n` up front, so an unbounded 32-bit length —
+    four corrupt bytes, which is exactly how optical media fails — would commit up to
+    4 GiB per slice, and the `MemoryError` that follows on a machine that cannot
+    satisfy it is *not* an `OSError`, so it would escape the reader's "never fails
+    the ingest" contract.
+    """
+    root = tmp_path / "disc"
+    root.mkdir()
+    (root / "IM000001").write_bytes(dicom_bytes(meta_length=0xFFFFFFFF))
+
+    tracemalloc.start()
+    try:
+        meta = study.read_metadata(study.scan_study_dir(root))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert meta == study.StudyMetadata(series=(study.Series("", None, 1),))
+    # Without the bound this is ~4 GiB; the bound makes it a few KiB.
+    assert peak < 8 * 1024**2
+
+
+def test_read_metadata_caps_an_overlong_tag_value(tmp_path):
+    """Issue #69 audit B2: an untrusted element length must not reach `ocr_text`.
+
+    `StudyDescription` is VR `LO` (64 chars); a file declaring 60,000 would otherwise
+    be spliced verbatim into the FTS index and into an agent's context as if it were
+    clinical record text.
+    """
+    root = tmp_path / "disc"
+    root.mkdir()
+    (root / "IM000001").write_bytes(dicom_bytes(study_description="X" * 60_000))
+    scan = study.scan_study_dir(root)
+    meta = study.read_metadata(scan)
+
+    assert meta.study_description is not None
+    assert len(meta.study_description) == 128
+    assert len(study.summary_text(scan, meta)) < 512
+    # Truncation is of the stored *value* only — the element stream still advances by
+    # the declared length, so later tags are read as usual.
+    assert [s.description for s in meta.series] == ["AXIAL 2.0"]
+
+
+def test_identity_text_is_shaped_for_the_owner_check(tmp_path):
+    root = tmp_path / "disc"
+    root.mkdir()
+    (root / "IM000001").write_bytes(
+        dicom_bytes(patient_name="DOE^JANE^", patient_birth_date="19810307")
+    )
+    meta = study.read_metadata(study.scan_study_dir(root))
+
+    assert meta.patient_name == "DOE^JANE^"
+    assert meta.patient_birth_date == "1981-03-07"  # ISO, as `dob_candidates` renders
+    text = study.identity_text(meta)
+    # The labels are what `check_owner`'s identity anchor recognises, and
+    # `normalize_text` reduces the DICOM caret form to plain name tokens.
+    assert text == "Patient: DOE^JANE^\nDOB: 1981-03-07"
+    assert " doe jane " in ingest.normalize_text(text)
+
+
+def test_identity_text_is_none_without_the_tags(tmp_path):
+    """No signal must stay `unverified`, not become a spurious refusal."""
+    root = tmp_path / "disc"
+    root.mkdir()
+    (root / "IM000001").write_bytes(dicom_bytes())
+    assert study.identity_text(study.read_metadata(study.scan_study_dir(root))) is None
+
+
 def test_metadata_ignores_dicomdir_as_the_tag_source(tmp_path):
     """DICOMDIR is packed but carries directory records, not study tags."""
     root = tmp_path / "disc"
@@ -370,8 +453,7 @@ def test_ingest_document_points_a_directory_at_the_study_flag(conn, tmp_path, so
     assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
 
 
-def test_ingest_study_dir_owner_check_runs_on_supplied_text_only(conn, tmp_path,
-                                                                 sources):
+def test_ingest_study_dir_owner_check_runs_on_supplied_text(conn, tmp_path, sources):
     persons.add_person(conn, "john-roe", "John Roe")
     root = make_study(tmp_path / "disc")
 
@@ -387,6 +469,75 @@ def test_ingest_study_dir_owner_check_runs_on_supplied_text_only(conn, tmp_path,
     # The derived summary is engine output, not document text: it is never checked.
     result = ingest.ingest_study_dir(conn, root, "jane-doe", sources)
     assert result.owner_check.verdict == "unverified"
+
+
+def test_ingest_study_dir_owner_check_reads_the_dicom_header(conn, tmp_path, sources):
+    """Issue #69 audit B3: the study path must not opt out of the #61 misfile rail.
+
+    A 2,000-slice binary folder is the one document type a human cannot eyeball, so
+    pointing `--person jane-doe` at the spouse's disc is the realistic slip — and the
+    identity is sitting in the header.
+    """
+    persons.add_person(conn, "john-roe", "John Roe")
+    root = make_study(tmp_path / "disc", patient_name="ROE^JOHN^")
+
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_study_dir(conn, root, "jane-doe", sources)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "john-roe"
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+    assert not sources.exists()  # refused pre-write *and* pre-pack
+
+    # ...and `--force` is still the whole recovery.
+    result = ingest.ingest_study_dir(conn, root, "jane-doe", sources, force=True)
+    assert result.status == "new"
+    assert result.owner_check.verdict == "mismatch"
+
+
+def test_ingest_study_dir_header_identity_verifies_and_is_never_stored(
+    conn, tmp_path, sources
+):
+    root = make_study(tmp_path / "disc", patient_name="DOE^JANE^")
+    result = ingest.ingest_study_dir(conn, root, "jane-doe", sources)
+
+    assert result.owner_check.verdict == "match"
+    assert result.owner_check.matched_slug == "jane-doe"
+    # Verification input, not stored text: the identity tags never reach `ocr_text`,
+    # so they never reach the FTS index or an agent's context.
+    assert "JANE" not in result.document.ocr_text
+    assert "DOE" not in result.document.ocr_text
+
+
+def test_ingest_study_dir_header_dob_alone_verifies(conn, tmp_path, sources):
+    persons.add_person(conn, "ann-poe", "Ann Poe", dob="1981-03-07")
+    root = make_study(tmp_path / "disc", patient_birth_date="19810307")
+
+    result = ingest.ingest_study_dir(conn, root, "ann-poe", sources)
+    assert result.owner_check.verdict == "match"
+
+
+def test_ingest_study_dir_unknown_patient_is_suspect(conn, tmp_path, sources):
+    """Nobody on the roster: the header names *someone*, and it isn't the claimant."""
+    root = make_study(tmp_path / "disc", patient_name="STRANGER^SAM^")
+
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_study_dir(conn, root, "jane-doe", sources)
+    assert excinfo.value.check.verdict == "suspect"
+
+
+@pytest.mark.parametrize(
+    "verdicts, expected",
+    [
+        (("match", "mismatch"), "mismatch"),   # blocking beats affirmative
+        (("suspect", "match"), "suspect"),
+        (("unverified", "match"), "match"),    # affirmative beats ignorance
+        (("unverified", "unverified"), "unverified"),
+        ((), "unverified"),
+    ],
+)
+def test_strongest_check_orders_by_consequence(verdicts, expected):
+    checks = [ingest.OwnerCheck(verdict=v) for v in verdicts]
+    assert ingest._strongest_check(checks).verdict == expected
 
 
 # --------------------------------------------------------------------------- #
