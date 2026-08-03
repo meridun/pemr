@@ -877,13 +877,23 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
 
 
 def _resolved_as(result: dedup.ResolveResult) -> str:
-    """How a resolution reports itself on the success line."""
+    """How a resolution reports itself on the success line.
+
+    A keep-both no-op on a sparse type is only a no-op about the *row count*: it still
+    fills the matched sibling's NULL columns from the staged payload (issue #63). Naming
+    those fields keeps the operator's line honest about the write, matching what
+    `dedup._resolution_text` persists on the conflict. Field names only, never values --
+    the resolution text is an audit trail, not a place to echo clinical data.
+    """
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
+        filled = (
+            f", filled {', '.join(sorted(result.gains))}" if result.gains else ""
+        )
         return (
             f"keep-both, no-op: already stored as {result.record_type} "
-            f"#{result.row_id}"
+            f"#{result.row_id}{filled}"
         )
     return (
         f"keep-both -> {result.record_type} #{result.row_id}, "

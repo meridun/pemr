@@ -399,3 +399,43 @@ def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "applied 006_condition_allergy.sql" in out
     assert "note:" not in out
+
+
+def test_keep_both_no_op_line_names_the_fields_it_filled(ready, capsys):
+    """A keep-both no-op on a sparse type still writes: it fills the matched sibling's
+    NULL columns. The operator's line must say so - reporting a clinical write as a bare
+    "no-op" is the invisible-write failure the `enriched` bucket exists to prevent
+    (issue #63). The persisted resolution already names the fields; the CLI line did not.
+    """
+    tmp_path = ready
+    scan = tmp_path / "a.txt"
+    scan.write_bytes(b"allergy list")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    for name, rows in (
+        ("a1", [{"substance": "Latex", "reaction": "hives"}]),
+        ("a2", [{"substance": "Latex", "reaction": "rash", "criticality": "high"}]),
+        ("a3", [{"substance": "Latex", "reaction": "rash"}]),
+    ):
+        payload = _write_json(tmp_path, f"{name}.json", {"allergy": rows})
+        assert _run(tmp_path, "commit-extraction", "--document", "1",
+                    "--json", str(payload)) == 0
+    capsys.readouterr()
+
+    # Admit the thin "rash" row first, so the rich one then matches a sibling missing
+    # exactly the field the promotion was about.
+    assert _run(tmp_path, "review-conflicts", "--resolve", "2", "--keep", "both") == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both") == 0
+    out = capsys.readouterr().out
+    assert "no-op" in out and "filled criticality" in out
+    assert out.isascii()
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        stored = conn.execute(
+            "SELECT reaction, criticality FROM allergy WHERE reaction = 'rash'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (stored["reaction"], stored["criticality"]) == ("rash", "high")
