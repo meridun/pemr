@@ -39,6 +39,7 @@ pemr/
     db.py                      # connection, migrations runner, pragmas (WAL, foreign_keys)
     models.py                  # dataclasses / typed row shapes
     ingest.py                  # document intake, hashing, staging
+    study.py                   # study directories -> one canonical-zip blob (§4)
     dedup.py                   # content-hash + semantic-key matching
     query.py                   # canned + ad-hoc read queries
     render.py                  # generated docs (summary, journal, briefs)
@@ -49,6 +50,7 @@ pemr/
     002_...
   sources/                     # retained original documents (content-addressed)
     <sha256[:2]>/<sha256>.pdf  # dedup-friendly, immutable blob store
+    .tmp/                      # staging for study archives (§4); exclude from cloud sync
   inbox/                       # drop zone for new un-ingested scans
   exports/                     # generated docs (disposable): summaries, briefs, journal
   backups/                     # local VACUUM INTO snapshots before they sync
@@ -327,6 +329,37 @@ can't get subtly wrong. That's the whole point of lifting them out.
 Optional `--ocr tesseract` flag pre-fills `document.ocr_text` when scans are flat images,
 giving the agent text to work from instead of re-reading pixels every time.
 
+### Study directories (issue #69)
+
+A burned imaging disc is clinically *one* document but physically one folder holding
+`DICOMDIR`, thousands of extension-less slices, and a Windows viewer payload. `pemr ingest
+<dir> --person <slug> --study dicom` (module: `study.py`) folds it into the pipeline above
+rather than beside it:
+
+```
+disc/                                        (DICOMDIR + IM000001… + VIEWER.EXE + report.pdf)
+  → include every file whose bytes 128..132 are `DICM`     (content, not extension:
+      the viewer payload is excluded by construction; document-like drops are named
+      on stderr, because a radiology report is its own document)
+  → pack them into a *canonical* zip: entries sorted by POSIX relative path, ZIP_STORED,
+      timestamps/host-system/mode pinned  ⇒ same disc, any machine, same bytes
+  → sha256 of the archive IS document.sha256  ⇒ step 1 dedup and `pemr verify` work
+      unchanged; the blob lands at sources/<sha[:2]>/<sha>.dcm.zip
+```
+
+The archive is staged in `sources/.tmp/` and `os.replace`d into the store, so a crash can
+never leave a truncated blob under a valid content-hash name; the temp is unlinked on every
+path (a re-ingest repacks before it can know it is a duplicate — the accepted cost of
+hashing the bytes rather than a manifest). Studies over 4 GiB need `--allow-large`, since
+`sources_dir` is cloud-synced by default.
+
+`doc_date` (from `StudyDate`), `category` (`imaging`), and `ocr_text` (a short derived
+summary: modality, date, per-series slice counts) are **defaults only** — anything the
+caller passes wins. Header tags are read by a minimal stdlib parser for five tags,
+best-effort like `run_ocr`: the zero-runtime-dependency rule (`pyproject.toml`) rules out
+`pydicom`, and any parse failure yields no metadata rather than a failed ingest. Per-slice
+rows, pixel decoding, and thumbnails are out of scope.
+
 ---
 
 ## 5. Tool surface
@@ -336,6 +369,7 @@ giving the agent text to work from instead of re-reading pixels every time.
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr tesseract] [--force]   # --force: skip owner verification
+pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
@@ -375,7 +409,8 @@ under a PEP 660 editable install); see issue #22.
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
 `trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
-`ingest`, `commit_extraction`, `document_set_text` (fills an empty `ocr_text` only — the `--force`
+`ingest` (`study="dicom"` + `allow_large` make `file` a study directory, §4), `commit_extraction`,
+`document_set_text` (fills an empty `ocr_text` only — the `--force`
 replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). Each returns the
 same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
 calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`

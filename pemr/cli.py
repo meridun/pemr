@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import (
     __version__, backup, db, dedup, documents, ingest, persons, query, render,
-    restore, verify,
+    restore, study, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -662,18 +662,42 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     conn = _connect_db(args)
     try:
         try:
-            result = ingest.ingest_document(
-                conn,
-                args.file,
-                person_slug=args.person,
-                sources_dir=_resolve_sources_dir(args),
-                doc_date=args.doc_date,
-                category=args.category,
-                provider=args.provider,
-                ocr=(args.ocr == "tesseract"),
-                ocr_text=ocr_text,
-                force=args.force,
-            )
+            if args.study:
+                # A study *directory* is one document (issue #69): the blob is a
+                # canonical zip of its slices, hashed like any other file.
+                if args.ocr:
+                    print(
+                        f"note: --ocr is ignored for --study {args.study} (there is "
+                        "no flat image to OCR); the study's ocr_text is a derived "
+                        "summary unless you pass --ocr-text-file",
+                        file=sys.stderr,
+                    )
+                result = ingest.ingest_study_dir(
+                    conn,
+                    args.file,
+                    person_slug=args.person,
+                    sources_dir=_resolve_sources_dir(args),
+                    study=args.study,
+                    allow_large=args.allow_large,
+                    doc_date=args.doc_date,
+                    category=args.category,
+                    provider=args.provider,
+                    ocr_text=ocr_text,
+                    force=args.force,
+                )
+            else:
+                result = ingest.ingest_document(
+                    conn,
+                    args.file,
+                    person_slug=args.person,
+                    sources_dir=_resolve_sources_dir(args),
+                    doc_date=args.doc_date,
+                    category=args.category,
+                    provider=args.provider,
+                    ocr=(args.ocr == "tesseract"),
+                    ocr_text=ocr_text,
+                    force=args.force,
+                )
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -1403,8 +1427,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
     )
-    p_ingest.add_argument("file", help="path to the document to ingest")
+    p_ingest.add_argument(
+        "file", help="path to the document, or study directory with --study"
+    )
     p_ingest.add_argument("--person", required=True, help="owner slug, e.g. jane-doe")
+    p_ingest.add_argument(
+        "--study",
+        choices=list(study.STUDY_KINDS),
+        help="treat the path as a study directory: pack it into one document",
+    )
+    p_ingest.add_argument(
+        "--allow-large",
+        dest="allow_large",
+        action="store_true",
+        help="ingest a study over the size limit (sources_dir may be cloud-synced)",
+    )
     p_ingest.add_argument("--sources", help="sources blob dir (overrides config)")
     p_ingest.add_argument("--doc-date", dest="doc_date", help="date the doc pertains to")
     p_ingest.add_argument("--category", help="labs|imaging|visit-note|rx|vaccine|...")
