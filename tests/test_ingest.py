@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from pemr import db, ingest, persons
+from pemr.models import Person
 
 
 @pytest.fixture()
@@ -112,3 +113,217 @@ def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "tesseract" in capsys.readouterr().err
+
+
+# --- owner verification (issue #61) -------------------------------------------
+
+JANE = Person(person_id=1, slug="jane-doe", full_name="Jane Doe", dob="1962-03-14")
+BOB = Person(person_id=2, slug="bob-roe", full_name="Robert Alan Roe", dob="1955-11-02")
+ROSTER = (JANE, BOB)
+
+
+@pytest.mark.parametrize(
+    "text, verdict, matched",
+    [
+        # --- match: name, in the orderings scanned headers actually use
+        ("Patient: Jane Doe   MRN 44812", "match", "jane-doe"),
+        ("Patient Name: DOE, JANE A", "match", "jane-doe"),
+        ("PATIENT\nDOE\nJANE\nDOB 01/01/1900", "match", "jane-doe"),
+        # middle initial in the text but not the roster, and vice versa
+        ("Patient: Jane Q. Doe", "match", "jane-doe"),
+        # every token must be present: 'Alan' missing -> Bob does *not* match either
+        ("Patient: Robert Roe", "suspect", None),
+        # --- match: DOB alone is high-entropy enough
+        ("Patient: unreadable smudge   DOB: 03/14/1962", "match", "jane-doe"),
+        ("date of birth 3/14/1962", "match", "jane-doe"),
+        ("DOB 1962-03-14", "match", "jane-doe"),
+        ("DOB 03-14-1962", "match", "jane-doe"),
+        ("DOB Mar 14, 1962", "match", "jane-doe"),
+        ("DOB March 14, 1962", "match", "jane-doe"),
+        ("DOB 14 Mar 1962", "match", "jane-doe"),
+        # day-first is deliberately not parsed: 14/03/1962 is not a match
+        ("DOB 14/03/1962", "suspect", None),
+        # --- mismatch: the text names a *different* roster person
+        ("Patient: ROE, ROBERT ALAN    DOB: 11/02/1955", "mismatch", "bob-roe"),
+        # --- suspect: an identity header naming nobody on the roster (the 2026-08-01
+        # incident: a Piedmont summary for a non-roster patient)
+        ("Patient: SMITH, JANE A    DOB: 03/14/1900", "suspect", None),
+        ("MRN 99812  Name: Karen Fields", "suspect", None),
+        # --- unverified: no identity anchor at all, or nothing to go on
+        ("Sodium 140 mmol/L; potassium 4.1", "unverified", None),
+        ("", "unverified", None),
+        ("   \n\t ", "unverified", None),
+        (None, "unverified", None),
+        # 'name' without a colon is prose, not an anchor
+        ("the brand name is atorvastatin", "unverified", None),
+    ],
+)
+def test_check_owner_verdicts(text, verdict, matched):
+    check = ingest.check_owner(text, JANE, ROSTER)
+    assert check.verdict == verdict
+    assert check.matched_slug == matched
+    assert check.blocks is (verdict in ("mismatch", "suspect"))
+
+
+@pytest.mark.parametrize(
+    "full_name",
+    ["Cher", "Al Wu", "J Doe"],  # <2 usable tokens, or a survivor under 3 chars
+)
+def test_unusable_name_never_produces_a_false_suspect(full_name):
+    """A one-word or very short name carries no name signal — such a person must land
+    in `unverified`, never `suspect`, or every document would refuse."""
+    person = Person(person_id=9, slug="short", full_name=full_name)
+    assert ingest.name_tokens(full_name) == []
+    # An anchor is present and nobody matched, but we could never have recognised
+    # this person by name, so their absence is ignorance rather than evidence.
+    check = ingest.check_owner("Patient: Jane Doe  DOB: 03/14/1962", person, [person])
+    assert check.verdict == "unverified"
+    assert check.blocks is False
+    # ...and with no anchor either, likewise:
+    assert ingest.check_owner("routine bloodwork", person, [person]).verdict == (
+        "unverified"
+    )
+
+
+def test_unusable_name_with_a_dob_is_not_blocked_by_a_dobless_document():
+    """Most documents don't print a DOB; its absence is not evidence of a misfile.
+
+    Regression for the "Michael Vu" case: a two-letter surname erases the name
+    signal, and refusing every DOB-less document would make `ingest` unusable
+    without --force for anyone with a short name.
+    """
+    vu = Person(person_id=9, slug="michael-vu", full_name="Michael Vu", dob="1990-09-09")
+    correctly_named = ingest.check_owner(
+        "Patient: VU, MICHAEL   chest x-ray, two views", vu, [vu]
+    )
+    assert correctly_named.verdict == "unverified"
+    assert correctly_named.blocks is False
+    # the DOB still carries them to a positive verdict when it *is* printed
+    assert ingest.check_owner(
+        "Patient: VU, MICHAEL   DOB: 09/09/1990", vu, [vu]
+    ).verdict == "match"
+
+
+def test_unusable_name_still_bounces_off_another_roster_person():
+    """No name signal weakens `suspect`, not `mismatch`: affirmative evidence that the
+    text names *someone else on the roster* still blocks."""
+    vu = Person(person_id=9, slug="michael-vu", full_name="Michael Vu")
+    check = ingest.check_owner("Patient: DOE, JANE A   DOB: 03/14/1962", vu, [vu, JANE])
+    assert check.verdict == "mismatch"
+    assert check.matched_slug == "jane-doe"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Patient: DOE, JOHN Q   DOB: 23/7/1981",   # day-first, unpadded
+        "Patient: DOE, JOHN Q   DOB: 13/7/1981",
+        "Patient: DOE, JOHN Q   accession 13/7/1981x",
+        "Patient: DOE, JOHN Q   DOB: 03/07/19810",  # trailing digit
+    ],
+)
+def test_dob_needs_digit_boundaries(text):
+    """A candidate rendering that is merely a *substring* of a longer digit run is not
+    a DOB match — otherwise a day-first `23/7/1981` silently verifies a 1981-03-07
+    person and the document is misfiled with an `owner verified` line to reassure."""
+    mike = Person(
+        person_id=9, slug="alex-carter", full_name="Alex Carter",
+        dob="1981-03-07",
+    )
+    check = ingest.check_owner(text, mike, [mike])
+    assert check.verdict == "suspect"
+    assert check.matched_slug is None
+
+
+def test_partial_precision_dob_is_not_a_signal():
+    person = Person(person_id=9, slug="p", full_name="Ann Zed", dob="1962")
+    assert ingest.dob_candidates("1962") == []
+    assert ingest.dob_candidates(None) == []
+    assert ingest.check_owner("Patient: someone  DOB: 1962", person, [person]).verdict == (
+        "suspect"
+    )
+
+
+def test_evidence_quotes_the_window_around_the_anchor():
+    text = "PIEDMONT HEALTHCARE\n" * 3 + "Patient: SMITH, JANE A    DOB: 03/14/1900\n"
+    check = ingest.check_owner(text, JANE, ROSTER)
+    assert check.verdict == "suspect"
+    assert "SMITH, JANE A" in check.evidence
+    assert "\n" not in check.evidence  # whitespace collapsed for a one-line message
+
+
+def test_refusal_message_names_the_other_roster_person():
+    check = ingest.check_owner("Patient: ROE, ROBERT ALAN", JANE, ROSTER)
+    msg = ingest.refusal_message(check, JANE, ROSTER)
+    assert "'bob-roe' (Robert Alan Roe)" in msg
+    assert "'jane-doe' (Jane Doe)" in msg
+    assert "--force" in msg
+
+
+def _seed_roster(conn):
+    persons.update_person(conn, "jane-doe", dob="1962-03-14")
+    persons.add_person(conn, "bob-roe", "Robert Alan Roe", dob="1955-11-02")
+
+
+def test_ingest_refuses_and_writes_nothing(conn, tmp_path, sources):
+    _seed_roster(conn)
+    src = _make_file(tmp_path, "wrong.txt", b"scan of somebody else")
+    sha = ingest.hash_file(src)
+
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(
+            conn, src, "jane-doe", sources,
+            ocr_text="Patient: SMITH, KAREN    DOB: 09/09/1971",
+        )
+    assert excinfo.value.check.verdict == "suspect"
+    # pre-write: no blob, no row -> re-running with force is the whole recovery
+    assert not (sources / sha[:2] / f"{sha}.txt").exists()
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+    # OwnerMismatchError is an IngestError, so existing handlers still catch it
+    assert isinstance(excinfo.value, ingest.IngestError)
+
+
+def test_ingest_force_overrides_and_still_reports_the_verdict(conn, tmp_path, sources):
+    _seed_roster(conn)
+    result = ingest.ingest_document(
+        conn, _make_file(tmp_path, "forced.txt", b"forced bytes"), "jane-doe", sources,
+        ocr_text="Patient: ROE, ROBERT ALAN", force=True,
+    )
+    assert result.status == "new"
+    assert result.owner_check.verdict == "mismatch"
+    assert result.owner_check.matched_slug == "bob-roe"
+
+
+def test_ingest_reports_a_match(conn, tmp_path, sources):
+    _seed_roster(conn)
+    result = ingest.ingest_document(
+        conn, _make_file(tmp_path, "ok.txt", b"good bytes"), "jane-doe", sources,
+        ocr_text="Patient: DOE, JANE    DOB: 03/14/1962",
+    )
+    assert result.owner_check.verdict == "match"
+    assert result.owner_check.blocks is False
+
+
+def test_deactivated_people_still_count_as_roster(conn, tmp_path, sources):
+    """A deactivated person is still a real person whose documents must not land on
+    someone else — the text naming them is a `mismatch`, not a `suspect`."""
+    _seed_roster(conn)
+    persons.deactivate_person(conn, "bob-roe")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(
+            conn, _make_file(tmp_path, "d.txt", b"deact"), "jane-doe", sources,
+            ocr_text="Patient: ROE, ROBERT ALAN",
+        )
+    assert excinfo.value.check.verdict == "mismatch"
+
+
+def test_layer1_duplicate_is_unaffected_by_mismatching_text(conn, tmp_path, sources):
+    _seed_roster(conn)
+    src = _make_file(tmp_path, "dup.txt", b"same bytes twice")
+    first = ingest.ingest_document(conn, src, "jane-doe", sources)
+    again = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr_text="Patient: ROE, ROBERT ALAN"
+    )
+    assert again.status == "duplicate"
+    assert again.document.document_id == first.document.document_id
+    assert again.owner_check is None  # nothing written -> nothing checked

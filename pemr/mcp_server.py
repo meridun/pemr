@@ -170,12 +170,19 @@ def ingest_document(
     category: str | None = None,
     provider: str | None = None,
     ocr: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """[write] Ingest a document (hash, blob-store, layer-1 dedup). Mirrors ``pemr ingest``.
 
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
     contract without a follow-up read.
+
+    When text is present it is checked against the claimed owner; the verdict comes
+    back as ``owner_check`` (``null`` on a duplicate, which is never checked). A
+    ``mismatch``/``suspect`` verdict refuses the ingest pre-write — per ``AGENTS.md``
+    §3, surface the verdict and its evidence to the human and get an explicit
+    go-ahead before retrying with ``force=true``.
     """
     try:
         sources_dir = cli._resolve_sources_dir(_ARGS)
@@ -185,7 +192,7 @@ def ingest_document(
         result = _ingest.ingest_document(
             conn, file, person_slug=person, sources_dir=sources_dir,
             doc_date=doc_date, category=category, provider=provider,
-            ocr=ocr, ocr_text=ocr_text,
+            ocr=ocr, ocr_text=ocr_text, force=force,
         )
     except (db.NotMigratedError, _ingest.IngestError) as exc:
         raise _friendly(exc) from exc
@@ -193,6 +200,9 @@ def ingest_document(
         "status": result.status,
         "is_duplicate": result.is_duplicate,
         "ocr_text_populated": result.ocr_text_populated,
+        "owner_check": (
+            asdict(result.owner_check) if result.owner_check is not None else None
+        ),
         "document": asdict(result.document),
     }
 
@@ -480,9 +490,11 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     @server.tool(name="ingest", annotations=rw)
     def ingest_tool(file: str, person: str, ocr_text: str | None = None,
                     doc_date: str | None = None, category: str | None = None,
-                    provider: str | None = None, ocr: bool = False) -> dict:
+                    provider: str | None = None, ocr: bool = False,
+                    force: bool = False) -> dict:
         return _run(ingest_document, file=file, person=person, ocr_text=ocr_text,
-                    doc_date=doc_date, category=category, provider=provider, ocr=ocr)
+                    doc_date=doc_date, category=category, provider=provider, ocr=ocr,
+                    force=force)
 
     @server.tool(name="commit_extraction", annotations=rw)
     def commit_extraction_tool(document_id: int, records: dict) -> dict:
