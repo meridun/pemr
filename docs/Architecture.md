@@ -324,8 +324,22 @@ Division of labor: **the LLM only does the fuzzy vision-to-structure step.** Has
 validation, dedup, insertion, conflict detection are all deterministic Python the agent
 can't get subtly wrong. That's the whole point of lifting them out.
 
-Optional `--ocr tesseract` flag pre-fills `document.ocr_text` when scans are flat images,
-giving the agent text to work from instead of re-reading pixels every time.
+Optional `--ocr tesseract` flag pre-fills `document.ocr_text`, giving the agent text to work
+from instead of re-reading pixels every time. Two routes, dispatched on file type:
+
+- **Flat image scans** (`.jpg`, `.png`, …) go straight to a system `tesseract`.
+- **PDFs** are read page by page (issue #70). A page with an embedded text layer (≥ 20
+  characters) contributes it verbatim; a page without one is rendered at 300 dpi grayscale and
+  OCR'd. The decision is per *page*, so a scan appended to a searchable report is still read.
+  Pages are joined by a form feed (`\f`) — tesseract's own page separator, and a token
+  separator to FTS5, so it can never produce a false `find` hit. At most `OCR_MAX_PAGES` (20)
+  pages are read; a longer document gets a stderr note naming the shortfall.
+
+Both are **soft dependencies** that degrade to a stderr note and an empty `ocr_text`, never a
+failed ingest: `tesseract` is a system binary looked up on `PATH`, and the PDF backend
+(PyMuPDF, behind the `_load_pdf_backend()` seam in `ingest.py`) is the optional
+`pip install pemr[ocr]` extra. Note that `tesseract` alone cannot read a PDF at all — its
+Leptonica backend has no PDF decoder — so without the extra a PDF stores no text.
 
 ---
 

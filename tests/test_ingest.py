@@ -1,6 +1,7 @@
 """Document ingest: hashing, content-addressed blob store, layer-1 dedup."""
 
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -113,6 +114,294 @@ def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "tesseract" in capsys.readouterr().err
+
+
+# --- PDF OCR (issue #70) ------------------------------------------------------
+#
+# Every test here fakes both halves of the soft dependency — the PDF backend via the
+# `_load_pdf_backend` seam and tesseract via `subprocess.run` — so the suite passes on
+# a machine with neither PyMuPDF nor tesseract installed, which is the CI contract.
+
+
+class _FakePixmap:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+
+    def tobytes(self, fmt: str) -> bytes:
+        assert fmt == "png"
+        # Carries the page's OCR text through the fake tesseract below, standing in
+        # for "these pixels say this".
+        return f"PNG:{self.payload}".encode()
+
+
+class _FakePage:
+    """A PDF page: `text` is its embedded text layer, `scanned` what OCR would read."""
+
+    def __init__(self, text: str = "", scanned: str = "") -> None:
+        self.text = text
+        self.scanned = scanned
+        self.pixmap_kwargs: dict | None = None
+
+    def get_text(self) -> str:
+        return self.text
+
+    def get_pixmap(self, **kwargs):
+        self.pixmap_kwargs = kwargs
+        return _FakePixmap(self.scanned)
+
+
+class _FakeDoc:
+    def __init__(self, pages, needs_pass: bool = False) -> None:
+        self.pages = list(pages)
+        self.needs_pass = needs_pass
+        self.closed = False
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+    def __getitem__(self, index: int) -> _FakePage:
+        return self.pages[index]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBackend:
+    csGRAY = "device-gray"
+
+    def __init__(self, doc=None, error: Exception | None = None) -> None:
+        self.doc = doc
+        self.error = error
+
+    def open(self, path: str):
+        if self.error is not None:
+            raise self.error
+        return self.doc
+
+
+def _install_backend(monkeypatch, backend) -> None:
+    monkeypatch.setattr(ingest, "_load_pdf_backend", lambda: backend)
+
+
+def _install_tesseract(monkeypatch, *, available: bool = True, stderr: bytes = b""):
+    """Fake tesseract that echoes back whatever `_FakePixmap` encoded (or fails)."""
+    monkeypatch.setattr(
+        ingest.shutil, "which", lambda name: "/usr/bin/tesseract" if available else None
+    )
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, **kwargs})
+        assert cmd == ["tesseract", "stdin", "stdout"]
+        assert "text" not in kwargs  # bytes in, bytes out (issue #64's decode policy)
+        if stderr:
+            raise subprocess.CalledProcessError(1, cmd, output=b"", stderr=stderr)
+        payload = kwargs["input"].decode().removeprefix("PNG:")
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload.encode(), stderr=b"")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    return calls
+
+
+def _pdf(tmp_path, name="scan.pdf"):
+    return _make_file(tmp_path, name, b"%PDF-1.4 fake bytes")
+
+
+def test_ocr_pdf_uses_text_layer_without_touching_tesseract(tmp_path, monkeypatch):
+    # A searchable PDF: text layer on every page, so nothing is rasterized and
+    # tesseract is never consulted (`shutil.which` unpatched would still be fine —
+    # `subprocess.run` raising is the assertion that it isn't called).
+    pages = [_FakePage(text="Patient: Jane Doe, HbA1c 6.1"), _FakePage(text="B" * 40)]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    monkeypatch.setattr(
+        ingest.subprocess, "run",
+        lambda *a, **k: pytest.fail("tesseract ran on a page with a text layer"),
+    )
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert text == "Patient: Jane Doe, HbA1c 6.1\f" + "B" * 40
+    assert all(page.pixmap_kwargs is None for page in pages)
+
+
+def test_ocr_pdf_rasterizes_and_ocrs_pages_with_no_text_layer(tmp_path, monkeypatch):
+    # The reported bug: a scanned PDF has no text layer at all, and used to store
+    # nothing because tesseract cannot decode a PDF.
+    pages = [_FakePage(scanned="page one scan"), _FakePage(scanned="page two scan")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "page one scan\fpage two scan"
+    for page in pages:
+        assert page.pixmap_kwargs == {
+            "dpi": ingest.OCR_DPI, "colorspace": _FakeBackend.csGRAY
+        }
+    assert ingest.OCR_DPI == 300
+
+
+def test_ocr_pdf_decides_per_page_not_per_document(tmp_path, monkeypatch):
+    # Mixed document: a searchable cover page, then a scan carrying a stray stamp
+    # character. The stray character must not suppress OCR of the whole page.
+    pages = [
+        _FakePage(text="Discharge summary for the visit of 2024-03-02"),
+        _FakePage(text="  X ", scanned="the labs table"),
+    ]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert text == "Discharge summary for the visit of 2024-03-02\fthe labs table"
+    assert pages[0].pixmap_kwargs is None
+    assert pages[1].pixmap_kwargs is not None
+
+
+def test_ocr_pdf_falls_back_to_short_text_layer_when_ocr_finds_nothing(
+    tmp_path, monkeypatch
+):
+    # A page under the floor whose pixels yield nothing keeps its stray characters
+    # rather than dropping them — some text beats none.
+    pages = [_FakePage(text="Rx", scanned="")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "Rx"
+
+
+def test_ocr_pdf_caps_long_documents_and_says_so(tmp_path, monkeypatch, capsys):
+    pages = [_FakePage(text=f"page {n} " + "z" * 30) for n in range(25)]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert len(text.split("\f")) == ingest.OCR_MAX_PAGES == 20
+    err = capsys.readouterr().err
+    assert "25 pages" in err and "first 20" in err
+
+
+def test_load_pdf_backend_prefers_pymupdf_and_tolerates_absence(monkeypatch):
+    # The seam itself, exercised without caring whether PyMuPDF is installed here.
+    tried: list[str] = []
+
+    def only(available):
+        def import_module(name):
+            tried.append(name)
+            if name != available:
+                raise ImportError(name)
+            return f"<{name}>"
+        return import_module
+
+    monkeypatch.setattr(ingest.importlib, "import_module", only("pymupdf"))
+    assert ingest._load_pdf_backend() == "<pymupdf>"
+    assert tried == ["pymupdf"]  # modern name first, no needless `fitz` import
+
+    tried.clear()
+    monkeypatch.setattr(ingest.importlib, "import_module", only("fitz"))
+    assert ingest._load_pdf_backend() == "<fitz>"  # older wheels
+
+    monkeypatch.setattr(ingest.importlib, "import_module", only(None))
+    assert ingest._load_pdf_backend() is None  # extra not installed
+
+
+def test_ocr_pdf_without_backend_names_the_extra(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, None)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "pemr[ocr]" in capsys.readouterr().err
+
+
+def test_ocr_pdf_without_tesseract_degrades(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc([_FakePage(scanned="x")])))
+    _install_tesseract(monkeypatch, available=False)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "tesseract" in capsys.readouterr().err
+
+
+def test_ocr_pdf_encrypted_returns_none(tmp_path, monkeypatch, capsys):
+    doc = _FakeDoc([_FakePage(scanned="secret")], needs_pass=True)
+    _install_backend(monkeypatch, _FakeBackend(doc))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "password-protected" in capsys.readouterr().err
+    assert doc.closed
+
+
+def test_ocr_pdf_unparseable_returns_none(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(error=RuntimeError("Failed to open")))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_ocr_pdf_bad_page_skips_only_that_page(tmp_path, monkeypatch, capsys):
+    class _Exploding(_FakePage):
+        def get_text(self):
+            raise RuntimeError("mupdf: cannot parse page")
+
+    pages = [_Exploding(), _FakePage(text="the page that still works fine")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "the page that still works fine"
+    assert "page 1" in capsys.readouterr().err
+
+
+def test_ocr_pdf_surfaces_tesseract_stderr(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc([_FakePage(scanned="x")])))
+    _install_tesseract(monkeypatch, stderr=b"Error in pixReadStream: unsupported\n")
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    # The line that would have made 501 silent failures self-diagnosing.
+    assert "Error in pixReadStream: unsupported" in capsys.readouterr().err
+
+
+def test_run_ocr_on_an_image_is_unchanged(tmp_path, monkeypatch):
+    # Regression guard for the non-PDF path: same argv, same text-mode capture as
+    # before the PDF dispatch existed.
+    src = _make_file(tmp_path, "scan.jpg", b"jpeg bytes")
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, **kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="image text\n", stderr="")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+
+    assert ingest.run_ocr(src) == "image text"
+    assert seen["cmd"] == ["tesseract", str(src), "stdout"]
+    assert seen["text"] is True
+
+
+def test_run_ocr_image_failure_note_carries_tesseract_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(
+            1, cmd, output="", stderr="Warning: bad dpi\nError: unsupported format\n"
+        )
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+
+    assert ingest.run_ocr(_make_file(tmp_path, "scan.jpg", b"jpeg")) is None
+    assert "Error: unsupported format" in capsys.readouterr().err
+
+
+def test_ingest_pdf_with_ocr_populates_ocr_text(conn, tmp_path, sources, monkeypatch):
+    pages = [_FakePage(scanned="Jane Doe cholesterol panel")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    result = ingest.ingest_document(
+        conn, _pdf(tmp_path), "jane-doe", sources, ocr=True
+    )
+
+    assert result.status == "new"
+    assert result.ocr_text_populated
+    assert result.document.ocr_text == "Jane Doe cholesterol panel"
 
 
 # --- owner verification (issue #61) -------------------------------------------

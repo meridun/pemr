@@ -132,7 +132,10 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Default path: agent-supplied transcription.** You already read the document to extract from it;
   pass that text as the `ocr_text` tool param (CLI: `--ocr-text-file <path>`). A vision transcript
   beats tesseract on messy scans.
-- **Fallback:** `ocr=true` (tesseract) only when you cannot read the file type yourself.
+- **Fallback:** `ocr=true` only when you cannot read the file type yourself. Images go to
+  tesseract; a PDF is read page by page — embedded text layer where there is one, a 300-dpi
+  render OCR'd where there isn't (first 20 pages, joined by `\f`). The PDF route needs the
+  optional `pip install pemr[ocr]` extra; without it a PDF stores no text and says so on stderr.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
