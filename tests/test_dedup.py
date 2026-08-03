@@ -429,6 +429,115 @@ def test_serial_same_day_observations_are_distinct_rows(conn):
     assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 2
 
 
+# --- intra-payload collisions (issue #58) -------------------------------------
+
+def test_intra_payload_collision_with_differing_values_is_rejected(conn):
+    """Two rows of ONE submission deriving one key and disagreeing is an extraction
+    error, not a conflict: the 'existing' side would have been inserted milliseconds
+    earlier in the same batch, so there is nothing independent to adjudicate."""
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError) as exc:
+        dedup.commit_extraction(conn, doc, {"lab_result": [
+            {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95,
+             "value_text": "fasting draw"},
+            {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148,
+             "value_text": "2-hour post-prandial draw"},
+        ]})
+    message = str(exc.value)
+    assert "rows 0 and 1" in message
+    assert "person 1 | glucose | 2024-04-01" in message   # the identity, not a hash
+    assert "--keep both" in message                       # names the recovery path
+    assert message.isascii()                              # cp1252 console (issue #23)
+    # Atomic: nothing of the batch landed.
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 0
+
+
+def test_intra_payload_identical_rows_still_report_duplicate(conn):
+    """An agent listing one fact twice is benign, not an error."""
+    doc = _make_document(conn)
+    row = {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95}
+    summary = dedup.commit_extraction(conn, doc, {"lab_result": [dict(row), dict(row)]})
+    assert summary.counts == {"new": 1, "duplicate": 1, "conflict": 0}
+
+
+def test_intra_payload_collision_checked_per_record_type(conn):
+    """Distinct types never collide with each other, and a same-key observation pair is
+    caught the same way a lab pair is."""
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError, match="observation: rows 0 and 1"):
+        dedup.commit_extraction(conn, doc, {"observation": [
+            {"obs_type": "vital", "key": "systolic", "observed_at": "2024-04-01",
+             "value_num": 120},
+            {"obs_type": "vital", "key": "systolic", "observed_at": "2024-04-01",
+             "value_num": 138},
+        ]})
+
+
+# --- occurrence numbering -----------------------------------------------------
+
+def test_occurrence_zero_key_is_the_base_byte_for_byte(conn):
+    """Migration 005 is a pure column copy only because occurrence 0 reproduces the
+    pre-005 key exactly - anything else would invalidate every stored key."""
+    row = {"test_name": "hba1c", "collected_at": "2026-01-02"}
+    base = dedup.dedup_key("lab_result", row, 1)
+    assert dedup.dedup_key("lab_result", row, 1, None, 0) == base
+    assert dedup.occurrence_key(base, 0) == base
+    assert dedup.occurrence_key(base, 1) != base
+    assert dedup.dedup_key("lab_result", row, 1, None, 1) == dedup.occurrence_key(base, 1)
+
+
+def test_migration_005_preserves_pre_existing_keys(tmp_path):
+    """The upgrade path: a database written before the occurrence columns existed must
+    come through 005 with every stored key byte-identical, and must keep deduping."""
+    import shutil
+
+    staged = tmp_path / "migrations"
+    staged.mkdir()
+    all_migrations = sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql"))
+    pre_005 = [p for p in all_migrations if not p.name.startswith("005_")]
+    for path in pre_005:
+        shutil.copy(path, staged / path.name)
+
+    conn = db.connect(tmp_path / "legacy.db")
+    try:
+        db.migrate(conn, staged)
+        persons.add_person(conn, "jane-doe", "Jane Doe")
+        pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+        row = {"test_name": "hba1c", "collected_at": "2026-01-02", "value_num": 5.7}
+        legacy_key = dedup.dedup_key("lab_result", row, pid)
+        conn.execute(
+            "INSERT INTO lab_result (person_id, test_name, collected_at, value_num, "
+            "dedup_key) VALUES (?, ?, ?, ?, ?)",
+            (pid, row["test_name"], row["collected_at"], row["value_num"], legacy_key),
+        )
+        conn.commit()
+
+        for path in all_migrations:
+            shutil.copy(path, staged / path.name)
+        assert db.migrate(conn, staged) == ["005_dedup_occurrence.sql"]
+
+        stored = conn.execute("SELECT * FROM lab_result").fetchone()
+        assert stored["dedup_key"] == legacy_key      # no key churn
+        assert stored["dedup_base"] == legacy_key     # backfilled from the key
+        assert stored["dedup_occurrence"] == 0
+
+        # And the pre-005 row still dedups against a fresh commit of the same fact.
+        doc = _make_document(conn)
+        summary = dedup.commit_extraction(conn, doc, {"lab_result": [row]})
+        assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    finally:
+        conn.close()
+
+
+def test_commit_stores_dedup_base_for_every_row(conn):
+    """The family lookup keys off dedup_base, so no write path may leave it null."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [_lab(5.7)]})
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["dedup_base"] == row["dedup_key"]
+    assert row["dedup_occurrence"] == 0
+
+
 def test_commit_unknown_type_rolls_back(conn):
     doc = _make_document(conn)
     with pytest.raises(dedup.ValidationError):
@@ -577,3 +686,34 @@ def test_rekey_covers_every_record_type(conn):
     report = dedup.rekey(conn, None)
     assert report.scanned == {t: 1 for t in dedup.KNOWN_TYPES}
     assert report.changes == []  # same dictionary (none) -> keys already current
+
+
+def test_rekey_is_a_no_op_over_a_keep_both_family(conn):
+    """The whole reason occurrence lives in a column: `rekey` re-derives keys from
+    payload, so siblings must recompute to their own keys rather than collide."""
+    doc = _make_document(conn)
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95}]}, d)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148}]}, d)
+    conflict_id = dedup.list_conflicts(conn)[0]["conflict_id"]
+    dedup.resolve_conflict(conn, conflict_id, keep="both")
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+
+    report = dedup.rekey(conn, d, apply=True)
+    assert report.changes == []            # no RekeyCollisionError, no key churn
+    keys = [r["dedup_key"] for r in conn.execute("SELECT * FROM lab_result")]
+    assert len(set(keys)) == 2
+
+
+def test_rekey_moves_dedup_base_with_the_key(conn):
+    """A dictionary edit must not leave dedup_base pointing at the old family, or the
+    commit-time family lookup would miss."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}]},
+        dedup.load_dictionary(DICT_PATH))
+    dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"), apply=True)
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["dedup_base"] == row["dedup_key"]   # occurrence 0: base IS the key

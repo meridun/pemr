@@ -153,11 +153,27 @@ Agents never resolve staged conflicts silently.
 
 - `review_conflicts` with no `resolve` id **lists** conflicts — call it freely.
 - **Resolution requires explicit human sign-off.** The human must have named the specific conflict
-  and the chosen resolution (`keep existing` / `keep incoming`) in the current session. "Clean this
-  up", silence, or a standing general instruction is **not** sign-off.
+  and the chosen resolution (`keep existing` / `keep incoming` / `keep both`) in the current
+  session. "Clean this up", silence, or a standing general instruction is **not** sign-off.
 - Mechanically: `review_conflicts(resolve=…)` requires a non-empty `signoff` param quoting the
   human's instruction verbatim; the wrapper refuses the write otherwise and stores the sign-off
   text with the resolution.
+- `keep both` is the odd one out: it **admits a row** rather than choosing between two. Use it only
+  for a genuine repeat the source cannot distinguish — two same-day draws on a report that prints
+  no collection times (see §6). It inserts the incoming row alongside the stored one as the next
+  *occurrence* of that identity; a later re-commit of that same payload then dedups against it. If
+  the source *did* give distinct times and the extraction dropped them, the fix is a corrected
+  extraction, not `keep both`.
+- The listing reports `occurrences` — how many rows already sit under that identity. More than one
+  means a repeat was admitted before, so check whether the incoming row is a re-read of one of them
+  before proposing anything.
+- `keep incoming` overwrites the stored row the conflict is anchored to. If every row under that
+  identity was removed in the meantime (the source document was deleted or reassigned), it is
+  **refused** — never silently applied to nothing. Report the refusal to the human; `keep both`
+  admits the staged row as a fresh record if they want the value kept.
+- `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
+  that is an extraction error, not a conflict. Re-read the source for collection times; if there
+  genuinely are none, submit them separately and ask the human about `keep both`.
 
 ### 5. Medication-interaction section
 
@@ -191,6 +207,9 @@ day or month the source didn't state, and never fall back to stashing an impreci
   ISO prefix first.
 - A partial and a later full date of the same event stay **distinct rows** (the dedup layer never
   guesses that one refines the other); reconciling them is a human conflict-review action.
+- Date-only precision is also why two genuine same-day results collide: they derive one key, so the
+  second stages a conflict. Emitting a time you invented is never the fix — the recovery path is
+  `keep both` under human sign-off (§4).
 
 ## Privacy posture
 

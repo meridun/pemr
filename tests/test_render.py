@@ -5,6 +5,7 @@ abnormal-lab selection, latest-vitals pick, brief scoping, journal ordering + pr
 footnotes, ASCII output (cp1252/cp437 console lesson), and the read-only guarantee
 (no row-count change after any render)."""
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,21 @@ def _doc(conn, slug, ocr=None, doc_date="2026-01-01", category=None, provider=No
         "source_path, ocr_text, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (f"sha-{slug}-{conn.total_changes}", pid, doc_date, category, provider,
          "aa/x.pdf", ocr, "2026-01-01T00:00:00"),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _stage_conflict(conn, slug, *, record_type="lab_result", status="open"):
+    """Stage one conflict row for `slug` (the shape `dedup` writes on a key collision)."""
+    cur = conn.execute(
+        "INSERT INTO conflict (record_type, dedup_key, person_id, existing_json, "
+        "incoming_json, status, resolution, detected_at, resolved_at) VALUES "
+        "(?, 'k', (SELECT person_id FROM person WHERE slug = ?), '{}', '{}', ?, ?, "
+        "'2026-01-01', ?)",
+        (record_type, slug, status,
+         "keep-incoming" if status == "resolved" else None,
+         "2026-01-02" if status == "resolved" else None),
     )
     conn.commit()
     return cur.lastrowid
@@ -125,6 +141,35 @@ def test_summary_active_meds_only(seeded):
     assert "Lisinopril" not in md  # ended med excluded from the active list
 
 
+def _seed_expired_active_course(conn):
+    """A finished 2024 antibiotic course transcribed with status='active' (issue #57)."""
+    dedup.commit_extraction(conn, _doc(conn, "jane-doe"), {
+        "medication": [
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-01-01", "ended_on": "2024-01-10", "status": "active"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def test_summary_excludes_expired_course_labelled_active(seeded):
+    """Issue #57: a stale 'active' label must not keep a 2024 course in the summary --
+    and `now` has to reach the currency test, not just the generated-at stamp."""
+    _seed_expired_active_course(seeded)
+    md = render.render_summary(seeded, "jane-doe", now=datetime(2026, 8, 2, 9, 30))
+    assert "Amoxicillin" not in md
+    assert "Metformin" in md  # control: genuinely current med still listed
+
+
+def test_brief_excludes_expired_course_labelled_active(seeded):
+    """Same for the brief -- the document actually handed to a clinician (issue #57)."""
+    _seed_expired_active_course(seeded)
+    md = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), now=datetime(2026, 8, 2, 9, 30)
+    )
+    assert "Amoxicillin" not in md
+    assert "Metformin" in md
+
+
 def test_summary_conditions_and_allergies(seeded):
     md = render.render_summary(seeded, "jane-doe")
     assert "## Conditions" in md and "Type 2 Diabetes" in md
@@ -161,12 +206,57 @@ def test_summary_abnormal_lab_selection(seeded):
     assert section.index("Glucose") < section.index("LDL")
 
 
+def test_summary_same_date_lab_siblings_order_by_row_id(seeded):
+    """A `--keep both` sibling (#58) shares its date with the row it was admitted
+    beside, so newest-first ordering needs a row-id tiebreak to stay deterministic:
+    the later-admitted row reads as the later point."""
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(seeded, _doc(seeded, "jane-doe"), {"lab_result": [
+        {"test_name": "Glucose, fasting", "collected_at": "2026-01-01",
+         "value_num": 320, "unit": "mg/dL", "ref_high": 100},
+    ]}, d)
+    conflict_id = dedup.list_conflicts(seeded)[0]["conflict_id"]
+    admitted = dedup.resolve_conflict(seeded, conflict_id, keep="both")
+    assert admitted.occurrence == 1
+
+    md = render.render_summary(seeded, "jane-doe", dictionary=d)
+    section = md.split("## Recent Abnormal Labs")[1].split("##")[0]
+    assert section.index("320.0") < section.index("200.0")
+
+
 def test_summary_upcoming_and_open_appointments(seeded):
     md = render.render_summary(seeded, "jane-doe")
-    section = md.split("## Upcoming / Open Appointments")[1]
+    section = md.split("## Upcoming / Open Appointments")[1].split("\n## ")[0]
     assert "Dr. Smith" in section    # upcoming
     assert "Dr. Open" in section     # past but no summary -> open
     assert "Dr. Past" not in section  # past + documented -> closed
+
+
+def test_summary_open_conflicts_section(seeded):
+    """The summary is the doc read between appointments, so a staged correction must be
+    visible there and not only in `review-conflicts` / a per-appointment brief: without
+    it the summary prints the stale value with no hint a correction is pending (#59)."""
+    cid = _stage_conflict(seeded, "jane-doe")
+    md = render.render_summary(seeded, "jane-doe")
+    section = md.split("## Open Conflicts")[1].split("\n## ")[0]
+    assert f"conflict #{cid} (lab_result)" in section
+    assert "`pemr review-conflicts`" in section       # tells the reader how to clear it
+
+
+def test_summary_open_conflicts_empty_state_and_scoping(seeded):
+    """Empty state is explicit (`_none_`, matching the brief), resolved conflicts drop
+    out of the section, and another person's conflict never leaks in."""
+    md = render.render_summary(seeded, "jane-doe")
+    assert "_none_" in md.split("## Open Conflicts")[1].split("\n## ")[0]
+
+    resolved = _stage_conflict(seeded, "jane-doe", status="resolved")
+    johns = _stage_conflict(seeded, "john-doe")
+    section = render.render_summary(
+        seeded, "jane-doe"
+    ).split("## Open Conflicts")[1].split("\n## ")[0]
+    assert f"conflict #{resolved}" not in section     # resolved -> not open
+    assert f"conflict #{johns}" not in section        # other person's conflict
+    assert "_none_" in section
 
 
 def test_summary_empty_sections_are_explicit(seeded):
@@ -245,13 +335,7 @@ def test_brief_has_interaction_placeholder(seeded):
 
 def test_brief_open_conflict_warning(seeded):
     # stage an open conflict for jane, then confirm the brief warns about it
-    seeded.execute(
-        "INSERT INTO conflict (record_type, dedup_key, person_id, existing_json, "
-        "incoming_json, status, detected_at) VALUES "
-        "('lab_result', 'k', (SELECT person_id FROM person WHERE slug='jane-doe'), "
-        "'{}', '{}', 'open', '2026-01-01')"
-    )
-    seeded.commit()
+    _stage_conflict(seeded, "jane-doe")
     md = render.render_brief(seeded, _upcoming_appt_id(seeded))
     section = md.split("## Open Conflicts")[1].split("##")[0]
     assert "review-conflicts" in section

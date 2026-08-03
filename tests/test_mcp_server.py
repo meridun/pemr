@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, mcp_server, persons
+from pemr import __version__, db, dedup, mcp_server, persons
 
 REPO = Path(__file__).resolve().parent.parent
 DICT_PATH = REPO / "data" / "dictionary.example.toml"
@@ -251,6 +251,75 @@ def test_review_conflicts_lists_and_requires_signoff(seeded, tmp_path, monkeypat
     assert "Jane said keep" in row["resolution"]
 
 
+def _stage_repeat_draw(seeded, tmp_path, monkeypatch) -> int:
+    """One open conflict from two genuine same-day draws (issue #58); returns its id."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    draw = {"test_name": "glucose", "collected_at": "2024-04-01"}
+    for name, value_text, value_num in (("g1.txt", "fasting", 95),
+                                        ("g2.txt", "post-prandial", 148)):
+        scan = tmp_path / name
+        scan.write_bytes(name.encode())
+        doc = mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe",
+                                         ocr_text="glucose")["document"]["document_id"]
+        mcp_server.commit_extraction(seeded, document_id=doc, records={
+            "lab_result": [draw | {"value_num": value_num, "value_text": value_text}],
+        })
+    return mcp_server.review_conflicts(seeded)[0]["conflict_id"]
+
+
+def test_review_conflicts_keep_both_requires_signoff(seeded, tmp_path, monkeypatch):
+    """`both` admits a row rather than choosing one, so it goes through the *same*
+    sign-off gate - no new bypass (AGENTS.md conflict discipline)."""
+    cid = _stage_repeat_draw(seeded, tmp_path, monkeypatch)
+    with pytest.raises(mcp_server.ToolError, match="sign-off"):
+        mcp_server.review_conflicts(seeded, resolve=cid, keep="both")
+    assert seeded.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+
+def test_review_conflicts_keep_both_reports_the_admitted_row(seeded, tmp_path,
+                                                             monkeypatch):
+    cid = _stage_repeat_draw(seeded, tmp_path, monkeypatch)
+    res = mcp_server.review_conflicts(
+        seeded, resolve=cid, keep="both",
+        signoff="Jane confirmed both draws are real",
+    )
+    assert res["keep"] == "both" and res["record_type"] == "lab_result"
+    assert res["occurrence"] == 1 and res["no_op"] is False
+    row = seeded.execute(
+        "SELECT * FROM lab_result WHERE lab_result_id = ?", (res["row_id"],)
+    ).fetchone()
+    assert row["value_num"] == 148.0
+    assert "Jane confirmed" in seeded.execute(
+        "SELECT resolution FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["resolution"]
+
+
+def test_review_conflicts_listing_reports_family_size(seeded, tmp_path, monkeypatch):
+    cid = _stage_repeat_draw(seeded, tmp_path, monkeypatch)
+    assert mcp_server.review_conflicts(seeded)[0]["occurrences"] == 1
+    mcp_server.review_conflicts(seeded, resolve=cid, keep="both",
+                                signoff="Jane confirmed both draws are real")
+    # A later conflict on that identity now shows the reviewer that a repeat was admitted.
+    scan = tmp_path / "g3.txt"
+    scan.write_bytes(b"g3")
+    doc = mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe",
+                                     ocr_text="glucose")["document"]["document_id"]
+    mcp_server.commit_extraction(seeded, document_id=doc, records={
+        "lab_result": [{"test_name": "glucose", "collected_at": "2024-04-01",
+                        "value_num": 210, "value_text": "third"}],
+    })
+    assert mcp_server.review_conflicts(seeded)[0]["occurrences"] == 2
+
+
+def test_review_conflicts_rejects_an_unknown_keep(seeded, tmp_path, monkeypatch):
+    cid = _stage_repeat_draw(seeded, tmp_path, monkeypatch)
+    with pytest.raises(mcp_server.ToolError, match="keep must be"):
+        mcp_server.review_conflicts(seeded, resolve=cid, keep="neither",
+                                    signoff="Jane said neither")
+
+
 def test_write_tools_refused_on_unmigrated_db(tmp_path):
     fresh = db.connect(tmp_path / "empty.db")
     try:
@@ -296,3 +365,15 @@ def test_registered_tool_names_equal_contract():
     server = mcp_server.build_server()
     registered = {t.name for t in server._tool_manager.list_tools()}
     assert registered == set(mcp_server.TOOL_NAMES)
+
+
+def test_server_info_advertises_pemr_version():
+    """`serverInfo` must report pemr's version, not the `mcp` SDK's (#60).
+
+    Asserted on the initialize options the server actually puts on the wire, so this
+    also catches an SDK change to how the version is resolved.
+    """
+    pytest.importorskip("mcp")
+    opts = mcp_server.build_server()._mcp_server.create_initialization_options()
+    assert opts.server_name == "pemr"
+    assert opts.server_version == __version__

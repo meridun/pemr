@@ -3,6 +3,7 @@ FTS backfill on migrate, trends math, dictionary normalization, and person isola
 
 import shutil
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -110,19 +111,48 @@ def test_query_meds_all_vs_active(seeded):
     assert [m["name"] for m in active] == ["Metformin"]  # Lisinopril is ended
 
 
+NOW = datetime(2026, 8, 2, 9, 30)  # fixed "today" so the currency tests never age out
+
+
 @pytest.mark.parametrize("row, expected", [
     ({"status": None, "ended_on": None}, True),          # nothing set -> current
     ({"status": "", "ended_on": None}, True),            # blank status -> current
     ({"status": "active", "ended_on": None}, True),      # explicitly active
-    ({"status": "active", "ended_on": "2024-01-01"}, True),  # explicit active wins over end
     ({"status": "prn", "ended_on": None}, True),         # prn is not terminal
     ({"status": "completed", "ended_on": None}, False),  # issue #21: terminal, no end date
     ({"status": "Stopped", "ended_on": None}, False),    # case-insensitive
     ({"status": " discontinued ", "ended_on": None}, False),  # trimmed
     ({"status": None, "ended_on": "2024-06-01"}, False), # explicit end date
+    # issue #57: a past end date ends the course whatever the status label says.
+    ({"status": "active", "ended_on": "2024-01-10"}, False),
+    ({"status": "Active", "ended_on": "2026-08-01"}, False),   # ended yesterday
+    ({"status": "active", "ended_on": "2026-08-02"}, True),    # ends today -> still on it
+    ({"status": "active", "ended_on": "2026-09-04"}, True),    # prior auth through a future date
+    ({"status": "active", "ended_on": "2026-08-02T00:00:00"}, True),  # timestamp form
+    # Partial precision widens to the END of the period it names, so a course only
+    # expires once every day it could have covered is past.
+    ({"status": "active", "ended_on": "2024"}, False),         # 2024-12-31 < today
+    ({"status": "active", "ended_on": "2026"}, True),          # 2026-12-31 >= today
+    ({"status": "active", "ended_on": "2026-07"}, False),      # 2026-07-31 < today
+    ({"status": "active", "ended_on": "2026-08"}, True),       # 2026-08-31 >= today
+    ({"status": "active", "ended_on": "2026-02"}, False),      # leap-month end, still past
+    ({"status": "active", "ended_on": "not-a-date"}, True),    # unparseable -> active wins
+    ({"status": None, "ended_on": "not-a-date"}, False),       # ...but only for 'active'
+    # Unchanged: a bare end date still ends the course; only status='active' overrides
+    # a future one.
+    ({"status": None, "ended_on": "2026-09-04"}, False),
+    ({"status": "completed", "ended_on": "2026-09-04"}, False),
 ])
 def test_med_is_current(row, expected):
-    assert query.med_is_current(row) is expected
+    assert query.med_is_current(row, now=NOW) is expected
+
+
+def test_med_is_current_defaults_to_the_real_clock():
+    """Without an injected ``now`` the currency test uses today (the CLI/MCP path)."""
+    past = (datetime.now() - timedelta(days=1)).date().isoformat()
+    future = (datetime.now() + timedelta(days=365)).date().isoformat()
+    assert query.med_is_current({"status": "active", "ended_on": past}) is False
+    assert query.med_is_current({"status": "active", "ended_on": future}) is True
 
 
 def test_query_meds_active_excludes_terminal_status_without_end(seeded):
@@ -138,6 +168,25 @@ def test_query_meds_active_excludes_terminal_status_without_end(seeded):
     assert "Amoxicillin" in names_all  # still listed by the unfiltered query
     names_active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True)}
     assert "Amoxicillin" not in names_active
+
+
+def test_query_meds_active_excludes_expired_course_labelled_active(seeded):
+    """A finished course transcribed with status='active' is not current (issue #57);
+    a still-open one with a future end date is."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-01-01", "ended_on": "2024-01-10", "status": "active"},
+            {"name": "Skyrizi", "dose": "150mg", "frequency": "q8w",
+             "started_on": "2025-09-04", "ended_on": "2026-09-04", "status": "active"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    names_all = {m["name"] for m in query.query_meds(seeded, "jane-doe")}
+    assert {"Amoxicillin", "Skyrizi"} <= names_all  # both still listed unfiltered
+    active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True, now=NOW)}
+    assert "Amoxicillin" not in active
+    assert "Skyrizi" in active
 
 
 # --- structured: timeline -----------------------------------------------------
@@ -334,6 +383,22 @@ def test_trends_distinct_intraday_times_are_not_a_tie(seeded):
                 value_num=5.4, unit="mmol/L", collected_at="2026-07-17T14:00:00")
     t = query.trends(seeded, "jane-doe", "glucose", dictionary=d)
     assert t["latest"] == 5.4 and t["latest_tie"] == 1
+
+
+def test_query_labs_same_date_siblings_order_by_row_id(seeded):
+    """`--keep both` (#58) admits a second draw under the same date, so
+    `collected_at, test_name` no longer totally orders lab rows. Row id breaks the
+    tie: the later-admitted sibling reads as the later point."""
+    first = _insert_lab(seeded, "jane-doe", test_name="Glucose", value_num=95.0,
+                        unit="mg/dL", collected_at="2024-04-01")
+    second = _insert_lab(seeded, "jane-doe", test_name="Glucose", value_num=148.0,
+                         unit="mg/dL", collected_at="2024-04-01")
+    same_day = [
+        r for r in query.query_labs(seeded, "jane-doe")
+        if r["collected_at"] == "2024-04-01"
+    ]
+    assert [r["lab_result_id"] for r in same_day] == [first, second]
+    assert [r["value_num"] for r in same_day] == [95.0, 148.0]
 
 
 # --- error surfaces -----------------------------------------------------------

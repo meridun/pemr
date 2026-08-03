@@ -113,10 +113,17 @@ def _conflicts_anchored_to(conn: sqlite3.Connection, document_id: int) -> list[i
     **incoming** row collided; ``conflict.dedup_key`` anchors it to the **stored**
     row — which a *different* document usually created. Only the first end is
     reachable from ``document_id``, so removing or reassigning the owner of the
-    stored row silently orphans the anchor: a later `keep incoming` resolution runs
-    ``UPDATE ... WHERE dedup_key = ?`` (:func:`dedup._overwrite_record`), matches
-    zero rows, and stamps the conflict ``resolved`` while discarding the staged
-    value with rc 0. Both `rm` and `reassign` therefore have to see this end too.
+    stored row orphans the anchor and leaves a conflict that `keep incoming` can no
+    longer resolve. Both `rm` and `reassign` therefore have to see this end too.
+
+    Matching on ``dedup_key`` finds the anchor exactly while occurrence 0 is alive,
+    which is every family a conflict is normally staged against
+    (:func:`dedup._stage_conflict` anchors to ``family[0]``). It misses the residual
+    case where occurrence 0 is already gone and the anchor is an occurrence >= 1
+    sibling, whose key is ``hash(base|n)`` rather than the base: that document can
+    still be removed without a warning. The consequence is bounded — a later
+    `keep incoming` refuses loudly rather than discarding the staged value
+    (:func:`dedup._anchor_row`), and `keep both` still admits it.
     """
     ids: list[int] = []
     for record_type in dedup.KNOWN_TYPES:
@@ -226,6 +233,7 @@ class ReassignChange:
     label: str
     old_key: str
     new_key: str
+    new_base: str = ""   # recomputed dedup_base (== new_key at occurrence 0)
 
 
 @dataclass
@@ -268,8 +276,8 @@ def reassign_document(
       owned by the *old* person; resolving it after a move would write data into
       records the document no longer owns. One *anchored to* a row this document owns
       (staged by some other document — see :func:`_conflicts_anchored_to`) would have
-      its ``dedup_key`` re-derived out from under it, and resolve to nothing. Resolve
-      them first (`pemr review-conflicts`).
+      its ``dedup_key`` re-derived out from under it, leaving nothing to resolve
+      against. Resolve them first (`pemr review-conflicts`).
     * **dictionary drift** (:class:`DictionaryDriftError`) — a stored key that does not
       match its recompute under the current dictionary means a reassign would silently
       perform a `rekey` too. Run `pemr rekey --apply` first; reassign changes ownership
@@ -308,7 +316,7 @@ def reassign_document(
             f"'{from_slug}' - raised by this document, or anchored to a row it owns. "
             "Resolving one after the move would write this document's data into "
             "records it no longer owns, or target a dedup_key the move re-derives "
-            "(silently discarding the staged value). Resolve them first with "
+            "(leaving the staged value unresolvable). Resolve them first with "
             "`pemr review-conflicts`; nothing was written"
         )
 
@@ -322,8 +330,13 @@ def reassign_document(
         for row in rows:
             label = dedup._rekey_label(record_type, row)
             payload = {name: row[name] for name in dedup.FIELD_SPECS[record_type]}
+            # A row admitted by `review-conflicts --keep both` is occurrence >0 of its
+            # identity family; its key hashes the base together with that stored
+            # occurrence, so the recompute has to carry it or every sibling would read
+            # as dictionary drift.
+            occurrence = int(row["dedup_occurrence"] or 0)
             current = dedup.dedup_key(
-                record_type, payload, row["person_id"], dictionary
+                record_type, payload, row["person_id"], dictionary, occurrence
             )
             if current != row["dedup_key"]:
                 raise DictionaryDriftError(
@@ -332,9 +345,10 @@ def reassign_document(
                     "changed since it was committed. Run `pemr rekey --apply` first, "
                     "then retry; nothing was written"
                 )
-            new_key = dedup.dedup_key(
+            new_base = dedup.dedup_key(
                 record_type, payload, target.person_id, dictionary
             )
+            new_key = dedup.occurrence_key(new_base, occurrence)
             # Every moving row shares one old person_id and one new one, and the drift
             # check above proves the stored keys are injective under the current
             # dictionary — so new keys cannot collide with each other or with the
@@ -352,7 +366,7 @@ def reassign_document(
                 )
             report.changes.append(
                 ReassignChange(
-                    record_type, row[pk], label, row["dedup_key"], new_key
+                    record_type, row[pk], label, row["dedup_key"], new_key, new_base
                 )
             )
 
@@ -365,9 +379,9 @@ def reassign_document(
             )
             for change in report.changes:
                 conn.execute(
-                    f"UPDATE {change.record_type} SET person_id = ?, dedup_key = ? "
-                    f"WHERE {change.record_type}_id = ?",
-                    (target.person_id, change.new_key, change.row_id),
+                    f"UPDATE {change.record_type} SET person_id = ?, dedup_key = ?, "
+                    f"dedup_base = ? WHERE {change.record_type}_id = ?",
+                    (target.person_id, change.new_key, change.new_base, change.row_id),
                 )
     report.applied = apply
     return report
@@ -419,9 +433,10 @@ def remove_document(
     landed and their document is going away), resolved ones keep their audit trail
     with ``document_id`` nulled out. Open conflicts *anchored to* a row this document
     owns (:func:`_conflicts_anchored_to`) are deleted too and counted separately — the
-    row they were staged against is going away, so they cannot be resolved either way,
-    and leaving them would make a later `keep incoming` discard the staged value in
-    silence. Every count is in the dry-run report: the blast radius is the safety
+    row they were staged against is going away, so leaving them would strand a conflict
+    whose only remaining resolution is `keep both` (`keep incoming` refuses loudly once
+    the family is empty — :func:`dedup._anchor_row`). Every count is in the dry-run
+    report: the blast radius is the safety
     mechanism here, so it has to be truthful.
 
     The scan under ``sources_dir`` is **kept** unless ``purge_blob`` is set — it is the
