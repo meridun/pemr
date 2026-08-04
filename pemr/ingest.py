@@ -118,6 +118,14 @@ def run_ocr(path: str | Path) -> str | None:
             ["tesseract", str(path), "stdout"],
             capture_output=True,
             text=True,
+            # tesseract emits UTF-8. Without an explicit encoding, `text=True`
+            # decodes with the platform default (cp1252 on Windows), which kills
+            # the subprocess reader thread with UnicodeDecodeError on any byte
+            # invalid in that codepage — failing the whole ingest. errors=
+            # "replace" keeps a page with a stray undecodable byte usable rather
+            # than losing the OCR entirely.
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except (subprocess.SubprocessError, OSError) as exc:

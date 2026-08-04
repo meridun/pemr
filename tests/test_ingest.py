@@ -1,6 +1,7 @@
 """Document ingest: hashing, content-addressed blob store, layer-1 dedup."""
 
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -113,6 +114,61 @@ def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "tesseract" in capsys.readouterr().err
+
+
+# --- OCR output decoding (issue #64) ------------------------------------------
+#
+# Tesseract emits UTF-8. `subprocess.run(..., text=True)` with no explicit
+# encoding decodes the pipe with the *platform default* codepage — cp1252 on
+# Windows — inside subprocess's reader thread, so any byte invalid there
+# (0x81/0x8D/0x8F/0x90/0x9D) raised UnicodeDecodeError and failed the ingest.
+
+# 0xC3 0x8D ("Í") lands a 0x8D on the wire: undefined in cp1252, decodes fine as UTF-8.
+# Names the fixture's owner so the #61 owner check passes and the round-trip test
+# exercises decoding rather than refusal.
+OCR_UTF8 = "Patient: Jane Doe — 20 µg/dL — MARTÍNEZ CLINIC".encode("utf-8")
+
+
+def _fake_tesseract(payload: bytes, platform_default: str = "cp1252"):
+    """`subprocess.run` stand-in that decodes the way CPython actually does.
+
+    Mirrors the real contract: with `text=True` and `encoding=None` the pipe is
+    wrapped with the locale's preferred encoding under strict error handling.
+    """
+
+    def _run(argv, capture_output=False, text=False, encoding=None,
+             errors=None, check=False):
+        assert argv[0] == "tesseract"
+        if not text:
+            return subprocess.CompletedProcess(argv, 0, payload, b"")
+        decoded = payload.decode(encoding or platform_default, errors or "strict")
+        return subprocess.CompletedProcess(argv, 0, decoded, "")
+
+    return _run
+
+
+def test_run_ocr_decodes_utf8_under_a_cp1252_platform_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(ingest.subprocess, "run", _fake_tesseract(OCR_UTF8))
+    assert ingest.run_ocr(_make_file(tmp_path)) == OCR_UTF8.decode("utf-8")
+
+
+def test_run_ocr_survives_undecodable_bytes(tmp_path, monkeypatch):
+    """A stray non-UTF-8 byte degrades to U+FFFD, it does not lose the page."""
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        ingest.subprocess, "run", _fake_tesseract(b"scan \xff noise")
+    )
+    assert ingest.run_ocr(_make_file(tmp_path)) == "scan � noise"
+
+
+def test_ocr_text_round_trips_through_ingest(conn, tmp_path, sources, monkeypatch):
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(ingest.subprocess, "run", _fake_tesseract(OCR_UTF8))
+    result = ingest.ingest_document(
+        conn, _make_file(tmp_path), "jane-doe", sources, ocr=True
+    )
+    assert result.document.ocr_text == OCR_UTF8.decode("utf-8")
 
 
 # --- owner verification (issue #61) -------------------------------------------
