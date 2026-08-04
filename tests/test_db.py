@@ -14,6 +14,8 @@ EXPECTED_TABLES = {
     "procedure",
     "appointment",
     "observation",
+    "condition",
+    "allergy",
     "conflict",
     "schema_migrations",
 }
@@ -37,10 +39,15 @@ ALL_MIGRATIONS = [
     "003_fts.sql",
     "004_person_deactivate.sql",
     "005_dedup_occurrence.sql",
+    "006_condition_allergy.sql",
 ]
 
-# Every record table carries the occurrence-family columns (migration 005).
-RECORD_TABLES = ("lab_result", "medication", "procedure", "appointment", "observation")
+# Every record table carries the occurrence-family columns (migration 005; 006's two
+# new tables were born with them).
+RECORD_TABLES = (
+    "lab_result", "medication", "procedure", "appointment", "observation",
+    "condition", "allergy",
+)
 
 
 def test_migrate_creates_all_tables(conn):
@@ -88,6 +95,77 @@ def test_occurrence_defaults_to_zero_for_a_bare_insert(conn):
     )
     row = conn.execute("SELECT dedup_occurrence FROM lab_result").fetchone()
     assert row["dedup_occurrence"] == 0
+
+
+def _migrate_through_005(conn, tmp_path):
+    """Apply every migration up to 005 into a staging dir, leaving 006 pending."""
+    import shutil
+
+    staged = tmp_path / "pre006"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "006":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
+    """The upgrade path (issue #63): rows committed under the old `obs_type` convention
+    land in the typed tables, keep their keys and provenance, and leave `observation`."""
+    _migrate_through_005(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.executemany(
+        "INSERT INTO observation (person_id, obs_type, observed_at, key, value_text, "
+        "dedup_key, dedup_base) VALUES (1, ?, ?, ?, ?, ?, ?)",
+        [
+            ("allergy", "2010-01-01", "Penicillin", "rash", "k-allergy", "k-allergy"),
+            ("condition", "2024-01-01", "Type 2 Diabetes", "dx by PCP", "k-cond", "k-cond"),
+            ("vital", "2026-01-01", "weight", None, "k-vital", "k-vital"),
+        ],
+    )
+    conn.commit()
+
+    assert db.migrate(conn) == ["006_condition_allergy.sql"]
+
+    a = conn.execute("SELECT * FROM allergy").fetchone()
+    assert (a["substance"], a["reaction"], a["noted_on"]) == (
+        "Penicillin", "rash", "2010-01-01")
+    assert a["dedup_key"] == "k-allergy" and a["dedup_base"] == "k-allergy"
+    c = conn.execute("SELECT * FROM condition").fetchone()
+    assert (c["name"], c["note"], c["onset_on"]) == (
+        "Type 2 Diabetes", "dx by PCP", "2024-01-01")
+    assert c["status"] == "active"       # the honest reading: the old convention had none
+    assert c["dedup_key"] == "k-cond"
+
+    # The vital stays behind; the two moved rows are gone from `observation`.
+    left = [r["obs_type"] for r in conn.execute("SELECT * FROM observation")]
+    assert left == ["vital"]
+
+    # FTS follows them (the triggers are created before the move, so no backfill).
+    hits = {
+        (r["source_table"], r["source_id"])
+        for r in conn.execute(
+            "SELECT source_table, source_id FROM record_fts WHERE record_fts MATCH ?",
+            ("Penicillin OR Diabetes",),
+        )
+    }
+    assert hits == {("allergy", 1), ("condition", 1)}
+
+
+def test_migration_006_keeps_keyless_rows_in_observation(conn, tmp_path):
+    """A legacy row with no `key` has no allergen/problem name, and `substance`/`name`
+    are NOT NULL - it stays put for a human rather than being dropped."""
+    _migrate_through_005(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO observation (person_id, obs_type, value_text, dedup_key, dedup_base) "
+        "VALUES (1, 'allergy', 'unspecified reaction', 'k1', 'k1')"
+    )
+    conn.commit()
+    db.migrate(conn)
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 1
 
 
 def test_multi_statement_migration_rolls_back_partial_ddl(conn, tmp_path):
