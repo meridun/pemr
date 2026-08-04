@@ -20,6 +20,11 @@ dependencies): a pre-write refusal of Google Drive **pointer stubs** (see
 :func:`is_pointer_stub`) and a text-extraction dispatcher (:func:`extract_text`) so
 `.txt`/`.docx`/`.xlsx` and friends become findable instead of landing as opaque blobs.
 
+Issue #70 closes that dispatcher's last hole, **PDFs**. They fall through to
+:func:`run_ocr`, and tesseract cannot decode a PDF at all (its Leptonica backend has
+no PDF reader), so every PDF ingest used to store an empty `ocr_text`. See
+:func:`_ocr_pdf`.
+
 Issue #69 adds a second entry point, :func:`ingest_study_dir`: a DICOM study
 *directory* becomes one document whose blob is a canonical zip of its slices (see
 :mod:`pemr.study`). It reuses every rail above — same person lookup, same layer-1
@@ -30,6 +35,7 @@ owner check, fed by the study's ``PatientName``/``PatientBirthDate`` header tags
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -116,13 +122,190 @@ def _relative_source_path(sha: str, ext: str) -> str:
     return f"{sha[:2]}/{sha}{ext}"
 
 
-def run_ocr(path: str | Path) -> str | None:
-    """Best-effort OCR via a system `tesseract` binary. Soft dependency:
+# --------------------------------------------------------------------------- #
+# PDF text (issue #70).
+#
+# `tesseract scan.pdf stdout` fails outright — "Error in pixReadStream: Pdf reading
+# is not supported" — so the `--ocr` path extracted *nothing* from a PDF, searchable
+# or scanned, and said so only through a generic failure note. The fix is two-part
+# and per page: use the embedded text layer where there is one, rasterize and OCR
+# where there isn't.
+#
+# The PDF backend (PyMuPDF) is an **optional extra** (`pip install pemr[ocr]`), lazily
+# imported and degrading to a stderr note when absent — the same soft-dependency
+# stance the tesseract integration already takes. `_load_pdf_backend` is the single
+# place the backend choice lives (and the monkeypatch seam the tests use, so neither
+# PyMuPDF nor tesseract is needed to run the suite).
+# --------------------------------------------------------------------------- #
 
-    returns None (with a stderr note) when tesseract is unavailable instead of
-    failing the ingest. Only sensible for flat image scans; callers pass this
-    through as `ocr_text` for the agent to work from.
+# 300 dpi is tesseract's documented sweet spot for small print; grayscale buys back
+# most of the cost of 300-over-200 with no accuracy loss on text.
+OCR_DPI = 300
+
+# Runtime guard, not a correctness one: a 400-page bundle would otherwise spend
+# minutes in tesseract at ingest. Over the cap, the first `OCR_MAX_PAGES` are read and
+# a stderr note names the shortfall.
+OCR_MAX_PAGES = 20
+
+# A page needs this much text-layer text to skip OCR. Not `> 0`: scanned PDFs commonly
+# carry a stray stamp or watermark character, and a couple of those must not suppress
+# OCR of an otherwise-image page.
+PDF_TEXT_LAYER_MIN_CHARS = 20
+
+# tesseract's own multi-page separator. Page provenance stays recoverable by splitting,
+# and FTS5's unicode61 tokenizer treats it as a separator, so — unlike a "[page 2]"
+# marker — it can never produce a false `find` hit.
+_PAGE_SEPARATOR = "\f"
+
+# What a PDF backend may raise on a malformed/truncated file. PyMuPDF's own errors
+# (FileDataError, FileNotFoundError) subclass RuntimeError. Extraction is best-effort:
+# any of these degrades to "no ocr_text", never a lost document.
+_PDF_ERRORS = (RuntimeError, ValueError, OSError, TypeError, IndexError, KeyError)
+
+
+def _load_pdf_backend():
+    """The PDF backend module, or ``None`` when the ``pemr[ocr]`` extra isn't installed.
+
+    `pymupdf` is the modern import name; `fitz` is the same package on older wheels.
+    Kept as a one-liner seam so swapping the backend (e.g. to `pypdfium2`, if pemr is
+    ever distributed and PyMuPDF's AGPL matters) stays a local change — and so tests
+    can monkeypatch a fake in.
     """
+    for name in ("pymupdf", "fitz"):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    return None
+
+
+def _tesseract_stderr_tail(exc: BaseException) -> str:
+    """Last non-empty line of a failed tesseract run's stderr ("" when there is none).
+
+    Worth surfacing because tesseract explains itself there and the exception's own
+    `str()` does not: 501 documents in one batch stored empty `ocr_text` while the one
+    line that named the cause ("Pdf reading is not supported") was captured and
+    dropped.
+    """
+    raw = getattr(exc, "stderr", None)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    if not raw:
+        return ""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _ocr_page_image(png: bytes, label: str) -> str | None:
+    """OCR one rendered page. PNG bytes go in over stdin — no temp files to clean up."""
+    try:
+        proc = subprocess.run(
+            ["tesseract", "stdin", "stdout"],
+            input=png,
+            capture_output=True,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        detail = _tesseract_stderr_tail(exc)
+        print(
+            f"note: tesseract OCR failed on {label} ({exc}"
+            f"{': ' + detail if detail else ''})",
+            file=sys.stderr,
+        )
+        return None
+    # Bytes in, bytes out: decode explicitly rather than letting `text=True` pick the
+    # platform codepage (issue #64 — cp1252 on Windows crashes on tesseract's UTF-8).
+    return proc.stdout.decode("utf-8", errors="replace").strip() or None
+
+
+def _ocr_pdf(src: Path) -> str | None:
+    """Text of a PDF: embedded text layer per page, OCR of a rendered page otherwise.
+
+    Per page rather than per document, so a scan appended to a searchable report is
+    still read. Never raises — an encrypted or unparseable PDF is a stderr note and
+    ``None``, the same warning-not-error contract :func:`run_ocr` already has.
+    """
+    backend = _load_pdf_backend()
+    if backend is None:
+        print(
+            "note: --ocr on a PDF needs the PDF backend; install it with "
+            "`pip install pemr[ocr]`. Storing document without ocr_text",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        doc = backend.open(str(src))
+    except _PDF_ERRORS as exc:
+        print(
+            f"note: could not read PDF {src.name} ({exc}); storing without ocr_text",
+            file=sys.stderr,
+        )
+        return None
+
+    pages: list[str] = []
+    # None = not looked yet. Deferred on purpose: a fully searchable PDF needs no
+    # tesseract at all and must not draw a "tesseract is not on PATH" note.
+    have_tesseract: bool | None = None
+    try:
+        if getattr(doc, "needs_pass", False):
+            print(
+                f"note: {src.name} is password-protected; storing without ocr_text",
+                file=sys.stderr,
+            )
+            return None
+        total = doc.page_count
+        if total > OCR_MAX_PAGES:
+            print(
+                f"note: {src.name} has {total} pages; storing text for the first "
+                f"{OCR_MAX_PAGES} only",
+                file=sys.stderr,
+            )
+        for index in range(min(total, OCR_MAX_PAGES)):
+            label = f"{src.name} page {index + 1}"
+            try:
+                page = doc[index]
+                text = (page.get_text() or "").strip()
+                if len(text) < PDF_TEXT_LAYER_MIN_CHARS:
+                    if have_tesseract is None:
+                        have_tesseract = shutil.which("tesseract") is not None
+                        if not have_tesseract:
+                            print(
+                                "note: --ocr requested but `tesseract` is not on "
+                                "PATH; storing document without ocr_text",
+                                file=sys.stderr,
+                            )
+                    if have_tesseract:
+                        pixmap = page.get_pixmap(
+                            dpi=OCR_DPI, colorspace=backend.csGRAY
+                        )
+                        text = _ocr_page_image(pixmap.tobytes("png"), label) or text
+            except _PDF_ERRORS as exc:
+                print(
+                    f"note: could not read {label} ({exc}); skipping that page",
+                    file=sys.stderr,
+                )
+                continue
+            if text:
+                pages.append(text)
+    finally:
+        doc.close()
+    return _PAGE_SEPARATOR.join(pages).strip() or None
+
+
+def run_ocr(path: str | Path) -> str | None:
+    """Best-effort document text for `--ocr`. Soft dependencies throughout:
+
+    returns None (with a stderr note) when a needed tool is unavailable instead of
+    failing the ingest. A PDF goes to :func:`_ocr_pdf` (text layer per page, rendered
+    + OCR'd where there is none); everything else is handed to a system `tesseract`,
+    which is only sensible for flat image scans. Callers pass the result through as
+    `ocr_text` for the agent to work from.
+    """
+    src = Path(path)
+    if src.suffix.lower() == ".pdf":
+        # tesseract cannot decode a PDF at all, so this is a different pipeline, not
+        # a tweak to the one below.
+        return _ocr_pdf(src)
     if shutil.which("tesseract") is None:
         print(
             "note: --ocr requested but `tesseract` is not on PATH; "
@@ -146,8 +329,12 @@ def run_ocr(path: str | Path) -> str | None:
             check=True,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        print(f"note: tesseract OCR failed ({exc}); storing without ocr_text",
-              file=sys.stderr)
+        detail = _tesseract_stderr_tail(exc)
+        print(
+            f"note: tesseract OCR failed ({exc}"
+            f"{': ' + detail if detail else ''}); storing without ocr_text",
+            file=sys.stderr,
+        )
         return None
     text = proc.stdout.strip()
     return text or None
@@ -283,9 +470,11 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     thing `ocr=True` did before this dispatcher existed. Deliberately not a suffix
     allowlist: image extensions vary far too widely (`.jfif`, `.jpe`, extension-less
     scans) for one to be safe, and silently skipping a scan that used to OCR is the
-    worse failure — it drops the document out of `find` with no signal. When tesseract
-    declines (absent, failed, or no text — e.g. `.pdf`, `.rtf`, `.msg`, `.doc`) the
-    caller gets ``None`` plus a stderr note pointing at `--ocr-text-file`.
+    worse failure — it drops the document out of `find` with no signal. `.pdf` takes
+    its own branch inside `run_ocr` (issue #70) rather than reaching tesseract, which
+    cannot decode one. When that pass declines (tool absent, failed, or no text — e.g.
+    `.rtf`, `.msg`, `.doc`, or a PDF with no `pemr[ocr]` extra installed) the caller
+    gets ``None`` plus a stderr note pointing at `--ocr-text-file`.
 
     The route matters to the caller because the #61 owner check reads identity
     *anchors* (`Patient`, `DOB`, `MRN`) as "this document names somebody". That
@@ -729,8 +918,9 @@ def ingest_document(
     ``ocr_text`` is caller-supplied document text (the agent's own transcription —
     the `AGENTS.md` default path, which beats tesseract on messy scans). When
     provided it wins; otherwise ``ocr=True`` runs a best-effort
-    :func:`extract_text_routed` pass (native for text/OOXML, tesseract for everything
-    else — issue #66).
+    :func:`extract_text_routed` pass (native for text/OOXML, issue #66; everything
+    else through :func:`run_ocr` — tesseract on images, text layer + rendered-page
+    OCR on PDFs, issue #70).
     An empty/whitespace-only string is treated as absent. Populating text here
     is what makes a document findable via FTS (`find`), so it is a warning-not-error
     when it ends up empty — see :attr:`IngestResult.ocr_text_populated`.

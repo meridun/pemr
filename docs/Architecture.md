@@ -383,19 +383,29 @@ can't get subtly wrong. That's the whole point of lifting them out.
 
 Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text to work
 from instead of re-reading the source every time. It extracts by whatever route the file
-type allows, all stdlib (the engine has no runtime dependencies):
+type allows (issue #66), with only the image and PDF routes reaching outside the stdlib:
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
 parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
-allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Formats
-tesseract can't read need a third-party parser and are deliberately out: `.rtf`, `.msg`,
-`.doc`, and **`.pdf` in any form** — tesseract 5 does not accept PDF input at all, so a
-scanned PDF is no better off than a text-layer one. For those you get a stderr note
-telling you to transcribe it yourself and pass `--ocr-text-file` (or rasterize the PDF to
-an image first). Extraction is best-effort and never fatal; a malformed file costs you the
-text, not the document. It is capped at 32 MiB per file — `ocr_text` is mirrored into the
-FTS index, so an unbounded read is both a database-size problem and a decompression-bomb
-surface (a small `.docx` can declare a gigabyte of `word/document.xml`). `--ocr tesseract`
-is a retained alias for `--ocr auto`.
+allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image.
+
+`.pdf` takes its own branch inside `run_ocr` (issue #70), because `tesseract` alone cannot
+read a PDF at all — its Leptonica backend has no PDF decoder, so a scanned PDF is no better
+off than a text-layer one. Instead a PDF is read page by page: a page with an embedded text
+layer (≥ 20 characters) contributes it verbatim; a page without one is rendered at 300 dpi
+grayscale and OCR'd. The decision is per *page*, so a scan appended to a searchable report is
+still read. Pages are joined by a form feed (`\f`) — tesseract's own page separator, and a
+token separator to FTS5, so it can never produce a false `find` hit. At most `OCR_MAX_PAGES`
+(20) pages are read; a longer document gets a stderr note naming the shortfall. The PDF
+backend (PyMuPDF, behind the `_load_pdf_backend()` seam in `ingest.py`) is the optional
+`pip install pemr[ocr]` extra; without it a PDF stores no text and says so on stderr.
+
+Formats that need a third-party parser are still deliberately out — `.rtf`, `.msg`, `.doc`.
+For those you get a stderr note telling you to transcribe it yourself and pass
+`--ocr-text-file`. Every route is best-effort and never fatal; a malformed file, an absent
+`tesseract`, and a missing PDF backend all cost you the text, not the document. Extraction is
+capped at 32 MiB per file — `ocr_text` is mirrored into the FTS index, so an unbounded read is
+both a database-size problem and a decompression-bomb surface (a small `.docx` can declare a
+gigabyte of `word/document.xml`). `--ocr tesseract` is a retained alias for `--ocr auto`.
 
 Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
 only to an agent transcription or a tesseract pass, never to natively-extracted text —
