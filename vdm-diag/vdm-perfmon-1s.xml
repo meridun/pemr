@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataCollectorSet>
+	<Status>0</Status>
+	<Duration>0</Duration>
+	<Description>VDM interactive-lag diagnostics: 1-second samples of per-process CPU, disk latency, memory, and run-queue. Binary log (survives process instance churn); convert with relog for analysis.</Description>
+	<DescriptionUnresolved>VDM interactive-lag diagnostics (1s samples)</DescriptionUnresolved>
+	<DisplayName>VDM-Diag</DisplayName>
+	<DisplayNameUnresolved>VDM-Diag</DisplayNameUnresolved>
+	<SchedulesEnabled>-1</SchedulesEnabled>
+	<Keyword>VDM</Keyword>
+	<Keyword>Performance</Keyword>
+	<Name>VDM-Diag</Name>
+	<OutputLocation>C:\PerfLogs\VDM-Diag</OutputLocation>
+	<RootPath>C:\PerfLogs\VDM-Diag</RootPath>
+	<Segment>0</Segment>
+	<SegmentMaxDuration>0</SegmentMaxDuration>
+	<SegmentMaxSize>1024</SegmentMaxSize>
+	<SerialNumber>1</SerialNumber>
+	<StopOnCompletion>0</StopOnCompletion>
+	<SubdirectoryFormat>3</SubdirectoryFormat>
+	<SubdirectoryFormatPattern>yyyyMMdd\-NNNNNN</SubdirectoryFormatPattern>
+	<Task></Task>
+	<TaskRunAsSelf>0</TaskRunAsSelf>
+	<TaskArguments></TaskArguments>
+	<TaskUserTextArguments></TaskUserTextArguments>
+	<UserAccount>SYSTEM</UserAccount>
+	<PerformanceCounterDataCollector>
+		<DataCollectorType>0</DataCollectorType>
+		<Name>VDM-Counters</Name>
+		<FileName>vdm-diag</FileName>
+		<FileNameFormat>1</FileNameFormat>
+		<FileNameFormatPattern>yyyyMMdd\-HHmmss</FileNameFormatPattern>
+		<LogAppend>0</LogAppend>
+		<LogCircular>0</LogCircular>
+		<LogOverwrite>0</LogOverwrite>
+		<LatestOutputLocation></LatestOutputLocation>
+		<DataSourceName></DataSourceName>
+		<SampleInterval>1</SampleInterval>
+		<SegmentMaxRecords>0</SegmentMaxRecords>
+		<LogFileFormat>3</LogFileFormat>
+		<Counter>\Processor(_Total)\% Processor Time</Counter>
+		<Counter>\Process(*)\% Processor Time</Counter>
+		<Counter>\PhysicalDisk(*)\Avg. Disk sec/Read</Counter>
+		<Counter>\PhysicalDisk(*)\Avg. Disk sec/Write</Counter>
+		<Counter>\PhysicalDisk(*)\Current Disk Queue Length</Counter>
+		<Counter>\Memory\Available MBytes</Counter>
+		<Counter>\Memory\Pages/sec</Counter>
+		<Counter>\System\Processor Queue Length</Counter>
+		<Counter>\Network Interface(*)\Bytes Total/sec</Counter>
+		<Counter>\Network Interface(*)\Output Queue Length</Counter>
+	</PerformanceCounterDataCollector>
+</DataCollectorSet>

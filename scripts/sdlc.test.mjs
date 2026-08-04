@@ -4,7 +4,37 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { planClaimVerify, lastUnlabeledAt } from './sdlc.mjs';
+import {
+  STAGES,
+  STAGE_GRAPH,
+  isValidStage,
+  isValidTransition,
+  planClaimVerify,
+  lastUnlabeledAt,
+} from './sdlc.mjs';
+
+// Stage-graph invariants (ported from agentic-sdlc's reference suite). The
+// ship→build edge is load-bearing: ship.md documents BOUNCE → stage:build on
+// code conflicts, and dispatch.md step 0a.3 swaps conflicted ship items back
+// to build — `advance` must accept the documented transition (issue #71 was
+// stranded when the graph rejected it).
+test('STAGE_GRAPH: has a node for every declared stage and vice versa', () => {
+  assert.deepEqual(Object.keys(STAGE_GRAPH).sort(), [...STAGES].sort());
+});
+
+test('STAGE_GRAPH: only points to declared stages', () => {
+  for (const [from, tos] of Object.entries(STAGE_GRAPH)) {
+    for (const to of tos) {
+      assert.equal(isValidStage(to), true, `${from} → ${to}`);
+    }
+  }
+});
+
+test('STAGE_GRAPH: ship has no forward edge — only the conflict bounce to build', () => {
+  assert.deepEqual(STAGE_GRAPH.ship, ['build']);
+  assert.equal(isValidTransition('ship', 'build'), true);
+  assert.equal(isValidTransition('ship', 'verify'), false);
+});
 
 // Regression for issue #13: a formatted EMIT comment (e.g.
 // `**Intake triage: ADVANCE -> stage:queued**`) must NOT be mistaken for

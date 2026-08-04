@@ -206,6 +206,30 @@ def test_ingest_refuses_a_mismatched_owner(seeded, tmp_path, monkeypatch):
     assert "SMITH, KAREN A" in out["owner_check"]["evidence"]
 
 
+def test_ingest_study_directory(seeded, tmp_path, monkeypatch):
+    """Issue #69 through MCP: `study` makes `file` a directory, packed as one document."""
+    from test_study import make_study  # same synthesized fixtures, one definition
+
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    out = mcp_server.ingest_document(
+        seeded, file=str(make_study(tmp_path / "disc")), person="jane-doe",
+        study="dicom",
+    )
+    assert out["status"] == "new"
+    assert out["ocr_text_populated"] is True
+    assert out["document"]["source_path"].endswith(".dcm.zip")
+    assert out["document"]["category"] == "imaging"
+    assert out["document"]["doc_date"] == "2019-04-12"
+
+
+def test_ingest_study_unknown_kind_is_a_tool_error(seeded, tmp_path, monkeypatch):
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    (tmp_path / "disc").mkdir()
+    with pytest.raises(mcp_server.ToolError, match="unknown study kind"):
+        mcp_server.ingest_document(seeded, file=str(tmp_path / "disc"),
+                                   person="jane-doe", study="ct-raw")
+
+
 def test_commit_extraction_via_wrapper(seeded, tmp_path, monkeypatch):
     monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
     scan = tmp_path / "s2.txt"

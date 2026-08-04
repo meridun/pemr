@@ -8,13 +8,15 @@ optional synonym ``dictionary`` and a ``now`` for a deterministic generated-at s
 phase 5's MCP wrapper stays thin. The CLI owns argument parsing and the §5
 stdout/redirect contract; nothing here writes to the DB, ever.
 
+**Conditions and allergies are typed tables**, not observations, since migration 006
+(issue #63): ``condition`` (``name`` + a ``status`` of active/resolved/history/
+family-history, ``onset_on``/``resolved_on``, ``relation`` for a family entry) feeds the
+Active Problems / Past Medical History / Family History sections, and ``allergy``
+(``substance``, ``reaction``, ``criticality``, ``noted_on``) feeds Allergies.
+
 Observation conventions (decided for this phase, documented alongside the dictionary's
 canonical *vital* vocabulary in ``data/dictionary.example.toml``):
 
-  * **conditions** -> ``observation`` rows with ``obs_type='condition'`` (the condition
-    name in ``key``, optional detail in ``value_text``).
-  * **allergies**  -> ``observation`` rows with ``obs_type='allergy'`` (the allergen in
-    ``key``, optional reaction in ``value_text``).
   * **vitals**     -> ``observation`` rows with ``obs_type='vital'`` whose ``key`` is one
     of the dictionary's canonical vital tokens (``blood_pressure``, ``weight`` ...).
     "Latest vitals" is the most recent row per normalized ``key``.
@@ -39,13 +41,17 @@ import sqlite3
 from datetime import datetime
 
 from . import db, query
-from .dedup import key_token
+from .dedup import enum_token, key_token
 
 # Observation obs_type conventions this layer reads (see module docstring).
-OBS_CONDITION = "condition"
-OBS_ALLERGY = "allergy"
 OBS_VITAL = "vital"
 OBS_ORDER = "order"
+
+# `condition.status` buckets, one rendered section each (family history last: it is
+# context about relatives, not the patient's own record).
+CONDITION_ACTIVE = ("active",)
+CONDITION_PAST = ("resolved", "history")
+CONDITION_FAMILY = "family-history"
 
 # Default window for "recent labs" in an appointment brief (last N most recent).
 _BRIEF_RECENT_LABS = 10
@@ -122,6 +128,51 @@ def _observations(conn: sqlite3.Connection, person_id: int, obs_type: str) -> li
     return [dict(r) for r in rows]
 
 
+def _conditions(
+    conn: sqlite3.Connection, person_id: int, statuses: tuple[str, ...] | str
+) -> list[dict]:
+    """Condition rows in one status bucket, ordered by name.
+
+    Filtering happens in Python on :func:`enum_token` rather than in SQL: the column
+    stores the source's verbatim casing (``"Family History"`` validates and is stored as
+    written), so a literal ``WHERE status = 'family-history'`` would silently drop rows.
+    """
+    wanted = {statuses} if isinstance(statuses, str) else set(statuses)
+    rows = conn.execute(
+        "SELECT * FROM condition WHERE person_id = ? ORDER BY name, condition_id",
+        (person_id,),
+    ).fetchall()
+    return [dict(r) for r in rows if enum_token(r["status"]) in wanted]
+
+
+def _allergies(conn: sqlite3.Connection, person_id: int) -> list[dict]:
+    """Allergy rows, ``criticality='high'`` first then alphabetical -- the dangerous ones
+    have to survive a skim of the list."""
+    rows = conn.execute(
+        "SELECT * FROM allergy WHERE person_id = ? ORDER BY substance, allergy_id",
+        (person_id,),
+    ).fetchall()
+    return sorted(
+        (dict(r) for r in rows), key=lambda r: enum_token(r["criticality"]) != "high"
+    )
+
+
+def _condition_line(row: dict, *, past: bool = False) -> str:
+    since = f"  (since {row['onset_on']})" if row["onset_on"] else ""
+    resolved = (
+        f"  (resolved {row['resolved_on']})" if past and row["resolved_on"] else ""
+    )
+    note = f" - {row['note']}" if row["note"] else ""
+    return f"- {row['name']}{since}{resolved}{note}"
+
+
+def _allergy_line(row: dict) -> str:
+    crit = f" [{str(row['criticality']).upper()}]" if row["criticality"] else ""
+    reaction = f" - {row['reaction']}" if row["reaction"] else ""
+    noted = f"  (noted {row['noted_on']})" if row["noted_on"] else ""
+    return f"- {row['substance']}{crit}{reaction}{noted}"
+
+
 def _latest_vitals(
     conn: sqlite3.Connection, person_id: int, dictionary: dict[str, str] | None
 ) -> list[dict]:
@@ -175,7 +226,8 @@ def _open_appointments(
 
 def _row_counts(conn: sqlite3.Connection, person_id: int) -> dict[str, int]:
     counts = {}
-    for table in ("lab_result", "medication", "procedure", "appointment", "observation"):
+    for table in ("lab_result", "medication", "procedure", "appointment",
+                  "observation", "condition", "allergy"):
         counts[table] = conn.execute(
             f"SELECT COUNT(*) AS n FROM {table} WHERE person_id = ?", (person_id,)
         ).fetchone()["n"]
@@ -234,8 +286,9 @@ def render_summary(
     dictionary: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> str:
-    """Markdown master summary for a person: active meds, conditions, allergies, latest
-    vitals, recent abnormal labs, upcoming/open appointments, and any open conflicts --
+    """Markdown master summary for a person: active meds, active problems, past medical
+    history, family history, allergies, orders, latest vitals, recent abnormal labs,
+    upcoming/open appointments, and any open conflicts --
     with a self-identifying header (name, DOB, generated-at, source row counts).
     Read-only.
 
@@ -259,7 +312,8 @@ def render_summary(
         f"- Source rows: labs={counts['lab_result']}, "
         f"medications={counts['medication']}, procedures={counts['procedure']}, "
         f"appointments={counts['appointment']}, "
-        f"observations={counts['observation']}\n"
+        f"observations={counts['observation']}, "
+        f"conditions={counts['condition']}, allergies={counts['allergy']}\n"
     )
 
     meds = query.query_meds(conn, slug, active=True, now=now)
@@ -270,16 +324,18 @@ def render_summary(
         since = f" (since {m['started_on']})" if m["started_on"] else ""
         med_lines.append(f"- {m['name']}{dose}{freq}{since}")
 
-    cond_lines = [
-        f"- {c['key'] or c['value_text'] or '(unspecified)'}"
-        + (f" - {c['value_text']}" if c["key"] and c["value_text"] else "")
-        for c in _observations(conn, person_id, OBS_CONDITION)
+    active_lines = [
+        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE)
     ]
-    allergy_lines = [
-        f"- {a['key'] or a['value_text'] or '(unspecified)'}"
-        + (f" - {a['value_text']}" if a["key"] and a["value_text"] else "")
-        for a in _observations(conn, person_id, OBS_ALLERGY)
+    past_lines = [
+        _condition_line(c, past=True)
+        for c in _conditions(conn, person_id, CONDITION_PAST)
     ]
+    family_lines = [
+        f"- {c['relation'] or 'family'}: {c['name']}"
+        for c in _conditions(conn, person_id, CONDITION_FAMILY)
+    ]
+    allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id)]
     order_lines = [
         f"- {o['key'] or o['value_text'] or '(unspecified)'}"
         + (f" - {o['value_text']}" if o["key"] and o["value_text"] else "")
@@ -308,7 +364,9 @@ def render_summary(
     parts = [
         header,
         _section("Active Medications", med_lines),
-        _section("Conditions", cond_lines),
+        _section("Active Problems", active_lines),
+        _section("Past Medical History", past_lines),
+        _section("Family History", family_lines),
         _section("Allergies", allergy_lines),
         _section("Orders & Referrals", order_lines),
         _section("Latest Vitals", vital_lines),
@@ -335,8 +393,12 @@ def render_brief(
 ) -> str:
     """Markdown walk-in brief for one appointment: the appointment header, current meds,
     recent labs (last N, newest draw first and abnormal-before-normal inside each draw),
-    procedures + observations, and an open-conflicts warning if any
-    staged rows touch this person. Read-only.
+    allergies, active problems, procedures + observations, and an open-conflicts warning
+    if any staged rows touch this person. Read-only.
+
+    Allergies and active problems are their own sections here (issue #63): a brief handed
+    to a clinician that omits allergies is a safety gap, and since migration 006 moved
+    them out of ``observation`` the generic observation loop no longer surfaces them.
 
     Med-interaction flags and suggested questions require external drug knowledge and are
     NOT deterministic engine work (Architecture.md §Open questions); a placeholder section
@@ -426,6 +488,11 @@ def render_brief(
             f"- {_date_part(o['observed_at']) or '(undated)'}  {detail}{val}"
         )
 
+    brief_allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id)]
+    brief_problem_lines = [
+        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE)
+    ]
+
     conflict_lines = _open_conflict_lines(conn, person_id)
 
     interaction = _section(
@@ -443,6 +510,8 @@ def render_brief(
         appt_block,
         _section("Current Medications", med_lines),
         _section(f"Recent Labs (last {recent_labs}, abnormal first)", lab_lines),
+        _section("Allergies", brief_allergy_lines),
+        _section("Active Problems", brief_problem_lines),
         _section("Procedures & Observations", ctx_lines),
         _section("Open Conflicts", conflict_lines, empty="_none_"),
         interaction,

@@ -83,16 +83,14 @@ report's verbatim label.
   edit for you to make in the payload.
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. Observation rows — conditions, allergies, vitals, orders, screenings, immunizations
+### 2. Observation rows — vitals, orders, screenings, immunizations
 
-`render_summary` populates its **Conditions**, **Allergies**, **Orders & Referrals**, and **Latest
-Vitals** sections purely from `observation` rows, keyed by `obs_type`. An extraction that omits them
-leaves those sections permanently `_none recorded_`, so a visit note carrying a diagnosis, allergy,
-vital reading, or non-medication order MUST commit the matching `observation` rows in
-`commit_extraction`:
+`render_summary` populates its **Orders & Referrals** and **Latest Vitals** sections purely from
+`observation` rows, keyed by `obs_type`. An extraction that omits them leaves those sections
+permanently `_none recorded_`, so a visit note carrying a vital reading or a non-medication order
+MUST commit the matching `observation` rows in `commit_extraction`. (Conditions and allergies are
+**no longer observations** — they are typed rows, see §3.)
 
-- **Condition** → `obs_type='condition'`, `key=<condition name>`, optional `value_text=<detail>`.
-- **Allergy** → `obs_type='allergy'`, `key=<allergen>`, optional `value_text=<reaction>`.
 - **Vital** → `obs_type='vital'`, `key=<canonical vital token>` (below), the reading in `value_num`
   (+ `unit`) or `value_text`. "Latest vitals" is the most recent `vital` row per normalized `key`.
 - **Order** → `obs_type='order'`, `key=<item/order name>`, optional `value_text=<instructions
@@ -130,7 +128,41 @@ the sole evidence of last-done** (no administration record to capture). Don't do
 event as both. Canonical screening/vaccine vocabulary is owned by the care-gap phase — for now emit
 sensible `snake_case` tokens (same discipline as vitals) and let `dedup.norm()` handle case/spacing.
 
-### 3. OCR text at ingest
+### 3. Allergy and condition rows (typed, not observations)
+
+`allergy` and `condition` are **first-class record types** (migration 006), not `obs_type` values —
+the generic `observation` shape has one date and no criticality, so it could not hold a resolved
+problem or a machine-readable allergy severity. `render_summary` feeds its **Active Problems**,
+**Past Medical History**, **Family History** and **Allergies** sections from them, so a visit note
+carrying a diagnosis or an allergy MUST commit these rows:
+
+- **Allergy** → `allergy` with `substance=<allergen>` (required), optional `reaction`,
+  `criticality` ∈ {`high`, `low`, `unable-to-assess`}, and `noted_on` (ISO date). Emit
+  `criticality` whenever the source states one — it is what sorts a dangerous allergen to the top
+  of the list, and free-text severity buried in `reaction` cannot do that.
+- **Condition** → `condition` with `name=<condition name>` and `status` (both required), optional
+  `onset_on` / `resolved_on` (ISO dates), `relation`, and `note=<free-text detail>`.
+  `status` is a closed vocabulary — a value outside it is rejected:
+  - `active` — a current problem-list entry;
+  - `resolved` — a past problem with an end (set `resolved_on` when the source gives one);
+  - `history` — a past-medical-history line with no stated resolution date;
+  - `family-history` — a **relative's** diagnosis.
+- A family-history item MUST carry `status='family-history'` and the relative in `relation`
+  (`mother`, `father`, `sibling`, ... free text) — **never** an `active` condition row. The subject
+  is part of the dedup key, so this is what keeps a mother's diabetes out of the patient's own
+  problem list; miscommitting it there is a clinical-safety error, not a cosmetic one.
+- Both are **standing facts**: their dedup keys are date-free, so restating the same allergen or
+  problem across documents collapses to one row. A stated disagreement (`penicillin: rash` vs
+  `penicillin: anaphylaxis`, or `active` -> `resolved`) stages a **conflict** for human
+  adjudication (§5); a field the new document simply doesn't mention is silence, not a change, and
+  never conflicts. Do not "helpfully" restate a value the source omitted.
+- Silence only reads that way in one direction. A field the new document **does** state over a
+  stored NULL is new information with nothing to adjudicate: it fills the stored row in place and
+  the commit reports it as `enriched` rather than `duplicate`. So emit every field the source
+  states even for an allergen or problem you know is already on file — a terse first document
+  followed by a detailed one is the normal case, and this is what makes the detail land.
+
+### 4. OCR text at ingest
 
 Every `ingest` MUST end with `document.ocr_text` populated. This is what makes a document visible
 to `find` (FTS5); an ingest without it is silently unsearchable.
@@ -138,12 +170,32 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Default path: agent-supplied transcription.** You already read the document to extract from it;
   pass that text as the `ocr_text` tool param (CLI: `--ocr-text-file <path>`). A vision transcript
   beats tesseract on messy scans.
-- **Fallback:** `ocr=true` (tesseract) only when you cannot read the file type yourself.
+- **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
+  It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
+  `.docx`/`.xlsx` parsed from their OOXML, everything else (images, unknown suffixes)
+  through tesseract. A `.pdf` is read page by page — embedded text layer where there is one, a
+  300-dpi render OCR'd where there isn't (first 20 pages, joined by `\f`); that route needs the
+  optional `pip install pemr[ocr]` extra, and without it a PDF stores no text and says so on
+  stderr. `.rtf`, `.msg` and `.doc` have no route at all: you get a stderr note, and must
+  transcribe those yourself. Extraction is also capped at 32 MiB per file.
+- **Pointer stubs are refused.** A `.gsheet`/`.gdoc` from a synced Drive folder is a ~1 KB JSON
+  link, not the document; `ingest` fails pre-write. Export it from Drive and ingest the export.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
 - **Remediation:** call `document_set_text(document_id, text)`. Re-ingesting will not work — the
   layer-1 content hash matches, so `ingest` returns the existing document and writes nothing.
+
+**Study directories** (`ingest(file=<dir>, study="dicom")` — a burned imaging disc, ingested as one
+document). The engine seeds `ocr_text` with a derived summary (modality, study date, per-series
+slice counts), so `ocr_text_populated` is already true and the study is findable. That is a floor,
+not the contract met: if the disc or the portal carries the **radiology report**, transcribe it and
+pass it as `ocr_text` — it replaces the summary and is the only text that carries findings. The
+report often ships as a PDF beside the slices; it is not packed into the study (the engine names
+what it dropped), so ingest it as its own document too. Owner verification below applies to
+studies as well, but reads the disc's own `PatientName`/`PatientBirthDate` header tags — *not*
+the derived summary, which is engine output and names nobody. Those tags are never stored, so
+they will not appear in `document_show` text or `find` hits.
 
 **Owner verification.** Because you supply the text, you are the primary consumer of the
 ingest-time owner check: it scans that text for the claimed person's name/DOB and returns
@@ -151,15 +203,21 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 *different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
 `unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
-**refuse the ingest** before anything is written.
+**refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
+the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
+— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set — because in a
+structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
+route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
+with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /
+`--ocr-text-file` (the default path above) and keep the check. `mismatch` holds on every route.
 
 - On a refusal, the agent MUST surface the verdict and the `evidence` snippet to the human and get
   an **explicit go-ahead** before retrying with `force=true`. Never force on your own judgment.
-- Unlike §4 conflict resolution, this is not mechanically gated on a `signoff` param. The
+- Unlike §5 conflict resolution, this is not mechanically gated on a `signoff` param. The
   asymmetry is deliberate: a wrongly-forced ingest is recoverable (`pemr document reassign`),
   whereas a wrongly-resolved conflict destroys the losing value.
 
-### 4. Conflict discipline
+### 5. Conflict discipline
 
 Agents never resolve staged conflicts silently.
 
@@ -172,7 +230,7 @@ Agents never resolve staged conflicts silently.
   text with the resolution.
 - `keep both` is the odd one out: it **admits a row** rather than choosing between two. Use it only
   for a genuine repeat the source cannot distinguish — two same-day draws on a report that prints
-  no collection times (see §6). It inserts the incoming row alongside the stored one as the next
+  no collection times (see §7). It inserts the incoming row alongside the stored one as the next
   *occurrence* of that identity; a later re-commit of that same payload then dedups against it. If
   the source *did* give distinct times and the extraction dropped them, the fix is a corrected
   extraction, not `keep both`.
@@ -183,11 +241,16 @@ Agents never resolve staged conflicts silently.
   identity was removed in the meantime (the source document was deleted or reassigned), it is
   **refused** — never silently applied to nothing. Report the refusal to the human; `keep both`
   admits the staged row as a fresh record if they want the value kept.
+- On the standing-fact types (§3) `keep incoming` overwrites only the fields the incoming row
+  actually states — an unstated field there means "this document didn't say", so adjudicating one
+  disagreement (`criticality: high` vs `low`) does not also erase a `reaction` the incoming
+  document simply didn't repeat. On the dated types an unstated field IS a clearing and is written
+  as one.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
   that is an extraction error, not a conflict. Re-read the source for collection times; if there
   genuinely are none, submit them separately and ask the human about `keep both`.
 
-### 5. Medication-interaction section
+### 6. Medication-interaction section
 
 `render_brief` emits a placeholder **"Medication Interaction Review"** section for the agent layer
 to fill. The engine deliberately does not compute this: an external drug-interaction API would send
@@ -204,16 +267,16 @@ The agent fills it **from its own general knowledge**, under fixed framing it MU
 The agent MUST NEVER: claim safety or the absence of interactions, give dosing advice, or recommend
 starting, stopping, or changing a medication.
 
-### 6. Date precision
+### 7. Date precision
 
 Every date field (`collected_at`, `started_on`, `ended_on`, `performed_on`, `scheduled_for`,
-`observed_at`) accepts an ISO prefix at **three precisions**: full `YYYY-MM-DD` (optionally + a
+`observed_at`, `noted_on`, `onset_on`, `resolved_on`) accepts an ISO prefix at **three precisions**: full `YYYY-MM-DD` (optionally + a
 `T`/space time), month `YYYY-MM`, or year `YYYY`. Emit the **most precise prefix the source
 supports** — a full date when the document gives one, else `YYYY-MM`, else `YYYY` — never invent a
 day or month the source didn't state, and never fall back to stashing an imprecise date elsewhere.
 
 - e.g. a prior surgery cited only as "03/2019" commits as `procedure.performed_on = "2019-03"`,
-  not stashed in a condition observation's `value_text`.
+  not stashed in a `condition.note`.
 - A time component is only valid with a full date (`2026-03T09:00` is rejected).
 - Non-ISO forms (`06/15/2026`, `2026-13`, `2026-3`, `Jan 2026`) are still rejected — reformat to an
   ISO prefix first.
@@ -221,7 +284,7 @@ day or month the source didn't state, and never fall back to stashing an impreci
   guesses that one refines the other); reconciling them is a human conflict-review action.
 - Date-only precision is also why two genuine same-day results collide: they derive one key, so the
   second stages a conflict. Emitting a time you invented is never the fix — the recovery path is
-  `keep both` under human sign-off (§4).
+  `keep both` under human sign-off (§5).
 
 ## Privacy posture
 

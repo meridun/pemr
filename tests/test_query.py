@@ -61,6 +61,15 @@ def seeded(tmp_path):
             {"obs_type": "blood_pressure", "observed_at": "2025-07-01",
              "key": "systolic", "value_num": 128, "unit": "mmHg"},
         ],
+        "condition": [
+            {"name": "Anemia", "status": "resolved", "onset_on": "2022-05-01",
+             "resolved_on": "2023-08-01"},
+            {"name": "Breast Cancer", "status": "family-history", "relation": "mother",
+             "onset_on": "2001-01-01"},
+        ],
+        "allergy": [
+            {"substance": "Penicillin", "reaction": "rash", "noted_on": "2010-01-01"},
+        ],
     }, d)
 
     doc2 = _doc(conn, "john-doe", ocr="unrelated note")
@@ -202,6 +211,25 @@ def test_timeline_merge_ordering_and_since(seeded):
     since = query.query_timeline(seeded, "jane-doe", since="2026-01-01")
     assert all(e["date"] >= "2026-01-01" for e in since)
     assert len(since) < len(events)
+
+
+def test_timeline_includes_conditions_and_allergies(seeded):
+    """Conditions contribute up to two events (onset + resolution) and allergies one,
+    so the journal keeps them after they left `observation` (issue #63)."""
+    events = query.query_timeline(seeded, "jane-doe")
+    by_type = {e["type"]: e for e in events}
+    assert by_type["condition"]["date"] == "2022-05-01"
+    assert by_type["condition"]["summary"] == "Anemia (resolved)"
+    assert by_type["condition-resolved"]["date"] == "2023-08-01"
+    assert by_type["condition-resolved"]["summary"] == "resolved Anemia"
+    assert by_type["allergy"]["summary"] == "Penicillin allergy"
+
+
+def test_timeline_excludes_family_history(seeded):
+    """A relative's onset date is not an event in this patient's chronology."""
+    events = query.query_timeline(seeded, "jane-doe")
+    assert not any("Breast Cancer" in e["summary"] for e in events)
+    assert not any(e["date"] == "2001-01-01" for e in events)
 
 
 def test_timeline_carries_provenance(seeded):

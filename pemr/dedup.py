@@ -83,6 +83,24 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
         "value_text": (str, False),
         "unit": (str, False),
     },
+    # Promoted out of `observation` by migration 006 (issue #63): both carry fields the
+    # generic shape has no legal home for (two dates on a resolved problem; an allergy's
+    # machine-readable criticality) and both need a subject discriminator in the key so a
+    # relative's diagnosis never dedups into the patient's own problem list.
+    "allergy": {
+        "substance": (str, True),
+        "reaction": (str, False),
+        "criticality": (str, False),
+        "noted_on": (str, False),
+    },
+    "condition": {
+        "name": (str, True),
+        "status": (str, True),
+        "onset_on": (str, False),
+        "resolved_on": (str, False),
+        "relation": (str, False),
+        "note": (str, False),
+    },
 }
 
 KNOWN_TYPES = tuple(FIELD_SPECS)
@@ -101,6 +119,22 @@ DATE_FIELDS: dict[str, frozenset[str]] = {
     "procedure": frozenset({"performed_on"}),
     "appointment": frozenset({"scheduled_for"}),
     "observation": frozenset({"observed_at"}),
+    "allergy": frozenset({"noted_on"}),
+    "condition": frozenset({"onset_on", "resolved_on"}),
+}
+
+# Closed vocabularies per record type, enforced by validate_row right after the
+# DATE_FIELDS check. Only fields the read layer *branches on* belong here: a typo'd
+# `condition.status='inactive'` would vanish from every rendered section rather than
+# show up wrong, which is the failure mode worth a hard reject. Membership is tested on
+# :func:`enum_token` (case/space/underscore/hyphen-insensitive) but the **verbatim**
+# value is stored, mirroring how `_norm_unit` compares case-insensitively while display
+# casing survives.
+ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
+    "allergy": {"criticality": frozenset({"high", "low", "unable-to-assess"})},
+    "condition": {
+        "status": frozenset({"active", "resolved", "history", "family-history"})
+    },
 }
 
 _WS = re.compile(r"\s+")
@@ -299,6 +333,21 @@ def key_token(value: object, dictionary: dict[str, str] | None = None) -> str:
     return f"{canonical} ({qualifier})"
 
 
+def enum_token(value: object) -> str:
+    """Canonical comparison form of an :data:`ENUM_FIELDS` value.
+
+    Case-, space-, underscore- and hyphen-insensitive: ``"Unable to Assess"``,
+    ``"unable_to_assess"`` and ``"unable-to-assess"`` all reduce to
+    ``unable-to-assess``, so a source's own casing/punctuation validates while the
+    verbatim value is what gets stored. Also the comparison the read layer uses when it
+    branches on a stored ``status`` (render sections, timeline) — reading the raw column
+    would miss a row stored as ``"Family History"``.
+    """
+    if value is None:
+        return ""
+    return _collapse(str(value)).replace(" ", "-")
+
+
 def _date_only(value: object) -> str:
     """Date portion of an ISO datetime/date string ('2026-01-02T09:00' -> '2026-01-02')."""
     if value is None:
@@ -360,7 +409,28 @@ def _key_parts(
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
         return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), kt("key")]
+    # allergy/condition are DATE-FREE by design: they are standing facts restated on
+    # every document with inconsistent or absent dates, so a date in the key would fork
+    # one allergy into one row per document. The dates are payload, and a disagreement
+    # in them stages a conflict (issue #63 design).
+    if record_type == "allergy":
+        return [person_id, n("substance")]
+    if record_type == "condition":
+        return [person_id, n("name"), _condition_subject(row, dictionary)]
     raise ValidationError(f"unknown record type: {record_type}")  # guarded by validate()
+
+
+def _condition_subject(row: dict, dictionary: dict[str, str] | None = None) -> str:
+    """Whose condition this is — the discriminator that keeps a relative's diagnosis out
+    of the patient's own problem list.
+
+    ``self`` for every status but ``family-history``, which keys on the relative instead
+    (``family:mother``). Two relatives with the same disease therefore stay distinct rows,
+    and neither collides with the patient's.
+    """
+    if enum_token(row.get("status")) != "family-history":
+        return "self"
+    return "family:" + norm(row.get("relation"), dictionary)
 
 
 def identity_label(
@@ -441,6 +511,12 @@ def validate_row(record_type: str, row: object) -> None:
                 f"(YYYY-MM) or full (YYYY-MM-DD) precision, or a full-date ISO "
                 f"timestamp, got {value!r}"
             )
+        allowed = ENUM_FIELDS.get(record_type, {}).get(name)
+        if allowed is not None and enum_token(value) not in allowed:
+            raise ValidationError(
+                f"{record_type}.{name}: expected one of "
+                f"{', '.join(sorted(allowed))}, got {value!r}"
+            )
 
 
 def _type_names(types: object) -> str:
@@ -457,6 +533,7 @@ def _type_names(types: object) -> str:
 class CommitSummary:
     new: list[tuple[str, int]] = field(default_factory=list)          # (type, row_id)
     duplicate: list[tuple[str, str]] = field(default_factory=list)    # (type, dedup_key)
+    enriched: list[tuple[str, int]] = field(default_factory=list)     # (type, row_id)
     conflict: list[tuple[str, int]] = field(default_factory=list)     # (type, conflict_id)
 
     @property
@@ -464,6 +541,7 @@ class CommitSummary:
         return {
             "new": len(self.new),
             "duplicate": len(self.duplicate),
+            "enriched": len(self.enriched),
             "conflict": len(self.conflict),
         }
 
@@ -482,7 +560,28 @@ _COMPARE_FIELDS: dict[str, list[str]] = {
     "procedure": ["provider", "outcome"],
     "appointment": ["specialty", "reason", "summary"],
     "observation": ["value_num", "value_text", "unit"],
+    "allergy": ["reaction", "criticality", "noted_on"],
+    "condition": ["status", "onset_on", "resolved_on", "relation", "note"],
 }
+
+# Types whose rows are standing facts restated across documents. For these, an absent
+# field means "this document didn't say" — never "the value was cleared" (issue #63).
+# That reading is asymmetric, and both halves matter:
+#
+#   incoming None over a stored value -> silence. Re-ingesting next year's health
+#       summary, which reprints the same 8 allergies but omits criticality, must not
+#       stage 8 conflicts that mean nothing.
+#   stored None under a stated incoming value -> a GAIN, not silence. The document is
+#       supplying a fact the record simply lacked; there is no competing value to
+#       adjudicate, so it is neither a conflict nor a duplicate to drop. The stored
+#       row's NULL columns are filled in place (:func:`_sparse_gains`) and the commit
+#       reports it as `enriched`.
+#
+# Present-and-different still always conflicts, and `condition.status` is required so a
+# lifecycle change (active -> resolved) is never skipped. For the date-keyed types
+# (labs, meds ...) a cleared field IS news, so they keep the strict comparison and can
+# never produce a gain.
+_SPARSE_TYPES = frozenset({"allergy", "condition"})
 
 
 def _stored_fields(record_type: str, row_map: dict) -> dict:
@@ -504,12 +603,20 @@ def _rows_equal(
     rather than a conflicting one — i.e. their payload fields all agree.
 
     ``existing`` is a stored row (or, in the pass-1 intra-payload check, an earlier
-    row of the same submission)."""
+    row of the same submission).
+
+    For a :data:`_SPARSE_TYPES` row this answers "is there anything to *adjudicate*",
+    which is not the same as "is there nothing to write": a field the incoming row
+    states over a stored NULL agrees here but is reported by :func:`_sparse_gains`."""
     existing_map = dict(existing)
+    sparse = record_type in _SPARSE_TYPES
     for name in _COMPARE_FIELDS[record_type]:
         ev = existing_map.get(name)
         iv = incoming.get(name)
         if ev is None and iv is None:
+            continue
+        # Standing facts: one side simply not stating a field is silence, not a change.
+        if sparse and (ev is None or iv is None):
             continue
         # Unit strings are compared case-insensitively so casing variants across
         # documents don't stage a spurious conflict.
@@ -572,6 +679,44 @@ def _assert_no_key_drift(
                 "stored row. Run `pemr rekey --apply` first, then retry; nothing was "
                 "written"
             )
+
+
+def _sparse_gains(
+    record_type: str, existing: sqlite3.Row | dict, incoming: dict
+) -> dict:
+    """Payload fields the incoming row states that the stored row is missing.
+
+    Only :data:`_SPARSE_TYPES` can gain: for every other type a stored NULL under a
+    stated incoming value is a disagreement, so it conflicts and never reaches here.
+    Empty dict = the incoming row adds nothing (a plain duplicate).
+
+    Only NULL columns are filled — a stated value never overwrites a stored one, so
+    enrichment can't launder a disagreement into a silent overwrite (that path still
+    stages a conflict via :func:`_rows_equal`)."""
+    if record_type not in _SPARSE_TYPES:
+        return {}
+    existing_map = dict(existing)
+    return {
+        name: incoming[name]
+        for name in _COMPARE_FIELDS[record_type]
+        if existing_map.get(name) is None and incoming.get(name) is not None
+    }
+
+
+def _enrich_record(
+    conn: sqlite3.Connection, record_type: str, row_id: int, gains: dict
+) -> None:
+    """Fill a stored row's NULL payload columns from a later document's statement.
+
+    ``document_id`` is deliberately left alone: it records which document the row
+    (and its identity) came from, and the identity fields are unchanged here. A row
+    attested by several documents already has this limitation for plain duplicates —
+    enrichment doesn't deepen it."""
+    assignments = ", ".join(f"{name} = ?" for name in gains)
+    conn.execute(
+        f"UPDATE {record_type} SET {assignments} WHERE {record_type}_id = ?",
+        [*gains.values(), row_id],
+    )
 
 
 def commit_extraction(
@@ -662,7 +807,17 @@ def commit_extraction(
                     (f for f in family if _rows_equal(record_type, f, row)), None
                 )
                 if twin is not None:
-                    summary.duplicate.append((record_type, twin["dedup_key"]))
+                    # A standing fact whose stored row lacks a field this document
+                    # states is not a duplicate to drop — fill the NULL in place
+                    # (issue #63). Nothing to adjudicate, so no conflict is staged,
+                    # but the write is reported rather than being invisible.
+                    gains = _sparse_gains(record_type, twin, row)
+                    twin_id = int(twin[f"{record_type}_id"])
+                    if gains:
+                        _enrich_record(conn, record_type, twin_id, gains)
+                        summary.enriched.append((record_type, twin_id))
+                    else:
+                        summary.duplicate.append((record_type, twin["dedup_key"]))
                 else:
                     # Stage against occurrence 0: it is the row the conflict's
                     # dedup_key anchors to, and the reviewer sees the family size.
@@ -798,6 +953,9 @@ class ResolveResult:
     dedup_key: str | None = None
     dedup_base: str | None = None
     no_op: bool = False          # keep-both that matched an existing sibling
+    # Sparse-type fields the matched sibling was missing and the staged payload
+    # supplies; filled in place so a no-op still can't drop stated data (issue #63).
+    gains: dict = field(default_factory=dict)
 
 
 KEEP_CHOICES = ("existing", "incoming", "both")
@@ -868,7 +1026,12 @@ def resolve_conflict(
             _overwrite_record(
                 conn, record_type, int(result.row_id), row["document_id"], incoming
             )
-        elif keep == "both" and not result.no_op:
+        elif keep == "both" and result.no_op:
+            if result.gains:
+                _enrich_record(
+                    conn, record_type, int(result.row_id), result.gains
+                )
+        elif keep == "both":
             result.row_id = _insert_record(
                 conn, record_type, json.loads(row["incoming_json"]),
                 row["person_id"], row["document_id"],
@@ -889,7 +1052,10 @@ def _resolution_text(result: ResolveResult) -> str:
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
-        return f"keep-both (no-op: matches {result.record_type} #{result.row_id})"
+        matched = f"keep-both (no-op: matches {result.record_type} #{result.row_id}"
+        if result.gains:
+            matched += f"; filled {', '.join(sorted(result.gains))}"
+        return matched + ")"
     return (
         f"keep-both -> {result.record_type} #{result.row_id} "
         f"occurrence={result.occurrence} key={(result.dedup_key or '')[:12]}..."
@@ -1019,11 +1185,15 @@ def _plan_keep_both(
     twin = next((f for f in family if _rows_equal(record_type, f, incoming)), None)
     if twin is not None:
         # Two conflicts staged from one payload, both resolved 'both': the second
-        # must not produce a twin row.
+        # must not produce a twin row. On a sparse type the matched sibling may be
+        # strictly thinner than the staged payload (it "matches" because an absent
+        # field is silence); absorbing it would drop the fields the payload adds, so
+        # the no-op still fills those NULLs (issue #63).
         return ResolveResult(
             kept="both", record_type=record_type, row_id=int(twin[pk]),
             occurrence=int(twin["dedup_occurrence"]),
             dedup_key=twin["dedup_key"], dedup_base=twin["dedup_base"], no_op=True,
+            gains=_sparse_gains(record_type, twin, incoming),
         )
 
     # Occurrence numbers are monotonic over the family and never reused, so a removed
@@ -1039,8 +1209,10 @@ def _rekey_label(record_type: str, row: sqlite3.Row) -> str:
     """Short human identifier for a row in `pemr rekey` output ("CL", "Metformin")."""
     if record_type == "lab_result":
         return row["test_name"] or ""
-    if record_type in ("medication", "procedure"):
+    if record_type in ("medication", "procedure", "condition"):
         return row["name"] or ""
+    if record_type == "allergy":
+        return row["substance"] or ""
     if record_type == "appointment":
         return " ".join(p for p in (row["provider"], row["scheduled_for"]) if p)
     return " ".join(p for p in (row["obs_type"], row["key"]) if p)  # observation
@@ -1176,10 +1348,19 @@ def _overwrite_record(
     error, never a silent success - it would discard the incoming row while the
     conflict is marked resolved. The guard only catches *no* row, not the *wrong*
     row; picking the right one is :func:`_conflict_family`'s job.
+
+    On a :data:`_SPARSE_TYPES` row, fields the incoming row does not state are left as
+    stored rather than nulled: for a standing fact an absent field is "this document
+    didn't say", so a single-field adjudication ("criticality: low, not high") must not
+    also erase the reaction and noted_on the incoming document simply didn't repeat
+    (issue #63). Fields it *does* state win, which is what keep-incoming means.
     """
+    sparse = record_type in _SPARSE_TYPES
     assignments = ["document_id = ?"]
     values: list[object] = [document_id]
     for name in _COMPARE_FIELDS[record_type]:
+        if sparse and incoming.get(name) is None:
+            continue
         assignments.append(f"{name} = ?")
         values.append(incoming.get(name))
     values.append(row_id)
