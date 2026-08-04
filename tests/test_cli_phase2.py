@@ -461,3 +461,87 @@ def test_lab_export_with_a_patient_column_is_not_refused(ready, capsys):
 
     assert _run(tmp_path, "find", "--person", "jane-doe", "glucose") == 0
     assert "#1" in capsys.readouterr().out
+def _stage_pre_006(tmp_path):
+    """Copy every migration below 006 into a staging dir (leaving 006 pending)."""
+    import shutil
+
+    staged = tmp_path / "pre006"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "006":
+            shutil.copy(path, staged / path.name)
+    return staged
+
+
+def test_migrate_prints_the_rekey_followup_when_006_moves_rows(tmp_path, capsys):
+    """Migration 006 carries the old observation dedup keys forward (SQL cannot compute
+    the new sha256 ones), so `migrate` has to name the follow-up or a re-commit of an
+    already-stored allergy/condition silently forks a second row (issue #63)."""
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane-doe', 'Jane')")
+    conn.execute(
+        "INSERT INTO observation (person_id, obs_type, key, dedup_key, dedup_base) "
+        "VALUES (1, 'allergy', 'Penicillin', 'k1', 'k1')"
+    )
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+
+    assert _run(tmp_path, "migrate") == 0
+    out = capsys.readouterr().out
+    assert "applied 006_condition_allergy.sql" in out
+    assert "note: run `pemr rekey --apply`" in out and "1 allergy/condition row" in out
+    # ... and it is not repeated on a no-op re-run.
+    assert _run(tmp_path, "migrate") == 0
+    assert capsys.readouterr().out.strip() == "up to date"
+
+
+def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
+    """Nothing moved, nothing to rekey - a note nobody must act on trains people to
+    skip notes."""
+    assert _run(tmp_path, "migrate", "--create") == 0
+    out = capsys.readouterr().out
+    assert "applied 006_condition_allergy.sql" in out
+    assert "note:" not in out
+
+
+def test_keep_both_no_op_line_names_the_fields_it_filled(ready, capsys):
+    """A keep-both no-op on a sparse type still writes: it fills the matched sibling's
+    NULL columns. The operator's line must say so - reporting a clinical write as a bare
+    "no-op" is the invisible-write failure the `enriched` bucket exists to prevent
+    (issue #63). The persisted resolution already names the fields; the CLI line did not.
+    """
+    tmp_path = ready
+    scan = tmp_path / "a.txt"
+    scan.write_bytes(b"allergy list")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    for name, rows in (
+        ("a1", [{"substance": "Latex", "reaction": "hives"}]),
+        ("a2", [{"substance": "Latex", "reaction": "rash", "criticality": "high"}]),
+        ("a3", [{"substance": "Latex", "reaction": "rash"}]),
+    ):
+        payload = _write_json(tmp_path, f"{name}.json", {"allergy": rows})
+        assert _run(tmp_path, "commit-extraction", "--document", "1",
+                    "--json", str(payload)) == 0
+    capsys.readouterr()
+
+    # Admit the thin "rash" row first, so the rich one then matches a sibling missing
+    # exactly the field the promotion was about.
+    assert _run(tmp_path, "review-conflicts", "--resolve", "2", "--keep", "both") == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both") == 0
+    out = capsys.readouterr().out
+    assert "no-op" in out and "filled criticality" in out
+    assert out.isascii()
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        stored = conn.execute(
+            "SELECT reaction, criticality FROM allergy WHERE reaction = 'rash'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (stored["reaction"], stored["criticality"]) == ("rash", "high")

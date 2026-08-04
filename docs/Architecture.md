@@ -39,6 +39,7 @@ pemr/
     db.py                      # connection, migrations runner, pragmas (WAL, foreign_keys)
     models.py                  # dataclasses / typed row shapes
     ingest.py                  # document intake, hashing, staging
+    study.py                   # study directories -> one canonical-zip blob (§4)
     dedup.py                   # content-hash + semantic-key matching
     query.py                   # canned + ad-hoc read queries
     render.py                  # generated docs (summary, journal, briefs)
@@ -49,6 +50,7 @@ pemr/
     002_...
   sources/                     # retained original documents (content-addressed)
     <sha256[:2]>/<sha256>.pdf  # dedup-friendly, immutable blob store
+    .tmp/                      # staging for study archives (§4); exclude from cloud sync
   inbox/                       # drop zone for new un-ingested scans
   exports/                     # generated docs (disposable): summaries, briefs, journal
   backups/                     # local VACUUM INTO snapshots before they sync
@@ -157,6 +159,31 @@ CREATE TABLE appointment (
   dedup_key      TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
+CREATE TABLE allergy (                     -- migration 006 (promoted from observation)
+  allergy_id    INTEGER PRIMARY KEY,
+  person_id     INTEGER NOT NULL REFERENCES person(person_id),
+  document_id   INTEGER REFERENCES document(document_id),
+  substance     TEXT NOT NULL,
+  reaction      TEXT,
+  criticality   TEXT,                      -- high|low|unable-to-assess
+  noted_on      TEXT,
+  dedup_key     TEXT NOT NULL,
+  UNIQUE(dedup_key)
+);
+
+CREATE TABLE condition (                   -- migration 006 (promoted from observation)
+  condition_id  INTEGER PRIMARY KEY,
+  person_id     INTEGER NOT NULL REFERENCES person(person_id),
+  document_id   INTEGER REFERENCES document(document_id),
+  name          TEXT NOT NULL,
+  status        TEXT NOT NULL,             -- active|resolved|history|family-history
+  onset_on      TEXT,
+  resolved_on   TEXT,
+  relation      TEXT,                      -- family-history only: mother|father|...
+  note          TEXT,
+  dedup_key     TEXT NOT NULL,
+  UNIQUE(dedup_key)
+);
 ```
 
 Generic catch-all (new record types with zero migration):
@@ -167,8 +194,9 @@ CREATE TABLE observation (
   person_id      INTEGER NOT NULL REFERENCES person(person_id),
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
-                                           -- 'blood_pressure'/'weight'), 'condition',
-                                           -- 'allergy' (phase 4 render.py convention)
+                                           -- 'blood_pressure'/'weight'), 'order',
+                                           -- 'screening', 'immunization'
+                                           -- (condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
   value_num      REAL,
@@ -181,7 +209,11 @@ CREATE TABLE observation (
 
 Promotion path: an `obs_type` that grows important graduates from `observation`
 into its own typed table via a migration. The generic table absorbs the long tail so
-you're never blocked waiting on schema work.
+you're never blocked waiting on schema work. `condition` and `allergy` are the worked
+example (migration 006, issue #63): both graduated on *fields with no legal home* in the
+generic shape — a resolved problem needs two dates where `observation` has one, and an
+allergy's `criticality` had nowhere to live but free text — not on row volume. Volume
+alone is not a reason to promote.
 
 ---
 
@@ -202,7 +234,30 @@ medication.dedup_key    = hash(person_id | norm(name) | dose | started_on)
 procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
 observation.dedup_key   = hash(person_id | obs_type | observed_at | key)
+allergy.dedup_key       = hash(person_id | norm(substance))
+condition.dedup_key     = hash(person_id | norm(name) | subject)
+    subject = 'family:' + norm(relation)  when status = 'family-history'
+            = 'self'                      otherwise
 ```
+
+The last two are deliberately **date-free**: allergies and problem lists are *standing
+facts* restated on every document with inconsistent or absent dates, so a date in the key
+would fork one allergy into one row per document. Their dates are payload, and a stated
+disagreement (in a date or anywhere else) stages a conflict. A field the incoming document
+simply omits is silence, not a change, and never conflicts — the one place the
+duplicate-vs-conflict comparison differs by record type (`dedup._SPARSE_TYPES`). The
+`subject` discriminator is a correctness fix, not a nicety: without it a patient's
+diabetes and her mother's derive one key and silently merge.
+
+That reading is asymmetric by design. Treating a *stored* NULL as silence too would make the
+common terse-then-detailed document sequence lossy: the second document's `criticality` would
+count as a duplicate and be dropped, with no conflict to catch it. So a field the incoming row
+states over a stored NULL is a **gain** — no competing value, nothing to adjudicate — and fills
+the stored row in place, reported as `enriched` (a fourth commit bucket beside
+new/duplicate/conflict). A stated value never overwrites a stored one on that path, so
+enrichment cannot launder a disagreement into a silent overwrite. The same reading governs
+`keep incoming` on these types: it writes the fields the incoming row states and leaves the
+rest as stored, so a one-field adjudication doesn't erase the row's other payload.
 
 `norm()` = lowercase, trim, collapse whitespace, map synonyms via an **analyte/name
 dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` → one
@@ -317,7 +372,7 @@ inbox/scan.pdf
       matching the record schemas (lab_result[], medication[], observation[]...)
   → pemr commit-extraction --document <id> --json extracted.json
       5. validate JSON against schema (types, required fields)
-      6. compute dedup_keys; split into {new, duplicate, conflict}
+      6. compute dedup_keys; split into {new, duplicate, enriched, conflict}
       7. insert new; report the rest
   → pemr review-conflicts   (if any)
 ```
@@ -355,6 +410,48 @@ file went to tesseract, which declined, so there was no text and no check either
 *different* roster person — is the half that actually prevents misfiling, and it blocks on
 every route.
 
+### Study directories (issue #69)
+
+A burned imaging disc is clinically *one* document but physically one folder holding
+`DICOMDIR`, thousands of extension-less slices, and a Windows viewer payload. `pemr ingest
+<dir> --person <slug> --study dicom` (module: `study.py`) folds it into the pipeline above
+rather than beside it:
+
+```
+disc/                                        (DICOMDIR + IM000001… + VIEWER.EXE + report.pdf)
+  → include every file whose bytes 128..132 are `DICM`     (content, not extension:
+      the viewer payload is excluded by construction; document-like drops are named
+      on stderr, because a radiology report is its own document)
+  → pack them into a *canonical* zip: entries sorted by POSIX relative path, ZIP_STORED,
+      timestamps/host-system/mode pinned  ⇒ same disc, any machine, same bytes
+  → sha256 of the archive IS document.sha256  ⇒ step 1 dedup and `pemr verify` work
+      unchanged; the blob lands at sources/<sha[:2]>/<sha>.dcm.zip
+```
+
+The archive is staged in `sources/.tmp/` and `os.replace`d into the store, so a crash can
+never leave a truncated blob under a valid content-hash name; the temp is unlinked on every
+path (a re-ingest repacks before it can know it is a duplicate — the accepted cost of
+hashing the bytes rather than a manifest). Studies over 4 GiB need `--allow-large`, since
+`sources_dir` is cloud-synced by default.
+
+`doc_date` (from `StudyDate`), `category` (`imaging`), and `ocr_text` (a short derived
+summary: modality, date, per-series slice counts) are **defaults only** — anything the
+caller passes wins. Header tags are read by a minimal stdlib parser, best-effort like
+`run_ocr`: the zero-runtime-dependency rule (`pyproject.toml`) rules out `pydicom`, and any
+parse failure yields no metadata rather than a failed ingest. Every length the file declares
+is bounded before it is used, since a scratched disc's corrupt length field is otherwise an
+unbounded allocation and a value spliced straight into `ocr_text`. Per-slice rows, pixel
+decoding, and thumbnails are out of scope.
+
+The step-2 owner check applies here too, and reads `PatientName`/`PatientBirthDate` from the
+header rather than the derived summary — engine output carries no patient identity, and a
+`StudyDescription` like "PATIENT POSITIONING" would trip the identity anchor into a spurious
+refusal. Caller-supplied text is checked as well; the more consequential verdict wins, and
+the refusal point is pre-pack, so a refused study costs nothing. **The identity tags are
+verification input only** — they are never written to `ocr_text`, so they never reach the
+FTS index or an agent's context. This matters most here: a 2,000-slice binary folder is the
+one document type a human cannot eyeball to catch a misfile.
+
 ---
 
 ## 5. Tool surface
@@ -364,6 +461,7 @@ every route.
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
+pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
@@ -403,7 +501,8 @@ under a PEP 660 editable install); see issue #22.
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
 `trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
-`ingest`, `commit_extraction`, `document_set_text` (fills an empty `ocr_text` only — the `--force`
+`ingest` (`study="dicom"` + `allow_large` make `file` a study directory, §4), `commit_extraction`,
+`document_set_text` (fills an empty `ocr_text` only — the `--force`
 replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). Each returns the
 same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
 calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`

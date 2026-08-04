@@ -147,6 +147,26 @@ def test_remove_with_dependents_refused(conn):
     assert persons.get_person(conn, "jane-doe") is not None  # not deleted
 
 
+def test_remove_refuses_on_condition_and_allergy_rows(conn):
+    """The typed tables from migration 006 are child tables too (issue #63): without
+    them in the guard, `remove` reaches a raw IntegrityError instead of the friendly
+    refusal, and the message never names what is actually blocking."""
+    for table, columns, values in (
+        ("condition", "name, status", "'Anemia', 'active'"),
+        ("allergy", "substance", "'Penicillin'"),
+    ):
+        person = persons.add_person(conn, f"jane-{table}", "Jane Doe")
+        conn.execute(
+            f"INSERT INTO {table} (person_id, {columns}, dedup_key, dedup_base) "
+            f"VALUES (?, {values}, ?, ?)",
+            (person.person_id, f"k-{table}", f"k-{table}"),
+        )
+        conn.commit()
+        with pytest.raises(persons.PersonHasDependentsError, match=table):
+            persons.remove_person(conn, f"jane-{table}")
+        assert persons.get_person(conn, f"jane-{table}") is not None
+
+
 def test_remove_unknown_slug_raises(conn):
     with pytest.raises(persons.PersonNotFoundError):
         persons.remove_person(conn, "nobody")
