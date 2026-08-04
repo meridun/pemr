@@ -266,6 +266,58 @@ def test_ingest_without_text_notes_the_owner_was_not_verified(ready, capsys):
     assert "owner not verified" in capsys.readouterr().err
 
 
+# --- --ocr-text-file reading (issue #78) --------------------------------------
+# Same helper backs `document set-text`; its half of these lives in test_documents.py.
+
+def test_ingest_non_utf8_ocr_text_file_is_a_friendly_error(ready, capsys):
+    """`UnicodeDecodeError` is a `ValueError`, not an `OSError` - a PDF or a UTF-16
+    file handed to `--ocr-text-file` used to traceback out of `main` (#78)."""
+    tmp_path = ready
+    scan = tmp_path / "scan.txt"
+    scan.write_bytes(b"some labs")
+    bad = tmp_path / "scan.pdf"
+    bad.write_bytes(b"%PDF-1.4\xff\xfe\x00binary junk")
+
+    rc = _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+              "--sources", str(tmp_path / "sources"), "--ocr-text-file", str(bad))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error: cannot read" in err and "scan.pdf" in err
+    assert not _document_id(tmp_path)  # the read fails before anything is written
+
+
+def test_ingest_bom_only_ocr_text_file_stores_no_ocr_text(ready, capsys):
+    """Three bytes of BOM is an empty file, not one character of text (#78):
+    U+FEFF survives `str.strip()`, so a `utf-8` read would report ocr_text populated."""
+    tmp_path = ready
+    scan = tmp_path / "scan.txt"
+    scan.write_bytes(b"some labs")
+    bom = tmp_path / "bomonly.txt"
+    bom.write_bytes(b"\xef\xbb\xbf")
+
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr-text-file", str(bom)) == 0
+    assert "no ocr_text stored" in capsys.readouterr().err
+    assert _run(tmp_path, "document", "show", "1", "--text") == 0
+    shown = capsys.readouterr()
+    assert shown.out == "" and "has no ocr_text stored" in shown.err
+
+
+def test_ingest_strips_a_leading_bom_from_the_ocr_text_file(ready, capsys):
+    """A BOM on a real transcription must not inflate the stored text (#78)."""
+    tmp_path = ready
+    scan = tmp_path / "hers.txt"
+    scan.write_bytes(b"her own labs")
+    ocr = tmp_path / "bommed.txt"
+    ocr.write_bytes(b"\xef\xbb\xbfPatient Name: DOE, JANE\nSodium 140 mmol/L")
+
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr-text-file", str(ocr)) == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "Patient Name: DOE, JANE\nSodium 140 mmol/L\n"
+
+
 def test_commit_bad_json_is_friendly(ready, capsys):
     tmp_path = ready
     bad = tmp_path / "bad.json"
