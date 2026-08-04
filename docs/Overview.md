@@ -16,8 +16,8 @@ is `pemr person add`, nothing else.
   (connection/pragmas/migrations), `models.py` typed rows; later `ingest.py`, `dedup.py`,
   `query.py`, `render.py`, `backup.py`, `mcp_server.py`.
 - **Schema** (`migrations/*.sql`) — hybrid: typed tables (`person`, `document`,
-  `lab_result`, `medication`, `procedure`, `appointment`) plus a generic `observation`
-  catch-all. See [Architecture.md §2](Architecture.md#2-schema-hybrid).
+  `lab_result`, `medication`, `procedure`, `appointment`, `condition`, `allergy`) plus a
+  generic `observation` catch-all. See [Architecture.md §2](Architecture.md#2-schema-hybrid).
 - **Dedup** — two layers: content-hash on documents, deterministic semantic keys on
   extracted rows. The core determinism win: [Architecture.md §3](Architecture.md#3-dedup-algorithm-the-core-determinism-win).
 - **Data layout** — the live `pemr.db` stays on a local-only (non-synced) path; only
