@@ -20,7 +20,7 @@ import sqlite3
 from datetime import date, datetime
 
 from . import db
-from .dedup import norm
+from .dedup import enum_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
 # can never be mis-parsed as FTS syntax (each token is quoted as a phrase, AND-ed).
@@ -171,7 +171,9 @@ def query_timeline(
     """Merged chronological event stream across the typed tables + observations.
 
     Each event carries ``date``, ``type``, a one-line ``summary`` and ``document_id``
-    provenance. Medications contribute up to two events (start and, if ended, stop).
+    provenance. Medications contribute up to two events (start and, if ended, stop), and
+    so do conditions (``onset_on`` -> ``condition``, ``resolved_on`` ->
+    ``condition-resolved``); family-history rows contribute none.
     Events without a usable date are omitted (they cannot be placed on a timeline).
     ``since`` (a date) drops events strictly before it. Ordered oldest first.
     """
@@ -227,6 +229,22 @@ def query_timeline(
         detail = " ".join(parts)
         val = "" if value is None else f" = {value}{unit}"
         add(r["observed_at"], "observation", f"{detail}{val}".strip(), r["document_id"])
+
+    for r in conn.execute(
+        "SELECT * FROM condition WHERE person_id = ?", (person_id,)
+    ).fetchall():
+        # A relative's onset date is not an event in *this* patient's chronology, so
+        # family history is deliberately absent from the timeline (issue #63).
+        if enum_token(r["status"]) == "family-history":
+            continue
+        add(r["onset_on"], "condition", f"{r['name']} ({r['status']})", r["document_id"])
+        add(r["resolved_on"], "condition-resolved", f"resolved {r['name']}",
+            r["document_id"])
+
+    for r in conn.execute(
+        "SELECT * FROM allergy WHERE person_id = ?", (person_id,)
+    ).fetchall():
+        add(r["noted_on"], "allergy", f"{r['substance']} allergy", r["document_id"])
 
     if since:
         cutoff = _date_part(since)

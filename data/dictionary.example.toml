@@ -162,15 +162,17 @@
 "beta-2 microglobulin" = "beta2_microglobulin"
 
 # --- observation obs_type conventions ---
-# Six obs_type families out of the generic `observation` table. Extraction
+# Four obs_type families out of the generic `observation` table. Extraction
 # agents should emit:
 #   * obs_type='vital'        key=<canonical vital token below>  (blood_pressure ...)
-#   * obs_type='condition'    key=<condition name>     value_text=<optional detail>
-#   * obs_type='allergy'      key=<allergen>           value_text=<optional reaction>
 #   * obs_type='order'        key=<item/order name>    value_text=<instructions/prescriber>
 #   * obs_type='screening'    key=<snake_case screen>  observed_at=<last-done date>  value_text=<freq/next-due>
 #   * obs_type='immunization' key=<snake_case vaccine> observed_at=<date given>      value_text=<optional detail>
-# vital/condition/allergy/order drive the phase-4 render layer (master summary /
+# Conditions and allergies used to live here too; migration 006 promoted them to the
+# typed `condition` / `allergy` tables (record types of their own in commit-extraction,
+# with status/criticality/two-date fields the generic shape could not hold) - see
+# AGENTS.md MUST rule 3. Nothing in this dictionary applies to them beyond norm().
+# vital/order drive the phase-4 render layer (master summary /
 # appointment brief); "Latest vitals" is the most recent `vital` row per normalized key.
 # The `order` family captures non-medication orders mined from the med-list section
 # (DME, outpatient PT, referrals, pre-op consults); `key` is free-text (verbatim item

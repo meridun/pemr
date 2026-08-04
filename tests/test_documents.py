@@ -29,7 +29,17 @@ RECORDS = {
         {"obs_type": "blood_pressure", "observed_at": "2026-01-02",
          "key": "systolic", "value_num": 120},
     ],
+    "allergy": [
+        {"substance": "Penicillin", "reaction": "rash", "criticality": "high"},
+    ],
+    "condition": [
+        {"name": "Type 2 Diabetes", "status": "active", "onset_on": "2024-01-01"},
+    ],
 }
+
+# One row of every known record type -- the fixture's whole point, so counts assert on
+# this rather than on a literal that goes stale the next time a type is added.
+_SEEDED_ROWS = sum(len(rows) for rows in RECORDS.values())
 
 
 @pytest.fixture()
@@ -86,7 +96,7 @@ def test_list_newest_first_with_counts(seeded):
     second = _insert_document(conn, jane.person_id, "bb99")
     views = documents.list_documents(conn)
     assert [v["document_id"] for v in views] == [second, seeded["doc"]]
-    assert views[1]["record_count"] == 5
+    assert views[1]["record_count"] == _SEEDED_ROWS
     assert views[1]["records"]["lab_result"] == 1
     assert views[0]["record_count"] == 0
     assert views[1]["person"] == "jane-doe"
@@ -123,7 +133,7 @@ def test_show_unknown_document_raises(conn):
 def test_show_carries_the_full_stable_record_key_set(seeded):
     view = documents.get_document_view(seeded["conn"], seeded["doc"])
     assert set(view["records"]) == set(dedup.KNOWN_TYPES)
-    assert view["record_count"] == 5
+    assert view["record_count"] == _SEEDED_ROWS
     assert "ocr_text" not in view
     assert view["has_ocr_text"] is True
     assert view["ocr_text_chars"] == len("scan text")
@@ -242,7 +252,7 @@ def test_set_text_leaves_records_and_keys_untouched(seeded):
         for r in conn.execute("SELECT * FROM lab_result").fetchall()
     ]
     assert before == after
-    assert documents.get_document_view(conn, seeded["doc"])["record_count"] == 5
+    assert documents.get_document_view(conn, seeded["doc"])["record_count"] == _SEEDED_ROWS
 
 
 # --- edit -------------------------------------------------------------------
@@ -295,7 +305,7 @@ def test_reassign_moves_document_and_every_record_type(seeded):
     )
     assert report.applied is True
     assert sorted(report.counts) == sorted(dedup.KNOWN_TYPES)
-    assert len(report.changes) == 5
+    assert len(report.changes) == len(dedup.KNOWN_TYPES)  # one row seeded per type
 
     assert conn.execute(
         "SELECT person_id FROM document WHERE document_id = ?", (seeded["doc"],)
@@ -328,7 +338,7 @@ def test_reassign_rederives_dedup_keys(seeded):
 def test_reassign_dry_run_writes_nothing(seeded):
     conn, jane = seeded["conn"], seeded["jane"]
     report = documents.reassign_document(conn, seeded["doc"], "john-doe")
-    assert report.applied is False and len(report.changes) == 5
+    assert report.applied is False and len(report.changes) == _SEEDED_ROWS
     assert conn.execute(
         "SELECT person_id FROM document WHERE document_id = ?", (seeded["doc"],)
     ).fetchone()["person_id"] == jane.person_id
@@ -458,7 +468,7 @@ def test_reassign_moves_a_keep_both_family_intact(seeded):
     summary = dedup.commit_extraction(
         conn, seeded["doc"], {"lab_result": [draw | {"value_num": 148}]}
     )
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
 
 
 def test_reassign_refused_on_dictionary_drift(seeded):
@@ -487,7 +497,7 @@ def test_reassign_unknown_document_and_slug(seeded):
 def test_rm_dry_run_reports_but_deletes_nothing(seeded):
     conn = seeded["conn"]
     report = documents.remove_document(conn, seeded["doc"])
-    assert report.applied is False and report.record_count == 5
+    assert report.applied is False and report.record_count == _SEEDED_ROWS
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 1
 
@@ -495,7 +505,7 @@ def test_rm_dry_run_reports_but_deletes_nothing(seeded):
 def test_rm_apply_cascades_records_and_fts(seeded):
     conn = seeded["conn"]
     report = documents.remove_document(conn, seeded["doc"], apply=True)
-    assert report.applied is True and report.record_count == 5
+    assert report.applied is True and report.record_count == _SEEDED_ROWS
     for record_type in dedup.KNOWN_TYPES:
         assert conn.execute(
             f"SELECT COUNT(*) AS n FROM {record_type}"
@@ -667,11 +677,11 @@ def test_cli_document_list_and_json(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "document", "list") == 0
     out = capsys.readouterr().out
-    assert "#1" in out and "jane-doe" in out and "5 rec" in out
+    assert "#1" in out and "jane-doe" in out and f"{_SEEDED_ROWS} rec" in out
 
     assert _run(cli_ready, "document", "list", "--json") == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["record_count"] == 5
+    assert payload[0]["record_count"] == _SEEDED_ROWS
     assert payload[0]["has_ocr_text"] is True
     assert "ocr_text" not in payload[0]
 
@@ -689,7 +699,7 @@ def test_cli_document_show(cli_ready, capsys):
     assert "document_id    1" in out
     assert "person         jane-doe" in out
     # Total plus the non-zero per-type breakdown only (zeros are a --json concern).
-    assert "records        5  (" in out and "lab_result 1" in out
+    assert f"records        {_SEEDED_ROWS}  (" in out and "lab_result 1" in out
     assert "procedure 0" not in out
     assert "has_ocr_text   yes (" in out
     assert "conflicts      none" in out
@@ -857,7 +867,7 @@ def test_cli_document_set_text_leaves_records_untouched(cli_ready, capsys):
                 "--ocr-text-file", str(text)) == 0
     capsys.readouterr()
     assert _run(cli_ready, "document", "show", "1", "--json") == 0
-    assert json.loads(capsys.readouterr().out)["record_count"] == 5
+    assert json.loads(capsys.readouterr().out)["record_count"] == _SEEDED_ROWS
     assert _run(cli_ready, "query", "labs", "--person", "jane-doe") == 0
     assert "HbA1c" in capsys.readouterr().out
 
@@ -877,11 +887,11 @@ def test_cli_document_reassign_dry_run_then_apply(cli_ready, capsys):
     assert _run(cli_ready, "document", "reassign", "1", "--person", "john-doe") == 0
     out = capsys.readouterr().out
     assert "jane-doe -> john-doe" in out
-    assert "dry run: 5 record(s) would move" in out and "--apply" in out
+    assert f"dry run: {_SEEDED_ROWS} record(s) would move" in out and "--apply" in out
 
     assert _run(cli_ready, "document", "reassign", "1", "--person", "john-doe",
                 "--apply") == 0
-    assert "reassigned 5 record(s)" in capsys.readouterr().out
+    assert f"reassigned {_SEEDED_ROWS} record(s)" in capsys.readouterr().out
 
     # The move is visible to the person-scoped reads.
     assert _run(cli_ready, "query", "labs", "--person", "john-doe") == 0
@@ -899,7 +909,7 @@ def test_cli_document_reassign_json(cli_ready, capsys):
                 "--json") == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["applied"] is False and payload["to"] == "john-doe"
-    assert len(payload["moved"]) == 5
+    assert len(payload["moved"]) == _SEEDED_ROWS
 
 
 def test_cli_document_reassign_unknown_person_fails(cli_ready, capsys):
@@ -912,7 +922,7 @@ def test_cli_document_rm_dry_run_then_apply(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "document", "rm", "1") == 0
     out = capsys.readouterr().out
-    assert "records: 5 total" in out and "blob kept" in out
+    assert f"records: {_SEEDED_ROWS} total" in out and "blob kept" in out
     assert "dry run: nothing was deleted" in out
 
     assert _run(cli_ready, "document", "rm", "1", "--apply") == 0

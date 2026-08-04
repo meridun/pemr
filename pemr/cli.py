@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import (
     __version__, backup, db, dedup, documents, ingest, persons, query, render,
-    restore, verify,
+    restore, study, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -174,6 +174,30 @@ def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
     return _DEFAULT_DICTIONARY if _DEFAULT_DICTIONARY.is_file() else None
 
 
+def _migration_followups(conn: sqlite3.Connection, applied: list[str]) -> list[str]:
+    """Manual follow-ups the just-applied migrations leave behind.
+
+    006 moves allergy/condition rows out of `observation` carrying their OLD dedup keys
+    (the new ones are sha256 over dictionary-normalized fields, which SQL cannot compute),
+    so until `rekey` re-derives them a re-commit of an already-stored allergy/condition
+    inserts a second row instead of deduping. Saying so here makes it impossible to miss
+    (issue #63) -- but only when rows actually moved: on a fresh `--create` there is
+    nothing to rekey, and a note nobody has to act on trains people to skip notes.
+    """
+    notes: list[str] = []
+    if "006_condition_allergy.sql" in applied:
+        moved = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM allergy) + (SELECT COUNT(*) FROM condition) "
+            "AS n"
+        ).fetchone()["n"]
+        if moved:
+            notes.append(
+                f"run `pemr rekey --apply` to re-derive dedup keys for the {moved} "
+                "allergy/condition row(s) migrated out of `observation`"
+            )
+    return notes
+
+
 def _cmd_migrate(args: argparse.Namespace) -> int:
     # The one command allowed to create a database - and only with --create. Without it
     # `migrate` applies migrations to an existing database and nothing else (issue #55).
@@ -183,11 +207,14 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     conn = db.connect(db_path)
     try:
         applied = db.migrate(conn, args.migrations_dir or db.DEFAULT_MIGRATIONS_DIR)
+        followups = _migration_followups(conn, applied)
     finally:
         conn.close()
     if applied:
         for name in applied:
             print(f"applied {name}")
+        for note in followups:
+            print(f"note: {note}")
     else:
         print("up to date")
     return 0
@@ -662,18 +689,44 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     conn = _connect_db(args)
     try:
         try:
-            result = ingest.ingest_document(
-                conn,
-                args.file,
-                person_slug=args.person,
-                sources_dir=_resolve_sources_dir(args),
-                doc_date=args.doc_date,
-                category=args.category,
-                provider=args.provider,
-                ocr=(args.ocr == "tesseract"),
-                ocr_text=ocr_text,
-                force=args.force,
-            )
+            if args.study:
+                # A study *directory* is one document (issue #69): the blob is a
+                # canonical zip of its slices, hashed like any other file.
+                if args.ocr:
+                    print(
+                        f"note: --ocr is ignored for --study {args.study} (there is "
+                        "no flat image to OCR); the study's ocr_text is a derived "
+                        "summary unless you pass --ocr-text-file",
+                        file=sys.stderr,
+                    )
+                result = ingest.ingest_study_dir(
+                    conn,
+                    args.file,
+                    person_slug=args.person,
+                    sources_dir=_resolve_sources_dir(args),
+                    study=args.study,
+                    allow_large=args.allow_large,
+                    doc_date=args.doc_date,
+                    category=args.category,
+                    provider=args.provider,
+                    ocr_text=ocr_text,
+                    force=args.force,
+                )
+            else:
+                result = ingest.ingest_document(
+                    conn,
+                    args.file,
+                    person_slug=args.person,
+                    sources_dir=_resolve_sources_dir(args),
+                    doc_date=args.doc_date,
+                    category=args.category,
+                    provider=args.provider,
+                    # `tesseract` is a retained alias for `auto`: both mean "extract
+                    # by whatever route this file type allows" (ingest.extract_text).
+                    ocr=(args.ocr is not None),
+                    ocr_text=ocr_text,
+                    force=args.force,
+                )
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -698,7 +751,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     if not result.ocr_text_populated:
         print(
             "note: no ocr_text stored - `find` (full-text search) will not see this "
-            "document. Supply --ocr-text-file <path> or --ocr tesseract.",
+            "document. Supply --ocr-text-file <path> or --ocr auto.",
             file=sys.stderr,
         )
     print(f"next: extract, then `pemr commit-extraction --document {doc.document_id} --json <file>`")
@@ -735,7 +788,7 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
     c = summary.counts
     print(
         f"committed: {c['new']} new, {c['duplicate']} duplicate, "
-        f"{c['conflict']} conflict"
+        f"{c['enriched']} enriched, {c['conflict']} conflict"
     )
     if summary.conflict:
         print(
@@ -850,13 +903,23 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
 
 
 def _resolved_as(result: dedup.ResolveResult) -> str:
-    """How a resolution reports itself on the success line."""
+    """How a resolution reports itself on the success line.
+
+    A keep-both no-op on a sparse type is only a no-op about the *row count*: it still
+    fills the matched sibling's NULL columns from the staged payload (issue #63). Naming
+    those fields keeps the operator's line honest about the write, matching what
+    `dedup._resolution_text` persists on the conflict. Field names only, never values --
+    the resolution text is an audit trail, not a place to echo clinical data.
+    """
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
+        filled = (
+            f", filled {', '.join(sorted(result.gains))}" if result.gains else ""
+        )
         return (
             f"keep-both, no-op: already stored as {result.record_type} "
-            f"#{result.row_id}"
+            f"#{result.row_id}{filled}"
         )
     return (
         f"keep-both -> {result.record_type} #{result.row_id}, "
@@ -1403,14 +1466,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
     )
-    p_ingest.add_argument("file", help="path to the document to ingest")
+    p_ingest.add_argument(
+        "file", help="path to the document, or study directory with --study"
+    )
     p_ingest.add_argument("--person", required=True, help="owner slug, e.g. jane-doe")
+    p_ingest.add_argument(
+        "--study",
+        choices=list(study.STUDY_KINDS),
+        help="treat the path as a study directory: pack it into one document",
+    )
+    p_ingest.add_argument(
+        "--allow-large",
+        dest="allow_large",
+        action="store_true",
+        help="ingest a study over the size limit (sources_dir may be cloud-synced)",
+    )
     p_ingest.add_argument("--sources", help="sources blob dir (overrides config)")
     p_ingest.add_argument("--doc-date", dest="doc_date", help="date the doc pertains to")
     p_ingest.add_argument("--category", help="labs|imaging|visit-note|rx|vaccine|...")
     p_ingest.add_argument("--provider")
     p_ingest.add_argument(
-        "--ocr", choices=["tesseract"], help="pre-fill ocr_text (soft dependency)"
+        "--ocr",
+        choices=["auto", "tesseract"],
+        help="pre-fill ocr_text: text/.docx/.xlsx read natively, images/PDF via "
+             "tesseract (soft dependency). 'tesseract' is an alias for 'auto'",
     )
     p_ingest.add_argument(
         "--ocr-text-file",
