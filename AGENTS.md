@@ -167,9 +167,11 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
   It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
   `.docx`/`.xlsx` parsed from their OOXML, everything else (images, unknown suffixes)
-  through tesseract. **`.pdf` has no working route** — tesseract does not accept PDF input at
-  all, scanned or text-layer — and neither do `.rtf`, `.msg` or `.doc`: you get a stderr note,
-  and must transcribe those yourself. Extraction is also capped at 32 MiB per file.
+  through tesseract. A `.pdf` is read page by page — embedded text layer where there is one, a
+  300-dpi render OCR'd where there isn't (first 20 pages, joined by `\f`); that route needs the
+  optional `pip install pemr[ocr]` extra, and without it a PDF stores no text and says so on
+  stderr. `.rtf`, `.msg` and `.doc` have no route at all: you get a stderr note, and must
+  transcribe those yourself. Extraction is also capped at 32 MiB per file.
 - **Pointer stubs are refused.** A `.gsheet`/`.gdoc` from a synced Drive folder is a ~1 KB JSON
   link, not the document; `ingest` fails pre-write. Export it from Drive and ingest the export.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
