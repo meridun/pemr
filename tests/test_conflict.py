@@ -114,7 +114,7 @@ def repeat_draw(conn):
         conn, _doc(conn, "draw-2"),
         {"lab_result": [_glucose(148, "2-hour post-prandial draw")]},
     )
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     return dedup.list_conflicts(conn)[0]["conflict_id"]
 
 
@@ -169,7 +169,7 @@ def test_recommit_of_an_admitted_draw_dedups_instead_of_forking(conn, repeat_dra
         conn, _doc(conn, "draw-3"),
         {"lab_result": [_glucose(148, "2-hour post-prandial draw")]},
     )
-    assert summary.counts == {"new": 0, "duplicate": 1, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
     # It deduped against the sibling, not against occurrence 0.
     sibling_key = conn.execute(
@@ -186,7 +186,7 @@ def test_a_changed_value_on_an_admitted_identity_restages_a_conflict(conn, repea
         conn, _doc(conn, "draw-4"),
         {"lab_result": [_glucose(210, "third draw")]},
     )
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
 
 
@@ -277,7 +277,7 @@ def orphaned_family(conn, repeat_draw):
     summary = dedup.commit_extraction(
         conn, _doc(conn, "draw-5"), {"lab_result": [_glucose(210, "third draw")]}
     )
-    assert summary.counts == {"new": 0, "duplicate": 0, "conflict": 1}
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1}
     conflict = dedup.list_conflicts(conn)[0]
     survivor = conn.execute("SELECT * FROM lab_result").fetchone()
     # The premise of the regression: key-targeted writes cannot find this row.
