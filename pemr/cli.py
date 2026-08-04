@@ -174,6 +174,33 @@ def _resolve_dictionary_path(args: argparse.Namespace) -> Path | None:
     return _DEFAULT_DICTIONARY if _DEFAULT_DICTIONARY.is_file() else None
 
 
+class _OcrTextFileError(Exception):
+    """`--ocr-text-file` could not be read; the message is already user-facing."""
+
+
+def _read_ocr_text_file(path: str) -> str:
+    """Read an `--ocr-text-file` for the two commands that accept one.
+
+    One helper for `ingest` and `document set-text` so their read paths cannot
+    diverge again (issue #78); #62 deliberately mirrored `ingest`'s read
+    byte-for-byte, which duplicated both of its defects:
+
+    * `utf-8-sig`, not `utf-8`: a UTF-8 BOM survives `str.strip()`, so a BOM-only
+      "empty" file (Notepad, PowerShell 5.1 - three bytes, `EF BB BF`) sails past
+      the emptiness guard and stores one invisible character as `ocr_text`, which
+      then reports `ocr_text_populated: true` while carrying no text. A BOM on a
+      real transcription silently inflates the stored text by one character.
+    * `UnicodeDecodeError` is a `ValueError`, not an `OSError`, and `main()` has no
+      catch-all: handing in a PDF/UTF-16/latin-1 file is an ordinary user mistake
+      and must read as the friendly error, not a traceback.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _OcrTextFileError(f"cannot read {path}: {exc}") from exc
+
+
 def _migration_followups(conn: sqlite3.Connection, applied: list[str]) -> list[str]:
     """Manual follow-ups the just-applied migrations leave behind.
 
@@ -473,10 +500,9 @@ def _cmd_document_show(args: argparse.Namespace) -> int:
 
 def _cmd_document_set_text(args: argparse.Namespace) -> int:
     try:
-        with open(args.ocr_text_file, encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError as exc:
-        print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
+        text = _read_ocr_text_file(args.ocr_text_file)
+    except _OcrTextFileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     def work(conn):
@@ -680,10 +706,9 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     ocr_text = None
     if getattr(args, "ocr_text_file", None):
         try:
-            with open(args.ocr_text_file, encoding="utf-8") as fh:
-                ocr_text = fh.read()
-        except OSError as exc:
-            print(f"error: cannot read {args.ocr_text_file}: {exc}", file=sys.stderr)
+            ocr_text = _read_ocr_text_file(args.ocr_text_file)
+        except _OcrTextFileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return 1
 
     conn = _connect_db(args)
