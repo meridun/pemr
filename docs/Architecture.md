@@ -95,6 +95,18 @@ CREATE TABLE document (
   ocr_text      TEXT,                     -- extracted full text (agent or tesseract)
   ingested_at   TEXT NOT NULL
 );
+
+-- Opt-in memory of an intentional removal (issue #80). Layer-1 identity is scoped to
+-- the live `document` table above, so without this a removed document silently
+-- re-ingests on the next sweep. Checked by `ingest`; written by
+-- `document rm --tombstone` and `document tombstone add`.
+CREATE TABLE document_tombstone (
+  sha256      TEXT PRIMARY KEY NOT NULL,  -- content hash; the value document.sha256 holds
+  removed_at  TEXT NOT NULL,              -- ISO8601 UTC
+  reason      TEXT,                       -- free-text slug, e.g. 'identifiers'; no taxonomy
+  note        TEXT,                       -- free text: the only human-recognisable label
+  document_id INTEGER                     -- the id it had; forensics only, not a FK
+);
 ```
 
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
@@ -223,6 +235,17 @@ alone is not a reason to promote.
 On ingest, `sha256` the raw file bytes. If the hash already exists in `document`,
 it's a re-scan of a document already filed → skip (or attach as an alternate path).
 Catches "I scanned the same lab report twice."
+
+That identity is scoped to the **live** `document` table, so `document rm` erases every
+trace that a hash was ever seen and the next sweep over the same source folder re-ingests
+the file as new. `document_tombstone` (migration 007, issue #80) is the opt-in memory of an
+*intentional* removal: `document rm --tombstone` records the hash in the same transaction
+as the delete, and `ingest` checks the table right after the `document` lookup, returning
+status `tombstoned` (rc=0, nothing written) instead of re-filing. Opt-in on purpose — most
+removals are corrections (wrong owner, bad scan, superseded version) and must stay
+re-ingestable, so tombstoning every removed hash would turn an ordinary correction into a
+permanent silent block. `ingest --force` overrides one run without lifting the row; the MCP
+`ingest` tool cannot (a tombstone is the human's recorded decision, not a heuristic).
 
 **Layer 2 — record identity (semantic key).**
 Each typed/observation row computes a deterministic `dedup_key` from normalized fields,
@@ -478,7 +501,13 @@ pemr document list [--person <slug>]                     # newest first; omit --
 pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
-pemr document rm <id> [--apply] [--purge-blob]           # delete a document + records; dry run by default
+pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--note ...]]
+                                                         # delete a document + records; dry run by default
+                                                         # --tombstone: also refuse to re-ingest this content (§3)
+pemr document tombstone list [--json]                    # recorded intentional removals, newest first
+pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]
+                                                         # pre-emptive exclusion; ingests and copies nothing
+pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
 pemr query labs --person jane --test hba1c --since 2023-01-01
 pemr query meds --person jane --active
@@ -600,6 +629,16 @@ and a command is testable (§5, "the tested engine"):
    counts, and blob resolution.
 
 Every abort path up to and including step 4 leaves the live database exactly as it was.
+
+Between steps 3 and 4 a read-only diff names any **`document_tombstone` rows** (§3, issue
+#80) the live database holds and the snapshot does not. A whole-database replace drops
+them — correct, since it equally drops every document and person edit made since, and
+merging them would break both the atomic single-file install and the "every abort leaves
+the live database as it was" property. But the *consequence* is issue #80's own bug
+resurrected (the next sweep silently re-ingests an excluded document), so the loss is
+reported before the replace, naming each hash, the rescue copy that still holds them, and
+`pemr document tombstone add --sha256 <hash>` to re-apply. Reported, never merged, never
+blocking.
 
 `pemr verify` runs step 7 on its own, any time. Blob checking is exact rather than
 heuristic — `document` stores both `sha256` and a relative content-addressed
