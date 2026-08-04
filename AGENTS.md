@@ -164,7 +164,14 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Default path: agent-supplied transcription.** You already read the document to extract from it;
   pass that text as the `ocr_text` tool param (CLI: `--ocr-text-file <path>`). A vision transcript
   beats tesseract on messy scans.
-- **Fallback:** `ocr=true` (tesseract) only when you cannot read the file type yourself.
+- **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
+  It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
+  `.docx`/`.xlsx` parsed from their OOXML, everything else (images, unknown suffixes)
+  through tesseract. **`.pdf` has no working route** — tesseract does not accept PDF input at
+  all, scanned or text-layer — and neither do `.rtf`, `.msg` or `.doc`: you get a stderr note,
+  and must transcribe those yourself. Extraction is also capped at 32 MiB per file.
+- **Pointer stubs are refused.** A `.gsheet`/`.gdoc` from a synced Drive folder is a ~1 KB JSON
+  link, not the document; `ingest` fails pre-write. Export it from Drive and ingest the export.
 - Self-check: the `ingest` response includes `ocr_text_populated: bool`. If it is `false`, treat
   the ingest as incomplete and supply text before moving on. (The engine only *warns* here rather
   than hard-failing, because a human at the CLI may legitimately defer — but the agent MUST not.)
@@ -188,7 +195,13 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 *different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
 `unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
-**refuse the ingest** before anything is written.
+**refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
+the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
+— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set — because in a
+structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
+route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
+with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /
+`--ocr-text-file` (the default path above) and keep the check. `mismatch` holds on every route.
 
 - On a refusal, the agent MUST surface the verdict and the `evidence` snippet to the human and get
   an **explicit go-ahead** before retrying with `force=true`. Never force on your own judgment.
