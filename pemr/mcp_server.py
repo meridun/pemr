@@ -173,29 +173,55 @@ def ingest_document(
     provider: str | None = None,
     ocr: bool = False,
     force: bool = False,
+    study: str | None = None,
+    allow_large: bool = False,
 ) -> dict[str, Any]:
     """[write] Ingest a document (hash, blob-store, layer-1 dedup). Mirrors ``pemr ingest``.
 
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
-    contract without a follow-up read.
+    contract without a follow-up read. ``ocr=true`` is the fallback: it extracts by
+    whatever route the file type allows (plaintext/`.docx`/`.xlsx` natively, everything
+    else via tesseract), and stores nothing when nothing could be read — `.pdf`, `.rtf`,
+    `.msg` and `.doc` have no route at all (tesseract does not accept PDF input), so
+    transcribe those yourself.
+
+    A Google Drive pointer stub (``.gsheet``/``.gdoc`` — a ~1 KB JSON link, not the
+    document) is refused pre-write; the fix is to export it from Drive first.
+
+    ``study="dicom"`` makes ``file`` a study *directory* — a burned imaging disc — and
+    packs its slices into one document (issue #69). ``ocr_text`` then defaults to a
+    derived study summary; pass a transcription of the accompanying radiology report
+    when you have one. ``allow_large`` waives the study size guard.
 
     When text is present it is checked against the claimed owner; the verdict comes
     back as ``owner_check`` (``null`` on a duplicate, which is never checked). A
     ``mismatch``/``suspect`` verdict refuses the ingest pre-write — per ``AGENTS.md``
     §3, surface the verdict and its evidence to the human and get an explicit
-    go-ahead before retrying with ``force=true``.
+    go-ahead before retrying with ``force=true``. ``suspect`` (a patient-identity
+    header naming nobody on the roster) is scoped by route: it applies to the text you
+    supply and to a tesseract pass, never to anything ``ocr=true`` extracts natively
+    (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``), where
+    those words are column labels — so pass your transcription as ``ocr_text`` rather
+    than saving it to a ``.txt`` and re-reading that. ``mismatch`` holds on every route.
     """
     try:
         sources_dir = cli._resolve_sources_dir(_ARGS)
     except SystemExit as exc:  # CLI resolvers exit the process; a server must not
         raise ToolError(str(exc)) from exc
     try:
-        result = _ingest.ingest_document(
-            conn, file, person_slug=person, sources_dir=sources_dir,
-            doc_date=doc_date, category=category, provider=provider,
-            ocr=ocr, ocr_text=ocr_text, force=force,
-        )
+        if study:
+            result = _ingest.ingest_study_dir(
+                conn, file, person_slug=person, sources_dir=sources_dir,
+                study=study, allow_large=allow_large, doc_date=doc_date,
+                category=category, provider=provider, ocr_text=ocr_text, force=force,
+            )
+        else:
+            result = _ingest.ingest_document(
+                conn, file, person_slug=person, sources_dir=sources_dir,
+                doc_date=doc_date, category=category, provider=provider,
+                ocr=ocr, ocr_text=ocr_text, force=force,
+            )
     except (db.NotMigratedError, _ingest.IngestError) as exc:
         raise _friendly(exc) from exc
     return {
@@ -231,6 +257,7 @@ def commit_extraction(
         "counts": summary.counts,
         "new": summary.new,
         "duplicate": summary.duplicate,
+        "enriched": summary.enriched,
         "conflict": summary.conflict,
     }
 
@@ -526,10 +553,11 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     def ingest_tool(file: str, person: str, ocr_text: str | None = None,
                     doc_date: str | None = None, category: str | None = None,
                     provider: str | None = None, ocr: bool = False,
-                    force: bool = False) -> dict:
+                    force: bool = False, study: str | None = None,
+                    allow_large: bool = False) -> dict:
         return _run(ingest_document, file=file, person=person, ocr_text=ocr_text,
                     doc_date=doc_date, category=category, provider=provider, ocr=ocr,
-                    force=force)
+                    force=force, study=study, allow_large=allow_large)
 
     @server.tool(name="commit_extraction", annotations=rw)
     def commit_extraction_tool(document_id: int, records: dict) -> dict:

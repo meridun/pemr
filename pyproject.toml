@@ -14,6 +14,13 @@ requires-python = ">=3.11"
 # does. Installed with `pip install pemr[mcp]`.
 mcp = ["mcp>=1.0"]
 
+# PDF reading for `--ocr` (issue #70): the embedded text layer, plus rasterizing pages
+# that have none so tesseract can OCR them. Optional for the same reason `tesseract`
+# itself is a soft dependency — without it `--ocr` on a PDF degrades to a stderr note
+# and every other path (including the agent-supplied `--ocr-text-file` default, which
+# `AGENTS.md` makes the norm) is unaffected. Installed with `pip install pemr[ocr]`.
+ocr = ["PyMuPDF>=1.24"]
+
 [project.scripts]
 pemr = "pemr.cli:main"
 

@@ -1,6 +1,9 @@
 """Document ingest: hashing, content-addressed blob store, layer-1 dedup."""
 
+import json
 import sqlite3
+import zipfile
+import subprocess
 
 import pytest
 
@@ -107,12 +110,357 @@ def test_failed_insert_does_not_orphan_blob(conn, tmp_path, sources):
 
 def test_ocr_degrades_when_tesseract_absent(conn, tmp_path, sources, monkeypatch, capsys):
     monkeypatch.setattr(ingest.shutil, "which", lambda _: None)
-    result = ingest.ingest_document(
-        conn, _make_file(tmp_path), "jane-doe", sources, ocr=True
-    )
+    # a scan (image suffix) is the tesseract branch of ingest.extract_text; text and
+    # OOXML suffixes are read natively and never reach the binary.
+    scan = _make_file(tmp_path, "scan.png", b"\x89PNG not really")
+    result = ingest.ingest_document(conn, scan, "jane-doe", sources, ocr=True)
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "tesseract" in capsys.readouterr().err
+
+
+# --- PDF OCR (issue #70) ------------------------------------------------------
+#
+# Every test here fakes both halves of the soft dependency — the PDF backend via the
+# `_load_pdf_backend` seam and tesseract via `subprocess.run` — so the suite passes on
+# a machine with neither PyMuPDF nor tesseract installed, which is the CI contract.
+
+
+class _FakePixmap:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+
+    def tobytes(self, fmt: str) -> bytes:
+        assert fmt == "png"
+        # Carries the page's OCR text through the fake tesseract below, standing in
+        # for "these pixels say this".
+        return f"PNG:{self.payload}".encode()
+
+
+class _FakePage:
+    """A PDF page: `text` is its embedded text layer, `scanned` what OCR would read."""
+
+    def __init__(self, text: str = "", scanned: str = "") -> None:
+        self.text = text
+        self.scanned = scanned
+        self.pixmap_kwargs: dict | None = None
+
+    def get_text(self) -> str:
+        return self.text
+
+    def get_pixmap(self, **kwargs):
+        self.pixmap_kwargs = kwargs
+        return _FakePixmap(self.scanned)
+
+
+class _FakeDoc:
+    def __init__(self, pages, needs_pass: bool = False) -> None:
+        self.pages = list(pages)
+        self.needs_pass = needs_pass
+        self.closed = False
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+    def __getitem__(self, index: int) -> _FakePage:
+        return self.pages[index]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBackend:
+    csGRAY = "device-gray"
+
+    def __init__(self, doc=None, error: Exception | None = None) -> None:
+        self.doc = doc
+        self.error = error
+
+    def open(self, path: str):
+        if self.error is not None:
+            raise self.error
+        return self.doc
+
+
+def _install_backend(monkeypatch, backend) -> None:
+    monkeypatch.setattr(ingest, "_load_pdf_backend", lambda: backend)
+
+
+def _install_tesseract(monkeypatch, *, available: bool = True, stderr: bytes = b""):
+    """Fake tesseract that echoes back whatever `_FakePixmap` encoded (or fails)."""
+    monkeypatch.setattr(
+        ingest.shutil, "which", lambda name: "/usr/bin/tesseract" if available else None
+    )
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, **kwargs})
+        assert cmd == ["tesseract", "stdin", "stdout"]
+        assert "text" not in kwargs  # bytes in, bytes out (issue #64's decode policy)
+        if stderr:
+            raise subprocess.CalledProcessError(1, cmd, output=b"", stderr=stderr)
+        payload = kwargs["input"].decode().removeprefix("PNG:")
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload.encode(), stderr=b"")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    return calls
+
+
+def _pdf(tmp_path, name="scan.pdf"):
+    return _make_file(tmp_path, name, b"%PDF-1.4 fake bytes")
+
+
+def test_ocr_pdf_uses_text_layer_without_touching_tesseract(tmp_path, monkeypatch):
+    # A searchable PDF: text layer on every page, so nothing is rasterized and
+    # tesseract is never consulted (`shutil.which` unpatched would still be fine —
+    # `subprocess.run` raising is the assertion that it isn't called).
+    pages = [_FakePage(text="Patient: Jane Doe, HbA1c 6.1"), _FakePage(text="B" * 40)]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    monkeypatch.setattr(
+        ingest.subprocess, "run",
+        lambda *a, **k: pytest.fail("tesseract ran on a page with a text layer"),
+    )
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert text == "Patient: Jane Doe, HbA1c 6.1\f" + "B" * 40
+    assert all(page.pixmap_kwargs is None for page in pages)
+
+
+def test_ocr_pdf_rasterizes_and_ocrs_pages_with_no_text_layer(tmp_path, monkeypatch):
+    # The reported bug: a scanned PDF has no text layer at all, and used to store
+    # nothing because tesseract cannot decode a PDF.
+    pages = [_FakePage(scanned="page one scan"), _FakePage(scanned="page two scan")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "page one scan\fpage two scan"
+    for page in pages:
+        assert page.pixmap_kwargs == {
+            "dpi": ingest.OCR_DPI, "colorspace": _FakeBackend.csGRAY
+        }
+    assert ingest.OCR_DPI == 300
+
+
+def test_ocr_pdf_decides_per_page_not_per_document(tmp_path, monkeypatch):
+    # Mixed document: a searchable cover page, then a scan carrying a stray stamp
+    # character. The stray character must not suppress OCR of the whole page.
+    pages = [
+        _FakePage(text="Discharge summary for the visit of 2024-03-02"),
+        _FakePage(text="  X ", scanned="the labs table"),
+    ]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert text == "Discharge summary for the visit of 2024-03-02\fthe labs table"
+    assert pages[0].pixmap_kwargs is None
+    assert pages[1].pixmap_kwargs is not None
+
+
+def test_ocr_pdf_falls_back_to_short_text_layer_when_ocr_finds_nothing(
+    tmp_path, monkeypatch
+):
+    # A page under the floor whose pixels yield nothing keeps its stray characters
+    # rather than dropping them — some text beats none.
+    pages = [_FakePage(text="Rx", scanned="")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "Rx"
+
+
+def test_ocr_pdf_caps_long_documents_and_says_so(tmp_path, monkeypatch, capsys):
+    pages = [_FakePage(text=f"page {n} " + "z" * 30) for n in range(25)]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+
+    text = ingest.run_ocr(_pdf(tmp_path))
+
+    assert len(text.split("\f")) == ingest.OCR_MAX_PAGES == 20
+    err = capsys.readouterr().err
+    assert "25 pages" in err and "first 20" in err
+
+
+def test_load_pdf_backend_prefers_pymupdf_and_tolerates_absence(monkeypatch):
+    # The seam itself, exercised without caring whether PyMuPDF is installed here.
+    tried: list[str] = []
+
+    def only(available):
+        def import_module(name):
+            tried.append(name)
+            if name != available:
+                raise ImportError(name)
+            return f"<{name}>"
+        return import_module
+
+    monkeypatch.setattr(ingest.importlib, "import_module", only("pymupdf"))
+    assert ingest._load_pdf_backend() == "<pymupdf>"
+    assert tried == ["pymupdf"]  # modern name first, no needless `fitz` import
+
+    tried.clear()
+    monkeypatch.setattr(ingest.importlib, "import_module", only("fitz"))
+    assert ingest._load_pdf_backend() == "<fitz>"  # older wheels
+
+    monkeypatch.setattr(ingest.importlib, "import_module", only(None))
+    assert ingest._load_pdf_backend() is None  # extra not installed
+
+
+def test_ocr_pdf_without_backend_names_the_extra(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, None)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "pemr[ocr]" in capsys.readouterr().err
+
+
+def test_ocr_pdf_without_tesseract_degrades(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc([_FakePage(scanned="x")])))
+    _install_tesseract(monkeypatch, available=False)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "tesseract" in capsys.readouterr().err
+
+
+def test_ocr_pdf_encrypted_returns_none(tmp_path, monkeypatch, capsys):
+    doc = _FakeDoc([_FakePage(scanned="secret")], needs_pass=True)
+    _install_backend(monkeypatch, _FakeBackend(doc))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "password-protected" in capsys.readouterr().err
+    assert doc.closed
+
+
+def test_ocr_pdf_unparseable_returns_none(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(error=RuntimeError("Failed to open")))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_ocr_pdf_bad_page_skips_only_that_page(tmp_path, monkeypatch, capsys):
+    class _Exploding(_FakePage):
+        def get_text(self):
+            raise RuntimeError("mupdf: cannot parse page")
+
+    pages = [_Exploding(), _FakePage(text="the page that still works fine")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "the page that still works fine"
+    assert "page 1" in capsys.readouterr().err
+
+
+def test_ocr_pdf_surfaces_tesseract_stderr(tmp_path, monkeypatch, capsys):
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc([_FakePage(scanned="x")])))
+    _install_tesseract(monkeypatch, stderr=b"Error in pixReadStream: unsupported\n")
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+    # The line that would have made 501 silent failures self-diagnosing.
+    assert "Error in pixReadStream: unsupported" in capsys.readouterr().err
+
+
+def test_run_ocr_on_an_image_is_unchanged(tmp_path, monkeypatch):
+    # Regression guard for the non-PDF path: same argv, same text-mode capture as
+    # before the PDF dispatch existed.
+    src = _make_file(tmp_path, "scan.jpg", b"jpeg bytes")
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, **kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="image text\n", stderr="")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+
+    assert ingest.run_ocr(src) == "image text"
+    assert seen["cmd"] == ["tesseract", str(src), "stdout"]
+    assert seen["text"] is True
+
+
+def test_run_ocr_image_failure_note_carries_tesseract_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(
+            1, cmd, output="", stderr="Warning: bad dpi\nError: unsupported format\n"
+        )
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+
+    assert ingest.run_ocr(_make_file(tmp_path, "scan.jpg", b"jpeg")) is None
+    assert "Error: unsupported format" in capsys.readouterr().err
+
+
+def test_ingest_pdf_with_ocr_populates_ocr_text(conn, tmp_path, sources, monkeypatch):
+    pages = [_FakePage(scanned="Jane Doe cholesterol panel")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    result = ingest.ingest_document(
+        conn, _pdf(tmp_path), "jane-doe", sources, ocr=True
+    )
+
+    assert result.status == "new"
+    assert result.ocr_text_populated
+    assert result.document.ocr_text == "Jane Doe cholesterol panel"
+# --- OCR output decoding (issue #64) ------------------------------------------
+#
+# Tesseract emits UTF-8. `subprocess.run(..., text=True)` with no explicit
+# encoding decodes the pipe with the *platform default* codepage — cp1252 on
+# Windows — inside subprocess's reader thread, so any byte invalid there
+# (0x81/0x8D/0x8F/0x90/0x9D) raised UnicodeDecodeError and failed the ingest.
+
+# 0xC3 0x8D ("Í") lands a 0x8D on the wire: undefined in cp1252, decodes fine as UTF-8.
+# Names the fixture's owner so the #61 owner check passes and the round-trip test
+# exercises decoding rather than refusal.
+OCR_UTF8 = "Patient: Jane Doe — 20 µg/dL — MARTÍNEZ CLINIC".encode("utf-8")
+
+
+def _fake_tesseract(payload: bytes, platform_default: str = "cp1252"):
+    """`subprocess.run` stand-in that decodes the way CPython actually does.
+
+    Mirrors the real contract: with `text=True` and `encoding=None` the pipe is
+    wrapped with the locale's preferred encoding under strict error handling.
+    """
+
+    def _run(argv, capture_output=False, text=False, encoding=None,
+             errors=None, check=False):
+        assert argv[0] == "tesseract"
+        if not text:
+            return subprocess.CompletedProcess(argv, 0, payload, b"")
+        decoded = payload.decode(encoding or platform_default, errors or "strict")
+        return subprocess.CompletedProcess(argv, 0, decoded, "")
+
+    return _run
+
+
+def test_run_ocr_decodes_utf8_under_a_cp1252_platform_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(ingest.subprocess, "run", _fake_tesseract(OCR_UTF8))
+    assert ingest.run_ocr(_make_file(tmp_path)) == OCR_UTF8.decode("utf-8")
+
+
+def test_run_ocr_survives_undecodable_bytes(tmp_path, monkeypatch):
+    """A stray non-UTF-8 byte degrades to U+FFFD, it does not lose the page."""
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        ingest.subprocess, "run", _fake_tesseract(b"scan \xff noise")
+    )
+    assert ingest.run_ocr(_make_file(tmp_path)) == "scan � noise"
+
+
+def test_ocr_text_round_trips_through_ingest(conn, tmp_path, sources, monkeypatch):
+    # `.png`, not the fixture's default `.txt`: issue #66's dispatcher reads
+    # plaintext natively, so only a non-native suffix still reaches tesseract —
+    # which is the route whose decoding this test is about.
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(ingest.subprocess, "run", _fake_tesseract(OCR_UTF8))
+    result = ingest.ingest_document(
+        conn, _make_file(tmp_path, "scan.png"), "jane-doe", sources, ocr=True
+    )
+    assert result.document.ocr_text == OCR_UTF8.decode("utf-8")
 
 
 # --- owner verification (issue #61) -------------------------------------------
@@ -327,3 +675,368 @@ def test_layer1_duplicate_is_unaffected_by_mismatching_text(conn, tmp_path, sour
     assert again.status == "duplicate"
     assert again.document.document_id == first.document.document_id
     assert again.owner_check is None  # nothing written -> nothing checked
+
+
+# --- intake formats (issue #66) -----------------------------------------------
+#
+# Two guards, both stdlib-only: Google Drive pointer stubs are refused pre-write, and
+# `ocr=True` extracts text natively for the formats that allow it.
+
+_STUB = {
+    "url": "https://docs.google.com/spreadsheets/d/1AbC_dEf/edit?usp=drivesdk",
+    "doc_id": "1AbC_dEf",
+    "email": "someone@example.com",
+    "resource_id": "spreadsheet:1AbC_dEf",
+}
+
+
+def _make_stub(tmp_path, name="budget.gsheet", payload=None):
+    p = tmp_path / name
+    p.write_text(json.dumps(_STUB if payload is None else payload), encoding="utf-8")
+    return p
+
+
+def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
+    body = "".join(
+        f"<w:p><w:r><w:t>{part}</w:t></w:r></w:p>" for part in paragraphs
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+        f'2006/main"><w:body>{body}</w:body></w:document>'
+    )
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", document)
+    return p
+
+
+def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "140"))):
+    strings: list[str] = []
+    for row in rows:
+        for cell in row:
+            if cell not in strings:
+                strings.append(cell)
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    shared = (
+        f'<sst xmlns="{ns}">'
+        + "".join(f"<si><t>{s}</t></si>" for s in strings)
+        + "</sst>"
+    )
+    body = "".join(
+        "<row>"
+        + "".join(f'<c t="s"><v>{strings.index(cell)}</v></c>' for cell in row)
+        + "</row>"
+        for row in rows
+    )
+    sheet = f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("xl/sharedStrings.xml", shared)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+    return p
+
+
+def test_pointer_stub_is_refused_pre_write(conn, tmp_path, sources):
+    stub = _make_stub(tmp_path)
+    with pytest.raises(ingest.IngestError) as excinfo:
+        ingest.ingest_document(conn, stub, "jane-doe", sources)
+    message = str(excinfo.value)
+    assert "pointer stub" in message
+    assert "Export it from Drive" in message  # names the fix
+    # pre-write: no blob and no row
+    assert not sources.exists()
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_pointer_guard_is_conjunctive_so_a_real_file_still_ingests(
+    conn, tmp_path, sources
+):
+    # a genuine spreadsheet that merely carries a `.gsheet` name: right suffix, but
+    # too big and not JSON -> not a stub.
+    real = _make_file(tmp_path, "real.gsheet", b"PK\x03\x04" + b"\xff" * 20_000)
+    result = ingest.ingest_document(conn, real, "jane-doe", sources)
+    assert result.status == "new"
+
+
+@pytest.mark.parametrize(
+    "name, payload",
+    [
+        ("notes.txt", _STUB),                       # wrong suffix
+        ("x.gsheet", {"url": "https://example.com/x"}),   # wrong host
+        ("x.gsheet", {"doc_id": "abc"}),            # older shape, missing `email`
+        ("x.gsheet", ["not", "an", "object"]),      # JSON, but not an object
+    ],
+)
+def test_pointer_guard_does_not_fire(conn, tmp_path, sources, name, payload):
+    src = _make_stub(tmp_path, name, payload)
+    assert not ingest.is_pointer_stub(src)
+    assert ingest.ingest_document(conn, src, "jane-doe", sources).status == "new"
+
+
+def test_pointer_guard_ignores_unparseable_files(tmp_path):
+    assert not ingest.is_pointer_stub(_make_file(tmp_path, "b.gsheet", b"\xff\xfe\x00"))
+
+
+def test_extract_text_reads_plaintext_formats(conn, tmp_path, sources):
+    src = _make_file(tmp_path, "labs.csv", "test,value\r\nsodium,140\n".encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.ocr_text_populated
+    assert "sodium,140" in result.document.ocr_text
+
+
+def test_extract_text_reads_docx(conn, tmp_path, sources):
+    src = _make_docx(tmp_path, paragraphs=("Visit summary", "HbA1c 5.7 percent"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Visit summary\nHbA1c 5.7 percent"
+
+
+def test_extract_text_reads_xlsx(conn, tmp_path, sources):
+    src = _make_xlsx(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "test\tvalue\nsodium\t140"
+
+
+def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys, monkeypatch):
+    monkeypatch.setattr(ingest, "run_ocr", lambda _: None)   # tesseract declines
+    src = _make_file(tmp_path, "thread.msg", b"\xd0\xcf\x11\xe0 outlook")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"          # the document still lands
+    assert result.document.ocr_text is None
+    assert "--ocr-text-file" in capsys.readouterr().err
+
+
+# --- routing boundary (issue #66 verify bounce) --------------------------------
+# `ocr=True` used to hand *every* file to tesseract. An image-suffix allowlist silently
+# dropped `.jfif`/`.jpe`/extension-less scans out of `find`, so anything without a native
+# route must still reach `run_ocr`.
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["alpha.jfif", "beta.jpe", "gamma_noext", "delta.JPG", "scan.pdf", "thread.msg"],
+)
+def test_suffixes_without_a_native_route_still_reach_tesseract(
+    conn, tmp_path, sources, monkeypatch, name
+):
+    seen: list[str] = []
+
+    def fake_run_ocr(path):
+        seen.append(str(path))
+        return "Ferritin 201 nanograms"
+
+    monkeypatch.setattr(ingest, "run_ocr", fake_run_ocr)
+    src = _make_file(tmp_path, name, b"\x89PNG pretend scan")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "Ferritin 201 nanograms"
+
+
+@pytest.mark.parametrize("maker", ["csv", "txt", "docx", "xlsx"])
+def test_natively_extracted_suffixes_never_shell_out(
+    conn, tmp_path, sources, monkeypatch, maker
+):
+    def boom(path):  # pragma: no cover - the assertion is that this never runs
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", boom)
+    if maker == "docx":
+        src = _make_docx(tmp_path, paragraphs=("sodium 140",))
+    elif maker == "xlsx":
+        src = _make_xlsx(tmp_path)
+    else:
+        src = _make_file(tmp_path, f"labs.{maker}", b"test,value\nsodium,140\n")
+    assert ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).ocr_text_populated
+
+
+def test_xlsx_bad_shared_string_index_only_loses_that_cell(conn, tmp_path, sources):
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    src = tmp_path / "badidx.xlsx"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            f'<sst xmlns="{ns}"><si><t>ferritin</t></si></sst>',
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            f'<worksheet xmlns="{ns}"><sheetData>'
+            '<row><c t="s"><v>0</v></c><c t="s"><v>notanint</v></c>'
+            '<c t="s"><v>0</v></c></row>'
+            "</sheetData></worksheet>",
+        )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    # bad cell blank, the rest of the workbook survives
+    assert result.document.ocr_text == "ferritin\t\tferritin"
+
+
+def test_malformed_docx_degrades_instead_of_losing_the_document(
+    conn, tmp_path, sources, capsys
+):
+    src = _make_file(tmp_path, "broken.docx", b"not a zip at all")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.document.ocr_text is None
+    assert "extraction failed" in capsys.readouterr().err
+
+
+def test_supplied_ocr_text_still_beats_extraction(conn, tmp_path, sources):
+    src = _make_docx(tmp_path, paragraphs=("extracted body",))
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True, ocr_text="agent transcription"
+    )
+    assert result.document.ocr_text == "agent transcription"
+
+
+# --- structured text vs. the #61 identity anchor (issue #66 audit bounce) -------
+#
+# Native extraction made text available for `.csv`/`.docx`/`.xlsx`/`.json`, and that text
+# flows into the owner check. `_ANCHOR` was tuned for scanned headers where `Patient:`
+# precedes a printed name; in a lab export those same words are *column labels*, so
+# trusting them refused files that ingested fine before this issue. The anchor→`suspect`
+# inference is therefore route-scoped; `match`/`mismatch` are not.
+
+
+_HEADER_ROW = "Patient ID,Test,Value,Unit\n1043,Glucose,98,mg/dL\n"
+
+
+def test_check_owner_anchor_trust_is_route_scoped():
+    text = "Patient: SMITH, JANE A    DOB: 03/14/1900"
+    assert ingest.check_owner(text, JANE, ROSTER).verdict == "suspect"
+    assert ingest.check_owner(
+        text, JANE, ROSTER, trust_anchors=False
+    ).verdict == "unverified"
+
+
+@pytest.mark.parametrize(
+    "text, verdict, matched",
+    [
+        ("Patient: DOE, JANE   DOB: 03/14/1962", "match", "jane-doe"),
+        ("Patient: ROE, ROBERT ALAN", "mismatch", "bob-roe"),
+    ],
+)
+def test_affirmative_verdicts_survive_untrusted_anchors(text, verdict, matched):
+    """Only `suspect` is route-scoped: an actual name/DOB is evidence on any route."""
+    check = ingest.check_owner(text, JANE, ROSTER, trust_anchors=False)
+    assert check.verdict == verdict
+    assert check.matched_slug == matched
+
+
+@pytest.mark.parametrize("kind", ["csv", "docx", "xlsx", "json"])
+def test_structured_headers_do_not_refuse_the_ingest(conn, tmp_path, sources, kind):
+    """A `Patient ID` column (or a `patient` JSON key) is a schema, not an identity
+    claim — these all ingested exit-0 before native extraction existed and must still."""
+    _seed_roster(conn)
+    if kind == "docx":
+        src = _make_docx(tmp_path, paragraphs=("Patient chart summary", "Ferritin 201"))
+    elif kind == "xlsx":
+        src = _make_xlsx(tmp_path, rows=(("Patient ID", "Test"), ("1043", "Glucose")))
+    elif kind == "json":
+        src = _make_file(tmp_path, "export.json", b'{"patient": 1043, "dob": null}')
+    else:
+        src = _make_file(tmp_path, "labs.csv", _HEADER_ROW.encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.owner_check.verdict == "unverified"
+    assert result.owner_check.blocks is False
+    assert result.ocr_text_populated
+
+
+@pytest.mark.parametrize("name", ["transcript.txt", "note.md", "panel.tsv", "app.log"])
+def test_plaintext_suffixes_are_route_scoped_too(conn, tmp_path, sources, name):
+    """The scope line is the *route*, not how prose-like the suffix is: a foreign
+    identity header in a natively-read `.txt`/`.md`/`.tsv`/`.log` yields `unverified`,
+    not `suspect`. Not a regression — before native extraction these went to tesseract,
+    which declined, so there was no text and no check either — but it is the behavior
+    `AGENTS.md` §3 documents, so pin it rather than let it drift silently."""
+    _seed_roster(conn)
+    src = _make_file(
+        tmp_path, name, b"MERCY LABS\nPatient: SMITH, KAREN\nDOB: 09/09/1971\n"
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "unverified"
+    assert result.status == "new"
+    # ...and the protective half still fires on the same route.
+    other = _make_file(tmp_path, f"other-{name}", b"Patient: ROE, ROBERT ALAN\n")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, other, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+
+
+def test_structured_text_still_refuses_another_roster_person(conn, tmp_path, sources):
+    """The half of #61 that actually protects against a misfile is untouched: an
+    affirmative match on a different roster person blocks on the native route too."""
+    _seed_roster(conn)
+    src = _make_docx(tmp_path, paragraphs=("Patient: ROE, ROBERT ALAN", "Ferritin 201"))
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "bob-roe"
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_ocr_route_still_produces_suspect(conn, tmp_path, sources, monkeypatch):
+    """Scoping the anchor to prose must not disarm #61 on the route it was built for."""
+    _seed_roster(conn)
+    monkeypatch.setattr(
+        ingest, "run_ocr", lambda _: "Patient: SMITH, KAREN    DOB: 09/09/1971"
+    )
+    src = _make_file(tmp_path, "scan.png", b"\x89PNG pretend scan")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "suspect"
+
+
+# --- extraction size cap (issue #66 audit) -------------------------------------
+#
+# `ocr_text` lands in the row *and* the FTS index, so an unbounded read is a DB-size
+# problem and a decompression-bomb surface (a small `.docx` can declare a ~1 GB
+# `word/document.xml`). Over the cap degrades like any other extraction failure.
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt"])
+def test_oversized_extraction_degrades_instead_of_reading_it(
+    conn, tmp_path, sources, capsys, monkeypatch, kind
+):
+    monkeypatch.setattr(ingest, "_MAX_EXTRACT_BYTES", 16)
+    if kind == "docx":
+        src = _make_docx(tmp_path, paragraphs=("a" * 500,))
+    elif kind == "xlsx":
+        src = _make_xlsx(tmp_path)
+    else:
+        src = _make_file(tmp_path, "big.txt", b"x" * 500)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"           # the document still lands
+    assert result.document.ocr_text is None
+    assert "extraction cap" in capsys.readouterr().err
+
+
+def test_extraction_cap_is_one_budget_shared_across_the_archive(
+    conn, tmp_path, sources, capsys, monkeypatch
+):
+    """Many members, none individually over the cap, must not add up past it — the
+    per-member check alone would let a 40-sheet workbook spend the budget 40 times."""
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    def sheet(text):
+        return (f'<worksheet xmlns="{ns}"><sheetData><row>'
+                f'<c t="inlineStr"><is><t>{text}</t></is></c>'
+                "</row></sheetData></worksheet>")
+    src = tmp_path / "many.xlsx"
+    members = ("xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml")
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr(members[0], sheet("a" * 200))
+        zf.writestr(members[1], sheet("b" * 200))
+    with zipfile.ZipFile(src) as zf:
+        sizes = [zf.getinfo(name).file_size for name in members]
+    assert ingest.extract_text(src) is not None   # fine under the real cap
+
+    # A cap each member clears on its own, but the pair does not.
+    monkeypatch.setattr(ingest, "_MAX_EXTRACT_BYTES", max(sizes))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"
+    assert result.document.ocr_text is None
+    assert "sheet2.xml" in capsys.readouterr().err
