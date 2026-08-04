@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import backup, cli, db, restore, verify
+from pemr import backup, cli, db, restore, tombstones, verify
 
 
 # --------------------------------------------------------------------------- #
@@ -612,3 +612,88 @@ def test_snapshot_name_override_is_verbatim_and_never_overwrites(tmp_path):
     with pytest.raises(backup.BackupError):
         backup.snapshot(db_path, out, name=snap.name)
     assert snap.exists(), "the refused second write must not clobber the first"
+
+
+# --------------------------------------------------------------------------- #
+# tombstones lost across a restore (issue #80)
+# --------------------------------------------------------------------------- #
+
+def test_restore_reports_tombstones_the_snapshot_does_not_have(tmp_path, capsys):
+    """A snapshot predating a tombstone loses it - correct, but the *consequence* is
+    issue #80's bug resurrected, so the loss is named before the replace."""
+    db_path, sources = _populated(tmp_path)
+    backups = tmp_path / "backups"
+    assert _run(db_path, "backup", "--backup-dir", str(backups)) == 0
+
+    # Recorded *after* the snapshot, so the restore drops it.
+    assert _run(db_path, "document", "rm", "1", "--tombstone", "--reason",
+                "identifiers", "--apply") == 0
+
+    capsys.readouterr()
+    assert _run(db_path, "restore", "latest", "--backup-dir", str(backups),
+                "--sources", str(sources), "--force") == 0
+    err = capsys.readouterr().err
+    assert "1 tombstone(s) in the current database are not in this snapshot" in err
+    assert "identifiers" in err
+    assert restore.RESCUE_PREFIX in err          # where they are still recoverable
+    assert "tombstone add --sha256" in err       # and how to put them back
+    assert err.isascii()
+
+    # Reported, never merged: the restored database is the snapshot's, tombstone-free.
+    conn = db.connect(db_path)
+    try:
+        assert verify.row_counts(conn)["document_tombstone"] == 0
+    finally:
+        conn.close()
+
+
+def test_restore_says_nothing_when_no_tombstone_is_lost(tmp_path, capsys):
+    db_path, sources = _populated(tmp_path)
+    backups = tmp_path / "backups"
+    assert _run(db_path, "document", "rm", "1", "--tombstone", "--apply") == 0
+    assert _run(db_path, "backup", "--backup-dir", str(backups)) == 0
+
+    capsys.readouterr()
+    assert _run(db_path, "restore", "latest", "--backup-dir", str(backups),
+                "--sources", str(sources), "--force") == 0
+    assert "will be lost" not in capsys.readouterr().err
+
+
+def test_restore_from_a_pre_migration_snapshot_does_not_crash(tmp_path, capsys):
+    """The snapshot has no `document_tombstone` table at all - guarded on both sides,
+    exactly as `verify.row_counts` omits tables missing from an older schema."""
+    import shutil
+
+    db_path = tmp_path / "pemr.db"
+    backups = tmp_path / "backups"
+    staged = tmp_path / "pre007"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "007":
+            shutil.copy(path, staged / path.name)
+    old = db.connect(db_path)
+    try:
+        db.migrate(old, staged)
+    finally:
+        old.close()
+    assert _run(db_path, "backup", "--backup-dir", str(backups)) == 0
+
+    # Bring the live database forward and record a tombstone the snapshot cannot hold.
+    assert _run(db_path, "migrate") == 0
+    conn = db.connect(db_path)
+    try:
+        tombstones.add_tombstone(conn, "c" * 64, reason="identifiers")
+    finally:
+        conn.close()
+
+    capsys.readouterr()
+    assert _run(db_path, "restore", "latest", "--backup-dir", str(backups),
+                "--force") == 0
+    err = capsys.readouterr().err
+    assert "1 tombstone(s)" in err
+    # migrate ran forward again, so the table is back (empty).
+    conn = db.connect(db_path)
+    try:
+        assert verify.row_counts(conn)["document_tombstone"] == 0
+    finally:
+        conn.close()
