@@ -157,6 +157,31 @@ CREATE TABLE appointment (
   dedup_key      TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
+CREATE TABLE allergy (                     -- migration 006 (promoted from observation)
+  allergy_id    INTEGER PRIMARY KEY,
+  person_id     INTEGER NOT NULL REFERENCES person(person_id),
+  document_id   INTEGER REFERENCES document(document_id),
+  substance     TEXT NOT NULL,
+  reaction      TEXT,
+  criticality   TEXT,                      -- high|low|unable-to-assess
+  noted_on      TEXT,
+  dedup_key     TEXT NOT NULL,
+  UNIQUE(dedup_key)
+);
+
+CREATE TABLE condition (                   -- migration 006 (promoted from observation)
+  condition_id  INTEGER PRIMARY KEY,
+  person_id     INTEGER NOT NULL REFERENCES person(person_id),
+  document_id   INTEGER REFERENCES document(document_id),
+  name          TEXT NOT NULL,
+  status        TEXT NOT NULL,             -- active|resolved|history|family-history
+  onset_on      TEXT,
+  resolved_on   TEXT,
+  relation      TEXT,                      -- family-history only: mother|father|...
+  note          TEXT,
+  dedup_key     TEXT NOT NULL,
+  UNIQUE(dedup_key)
+);
 ```
 
 Generic catch-all (new record types with zero migration):
@@ -167,8 +192,9 @@ CREATE TABLE observation (
   person_id      INTEGER NOT NULL REFERENCES person(person_id),
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
-                                           -- 'blood_pressure'/'weight'), 'condition',
-                                           -- 'allergy' (phase 4 render.py convention)
+                                           -- 'blood_pressure'/'weight'), 'order',
+                                           -- 'screening', 'immunization'
+                                           -- (condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
   value_num      REAL,
@@ -181,7 +207,11 @@ CREATE TABLE observation (
 
 Promotion path: an `obs_type` that grows important graduates from `observation`
 into its own typed table via a migration. The generic table absorbs the long tail so
-you're never blocked waiting on schema work.
+you're never blocked waiting on schema work. `condition` and `allergy` are the worked
+example (migration 006, issue #63): both graduated on *fields with no legal home* in the
+generic shape — a resolved problem needs two dates where `observation` has one, and an
+allergy's `criticality` had nowhere to live but free text — not on row volume. Volume
+alone is not a reason to promote.
 
 ---
 
@@ -202,7 +232,30 @@ medication.dedup_key    = hash(person_id | norm(name) | dose | started_on)
 procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
 observation.dedup_key   = hash(person_id | obs_type | observed_at | key)
+allergy.dedup_key       = hash(person_id | norm(substance))
+condition.dedup_key     = hash(person_id | norm(name) | subject)
+    subject = 'family:' + norm(relation)  when status = 'family-history'
+            = 'self'                      otherwise
 ```
+
+The last two are deliberately **date-free**: allergies and problem lists are *standing
+facts* restated on every document with inconsistent or absent dates, so a date in the key
+would fork one allergy into one row per document. Their dates are payload, and a stated
+disagreement (in a date or anywhere else) stages a conflict. A field the incoming document
+simply omits is silence, not a change, and never conflicts — the one place the
+duplicate-vs-conflict comparison differs by record type (`dedup._SPARSE_TYPES`). The
+`subject` discriminator is a correctness fix, not a nicety: without it a patient's
+diabetes and her mother's derive one key and silently merge.
+
+That reading is asymmetric by design. Treating a *stored* NULL as silence too would make the
+common terse-then-detailed document sequence lossy: the second document's `criticality` would
+count as a duplicate and be dropped, with no conflict to catch it. So a field the incoming row
+states over a stored NULL is a **gain** — no competing value, nothing to adjudicate — and fills
+the stored row in place, reported as `enriched` (a fourth commit bucket beside
+new/duplicate/conflict). A stated value never overwrites a stored one on that path, so
+enrichment cannot launder a disagreement into a silent overwrite. The same reading governs
+`keep incoming` on these types: it writes the fields the incoming row states and leaves the
+rest as stored, so a one-field adjudication doesn't erase the row's other payload.
 
 `norm()` = lowercase, trim, collapse whitespace, map synonyms via an **analyte/name
 dictionary** (`data/dictionary.toml`) — e.g. `A1c`, `HbA1c`, `Hemoglobin A1c` → one
@@ -315,7 +368,7 @@ inbox/scan.pdf
       matching the record schemas (lab_result[], medication[], observation[]...)
   → pemr commit-extraction --document <id> --json extracted.json
       5. validate JSON against schema (types, required fields)
-      6. compute dedup_keys; split into {new, duplicate, conflict}
+      6. compute dedup_keys; split into {new, duplicate, enriched, conflict}
       7. insert new; report the rest
   → pemr review-conflicts   (if any)
 ```

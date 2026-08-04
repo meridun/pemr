@@ -227,6 +227,7 @@ def commit_extraction(
         "counts": summary.counts,
         "new": summary.new,
         "duplicate": summary.duplicate,
+        "enriched": summary.enriched,
         "conflict": summary.conflict,
     }
 
