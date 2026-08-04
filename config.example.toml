@@ -6,6 +6,9 @@
 #   * backup_dir and sources_dir ARE cloud-synced — backups are consistent single-file
 #     `VACUUM INTO` snapshots, sources are immutable content-addressed blobs. Both are
 #     safe for sync and give off-machine copies of the irreplaceable data.
+#   * EXCEPT sources_dir/.tmp/ — exclude that one subfolder from sync. `pemr ingest
+#     --study` packs a study archive there, hashes it, then moves it into place;
+#     syncing the staging area uploads gigabytes that are deleted seconds later.
 
 [paths]
 # Local-only data root: holds pemr.db (+ -wal/-shm), inbox/, exports/.

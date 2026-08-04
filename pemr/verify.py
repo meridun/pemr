@@ -33,6 +33,8 @@ COUNTED_TABLES = (
     "procedure",
     "appointment",
     "observation",
+    "condition",
+    "allergy",
     "conflict",
     "record_fts",
 )

@@ -9,6 +9,7 @@
 
 CREATE VIRTUAL TABLE record_fts USING fts5(
   source_table UNINDEXED,   -- 'document'|'lab_result'|'medication'|'procedure'|'appointment'|'observation'
+                           -- (migration 006 added 'allergy'|'condition')
   source_id    UNINDEXED,   -- primary key of the row in source_table
   person_id    UNINDEXED,   -- owner, for the `pemr find --person` filter
   document_id  UNINDEXED,   -- provenance (self for 'document' rows)
