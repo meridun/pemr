@@ -846,6 +846,49 @@ def test_cli_document_set_text_rejects_an_empty_file(cli_ready, capsys):
     assert capsys.readouterr().out == "hba1c 5.7 percent\n"
 
 
+def test_cli_document_set_text_rejects_a_bom_only_file(cli_ready, capsys):
+    """A BOM-only "empty" file (Notepad/PowerShell 5.1) must not defeat the guard.
+
+    U+FEFF survives `str.strip()`, so a `utf-8` read would store one invisible
+    character and report `has_ocr_text: true` on a document with no text (#78).
+    """
+    text = cli_ready / "bomonly.txt"
+    text.write_bytes(b"\xef\xbb\xbf")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 1
+    assert "is empty - nothing to store" in capsys.readouterr().err
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
+def test_cli_document_set_text_strips_a_leading_bom(cli_ready, capsys):
+    """A BOM on a real transcription must not inflate the stored text (#78)."""
+    text = cli_ready / "bommed.txt"
+    text.write_bytes(b"\xef\xbb\xbfreplacement transcription")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 0
+    assert "set ocr_text on document #1: 25 chars" in capsys.readouterr().out
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "replacement transcription\n"
+
+
+def test_cli_document_set_text_non_utf8_file_is_a_friendly_error(cli_ready, capsys):
+    """`UnicodeDecodeError` is a `ValueError`, not an `OSError` - handing in a PDF
+    or a UTF-16 file used to escape the `except` and traceback out of `main` (#78)."""
+    text = cli_ready / "scan.pdf"
+    text.write_bytes(b"%PDF-1.4\xff\xfe\x00binary junk")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 1
+    err = capsys.readouterr().err
+    assert "error: cannot read" in err and "scan.pdf" in err
+    # Nothing was written: the read fails before the DB is even opened.
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
 def test_cli_document_set_text_unreadable_path_and_unknown_id_fail(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "document", "set-text", "1",
