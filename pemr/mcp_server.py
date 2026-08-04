@@ -180,7 +180,14 @@ def ingest_document(
 
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
-    contract without a follow-up read.
+    contract without a follow-up read. ``ocr=true`` is the fallback: it extracts by
+    whatever route the file type allows (plaintext/`.docx`/`.xlsx` natively, everything
+    else via tesseract), and stores nothing when nothing could be read — `.pdf`, `.rtf`,
+    `.msg` and `.doc` have no route at all (tesseract does not accept PDF input), so
+    transcribe those yourself.
+
+    A Google Drive pointer stub (``.gsheet``/``.gdoc`` — a ~1 KB JSON link, not the
+    document) is refused pre-write; the fix is to export it from Drive first.
 
     ``study="dicom"`` makes ``file`` a study *directory* — a burned imaging disc — and
     packs its slices into one document (issue #69). ``ocr_text`` then defaults to a
@@ -191,7 +198,12 @@ def ingest_document(
     back as ``owner_check`` (``null`` on a duplicate, which is never checked). A
     ``mismatch``/``suspect`` verdict refuses the ingest pre-write — per ``AGENTS.md``
     §3, surface the verdict and its evidence to the human and get an explicit
-    go-ahead before retrying with ``force=true``.
+    go-ahead before retrying with ``force=true``. ``suspect`` (a patient-identity
+    header naming nobody on the roster) is scoped by route: it applies to the text you
+    supply and to a tesseract pass, never to anything ``ocr=true`` extracts natively
+    (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``), where
+    those words are column labels — so pass your transcription as ``ocr_text`` rather
+    than saving it to a ``.txt`` and re-reading that. ``mismatch`` holds on every route.
     """
     try:
         sources_dir = cli._resolve_sources_dir(_ARGS)

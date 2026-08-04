@@ -360,10 +360,12 @@ point, so `trends` deltas and "latest value" stay deterministic.
 ```
 inbox/scan.pdf
   → pemr ingest inbox/scan.pdf --person jane-doe
+      0. refuse Google Drive pointer stubs (`.gsheet`/`.gdoc` — a ~1 KB JSON link,
+         not the document); pre-hash, so a refusal writes nothing
       1. hash bytes; if known → report duplicate, stop
       2. resolve document text (agent-supplied, or --ocr), then verify the owner:
-         text naming a different roster person, or a patient-identity header
-         naming nobody on the roster → refuse pre-write (--force overrides)
+         text naming a different roster person, or — in prose only — a patient-
+         identity header naming nobody → refuse pre-write (--force overrides)
       3. move blob → sources/<sha>/<sha>.pdf   (immutable)
       4. insert document row (category/provider left null for now)
   → AGENT step (vision): read the source, emit proposed rows as JSON
@@ -379,8 +381,34 @@ Division of labor: **the LLM only does the fuzzy vision-to-structure step.** Has
 validation, dedup, insertion, conflict detection are all deterministic Python the agent
 can't get subtly wrong. That's the whole point of lifting them out.
 
-Optional `--ocr tesseract` flag pre-fills `document.ocr_text` when scans are flat images,
-giving the agent text to work from instead of re-reading pixels every time.
+Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text to work
+from instead of re-reading the source every time. It extracts by whatever route the file
+type allows, all stdlib (the engine has no runtime dependencies):
+`.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
+parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
+allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Formats
+tesseract can't read need a third-party parser and are deliberately out: `.rtf`, `.msg`,
+`.doc`, and **`.pdf` in any form** — tesseract 5 does not accept PDF input at all, so a
+scanned PDF is no better off than a text-layer one. For those you get a stderr note
+telling you to transcribe it yourself and pass `--ocr-text-file` (or rasterize the PDF to
+an image first). Extraction is best-effort and never fatal; a malformed file costs you the
+text, not the document. It is capped at 32 MiB per file — `ocr_text` is mirrored into the
+FTS index, so an unbounded read is both a database-size problem and a decompression-bomb
+surface (a small `.docx` can declare a gigabyte of `word/document.xml`). `--ocr tesseract`
+is a retained alias for `--ocr auto`.
+
+Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
+only to an agent transcription or a tesseract pass, never to natively-extracted text —
+the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set. In a structured export
+`Patient`/`DOB`/`MRN` are column labels and field keys, and counting them as an identity
+header refuses ordinary lab exports as belonging to a stranger. The line is the *route*
+rather than how prose-like the format is, because the route is what the extractor actually
+knows; the cost is that a prose transcript saved as `.txt` and ingested with `--ocr auto`
+loses the anchor check too. That is no worse than before native extraction existed (such a
+file went to tesseract, which declined, so there was no text and no check either), and the
+`--ocr-text-file` path keeps full coverage. `mismatch` — an affirmative name/DOB match on a
+*different* roster person — is the half that actually prevents misfiling, and it blocks on
+every route.
 
 ### Study directories (issue #69)
 
@@ -432,7 +460,7 @@ one document type a human cannot eyeball to catch a misfile.
 
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
-pemr ingest <file> --person <slug> [--ocr tesseract] [--force]   # --force: skip owner verification
+pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
 pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
