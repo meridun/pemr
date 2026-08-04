@@ -131,6 +131,8 @@
 # --- Vitamins ---
 "vitamin d" = "vitamin_d_25oh"
 "vitamin d, 25-hydroxy" = "vitamin_d_25oh"
+"vit d, 25-hydroxy" = "vitamin_d_25oh"
+"vit d" = "vitamin_d_25oh"
 "25-hydroxyvitamin d" = "vitamin_d_25oh"
 "vitamin b12" = "vitamin_b12"
 "b12" = "vitamin_b12"
