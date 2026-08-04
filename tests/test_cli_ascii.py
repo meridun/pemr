@@ -49,6 +49,23 @@ def test_ingest_no_ocr_note_is_console_safe(ready, capsys):
     _assert_console_safe(captured.err)
 
 
+def test_study_ingest_output_is_console_safe(ready, capsys):
+    """Issue #69's new surface: the pack/exclusion notes and the derived summary."""
+    from test_study import make_study
+
+    capsys.readouterr()
+    assert _run(ready, "ingest", str(make_study(ready / "disc")), "--person",
+                "jane-doe", "--study", "dicom", "--sources", str(ready / "sources")) == 0
+    captured = capsys.readouterr()
+    assert "DICOM files" in captured.err
+    _assert_console_safe(captured.out)
+    _assert_console_safe(captured.err)
+
+    capsys.readouterr()
+    assert _run(ready, "document", "show", "1", "--text") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+
 def test_duplicate_output_is_console_safe(ready, capsys):
     """The exact reproduction from the issue: '... - nothing ingested'."""
     scan = ready / "s.txt"

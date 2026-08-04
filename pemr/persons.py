@@ -31,7 +31,7 @@ _EDITABLE_FIELDS = ("full_name", "dob", "sex", "blood_type", "notes")
 # otherwise fail with an IntegrityError, and destroying medical history is irreversible.
 _CHILD_TABLES = (
     "document", "lab_result", "medication", "procedure",
-    "appointment", "observation", "conflict",
+    "appointment", "observation", "condition", "allergy", "conflict",
 )
 
 

@@ -19,12 +19,19 @@ Issue #66 adds two intake-format guards, both stdlib-only (the engine has no run
 dependencies): a pre-write refusal of Google Drive **pointer stubs** (see
 :func:`is_pointer_stub`) and a text-extraction dispatcher (:func:`extract_text`) so
 `.txt`/`.docx`/`.xlsx` and friends become findable instead of landing as opaque blobs.
+
+Issue #69 adds a second entry point, :func:`ingest_study_dir`: a DICOM study
+*directory* becomes one document whose blob is a canonical zip of its slices (see
+:mod:`pemr.study`). It reuses every rail above — same person lookup, same layer-1
+dedup on the content hash, same content-addressed store, same insert, and the same
+owner check, fed by the study's ``PatientName``/``PatientBirthDate`` header tags.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -32,13 +39,14 @@ import sqlite3
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
-from . import db
+from . import db, study as _study
 from .models import Document, Person
 
 
@@ -127,6 +135,14 @@ def run_ocr(path: str | Path) -> str | None:
             ["tesseract", str(path), "stdout"],
             capture_output=True,
             text=True,
+            # tesseract emits UTF-8. Without an explicit encoding, `text=True`
+            # decodes with the platform default (cp1252 on Windows), which kills
+            # the subprocess reader thread with UnicodeDecodeError on any byte
+            # invalid in that codepage — failing the whole ingest. errors=
+            # "replace" keeps a page with a stray undecodable byte usable rather
+            # than losing the OCR entirely.
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except (subprocess.SubprocessError, OSError) as exc:
@@ -577,6 +593,21 @@ def check_owner(
     return OwnerCheck(verdict="unverified")
 
 
+def _strongest_check(checks: Sequence[OwnerCheck]) -> OwnerCheck:
+    """The verdict to act on when more than one identity signal was checked.
+
+    A study has two (the DICOM header tags and any caller-supplied transcription),
+    and they are independent, so the ordering is by consequence: anything blocking
+    wins — refusing on *any* evidence of a misfile is the whole point of the check —
+    then an affirmative match, then ignorance.
+    """
+    for verdict in ("mismatch", "suspect", "match"):
+        for check in checks:
+            if check.verdict == verdict:
+                return check
+    return OwnerCheck(verdict="unverified")
+
+
 def refusal_message(
     check: OwnerCheck, claimed: Person, roster: Sequence[Person]
 ) -> str:
@@ -633,6 +664,46 @@ def _roster(conn: sqlite3.Connection) -> list[Person]:
     ]
 
 
+def _insert_document(
+    conn: sqlite3.Connection,
+    *,
+    sha: str,
+    ext: str,
+    person_id: int,
+    doc_date: str | None,
+    category: str | None,
+    provider: str | None,
+    ocr_text: str | None,
+) -> Document:
+    """Insert the `document` row and read it back. Shared by both ingest paths.
+
+    Blob cleanup on failure stays with the caller: the file path copies its blob in
+    and the study path renames one in, so only they know what to undo.
+    """
+    with conn:
+        cur = conn.execute(
+            """
+            INSERT INTO document
+              (sha256, person_id, doc_date, category, provider, source_path,
+               ocr_text, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sha,
+                person_id,
+                doc_date,
+                category,
+                provider,
+                _relative_source_path(sha, ext),
+                ocr_text,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+    document = get_document_by_id(conn, cur.lastrowid)
+    assert document is not None  # just inserted
+    return document
+
+
 def ingest_document(
     conn: sqlite3.Connection,
     file_path: str | Path,
@@ -676,6 +747,12 @@ def ingest_document(
     db.require_migrated(conn)
 
     src = Path(file_path)
+    if src.is_dir():
+        # Naming the flag beats the old, misleading "file not found: <dir>".
+        raise IngestError(
+            f"{src} is a directory; ingest a study folder with "
+            f"--study {_study.STUDY_KINDS[0]} (see `pemr ingest --help`)"
+        )
     if not src.is_file():
         raise IngestError(f"file not found: {src}")
 
@@ -729,29 +806,177 @@ def ingest_document(
         shutil.copy2(src, dest)
 
     try:
-        with conn:
-            cur = conn.execute(
-                """
-                INSERT INTO document
-                  (sha256, person_id, doc_date, category, provider, source_path,
-                   ocr_text, ingested_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sha,
-                    person.person_id,
-                    doc_date,
-                    category,
-                    provider,
-                    _relative_source_path(sha, ext),
-                    ocr_text,
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                ),
-            )
+        document = _insert_document(
+            conn,
+            sha=sha,
+            ext=ext,
+            person_id=person.person_id,
+            doc_date=doc_date,
+            category=category,
+            provider=provider,
+            ocr_text=ocr_text,
+        )
     except Exception:
         if blob_created:
             dest.unlink(missing_ok=True)
         raise
-    document = get_document_by_id(conn, cur.lastrowid)
-    assert document is not None  # just inserted
+    return IngestResult(status="new", document=document, owner_check=owner_check)
+
+
+# --------------------------------------------------------------------------- #
+# Study directories (issue #69)
+# --------------------------------------------------------------------------- #
+
+#: Blob extension for a packed study. `blob_dest`/`_relative_source_path` treat it as
+#: an opaque suffix, so `sources/<sha[:2]>/<sha>.dcm.zip` keeps the content-addressed
+#: invariant and `pemr verify` re-hashes it like any other blob.
+STUDY_EXT = ".dcm.zip"
+
+#: Staging area for the archive: it is packed here, hashed, then `os.replace`d into
+#: the store — a same-filesystem atomic publish, so a crash can never leave a
+#: truncated blob sitting under a valid content-hash name.
+TMP_DIRNAME = ".tmp"
+
+#: A study is imaging by construction, so it defaults there rather than to null; the
+#: caller still wins (a disc filed under a narrower `radiology` bucket, say).
+_STUDY_CATEGORY = "imaging"
+
+
+def ingest_study_dir(
+    conn: sqlite3.Connection,
+    dir_path: str | Path,
+    person_slug: str,
+    sources_dir: str | Path,
+    *,
+    study: str = "dicom",
+    allow_large: bool = False,
+    doc_date: str | None = None,
+    category: str | None = None,
+    provider: str | None = None,
+    ocr_text: str | None = None,
+    force: bool = False,
+) -> IngestResult:
+    """Ingest a study *directory* as one document (issue #69).
+
+    A burned imaging disc is clinically one document but physically ~2,000 slice
+    files plus a viewer payload. The slices are packed into a canonical zip
+    (:func:`pemr.study.pack_study`) and **that archive's** sha256 is the document
+    hash — so the blob is still the original bytes, still content-addressed, and
+    layer-1 dedup needs no special case.
+
+    Derived defaults, all of which the caller beats:
+
+    * ``doc_date`` ← the study's ``StudyDate`` tag,
+    * ``category`` ← ``"imaging"``,
+    * ``ocr_text`` ← a short derived summary (modality/date/series), so the study is
+      visible to `find` instead of being an untitled row. An agent that transcribed
+      the accompanying radiology report should pass that text instead.
+
+    The issue-#61 owner check runs against two independent signals: the study's own
+    ``PatientName``/``PatientBirthDate`` header tags (:func:`pemr.study.identity_text`)
+    and any caller-supplied text, with the more consequential verdict winning. It is
+    never run against our *derived summary*, which would be meaningless (engine
+    output carries no patient identity) and worse than meaningless if a
+    ``StudyDescription`` like "PATIENT POSITIONING" tripped the identity anchor —
+    a spurious refusal of a study nobody could fix without ``force``. The refusal
+    point is pre-write **and** pre-pack, so a refused study costs nothing.
+    """
+    db.require_migrated(conn)
+
+    if study not in _study.STUDY_KINDS:
+        raise IngestError(
+            f"unknown study kind '{study}'; supported: "
+            + ", ".join(_study.STUDY_KINDS)
+        )
+
+    src = Path(dir_path)
+    if src.is_file():
+        raise IngestError(
+            f"--study expects a directory, but {src} is a file; "
+            "ingest it without --study"
+        )
+    if not src.is_dir():
+        raise IngestError(f"directory not found: {src}")
+
+    person = _person_for_slug(conn, person_slug)
+
+    scan = _study.scan_study_dir(src)
+    if not scan.rel_paths:
+        raise IngestError(
+            f"no DICOM files found under {src} - nothing to ingest. (Files are "
+            "recognised by the DICM magic at byte 128, not by extension.)"
+        )
+    print(
+        f"study: {scan.file_count} DICOM files, "
+        f"{_study.human_bytes(scan.total_bytes)} to pack",
+        file=sys.stderr,
+    )
+    if scan.excluded_documents:
+        print(
+            "note: not packed (a report is its own document - ingest it separately "
+            "through the normal file path): "
+            + ", ".join(scan.excluded_documents),
+            file=sys.stderr,
+        )
+    if scan.total_bytes > _study.MAX_STUDY_BYTES and not allow_large:
+        raise IngestError(
+            f"study is {_study.human_bytes(scan.total_bytes)}, over the "
+            f"{_study.human_bytes(_study.MAX_STUDY_BYTES)} limit; sources_dir is "
+            "cloud-synced by default (config.example.toml) - re-run with "
+            "--allow-large to ingest it anyway"
+        )
+
+    metadata = _study.read_metadata(scan)
+    supplied = ocr_text.strip() if ocr_text else None
+    text = supplied or _study.summary_text(scan, metadata)
+
+    roster = _roster(conn)
+    owner_check = _strongest_check([
+        check_owner(candidate, person, roster)
+        for candidate in (_study.identity_text(metadata), supplied)
+        if candidate
+    ])
+    if owner_check.blocks and not force:
+        # Pre-write *and* pre-pack: a refusal costs nothing and leaves nothing.
+        raise OwnerMismatchError(
+            refusal_message(owner_check, person, roster), owner_check
+        )
+
+    tmp_dir = Path(sources_dir) / TMP_DIRNAME
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_blob = tmp_dir / f"{uuid.uuid4().hex}{STUDY_EXT}"
+    try:
+        sha = _study.pack_study(scan, tmp_blob)
+
+        existing = get_document(conn, sha)
+        if existing is not None:
+            # Known cost of hashing the archive rather than a manifest: an already
+            # filed disc is repacked before we can know it is a duplicate. Nothing
+            # is published and no row is inserted, so the semantics match the file
+            # path exactly - only the work is wasted.
+            return IngestResult(status="duplicate", document=existing)
+
+        dest = blob_dest(sources_dir, sha, STUDY_EXT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob_created = not dest.exists()
+        if blob_created:
+            os.replace(tmp_blob, dest)
+        try:
+            document = _insert_document(
+                conn,
+                sha=sha,
+                ext=STUDY_EXT,
+                person_id=person.person_id,
+                doc_date=doc_date or metadata.study_date,
+                category=category or _STUDY_CATEGORY,
+                provider=provider,
+                ocr_text=text,
+            )
+        except Exception:
+            if blob_created:
+                dest.unlink(missing_ok=True)
+            raise
+    finally:
+        tmp_blob.unlink(missing_ok=True)
+
     return IngestResult(status="new", document=document, owner_check=owner_check)

@@ -173,6 +173,8 @@ def ingest_document(
     provider: str | None = None,
     ocr: bool = False,
     force: bool = False,
+    study: str | None = None,
+    allow_large: bool = False,
 ) -> dict[str, Any]:
     """[write] Ingest a document (hash, blob-store, layer-1 dedup). Mirrors ``pemr ingest``.
 
@@ -186,6 +188,11 @@ def ingest_document(
 
     A Google Drive pointer stub (``.gsheet``/``.gdoc`` — a ~1 KB JSON link, not the
     document) is refused pre-write; the fix is to export it from Drive first.
+
+    ``study="dicom"`` makes ``file`` a study *directory* — a burned imaging disc — and
+    packs its slices into one document (issue #69). ``ocr_text`` then defaults to a
+    derived study summary; pass a transcription of the accompanying radiology report
+    when you have one. ``allow_large`` waives the study size guard.
 
     When text is present it is checked against the claimed owner; the verdict comes
     back as ``owner_check`` (``null`` on a duplicate, which is never checked). A
@@ -203,11 +210,18 @@ def ingest_document(
     except SystemExit as exc:  # CLI resolvers exit the process; a server must not
         raise ToolError(str(exc)) from exc
     try:
-        result = _ingest.ingest_document(
-            conn, file, person_slug=person, sources_dir=sources_dir,
-            doc_date=doc_date, category=category, provider=provider,
-            ocr=ocr, ocr_text=ocr_text, force=force,
-        )
+        if study:
+            result = _ingest.ingest_study_dir(
+                conn, file, person_slug=person, sources_dir=sources_dir,
+                study=study, allow_large=allow_large, doc_date=doc_date,
+                category=category, provider=provider, ocr_text=ocr_text, force=force,
+            )
+        else:
+            result = _ingest.ingest_document(
+                conn, file, person_slug=person, sources_dir=sources_dir,
+                doc_date=doc_date, category=category, provider=provider,
+                ocr=ocr, ocr_text=ocr_text, force=force,
+            )
     except (db.NotMigratedError, _ingest.IngestError) as exc:
         raise _friendly(exc) from exc
     return {
@@ -239,6 +253,7 @@ def commit_extraction(
         "counts": summary.counts,
         "new": summary.new,
         "duplicate": summary.duplicate,
+        "enriched": summary.enriched,
         "conflict": summary.conflict,
     }
 
@@ -534,10 +549,11 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     def ingest_tool(file: str, person: str, ocr_text: str | None = None,
                     doc_date: str | None = None, category: str | None = None,
                     provider: str | None = None, ocr: bool = False,
-                    force: bool = False) -> dict:
+                    force: bool = False, study: str | None = None,
+                    allow_large: bool = False) -> dict:
         return _run(ingest_document, file=file, person=person, ocr_text=ocr_text,
                     doc_date=doc_date, category=category, provider=provider, ocr=ocr,
-                    force=force)
+                    force=force, study=study, allow_large=allow_large)
 
     @server.tool(name="commit_extraction", annotations=rw)
     def commit_extraction_tool(document_id: int, records: dict) -> dict:
