@@ -271,7 +271,11 @@ def commit_extraction(
     """
     try:
         summary = _dedup.commit_extraction(conn, document_id, records, _dictionary())
-    except (db.NotMigratedError, _dedup.ValidationError) as exc:
+    except (
+        db.NotMigratedError, _dedup.ValidationError, _dedup.DictionaryDriftError
+    ) as exc:
+        # Drift is a refusal carrying its own remedy (`pemr rekey --apply`), not an
+        # internal error - surface it as friendly as a schema violation.
         raise _friendly(exc) from exc
     return {
         "counts": summary.counts,

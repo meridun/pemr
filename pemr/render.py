@@ -41,7 +41,7 @@ import sqlite3
 from datetime import datetime
 
 from . import db, query
-from .dedup import enum_token, norm
+from .dedup import enum_token, key_token
 
 # Observation obs_type conventions this layer reads (see module docstring).
 OBS_VITAL = "vital"
@@ -177,7 +177,11 @@ def _latest_vitals(
     conn: sqlite3.Connection, person_id: int, dictionary: dict[str, str] | None
 ) -> list[dict]:
     """Most recent ``obs_type='vital'`` row per normalized ``key``. Rows are ordered so
-    that, for a given key, the latest date (then highest id) wins deterministically."""
+    that, for a given key, the latest date (then highest id) wins deterministically.
+
+    Grouped by ``key_token()``, matching the dedup key (issue #71), so a meaningful
+    qualifier keeps its own row: ``Blood Pressure (sitting)`` and ``(standing)`` are two
+    readings to show, not one that overwrites the other."""
     rows = conn.execute(
         "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
         "ORDER BY observed_at, observation_id",
@@ -185,7 +189,7 @@ def _latest_vitals(
     ).fetchall()
     latest: dict[str, dict] = {}
     for r in rows:
-        latest[norm(r["key"], dictionary)] = dict(r)  # ascending order -> last wins
+        latest[key_token(r["key"], dictionary)] = dict(r)  # ascending -> last wins
     return [latest[k] for k in sorted(latest)]
 
 

@@ -6,12 +6,26 @@
 # to a single canonical token so `A1c`, `HbA1c`, `Hemoglobin A1c` all collapse to
 # one dedup identity. Agents propose additions; a human approves them.
 #
-# Keys are matched AFTER norm() lowercases, trims and collapses whitespace AND strips
-# parenthetical qualifiers, so write keys in that already-normalized form: lowercase,
-# single spaces, and NO parentheses — norm() removes `(HGB)`, `(SPEP)`, `(calculated)`
-# etc. before lookup, so `Hemoglobin (HGB)` matches the bare `hemoglobin` key. Seeded
-# from common lab-panel headers plus the real-corpus report vocabulary (CMP/CBC panel
-# codes, serum free light chains, SPEP); extend as new documents surface new spellings.
+# Keys are matched AFTER lowercasing, trimming and whitespace collapse, so write them
+# in that already-normalized form: lowercase, single spaces.
+#
+# PARENTHESES ARE ALLOWED IN KEYS, and that is how you declare a parenthetical to be
+# noise (issue #71). A parenthetical qualifier is treated as MEANINGFUL by default —
+# `Albumin` and `Albumin (SPEP)` are two different assays off one draw and must keep
+# distinct dedup keys — with two escapes:
+#
+#   * A redundant alias needs no entry at all: `(HGB)`, `(HCT)`, `(PLT)` already map to
+#     the same canonical token as their stem, so `Hemoglobin (HGB)` collapses to
+#     `hemoglobin` automatically.
+#   * Anything else you want collapsed gets a full parenthesized key, e.g.
+#     `"m-spike (spep)" = "m_spike"` below.
+#
+# After adding or changing a key, run `pemr rekey` (dry-run) and then `--apply` to move
+# already-stored rows onto the keys the new dictionary derives.
+#
+# Seeded from common lab-panel headers plus the real-corpus report vocabulary (CMP/CBC
+# panel codes, serum free light chains, SPEP); extend as new documents surface new
+# spellings.
 
 [synonyms]
 # --- Glycemic ---
@@ -48,6 +62,8 @@
 "creatinine" = "creatinine"
 "cr" = "creatinine"
 "crea" = "creatinine"
+# "(calculated)" is a note about how the number was produced, not a second assay.
+"creatinine (calculated)" = "creatinine"
 "egfr" = "egfr"
 "estimated gfr" = "egfr"
 "bun" = "bun"
@@ -78,14 +94,14 @@
 "mean platelet volume" = "mpv"
 
 # --- Inflammatory markers ---
-# ESR (erythrocyte sedimentation rate). Report labels vary by method. The
-# unparenthesized Quest label "sed rate by modified westergren" matches its own
-# key below; a parenthetical variant like "Sed Rate (Modified Westergren)" has
-# the method tag stripped by norm() and reduces to the bare "sed rate" key
-# instead. All spellings collapse to `esr`.
+# ESR (erythrocyte sedimentation rate). Report labels vary by method, but ESR is a
+# single assay however the lab names the technique, so every spelling collapses to
+# `esr` — including the parenthesized variant, which needs its own full-label key
+# now that a parenthetical is meaningful by default.
 "esr" = "esr"
 "sed rate" = "esr"
 "sed rate by modified westergren" = "esr"
+"sed rate (modified westergren)" = "esr"
 "erythrocyte sedimentation rate" = "esr"
 
 # --- Basic metabolic panel (CMP abbreviations) ---
@@ -120,13 +136,18 @@
 "ldh" = "ldh"
 "lactate dehydrogenase" = "ldh"
 
-# --- Serum protein: NOT mapped, on purpose ---
+# --- Serum protein: still unmapped, but no longer unsafe ---
 # A CMP and an SPEP run off the SAME draw both report total protein (`TPro` /
 # `Protein, Total`) and albumin (`ALB` / `Albumin`) — different methods, slightly
-# different numbers, same person + same collected_at. Mapping `alb`->`albumin` or
-# `tpro`->`protein_total` would give those two rows one dedup key, so the second
-# would land as a staged CONFLICT (or silently collapse when the numbers happen to
-# agree). Leave the report labels distinct; revisit only with a method-aware key.
+# different numbers, same person + same collected_at. This used to make mapping
+# `alb`->`albumin` / `tpro`->`protein_total` unsafe: it gave those two rows one dedup
+# key and the second landed as a staged CONFLICT.
+#
+# Issue #71 supplied the method-aware key that block asked for: the SPEP row's
+# `Albumin (SPEP)` label now keys as `albumin (spep)`, distinct from the CMP's bare
+# `albumin`, so the mapping is safe to add. Curating it is a separate pass — add the
+# entries deliberately, alongside whatever full-label keys your reports' SPEP fraction
+# names need, then `pemr rekey`.
 
 # --- Vitamins ---
 "vitamin d" = "vitamin_d_25oh"
@@ -140,8 +161,9 @@
 
 # --- Myeloma / paraprotein panel (SPEP, serum free light chains) ---
 # Serum free light chains, their ratio, the monoclonal spike and the immunoglobulin
-# quant / beta-2 microglobulin that track plasma-cell disease. Parenthetical method
-# tags like `(SPEP)` are stripped by norm() before this lookup.
+# quant / beta-2 microglobulin that track plasma-cell disease. `(SPEP)` is noise on
+# an M-spike (an M-spike only ever comes off an SPEP) but load-bearing on albumin —
+# hence the full-label key below rather than a global rule.
 "kappa" = "kappa_free_light_chain"
 "free kappa light chain" = "kappa_free_light_chain"
 "lambda" = "lambda_free_light_chain"
@@ -149,6 +171,7 @@
 "k/l ratio" = "kappa_lambda_ratio"
 "kappa/lambda ratio" = "kappa_lambda_ratio"
 "m-spike" = "m_spike"
+"m-spike (spep)" = "m_spike"
 "immunoglobulin g" = "igg"
 "immunoglobulin g, qn, serum" = "igg"
 "iga" = "iga"
