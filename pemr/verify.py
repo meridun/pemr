@@ -28,6 +28,7 @@ from . import db, ingest
 COUNTED_TABLES = (
     "person",
     "document",
+    "document_tombstone",
     "lab_result",
     "medication",
     "procedure",

@@ -16,7 +16,8 @@ Six operations, mirroring `persons.py` in shape:
       every attached row, re-deriving each ``dedup_key`` (``person_id`` is part
       of every key — see :func:`dedup.dedup_key`)
     * ``remove_document``  — wrong file entirely: cascade-delete the attached
-      rows, then the document
+      rows, then the document (optionally recording a `document_tombstone` so a
+      later sweep does not silently re-ingest it — issue #80, :mod:`pemr.tombstones`)
     * ``set_document_text``— attach/replace ``ocr_text`` after ingest, the one
       thing only `ingest` could do before (issue #62)
 
@@ -40,7 +41,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import db, dedup
+from . import db, dedup, tombstones
 from .persons import PersonNotFoundError, get_person
 
 
@@ -496,6 +497,13 @@ class RemoveReport:
     blob_path: str = ""
     blob_purged: bool = False
     applied: bool = False
+    # Issue #80 — opt-in removal memory. `tombstoned` is what was asked for (so a dry
+    # run can report "would record"); `tombstone_existed` distinguishes recorded from
+    # updated, and suppresses the --purge-blob nag on a re-run.
+    tombstoned: bool = False
+    tombstone_reason: str | None = None
+    tombstone_note: str | None = None
+    tombstone_existed: bool = False
 
     @property
     def record_count(self) -> int:
@@ -508,6 +516,9 @@ def remove_document(
     *,
     sources_dir: str | Path | None = None,
     purge_blob: bool = False,
+    tombstone: bool = False,
+    reason: str | None = None,
+    note: str | None = None,
     apply: bool = False,
 ) -> RemoveReport:
     """Delete a document and cascade to every row it produced.
@@ -533,6 +544,15 @@ def remove_document(
     (content-addressed; a later re-ingest of the same file reuses it). Deleting the
     blob happens after the transaction commits, so a failed unlink leaves an orphan
     file rather than a document row pointing at a file that no longer exists.
+
+    ``tombstone=True`` additionally records this hash in `document_tombstone` (issue
+    #80), so a later sweep over the same source folder refuses it instead of silently
+    re-ingesting. Opt-in on purpose — most removals are corrections that must stay
+    re-ingestable. The insert happens **inside the same transaction** as the deletes: a
+    delete that commits without its tombstone is the exact failure being fixed. Under a
+    dry run nothing is written and the report merely says what would be recorded.
+    ``reason``/``note`` are free text (:mod:`pemr.tombstones` — no taxonomy) and are
+    ignored unless ``tombstone`` is set; the CLI rejects that combination up front.
     """
     db.require_migrated(conn)
     doc = _require_document(conn, document_id)
@@ -564,6 +584,14 @@ def remove_document(
         "SELECT COUNT(*) AS n FROM conflict WHERE document_id = ? AND status != 'open'",
         (document_id,),
     ).fetchone()["n"])
+    report.tombstoned = tombstone
+    report.tombstone_reason = reason
+    report.tombstone_note = note
+    # Reported either way: a dry run says "would update" rather than "would record", and
+    # the CLI uses it to skip the --purge-blob nag when the memory already exists.
+    report.tombstone_existed = (
+        tombstones.get_tombstone(conn, doc["sha256"]) is not None
+    )
 
     if apply:
         # Children first: foreign_keys=ON with NO ACTION means the document DELETE
@@ -587,6 +615,18 @@ def remove_document(
             conn.execute(
                 "DELETE FROM document WHERE document_id = ?", (document_id,)
             )
+            if tombstone:
+                # Same transaction as the deletes, and `allow_live` because the row it
+                # would object to is being deleted right here.
+                tombstones.add_tombstone(
+                    conn,
+                    doc["sha256"],
+                    reason=reason,
+                    note=note,
+                    document_id=document_id,
+                    allow_live=True,
+                    conn_managed=True,
+                )
         if purge_blob and blob is not None:
             existed = blob.exists()     # don't claim a delete that never happened
             blob.unlink(missing_ok=True)
