@@ -398,6 +398,18 @@ def test_ingest_study_dir_caller_values_win(conn, tmp_path, sources):
     assert doc.ocr_text == "IMPRESSION: no acute findings."
 
 
+def test_ingest_study_dir_zero_width_ocr_text_falls_back_to_the_summary(
+    conn, tmp_path, sources
+):
+    """A zero-width-only `ocr_text` is empty, so the generated study summary wins
+    rather than one invisible character (#87) - `.strip()` kept it."""
+    root = make_study(tmp_path / "disc")
+    result = ingest.ingest_study_dir(
+        conn, root, "jane-doe", sources, ocr_text=chr(0x200B),
+    )
+    assert "DICOM study: disc" in result.document.ocr_text
+
+
 def test_ingest_study_dir_reports_excluded_documents(conn, tmp_path, sources, capsys):
     ingest.ingest_study_dir(conn, make_study(tmp_path / "disc"), "jane-doe", sources)
     err = capsys.readouterr().err

@@ -510,7 +510,7 @@ def _cmd_document_set_text(args: argparse.Namespace) -> int:
         # Read first: the before-size feeds the status line, and resolving the id here
         # means an unknown id outranks an empty file in the error the human sees.
         before = documents.get_document_view(conn, args.document_id)
-        if not text.strip():
+        if not documents.normalize_document_text(text):
             # documents.set_document_text guards this too (so MCP gets it); repeated here
             # only to name the offending path, which the engine never sees.
             raise ValueError(

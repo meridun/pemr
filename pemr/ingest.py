@@ -53,6 +53,7 @@ from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study
+from .documents import normalize_document_text
 from .models import Document, Person
 
 
@@ -964,7 +965,10 @@ def ingest_document(
 
     # Resolve the text *before* the blob copy so the owner check is pre-write. OCR
     # runs on `src` rather than the copied blob — identical bytes, same result.
-    supplied = ocr_text.strip() if ocr_text else None
+    # `normalize_document_text`, not `.strip()`: a supplied text of nothing but
+    # zero-width characters is empty, and must neither count as supplied nor land in
+    # `ocr_text` (issue #87).
+    supplied = normalize_document_text(ocr_text) or None
     if supplied:
         # An agent transcription is prose off the page: anchors mean what they say.
         ocr_text, route = supplied, "ocr"
@@ -1117,7 +1121,9 @@ def ingest_study_dir(
         )
 
     metadata = _study.read_metadata(scan)
-    supplied = ocr_text.strip() if ocr_text else None
+    # Same guard as the file path: zero-width-only text is empty, so the generated
+    # study summary wins rather than an invisible character (issue #87).
+    supplied = normalize_document_text(ocr_text) or None
     text = supplied or _study.summary_text(scan, metadata)
 
     roster = _roster(conn)
