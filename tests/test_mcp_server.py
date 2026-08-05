@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import __version__, db, dedup, mcp_server, persons
+from pemr import __version__, db, dedup, ingest, mcp_server, persons, tombstones
 
 REPO = Path(__file__).resolve().parent.parent
 DICT_PATH = REPO / "data" / "dictionary.example.toml"
@@ -204,6 +204,42 @@ def test_ingest_refuses_a_mismatched_owner(seeded, tmp_path, monkeypatch):
     assert out["status"] == "new"
     assert out["owner_check"]["verdict"] == "suspect"
     assert "SMITH, KAREN A" in out["owner_check"]["evidence"]
+
+
+def test_ingest_of_tombstoned_content_is_structured_not_an_error(
+    seeded, tmp_path, monkeypatch
+):
+    """Issue #80 via MCP: a tombstone hit is a structured, non-exceptional answer."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    scan = tmp_path / "excluded.txt"
+    scan.write_bytes(b"a document carrying identifiers")
+    tombstones.add_tombstone(
+        seeded, ingest.hash_file(scan), reason="identifiers", note="insurance card"
+    )
+
+    out = mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe")
+    assert out["status"] == "tombstoned"
+    assert out["is_tombstoned"] is True
+    assert out["document"] is None
+    assert out["ocr_text_populated"] is False
+    assert out["tombstone"]["reason"] == "identifiers"
+
+
+def test_agent_cannot_force_past_a_tombstone(seeded, tmp_path, monkeypatch):
+    """Deliberately stricter than the owner check: that verdict is a heuristic a human
+    may reasonably ask an agent to override, a tombstone *is* the human's decision."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    scan = tmp_path / "excluded2.txt"
+    scan.write_bytes(b"still excluded")
+    sha = ingest.hash_file(scan)
+    tombstones.add_tombstone(seeded, sha, reason="identifiers")
+
+    with pytest.raises(mcp_server.ToolError, match="does not override a tombstone"):
+        mcp_server.ingest_document(seeded, file=str(scan), person="jane-doe",
+                                   force=True)
+    assert seeded.execute(
+        "SELECT COUNT(*) FROM document WHERE sha256 = ?", (sha,)
+    ).fetchone()[0] == 0
 
 
 def test_ingest_study_directory(seeded, tmp_path, monkeypatch):

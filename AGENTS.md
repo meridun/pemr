@@ -49,7 +49,8 @@ Write tools (mutate the DB; the only tools that do):
 - `person_add` — add a person to the roster.
 - `person_edit` — update a person's fields (partial; `slug` is not editable, pass `""` to
   clear a nullable field).
-- `ingest` — hash + blob-store + layer-1 dedup a document.
+- `ingest` — hash + blob-store + layer-1 dedup a document. Returns `status: "tombstoned"` for
+  content a human deliberately excluded, and `force` cannot override that (see §3).
 - `commit_extraction` — validate + dedup + commit extracted rows for a document.
 - `document_set_text` — attach a document's text (`ocr_text`) after ingest, when the ingest itself
   didn't carry it (see §3). Fills an empty `ocr_text` only; **replacing** an existing transcription
@@ -216,6 +217,17 @@ with `--ocr auto` gets no identity-header check either, so pass your transcripti
 - Unlike §5 conflict resolution, this is not mechanically gated on a `signoff` param. The
   asymmetry is deliberate: a wrongly-forced ingest is recoverable (`pemr document reassign`),
   whereas a wrongly-resolved conflict destroys the losing value.
+
+**Tombstones — never force past one.** Content whose hash carries a `document_tombstone` row
+comes back as `status: "tombstoned"` with `document: null` and the `tombstone` row (reason,
+removal date, note). That is not an error and not a failure of your call: a human recorded that
+this content is deliberately kept out of the store, and nothing was written. Report the skip and
+its reason to the human and **stop**. `force=true` does *not* override a tombstone — the tool
+refuses it. That is deliberately stricter than owner verification above: the owner check is a
+heuristic a human may reasonably ask you to override, whereas a tombstone *is* the human's
+already-recorded decision, so overriding it is never an agent judgment call. If they want the
+document filed after all, they lift it themselves at the CLI
+(`pemr document tombstone rm <sha256>`). No MCP tool writes or lifts tombstones.
 
 ### 5. Conflict discipline
 
