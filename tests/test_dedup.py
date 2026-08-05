@@ -87,6 +87,72 @@ def test_norm_strips_parenthetical_qualifiers():
     assert dedup.norm("Creatinine (calculated)") == "creatinine"
 
 
+# --- key_token(): qualifier-aware identity (issue #71) ------------------------
+
+def test_key_token_keeps_a_meaningful_qualifier():
+    # The bug: an SPEP albumin fraction and a CMP albumin off one draw are different
+    # assays. They stay one analyte *family* under norm() but must not share a key.
+    d = dedup.load_dictionary(DICT_PATH)
+    assert dedup.norm("Albumin (SPEP)", d) == dedup.norm("Albumin", d) == "albumin"
+    assert dedup.key_token("Albumin (SPEP)", d) == "albumin (spep)"
+    assert dedup.key_token("Albumin", d) == "albumin"
+
+
+def test_key_token_drops_a_redundant_alias_qualifier():
+    # Rule 2: the parenthetical maps to the same canonical token as the stem, so it is
+    # just another spelling of it -- no dictionary entry of its own required.
+    d = dedup.load_dictionary(DICT_PATH)
+    assert dedup.key_token("Hemoglobin (HGB)", d) == dedup.key_token("HGB", d) == "hemoglobin"
+    assert dedup.key_token("Hematocrit (HCT)", d) == "hematocrit"
+    assert dedup.key_token("Platelet Count (PLT)", d) == "platelets"
+
+
+def test_key_token_honors_a_declared_full_label():
+    # Rule 1: a full parenthesized key in [synonyms] is the human declaring that
+    # parenthetical noise for this analyte.
+    d = dedup.load_dictionary(DICT_PATH)
+    assert dedup.key_token("M-Spike (SPEP)", d) == dedup.key_token("M-Spike", d) == "m_spike"
+    assert dedup.key_token("Sed Rate (Modified Westergren)", d) \
+        == dedup.key_token("Sed Rate", d) == "esr"
+    assert dedup.key_token("Creatinine (calculated)", d) == "creatinine"
+
+
+def test_declared_full_label_tolerates_edge_underscores_and_paren_padding():
+    """Rule 1 matches the *collapsed* label, so the collapse has to be total: a
+    leading/trailing `_` (which becomes whitespace) or padding inside the parentheses
+    used to miss the declared entry and over-split a label the human already settled."""
+    d = dedup.load_dictionary(DICT_PATH)
+    for sloppy in ("_m-spike (spep)", "M-Spike ( SPEP )", "  m-spike (spep)_",
+                   "M-SPIKE  (  spep  )"):
+        assert dedup.key_token(sloppy, d) == "m_spike", sloppy
+
+
+def test_key_token_maps_the_qualifier_through_the_dictionary():
+    # Two spellings of one assay tag agree, so they do not fork the series.
+    d = {"albumin": "albumin", "serum protein electrophoresis": "spep"}
+    assert dedup.key_token("Albumin (Serum Protein Electrophoresis)", d) \
+        == dedup.key_token("Albumin (SPEP)", {**d, "spep": "spep"}) == "albumin (spep)"
+
+
+def test_key_token_without_dictionary_oversplits_but_norm_does_not():
+    # No dictionary: "(calculated)" cannot be proven noise, so the key splits (the
+    # accepted, visible, non-lossy failure). norm() is unchanged -- one family.
+    assert dedup.norm("Creatinine (calculated)") == dedup.norm("Creatinine") == "creatinine"
+    assert dedup.key_token("Creatinine (calculated)") == "creatinine (calculated)"
+    bare = {"test_name": "Creatinine", "collected_at": "2026-01-02", "value_num": 1.1}
+    calc = {**bare, "test_name": "Creatinine (calculated)"}
+    assert dedup.dedup_key("lab_result", bare, 1) != dedup.dedup_key("lab_result", calc, 1)
+
+
+def test_identity_of_none_and_bare_qualifier():
+    assert dedup.identity(None) == ("", "")
+    assert dedup.key_token(None) == ""
+    # Degenerate name that is nothing but a qualifier: norm() keeps its old ""
+    # contract, key_token falls back to the qualifier rather than emitting " (spep)".
+    assert dedup.norm("(SPEP)") == ""
+    assert dedup.key_token("(SPEP)") == "spep"
+
+
 # Real-corpus naming variants (issue #11): report-side spelling <-> CSV-side spelling
 # for the same clinical fact. Every pair must collapse to a single canonical token or
 # the same analyte splits into parallel rows/series downstream.
@@ -112,6 +178,20 @@ def test_corpus_naming_variants_share_canonical_token():
     d = dedup.load_dictionary(DICT_PATH)
     for report, csv in _CORPUS_VARIANTS:
         assert dedup.norm(report, d) == dedup.norm(csv, d), (report, csv)
+
+
+def test_corpus_naming_variants_share_dedup_key():
+    # Stronger than the norm()-level check above: a shared canonical token no longer
+    # implies a shared key now that qualifiers are part of the identity (issue #71), and
+    # a shared *key* is what actually makes the two spellings dedup.
+    d = dedup.load_dictionary(DICT_PATH)
+    for report, csv in _CORPUS_VARIANTS:
+        assert dedup.key_token(report, d) == dedup.key_token(csv, d), (report, csv)
+        a = dedup.dedup_key(
+            "lab_result", {"test_name": report, "collected_at": "2026-01-02"}, 1, d)
+        b = dedup.dedup_key(
+            "lab_result", {"test_name": csv, "collected_at": "2026-01-02"}, 1, d)
+        assert a == b, (report, csv)
 
 
 # --- dedup_key determinism ----------------------------------------------------
@@ -351,6 +431,42 @@ def test_real_corpus_overlap_dedups_not_splits(conn):
     # One row per analyte, not two — the split-series / double-count damage is gone.
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] \
         == len(_CORPUS_VARIANTS)
+
+
+def test_distinct_assays_of_one_analyte_both_land_as_new(conn):
+    """Acceptance (issue #71): a CMP `Albumin` and an SPEP `Albumin (SPEP)` off ONE draw
+    are two facts. Before the fix the parenthetical was stripped, both derived one key,
+    and the second was misfiled as a conflict whose value survived only in a free-text
+    resolution note."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _make_document(conn)
+    rows = [
+        {"test_name": "Albumin", "collected_at": "2026-01-05", "value_num": 4.1,
+         "unit": "g/dL"},
+        {"test_name": "Albumin (SPEP)", "collected_at": "2026-01-05", "value_num": 3.8,
+         "unit": "g/dL"},
+    ]
+    # Distinct keys, so this is not even an intra-payload collision any more.
+    keys = {dedup.dedup_key("lab_result", r, 1, d) for r in rows}
+    assert len(keys) == 2
+    summary = dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
+    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0}
+    stored = {r["test_name"]: r["value_num"] for r in
+              conn.execute("SELECT test_name, value_num FROM lab_result")}
+    assert stored == {"Albumin": 4.1, "Albumin (SPEP)": 3.8}
+
+
+def test_qualified_observation_keys_are_distinct_rows(conn):
+    # Same split for observation.key: two BP readings taken in two postures at one visit.
+    doc = _make_document(conn)
+    rows = [
+        {"obs_type": "vital", "key": "Blood Pressure (sitting)",
+         "observed_at": "2026-01-05", "value_text": "128/80"},
+        {"obs_type": "vital", "key": "Blood Pressure (standing)",
+         "observed_at": "2026-01-05", "value_text": "112/70"},
+    ]
+    summary = dedup.commit_extraction(conn, doc, {"observation": rows})
+    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0}
 
 
 def test_corrected_value_still_conflicts_after_normalization(conn):
@@ -713,6 +829,73 @@ def test_rekey_is_a_no_op_over_a_keep_both_family(conn):
     assert len(set(keys)) == 2
 
 
+def test_rekey_over_unqualified_names_reports_no_changes(conn):
+    """Acceptance (issue #71): the qualifier is FOLDED INTO the existing key part, not
+    appended as a fourth one. A fourth part would turn `"a|b|c"` into `"a|b||c"` and move
+    every stored key in the database; folding moves only the rows a qualifier splits.
+
+    Proven against the pre-fix formula spelled out longhand, so this fails loudly if the
+    key layout is ever changed rather than extended."""
+    import hashlib
+
+    d = dedup.load_dictionary(DICT_PATH)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    doc = _make_document(conn)
+    rows = [
+        {"test_name": "HbA1c", "collected_at": "2026-01-02T09:30", "value_num": 5.7},
+        {"test_name": "GLUC", "collected_at": "2026-01-02", "value_num": 95},
+        {"test_name": "Hemoglobin (HGB)", "collected_at": "2026-01-02", "value_num": 13.1},
+    ]
+    dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
+
+    for row in rows:
+        legacy = "|".join([
+            str(pid),
+            dedup.norm(row["test_name"], d),                    # pre-fix: norm(), not key_token()
+            row["collected_at"].replace("T", " "),
+        ])
+        assert dedup.dedup_key("lab_result", row, pid, d) \
+            == hashlib.sha256(legacy.encode("utf-8")).hexdigest(), row["test_name"]
+
+    assert dedup.rekey(conn, d).changes == []
+
+
+def test_rekey_migrates_a_row_stored_under_a_stripped_key(conn):
+    """The issue-#71 migration: a row committed *before* the fix carries the key the old
+    stripping formula derived, so `rekey` is what moves it onto its qualified key. Safe by
+    construction -- a qualifier only adds precision, so no two rows can fuse."""
+    import hashlib
+
+    d = dedup.load_dictionary(DICT_PATH)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    legacy_key = hashlib.sha256(
+        f"{pid}|albumin|2026-01-05".encode("utf-8")   # pre-fix: "(SPEP)" stripped away
+    ).hexdigest()
+    conn.execute(
+        "INSERT INTO lab_result (person_id, test_name, collected_at, value_num, "
+        "dedup_key, dedup_base, dedup_occurrence) VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (pid, "Albumin (SPEP)", "2026-01-05", 3.6, legacy_key, legacy_key),
+    )
+    conn.commit()
+
+    report = dedup.rekey(conn, d)
+    assert [(c.label, c.old_key) for c in report.changes] \
+        == [("Albumin (SPEP)", legacy_key)]
+
+    dedup.rekey(conn, d, apply=True)
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["dedup_key"] == row["dedup_base"] != legacy_key
+    assert row["value_num"] == 3.6 and row["test_name"] == "Albumin (SPEP)"
+    # The vacated key is now free for the CMP albumin that always belonged there.
+    doc = _make_document(conn)
+    summary = dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "Albumin", "collected_at": "2026-01-05", "value_num": 4.2}]}, d)
+    assert summary.counts == {"new": 1, "duplicate": 0, "enriched": 0, "conflict": 0}
+    assert conn.execute(
+        "SELECT dedup_key FROM lab_result WHERE test_name = 'Albumin'"
+    ).fetchone()["dedup_key"] == legacy_key
+
+
 def test_rekey_moves_dedup_base_with_the_key(conn):
     """A dictionary edit must not leave dedup_base pointing at the old family, or the
     commit-time family lookup would miss."""
@@ -723,6 +906,94 @@ def test_rekey_moves_dedup_base_with_the_key(conn):
     dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"), apply=True)
     row = conn.execute("SELECT * FROM lab_result").fetchone()
     assert row["dedup_base"] == row["dedup_key"]   # occurrence 0: base IS the key
+
+
+# --- ingest-before-rekey drift guard ------------------------------------------
+
+def test_commit_refuses_an_ingest_against_a_drifted_key(conn):
+    """The migration hazard behind issue #71: a stored row whose frozen key predates
+    the current dictionary is invisible to layer-2 dedup, so re-filing that same fact
+    used to land a SECOND row reported as `new` -- no duplicate, no conflict, no signal
+    at all -- and then wedged `rekey` on the collision it had just created. Refuse the
+    commit instead, naming the rekey that fixes it."""
+    doc = _make_document(conn)
+    row = {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}
+    dedup.commit_extraction(conn, doc, {"lab_result": [row]}, None)
+    d_new = _rekey_dict(zzt="zonulin_test")       # the stored key is now stale
+
+    with pytest.raises(dedup.DictionaryDriftError, match="rekey --apply"):
+        dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [row]}, d_new)
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+    # And the named remedy actually clears it: after the rekey the same submission
+    # dedups against the stored row instead of forking it.
+    dedup.rekey(conn, d_new, apply=True)
+    summary = dedup.commit_extraction(
+        conn, _make_document(conn), {"lab_result": [row]}, d_new
+    )
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+def test_commit_drift_guard_ignores_an_unrelated_drifted_row(conn):
+    """Deliberately narrow: drift somewhere else in the database is a `rekey` chore,
+    not a reason to refuse an unrelated ingest."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}]}, None)
+    d_new = _rekey_dict(zzt="zonulin_test")       # ZZT's stored key is stale
+
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95}]}, d_new)
+    assert summary.counts == {"new": 1, "duplicate": 0, "enriched": 0, "conflict": 0}
+
+
+def test_commit_drift_guard_accepts_a_keep_both_sibling(conn):
+    """An admitted repeat keys on hash(base|occurrence); if the guard recomputed at
+    occurrence 0 it would read every sibling as drift and refuse every later ingest."""
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 95}]}, d)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148}]}, d)
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"], keep="both")
+
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2024-04-01", "value_num": 148}]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
+
+
+def test_rekey_names_a_doubled_fact_instead_of_blaming_the_dictionary(conn):
+    """A database that drifted *before* the guard existed can still hold one fact under
+    two keys. "The dictionary maps two distinct facts onto one canonical name" is then
+    exactly the wrong diagnosis -- the dictionary is fine and the data is doubled."""
+    doc = _make_document(conn)
+    row = {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95}
+    dedup.commit_extraction(conn, doc, {"lab_result": [row]}, None)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    # The pre-guard state, built directly: the same fact filed again under a stale key.
+    dedup._insert_record(conn, "lab_result", row, pid, doc, "stale-base-0000")
+    conn.commit()
+
+    with pytest.raises(dedup.RekeyCollisionError, match="SAME fact"):
+        dedup.rekey(conn, None)
+    # Still all-or-nothing, and the dry-run wrote nothing either.
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM lab_result WHERE dedup_key = 'stale-base-0000'"
+    ).fetchone()["n"] == 1
+
+
+def test_rekey_still_blames_the_dictionary_when_it_fuses_distinct_facts(conn):
+    """The other cause keeps its own message: two *different* payloads recomputing onto
+    one key really is a dictionary that merges distinct facts."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    with pytest.raises(dedup.RekeyCollisionError, match="two distinct facts"):
+        dedup.rekey(conn, _rekey_dict(alb="albumin"))
 
 
 # --- allergy / condition typed rows (issue #63) -------------------------------

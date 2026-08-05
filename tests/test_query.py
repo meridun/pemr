@@ -365,6 +365,89 @@ def test_trends_unknown_analyte_is_empty(seeded):
     assert t["count"] == 0 and t["slope_per_day"] is None
 
 
+# --- assay split: labs lists the family, trends charts one assay (issue #71) ---
+
+@pytest.fixture()
+def albumin_assays(seeded):
+    """Two albumin assays off two draws: the CMP's bare `Albumin` and the SPEP
+    electrophoresis fraction `Albumin (SPEP)`."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="CMP + SPEP")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Albumin", "collected_at": "2025-01-01", "value_num": 4.2,
+         "unit": "g/dL"},
+        {"test_name": "Albumin (SPEP)", "collected_at": "2025-01-01", "value_num": 3.6,
+         "unit": "g/dL"},
+        {"test_name": "Albumin", "collected_at": "2026-01-01", "value_num": 4.0,
+         "unit": "g/dL"},
+    ]}, d)
+    return seeded
+
+
+def test_labs_lists_the_whole_analyte_family(albumin_assays):
+    # A listing is coarse on purpose: `--test albumin` shows every albumin filed.
+    d = dedup.load_dictionary(DICT_PATH)
+    rows = query.query_labs(albumin_assays, "jane-doe", test="albumin", dictionary=d)
+    assert sorted(r["test_name"] for r in rows) == \
+        ["Albumin", "Albumin", "Albumin (SPEP)"]
+
+
+def test_trends_charts_one_assay_and_discloses_the_others(albumin_assays):
+    # A series that interleaved the CMP and SPEP numbers would be a wrong chart, so
+    # trends splits them -- but the excluded rows are reported, never silently dropped.
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(albumin_assays, "jane-doe", "albumin", dictionary=d)
+    assert t["test"] == "albumin"
+    assert t["count"] == 2 and t["min"] == 4.0 and t["max"] == 4.2
+    assert t["other_assays"] == ["albumin (spep)"] and t["other_assay_count"] == 1
+
+    spep = query.trends(albumin_assays, "jane-doe", "Albumin (SPEP)", dictionary=d)
+    assert spep["test"] == "albumin (spep)"
+    assert spep["count"] == 1 and spep["latest"] == 3.6
+    assert spep["other_assays"] == ["albumin"] and spep["other_assay_count"] == 2
+
+
+def test_trends_discloses_other_assays_even_with_no_matching_points(albumin_assays):
+    # The empty-series path must still name the assay that does have data, or the user
+    # sees "no numeric results" for an analyte that is plainly in the record.
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(albumin_assays, "jane-doe", "Albumin (Nephelometry)", dictionary=d)
+    assert t["count"] == 0
+    assert t["other_assays"] == ["albumin", "albumin (spep)"]
+    assert t["other_assay_count"] == 3
+
+
+def test_trends_unrelated_analytes_are_not_reported_as_other_assays(albumin_assays):
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(albumin_assays, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["other_assays"] == [] and t["other_assay_count"] == 0
+
+
+def test_trends_disclosed_token_round_trips_over_an_underscore_canonical(seeded):
+    """The disclosure is only worth anything if its token can be fed straight back in.
+    A canonical value may contain underscores (`vitamin_d_25oh`) that `_collapse` turns
+    back into spaces on the way in, so a strict comparison made the printed token a
+    dead end -- zero rows *and* zero disclosure. `albumin` (the fixture above) has no
+    underscore, which is why the suite could not see this."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="vitamin D panel")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Vitamin D", "collected_at": "2025-01-01", "value_num": 31},
+        {"test_name": "Vitamin D", "collected_at": "2026-01-01", "value_num": 28},
+        {"test_name": "Vitamin D (25-OH)", "collected_at": "2025-01-01", "value_num": 44},
+    ]}, d)
+
+    t = query.trends(seeded, "jane-doe", "vitamin d", dictionary=d)
+    assert t["count"] == 2 and t["other_assay_count"] == 1
+    token = t["other_assays"][0]
+    assert "_" in token                       # the spelling that used to be a dead end
+
+    back = query.trends(seeded, "jane-doe", token, dictionary=d)
+    assert back["count"] == 1 and back["latest"] == 44
+    assert back["test"] == token              # echoed as disclosed, not as re-derived
+    assert back["other_assays"] == [t["test"]] and back["other_assay_count"] == 2
+
+
 def _insert_lab(conn, slug, **cols):
     """Insert a lab_result row directly (bypassing dedup) to simulate the #20
     same-timestamp duplicate-row state. Returns the new lab_result_id."""
