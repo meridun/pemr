@@ -37,6 +37,7 @@ detect multi-document attestation and does not pretend to.
 from __future__ import annotations
 
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,6 +72,58 @@ class OcrTextPresentError(ValueError):
 # record fields only), so correcting them is a pure metadata UPDATE. sha256 and
 # source_path are excluded by construction: the blob is content-addressed.
 _EDITABLE_FIELDS = ("doc_date", "category", "provider")
+
+
+# Unicode categories with no visible glyph, stripped alongside whitespace by
+# :func:`normalize_document_text`. `Cf` (format) is the one that matters: it holds
+# U+FEFF -- the survivor of a *doubled* BOM, which `utf-8-sig` only strips once --
+# plus U+200B/U+200C/U+200D and friends. `Cc` (control) is the same defect with a
+# NUL-only payload. Neither is `str.isspace()`, which is why plain `.strip()` let
+# them through (issue #87).
+_INVISIBLE_CATEGORIES = frozenset({"Cf", "Cc"})
+
+# Belt and braces for the zero-widths the issue names by codepoint: their category
+# has moved between Unicode revisions (U+200B was `Zs` before Unicode 4.0.1), and
+# the guard must not depend on which table the running Python ships.
+_INVISIBLE_CHARS = "".join(chr(cp) for cp in (0x200B, 0x200C, 0x200D, 0xFEFF))
+
+
+def _is_invisible(ch: str) -> bool:
+    return (
+        ch.isspace()
+        or ch in _INVISIBLE_CHARS
+        or unicodedata.category(ch) in _INVISIBLE_CATEGORIES
+    )
+
+
+def normalize_document_text(text: str | None) -> str:
+    """The engine's single answer to "is this document text meaningfully empty?".
+
+    Returns the text with every leading/trailing invisible character removed, so
+    ``not normalize_document_text(x)`` *is* the emptiness guard and its return value
+    is what gets stored -- one predicate for both, so a zero-width character can
+    neither pass the guard nor land in ``ocr_text`` (issue #87).
+
+    `str.strip()` alone is not that guard: it removes only characters where
+    ``.isspace()`` is true, so a file (or an MCP ``text`` argument) holding nothing
+    but U+200B, or the U+FEFF left over from a doubled BOM, sailed past every check
+    and stored one invisible character -- making ``has_ocr_text`` /
+    ``ocr_text_populated`` report ``true`` on a document carrying no text, the exact
+    wrong signal `AGENTS.md` §3 tells an agent to trust. Unrecoverable over MCP,
+    where ``document_set_text`` has no ``force``, which is why the fix sits here at
+    the engine layer rather than in `cli.py`'s read path (issue #78 fixed that half).
+
+    The contract is deliberately narrow: **text with no visible content is empty.**
+    Text that is merely *mostly* invisible is text, and nothing here normalises the
+    interior of a real transcription -- only its two ends.
+    """
+    value = text or ""
+    start, end = 0, len(value)
+    while start < end and _is_invisible(value[start]):
+        start += 1
+    while end > start and _is_invisible(value[end - 1]):
+        end -= 1
+    return value[start:end]
 
 
 # --------------------------------------------------------------------------- #
@@ -251,18 +304,20 @@ def set_document_text(
     ``NEW.ocr_text``, so the document becomes visible to `pemr find` with no explicit
     reindex (and a replace stops matching the old text).
 
-    The stored value is ``text.strip()``, matching :func:`ingest.ingest_document`.
+    The stored value is :func:`normalize_document_text` of the input, matching
+    :func:`ingest.ingest_document`.
 
     Raises :class:`DocumentNotFoundError` (unknown id), :class:`OcrTextPresentError` (the
     column is already populated and ``force`` is off — replacing a transcription is not
     cheaply undoable, so the surprising case is refused rather than silently applied), and
-    ``ValueError`` for empty/whitespace-only text. There is deliberately no path to *clear*
-    ``ocr_text``: that only removes FTS visibility, while an empty input is far more likely
-    a wrong or truncated file.
+    ``ValueError`` for text with no visible content — whitespace, but also zero-width and
+    other invisible characters, which `str.strip()` misses (issue #87). There is
+    deliberately no path to *clear* ``ocr_text``: that only removes FTS visibility, while
+    an empty input is far more likely a wrong or truncated file.
     """
     db.require_migrated(conn)
     row = _require_document(conn, document_id)
-    stored = (text or "").strip()
+    stored = normalize_document_text(text)
     if not stored:
         raise ValueError("text is empty - nothing to store; ocr_text unchanged")
     existing = row["ocr_text"] or ""
