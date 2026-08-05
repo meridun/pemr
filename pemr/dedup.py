@@ -14,6 +14,12 @@ agent can't subtly get wrong:
 analyte/name dictionary (``data/dictionary.toml``) so ``A1c`` / ``HbA1c`` /
 ``Hemoglobin A1c`` collapse to one canonical token — the one place fuzzy naming
 gets pinned down deterministically.
+
+``key_token()`` is the *identity* form of that name: the canonical token plus any
+**meaningful** parenthetical qualifier (``albumin (spep)``), so two genuinely
+distinct assays of one analyte off one draw keep distinct keys (issue #71).
+``norm()`` remains the *family* form (``albumin`` for both) and is what analyte
+listings match on.
 """
 
 from __future__ import annotations
@@ -132,7 +138,12 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
 }
 
 _WS = re.compile(r"\s+")
-_PAREN = re.compile(r"\([^)]*\)")
+# Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
+# bare analyte stem) and yields its contents (`findall`, giving the candidate qualifier).
+_PAREN = re.compile(r"\(([^)]*)\)")
+# Padding just inside a parenthesis, squeezed out by _collapse so `M-Spike ( SPEP )`
+# is the same label as `M-Spike (SPEP)` (and so hits the same dictionary entry).
+_PAREN_PAD = re.compile(r"\(\s+|\s+\)")
 
 # A date value is accepted at one of three precisions, each a lexically-sortable ISO
 # prefix (so `_date_only` slicing, timeline sort and every `ORDER BY <datecol>` keep
@@ -149,6 +160,15 @@ _ISO_YEAR_RE = re.compile(r"\d{4}")
 
 class ValidationError(ValueError):
     """Raised when the extraction JSON violates a record schema."""
+
+
+class DictionaryDriftError(ValueError):
+    """Stored keys no longer match the current dictionary; `pemr rekey` comes first.
+
+    Defined here rather than in :mod:`pemr.documents` because both the write paths
+    that can be corrupted by drift — `document reassign` and `commit-extraction` —
+    have to raise it, and only this module is importable from both.
+    """
 
 
 def _is_iso_date(value: str) -> bool:
@@ -213,31 +233,104 @@ def load_dictionary(path: str | Path | None) -> dict[str, str]:
 
 
 def _collapse(value: str) -> str:
-    # Underscores count as separators: machine-generated keys like
-    # "blood_pressure" must collapse to the same token as "Blood Pressure".
-    return _WS.sub(" ", value.strip().lower().replace("_", " "))
+    """Case/whitespace-normalized spelling of a free-text name.
+
+    Underscores count as separators: machine-generated keys like ``blood_pressure``
+    must collapse to the same token as ``Blood Pressure``. Trimming happens *after*
+    that substitution — a leading/trailing ``_`` becomes whitespace, and a stray edge
+    space would otherwise defeat :func:`identity`'s declared-full-label lookup
+    (``"_m-spike (spep)"`` must still find the ``"m-spike (spep)"`` entry). Padding
+    just inside a parenthesis is squeezed out for the same reason.
+    """
+    collapsed = _WS.sub(" ", value.lower().replace("_", " ")).strip()
+    return _PAREN_PAD.sub(lambda m: m.group(0).strip(), collapsed)
 
 
 def _strip_qualifiers(value: str) -> str:
-    """Drop parenthetical qualifiers (``(SPEP)``, ``(HGB)``, ``(calculated)``) that
-    label a value's method/source without changing *which analyte it is*, then
-    re-collapse whitespace. Applied inside :func:`norm` so real-report spellings like
-    ``Hemoglobin (HGB)`` or ``M-Spike (SPEP)`` reduce to their bare analyte name and
-    the dictionary only has to carry the minimal spelling, not every parenthesized
-    variant a lab happens to print."""
+    """Drop parenthetical qualifiers (``(SPEP)``, ``(HGB)``, ``(calculated)``) to leave
+    the bare analyte *stem*, then re-collapse whitespace. The stem is what
+    :func:`identity` looks up in the dictionary, so the dictionary only has to carry
+    the minimal spelling, not every parenthesized variant a lab happens to print."""
     return _WS.sub(" ", _PAREN.sub(" ", value)).strip()
 
 
-def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
-    """Normalize a free-text field: lowercase, trim, collapse whitespace (underscores
-    count as whitespace), strip parenthetical qualifiers, then map synonyms through
-    the dictionary. ``None`` -> ``""`` (deterministic key part)."""
+def _qualifier_text(value: str) -> str:
+    """The concatenated contents of ``value``'s parentheticals (``""`` when there are
+    none). ``"albumin (spep)"`` -> ``"spep"``; multiple groups join with a space."""
+    return _WS.sub(" ", " ".join(_PAREN.findall(value))).strip()
+
+
+def identity(
+    value: object, dictionary: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """``(canonical, qualifier)`` — the analyte family and, when the name carries a
+    *meaningful* parenthetical, the assay that distinguishes it within that family.
+
+    A parenthetical is meaningful **unless proven otherwise**, which is the deliberate
+    inversion behind issue #71. Collapsing two distinct assays (a CMP ``Albumin`` and an
+    SPEP ``Albumin (SPEP)`` off one draw) is lossy and near-silent — one row stores, the
+    other stages as a conflict. Over-splitting is visible and non-lossy: two parallel
+    series, repaired by one dictionary line plus ``pemr rekey``. Default to the
+    recoverable failure.
+
+    Three rules on ``full = _collapse(value)`` (parentheses preserved), in order:
+
+    1. **A declared full label wins.** ``dictionary["m-spike (spep)"]`` is the human
+       saying "this exact parenthesized label *is* that analyte" -> no qualifier. This
+       needs no schema change: ``[synonyms]`` keys may simply contain parentheses.
+    2. **A redundant alias is noise, with zero curation.** When the parenthetical maps
+       to the same canonical token as the stem — ``Hemoglobin (HGB)``, ``Hematocrit
+       (HCT)``, ``Platelet Count (PLT)`` — it is just another spelling of the stem, so
+       it drops out with no dictionary entry of its own.
+    3. **Everything else is meaningful** and becomes the qualifier, mapped through the
+       dictionary so ``(SPEP)`` and ``(Serum Protein Electrophoresis)`` agree.
+    """
     if value is None:
-        return ""
-    collapsed = _strip_qualifiers(_collapse(str(value)))
-    if dictionary:
-        return dictionary.get(collapsed, collapsed)
-    return collapsed
+        return "", ""
+    full = _collapse(str(value))
+    if dictionary and full in dictionary:
+        return dictionary[full], ""
+    stem = _strip_qualifiers(full)
+    canonical = dictionary.get(stem, stem) if dictionary else stem
+    inner = _qualifier_text(full)
+    if not inner:
+        return canonical, ""
+    qualifier = dictionary.get(inner, inner) if dictionary else inner
+    if qualifier == canonical:
+        return canonical, ""
+    return canonical, qualifier
+
+
+def norm(value: object, dictionary: dict[str, str] | None = None) -> str:
+    """Normalize a free-text field to its **analyte family** token: lowercase, trim,
+    collapse whitespace (underscores count as whitespace), drop parenthetical
+    qualifiers, then map synonyms through the dictionary. ``None`` -> ``""``
+    (deterministic key part).
+
+    This is the *family* form — ``Albumin`` and ``Albumin (SPEP)`` both normalize to
+    ``albumin`` — which is what analyte listings (``pemr labs --test``) match on so a
+    listing shows the whole family. Dedup keys and numeric series use the finer
+    :func:`key_token` instead.
+    """
+    return identity(value, dictionary)[0]
+
+
+def key_token(value: object, dictionary: dict[str, str] | None = None) -> str:
+    """The **dedup identity** token for a name: :func:`norm`'s canonical token, plus a
+    meaningful qualifier in parentheses when :func:`identity` finds one.
+
+    ``"albumin"`` / ``"albumin (spep)"``. Folded into the existing key part rather than
+    appended as a new one, deliberately: a fourth hash part would change ``"a|b|c"`` to
+    ``"a|b||c"`` and move the key of *every* stored row. Folding leaves every unqualified
+    row's ``dedup_key`` bit-identical, so ``pemr rekey`` moves only the rows this bug
+    actually affects.
+    """
+    canonical, qualifier = identity(value, dictionary)
+    if not qualifier:
+        return canonical
+    if not canonical:
+        return qualifier      # degenerate "(SPEP)"-only name: the qualifier is the name
+    return f"{canonical} ({qualifier})"
 
 
 def enum_token(value: object) -> str:
@@ -291,12 +384,22 @@ def _key_parts(
 
     Kept separate from the hashing so an error message can name *why* two rows
     collide (see :func:`identity_label`) instead of quoting a bare hash.
+
+    Analyte-style names — ``lab_result.test_name`` and ``observation.key`` — key on
+    :func:`key_token`, so a meaningful assay qualifier stays part of the identity
+    (issue #71). Everything else keys on :func:`norm`: medication / procedure /
+    appointment names already carry dose / date / provider in the key, and their
+    parentheticals are usually brand or descriptive (``Insulin (Lantus)``) rather than a
+    second measurement of one thing.
     """
     def n(field_name: str) -> str:
         return norm(row.get(field_name), dictionary)
 
+    def kt(field_name: str) -> str:
+        return key_token(row.get(field_name), dictionary)
+
     if record_type == "lab_result":
-        return [person_id, n("test_name"), _norm_ts(row.get("collected_at"))]
+        return [person_id, kt("test_name"), _norm_ts(row.get("collected_at"))]
     if record_type == "medication":
         return [person_id, n("name"), _collapse(str(row.get("dose") or "")),
                 _date_only(row.get("started_on"))]
@@ -305,7 +408,7 @@ def _key_parts(
     if record_type == "appointment":
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
-        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), n("key")]
+        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), kt("key")]
     # allergy/condition are DATE-FREE by design: they are standing facts restated on
     # every document with inconsistent or absent dates, so a date in the key would fork
     # one allergy into one row per document. The dates are payload, and a disagreement
@@ -530,6 +633,54 @@ def _rows_equal(
     return True
 
 
+def _assert_no_key_drift(
+    conn: sqlite3.Connection,
+    record_type: str,
+    rows: list,
+    person_id: int,
+    dictionary: dict[str, str] | None,
+) -> None:
+    """Refuse a commit that would fork a fact already stored under a **stale** key.
+
+    A ``dedup_key`` is frozen at commit time, so once the current dictionary (or the
+    key derivation itself — issue #71 gave every parenthesized analyte name a new key)
+    disagrees with what a stored row carries, layer-2 dedup silently misses: the same
+    fact lands a *second* time, reported as ``new``, with no duplicate/conflict signal
+    for anyone to notice. `pemr rekey --apply` is the fix, but nothing used to make the
+    user run it before their next ingest — this is what does.
+
+    Deliberately *narrow*: it fires only when a stored row recomputes onto an identity
+    this submission also derives, so an unrelated drifted row elsewhere in the database
+    never blocks an ingest. `document reassign` carries the equivalent guard
+    (:class:`DictionaryDriftError` there too), for the same reason.
+    """
+    bases = {dedup_key(record_type, row, person_id, dictionary) for row in rows}
+    if not bases:
+        return
+    pk = f"{record_type}_id"
+    stored = conn.execute(
+        f"SELECT * FROM {record_type} WHERE person_id = ?", (person_id,)
+    ).fetchall()
+    for row in stored:
+        payload = {name: row[name] for name in FIELD_SPECS[record_type]}
+        # An admitted repeat (`--keep both`) keys on hash(base|occurrence), so the
+        # recompute has to carry the stored occurrence or every sibling reads as drift.
+        occurrence = int(row["dedup_occurrence"] or 0)
+        base = dedup_key(record_type, payload, person_id, dictionary)
+        if base not in bases:
+            continue
+        if occurrence_key(base, occurrence) != row["dedup_key"]:
+            raise DictionaryDriftError(
+                f"{record_type}: {pk} {row[pk]} "
+                f"({_rekey_label(record_type, row)!r}) is stored under a dedup_key "
+                "that no longer matches the current dictionary, and this submission "
+                "derives that same identity - committing now would file the fact a "
+                "second time instead of deduping (or staging a conflict) against the "
+                "stored row. Run `pemr rekey --apply` first, then retry; nothing was "
+                "written"
+            )
+
+
 def _sparse_gains(
     record_type: str, existing: sqlite3.Row | dict, incoming: dict
 ) -> dict:
@@ -630,6 +781,9 @@ def commit_extraction(
                     "timestamp, commit them in separate submissions and resolve the "
                     "conflict with `--keep both`"
                 )
+        # Still pass 1 (nothing written yet): a stored row whose frozen key no longer
+        # matches its recompute would be missed by pass 2's dedup, forking the fact.
+        _assert_no_key_drift(conn, record_type, rows, person_id, dictionary)
 
     summary = CommitSummary()
     detected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1100,9 +1254,15 @@ def rekey(
     edit. Values, provenance and row ids are untouched — only ``dedup_key`` moves.
 
     Dry-run by default: pass ``apply=True`` to write. If two rows in a table recompute
-    to the same key the new dictionary would merge two distinct facts (typically two
-    methods for one analyte off one draw), so nothing is written and
-    :class:`RekeyCollisionError` is raised — fix the dictionary, not the data.
+    to the same key nothing is written and :class:`RekeyCollisionError` is raised, with
+    a message that names which of the two causes it is:
+
+    * the rows carry *different* payloads — the dictionary would merge two distinct
+      facts (typically two methods for one analyte off one draw): fix the dictionary;
+    * the rows carry the *same* payload — one fact was filed twice, once under a
+      pre-drift key, so it is the data that needs fixing. :func:`_assert_no_key_drift`
+      refuses the ingest that would create this state, so it should only be reachable
+      in a database that drifted before that guard existed.
     """
     db.require_migrated(conn)
     report = RekeyReport(applied=False)
@@ -1121,6 +1281,21 @@ def rekey(
             key = occurrence_key(base, occurrence)
             clash = seen.get(key)
             if clash is not None:
+                if _rows_equal(record_type, clash, payload):
+                    # Same payload, two keys: not a dictionary fault at all - one fact
+                    # was filed twice, once under a pre-drift key and once under the
+                    # current one. Say so, because "fix the dictionary" is exactly the
+                    # wrong advice here (`_assert_no_key_drift` now stops new ingests
+                    # from reaching this state).
+                    raise RekeyCollisionError(
+                        f"{record_type}: {pk} {row[pk]} and {pk} {clash[pk]} "
+                        f"({_rekey_label(record_type, row)!r}) hold the SAME fact "
+                        "under two dedup_keys - it was filed a second time by an "
+                        "ingest that ran against drifted keys before this rekey. The "
+                        "dictionary is fine; the data is doubled. Drop the duplicate "
+                        "(`pemr document rm` on the document that re-filed it, or "
+                        "resolve it by hand) and re-run; nothing was written"
+                    )
                 raise RekeyCollisionError(
                     f"{record_type}: {pk} {row[pk]} "
                     f"({_rekey_label(record_type, row)!r}) and {pk} {clash[pk]} "

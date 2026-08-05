@@ -6,10 +6,16 @@ owns human-readable vs ``--json`` formatting, and phase 5's MCP wrapper reuses t
 shapes as its payload. Person is always addressed by slug and resolved to ``person_id``
 here — an unknown slug raises :class:`PersonNotFoundError` (a friendly rc=1 at the CLI).
 
-Analyte matching (``--test`` on labs/trends) runs through the same ``norm()`` +
-dictionary as dedup, so ``A1c`` finds rows stored as ``HbA1c``. Because the typed tables
-store the *original* spelling (only ``dedup_key`` is normalized), that match is done in
-Python over the candidate rows rather than in SQL.
+Analyte matching (``--test`` on labs/trends) runs through the same dictionary as dedup,
+so ``A1c`` finds rows stored as ``HbA1c``. Because the typed tables store the *original*
+spelling (only ``dedup_key`` is normalized), that match is done in Python over the
+candidate rows rather than in SQL.
+
+The two readers match at deliberately **different granularities** (issue #71):
+``query_labs`` uses ``norm()`` and shows the whole analyte family, while ``trends`` uses
+``key_token()`` so a numeric series never interleaves two different assays of one
+analyte (a CMP ``Albumin`` and an SPEP ``Albumin (SPEP)``) — and discloses the rows it
+excluded on that basis rather than dropping them silently.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import sqlite3
 from datetime import date, datetime
 
 from . import db
-from .dedup import enum_token, norm
+from .dedup import enum_token, key_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
 # can never be mis-parsed as FTS syntax (each token is quoted as a phrase, AND-ed).
@@ -125,7 +131,13 @@ def query_labs(
     dictionary: dict[str, str] | None = None,
 ) -> list[dict]:
     """Lab rows for a person, oldest first. ``test`` is dictionary-normalized and matched
-    against each row's normalized ``test_name``; ``since`` keeps rows on/after that date."""
+    against each row's normalized ``test_name``; ``since`` keeps rows on/after that date.
+
+    Matching is on ``norm()``, the **analyte family** — deliberately coarser than the
+    dedup key (issue #71). ``--test albumin`` lists the CMP albumin *and* the SPEP
+    ``Albumin (SPEP)`` fraction, because a listing should show everything filed under
+    that analyte. Only the numeric series (:func:`trends`) needs assay precision.
+    """
     person_id = resolve_person_id(conn, slug)
     sql = "SELECT * FROM lab_result WHERE person_id = ?"
     params: list[object] = [person_id]
@@ -303,6 +315,22 @@ def find(conn: sqlite3.Connection, slug: str | None, query: str) -> list[dict]:
 # Trends
 # --------------------------------------------------------------------------- #
 
+def _loose(token: str) -> str:
+    """Compare-only spelling of a ``key_token``, underscore-insensitive.
+
+    A dictionary's *canonical value* may contain underscores (``vitamin_d_25oh``,
+    ``bilirubin_total``, ``m_spike``) while ``dedup._collapse`` turns ``_`` into a
+    space on the way **in** — so a token :func:`trends` prints, and offers as a
+    paste-ready ``--test``, does not survive the round trip: re-deriving it yields
+    ``vitamin d 25oh (25-oh)``, which matches nothing. Comparing both sides through
+    this makes the disclosed token actually findable.
+
+    Read-path only — no ``dedup_key`` is derived from it. The most it can do is treat
+    two spellings of one canonical name as one series, which is what they are.
+    """
+    return token.replace("_", " ")
+
+
 def _ordinal(value: object) -> int | None:
     try:
         return date.fromisoformat(_date_part(value)).toordinal()
@@ -331,27 +359,48 @@ def trends(
     test: str,
     dictionary: dict[str, str] | None = None,
 ) -> dict:
-    """Summary stats for one dictionary-normalized analyte over time.
+    """Summary stats for one **assay** of one analyte over time.
 
     Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
-    slope_per_day}``. ``count`` is the number of numeric points; ``slope_per_day``
-    degrades to ``None`` with fewer than two distinct collection dates. ``latest`` is
-    the row with the greatest ``collected_at``, ties broken by the greatest
-    ``lab_result_id`` (most-recently-ingested wins); ``latest_tie`` counts how many
-    matched rows share that exact ``collected_at`` timestamp.
+    slope_per_day, other_assays, other_assay_count}``. ``count`` is the number of
+    numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two distinct
+    collection dates. ``latest`` is the row with the greatest ``collected_at``, ties
+    broken by the greatest ``lab_result_id`` (most-recently-ingested wins);
+    ``latest_tie`` counts how many matched rows share that exact ``collected_at``
+    timestamp.
+
+    Matching is on ``key_token()``, not ``norm()`` (issue #71): a series that silently
+    interleaves a CMP albumin with an SPEP albumin is a wrong chart, the same class of
+    harm as the dedup collision this splits apart. Rows of the *same* analyte family
+    excluded by a differing qualifier are therefore **disclosed, not dropped** —
+    ``other_assays`` lists their key tokens (each usable verbatim as ``--test``, via
+    :func:`_loose` — a canonical value may carry underscores that a re-derivation
+    cannot reproduce) and ``other_assay_count`` counts the numeric rows behind them.
     """
     person_id = resolve_person_id(conn, slug)
-    target = norm(test, dictionary)
+    target = _loose(key_token(test, dictionary))
+    family = _loose(norm(test, dictionary))
     rows = conn.execute(
         "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
         "WHERE person_id = ? AND value_num IS NOT NULL "
         "ORDER BY collected_at, lab_result_id",
         (person_id,),
     ).fetchall()
-    matched = [r for r in rows if norm(r["test_name"], dictionary) == target]
+    matched = []
+    others: dict[str, int] = {}
+    matched_token = ""
+    for r in rows:
+        token = key_token(r["test_name"], dictionary)
+        if _loose(token) == target:
+            matched.append(r)
+            # Echo the stored spelling rather than whatever the caller typed, so a
+            # pasted `other_assays` token comes back labelled the way it was disclosed.
+            matched_token = matched_token or token
+        elif _loose(norm(r["test_name"], dictionary)) == family:
+            others[token] = others.get(token, 0) + 1
 
     result: dict = {
-        "test": target,
+        "test": matched_token or target,
         "count": len(matched),
         "unit": None,
         "min": None,
@@ -360,6 +409,9 @@ def trends(
         "latest_at": None,
         "latest_tie": 0,
         "slope_per_day": None,
+        # Same analyte, different assay: reported so the excluded rows stay findable.
+        "other_assays": sorted(others),
+        "other_assay_count": sum(others.values()),
     }
     if not matched:
         return result
