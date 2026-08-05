@@ -73,9 +73,15 @@ report's verbatim label.
   backstop, not the only defense — getting the name right at the source keeps trends, `query`, and
   dedup coherent.
 - **Unknown analyte** (no canonical match after normalization): commit the verbatim report name
-  (parentheticals stripped) and **propose the synonym to the human** in your response. Agents
-  never edit `data/dictionary.toml` directly — dictionary additions are human-approved
-  (`docs/Architecture.md` §3).
+  **including any parenthetical qualifier** and **propose the synonym to the human** in your
+  response. Agents never edit `data/dictionary.toml` directly — dictionary additions are
+  human-approved (`docs/Architecture.md` §3).
+- **Never drop a parenthetical qualifier** (issue #71). `Albumin (SPEP)` and a CMP's `Albumin`
+  are two different assays off one draw; the qualifier is what keeps their dedup keys distinct,
+  and an agent that strips it at the source destroys a distinction no later `pemr rekey` can
+  recover. Commit the label as printed. If the parenthetical really is noise for that analyte,
+  that is a dictionary entry for the human to approve (`"m-spike (spep)" = "m_spike"`), not an
+  edit for you to make in the payload.
 - MUST NOT invent abbreviations or "helpful" renames.
 
 ### 2. Observation rows — vitals, orders, screenings, immunizations

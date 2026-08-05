@@ -57,8 +57,11 @@ class OpenConflictsError(ValueError):
     """Raised when a reassign is refused because open conflicts cite the document."""
 
 
-class DictionaryDriftError(ValueError):
-    """Stored keys no longer match the current dictionary; `pemr rekey` comes first."""
+# Stored keys no longer match the current dictionary; `pemr rekey` comes first.
+# The class lives in `dedup` because `commit_extraction` raises it too (a drifted key
+# forks the fact on the next ingest, issue #71); re-exported here so
+# `documents.DictionaryDriftError` stays the name callers already catch.
+DictionaryDriftError = dedup.DictionaryDriftError
 
 
 class OcrTextPresentError(ValueError):
