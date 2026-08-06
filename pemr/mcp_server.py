@@ -38,6 +38,7 @@ from . import ingest as _ingest
 from . import persons as _persons
 from . import query as _query
 from . import render as _render
+from . import tombstones as _tombstones
 
 
 class ToolError(RuntimeError):
@@ -204,6 +205,13 @@ def ingest_document(
     (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``), where
     those words are column labels — so pass your transcription as ``ocr_text`` rather
     than saving it to a ``.txt`` and re-reading that. ``mismatch`` holds on every route.
+
+    Content whose hash carries a **tombstone** — a removal a human recorded as permanent
+    (issue #80) — comes back as ``status="tombstoned"`` with ``document: null`` and the
+    ``tombstone`` row: a structured, non-exceptional "not filed, on purpose". ``force``
+    does **not** override it (unlike the owner check, which is a heuristic): a tombstone
+    is the human's already-recorded decision, so forcing one is never an agent judgment
+    call. Report the skip and its reason and stop; lifting it is a CLI action.
     """
     try:
         sources_dir = cli._resolve_sources_dir(_ARGS)
@@ -215,23 +223,39 @@ def ingest_document(
                 conn, file, person_slug=person, sources_dir=sources_dir,
                 study=study, allow_large=allow_large, doc_date=doc_date,
                 category=category, provider=provider, ocr_text=ocr_text, force=force,
+                tombstone_force=False,
             )
         else:
             result = _ingest.ingest_document(
                 conn, file, person_slug=person, sources_dir=sources_dir,
                 doc_date=doc_date, category=category, provider=provider,
-                ocr=ocr, ocr_text=ocr_text, force=force,
+                ocr=ocr, ocr_text=ocr_text, force=force, tombstone_force=False,
             )
     except (db.NotMigratedError, _ingest.IngestError) as exc:
         raise _friendly(exc) from exc
+    if result.is_tombstoned and force:
+        # `force` overrides the owner check, which is a *heuristic* a human may
+        # reasonably ask an agent to override. A tombstone is the opposite: it is the
+        # human's already-recorded decision that this content stays out, so overriding
+        # it is never an agent judgment call (AGENTS.md §3). Lifting it is a CLI action.
+        sha = (result.tombstone or {}).get("sha256", "")
+        raise ToolError(
+            "this content is tombstoned - a human recorded its removal as intentional "
+            f"({_tombstones.describe(result.tombstone or {})}). `force` does not "
+            "override a tombstone. Report the skip and its reason to the human; if "
+            f"they want it filed, they lift it at the CLI with "
+            f"`pemr document tombstone rm {sha}`."
+        )
     return {
         "status": result.status,
         "is_duplicate": result.is_duplicate,
+        "is_tombstoned": result.is_tombstoned,
         "ocr_text_populated": result.ocr_text_populated,
         "owner_check": (
             asdict(result.owner_check) if result.owner_check is not None else None
         ),
-        "document": asdict(result.document),
+        "tombstone": result.tombstone,
+        "document": asdict(result.document) if result.document is not None else None,
     }
 
 
