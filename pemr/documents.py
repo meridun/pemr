@@ -309,8 +309,10 @@ def set_document_text(
     :func:`ingest.ingest_document`.
 
     Raises :class:`DocumentNotFoundError` (unknown id), :class:`OcrTextPresentError` (the
-    column is already populated and ``force`` is off — replacing a transcription is not
-    cheaply undoable, so the surprising case is refused rather than silently applied), and
+    column already holds *visible* text and ``force`` is off — replacing a transcription is
+    not cheaply undoable, so the surprising case is refused rather than silently applied;
+    a row holding only invisible characters counts as unpopulated, so it can be repaired
+    over MCP, where there is no ``force`` — issue #87), and
     ``ValueError`` for text with no visible content — whitespace, but also zero-width and
     other invisible characters, which `str.strip()` misses (issue #87). There is
     deliberately no path to *clear* ``ocr_text``: that only removes FTS visibility, while
@@ -321,7 +323,12 @@ def set_document_text(
     stored = normalize_document_text(text)
     if not stored:
         raise ValueError("text is empty - nothing to store; ocr_text unchanged")
-    existing = row["ocr_text"] or ""
+    # Normalised, not raw truthiness: a row holding nothing but invisible characters
+    # (pre-fix ingests, issue #87) counts as *unpopulated*, so it can be repaired over
+    # MCP, where `document_set_text` deliberately has no `force`. The only thing this
+    # lets through without `force` is content with no visible characters, so no real
+    # transcription can be lost.
+    existing = normalize_document_text(row["ocr_text"])
     if existing and not force:
         raise OcrTextPresentError(
             f"document {document_id} already has ocr_text ({len(existing)} chars) - "
