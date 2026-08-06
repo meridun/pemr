@@ -892,6 +892,83 @@ def test_supplied_ocr_text_still_beats_extraction(conn, tmp_path, sources):
     assert result.document.ocr_text == "agent transcription"
 
 
+def test_zero_width_only_ocr_text_is_no_text_at_all(conn, tmp_path, sources):
+    """`.strip()` keeps a zero-width character (it is not `.isspace()`), so a
+    zero-width-only transcription used to count as supplied and report
+    `ocr_text_populated` on a document carrying nothing (#87)."""
+    src = _make_file(tmp_path, "scan.txt", b"a scan with no text")
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr_text=chr(0x200B)
+    )
+    assert result.document.ocr_text is None
+    assert not result.ocr_text_populated
+
+
+def test_supplied_ocr_text_is_stored_without_invisible_padding(conn, tmp_path, sources):
+    """Normalise what is *stored*, not just what is rejected (#87)."""
+    src = _make_file(tmp_path, "scan2.txt", b"another scan")
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources,
+        ocr_text=chr(0xFEFF) + "  Sodium 140 mmol/L  " + chr(0x200B),
+    )
+    assert result.document.ocr_text == "Sodium 140 mmol/L"
+
+
+# One emptiness notion per column: the *extracted* routes (`--ocr auto`) must answer
+# "is this empty?" the same way the supplied-text route does, or the issue's headline
+# symptom survives on an unenumerated route (#87 audit bounce).
+
+
+def test_extracted_zero_width_only_text_is_no_text_at_all(conn, tmp_path, sources):
+    """The `--ocr auto` native route: a file of nothing but one U+200B is empty."""
+    src = _make_file(tmp_path, "zwsp.txt", chr(0x200B).encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text is None
+    assert not result.ocr_text_populated
+
+
+def test_extracted_text_is_stored_without_invisible_padding(conn, tmp_path, sources):
+    src = _make_file(
+        tmp_path, "padded.txt",
+        (chr(0xFEFF) * 2 + " Sodium 140 mmol/L " + chr(0x200B)).encode("utf-8"),
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Sodium 140 mmol/L"
+
+
+def test_run_ocr_zero_width_only_tesseract_output_is_none(tmp_path, monkeypatch):
+    """tesseract on a blank page can emit invisibles; that is no text, not text."""
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        ingest.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 0, stdout=chr(0x200B) + "\n" + chr(0xFEFF), stderr=""
+        ),
+    )
+    assert ingest.run_ocr(_make_file(tmp_path, "scan.jpg", b"jpeg")) is None
+
+
+def test_ocr_pdf_zero_width_text_layer_does_not_clear_the_threshold(
+    tmp_path, monkeypatch
+):
+    """A text layer of 60 zero-width characters used to clear
+    `PDF_TEXT_LAYER_MIN_CHARS` and suppress the tesseract fallback (#87)."""
+    pages = [_FakePage(text=chr(0x200B) * 60, scanned="the labs table")]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) == "the labs table"
+    assert pages[0].pixmap_kwargs is not None
+
+
+def test_ocr_pdf_all_invisible_pages_yield_no_text(tmp_path, monkeypatch):
+    pages = [_FakePage(text=chr(0xFEFF), scanned=chr(0x200B))]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    assert ingest.run_ocr(_pdf(tmp_path)) is None
+
+
 # --- structured text vs. the #61 identity anchor (issue #66 audit bounce) -------
 #
 # Native extraction made text available for `.csv`/`.docx`/`.xlsx`/`.json`, and that text

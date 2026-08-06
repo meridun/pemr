@@ -54,6 +54,7 @@ from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study, tombstones as _tombstones
+from .documents import normalize_document_text
 from .models import Document, Person
 
 
@@ -231,7 +232,10 @@ def _ocr_page_image(png: bytes, label: str) -> str | None:
         return None
     # Bytes in, bytes out: decode explicitly rather than letting `text=True` pick the
     # platform codepage (issue #64 — cp1252 on Windows crashes on tesseract's UTF-8).
-    return proc.stdout.decode("utf-8", errors="replace").strip() or None
+    # `normalize_document_text`, not `.strip()`: tesseract on a blank page can emit
+    # nothing but zero-widths/form-feeds, which must count as "no text" on every
+    # route, not just the supplied-text one (issue #87).
+    return normalize_document_text(proc.stdout.decode("utf-8", errors="replace")) or None
 
 
 def _ocr_pdf(src: Path) -> str | None:
@@ -280,7 +284,7 @@ def _ocr_pdf(src: Path) -> str | None:
             label = f"{src.name} page {index + 1}"
             try:
                 page = doc[index]
-                text = (page.get_text() or "").strip()
+                text = normalize_document_text(page.get_text())
                 if len(text) < PDF_TEXT_LAYER_MIN_CHARS:
                     if have_tesseract is None:
                         have_tesseract = shutil.which("tesseract") is not None
@@ -305,7 +309,7 @@ def _ocr_pdf(src: Path) -> str | None:
                 pages.append(text)
     finally:
         doc.close()
-    return _PAGE_SEPARATOR.join(pages).strip() or None
+    return normalize_document_text(_PAGE_SEPARATOR.join(pages)) or None
 
 
 def run_ocr(path: str | Path) -> str | None:
@@ -352,7 +356,9 @@ def run_ocr(path: str | Path) -> str | None:
             file=sys.stderr,
         )
         return None
-    text = proc.stdout.strip()
+    # Same predicate as every other route into `ocr_text` (issue #87): this return
+    # goes straight out of `extract_text_routed` without passing its normalisation.
+    text = normalize_document_text(proc.stdout)
     return text or None
 
 
@@ -533,7 +539,9 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             file=sys.stderr,
         )
         return None, "native"
-    text = text.strip()
+    # Same predicate as the supplied-text route below - one emptiness notion per
+    # column, so `--ocr auto` cannot store what `--ocr-text-file` rejects (issue #87).
+    text = normalize_document_text(text)
     return (text or None), "native"
 
 
@@ -998,7 +1006,10 @@ def ingest_document(
 
     # Resolve the text *before* the blob copy so the owner check is pre-write. OCR
     # runs on `src` rather than the copied blob — identical bytes, same result.
-    supplied = ocr_text.strip() if ocr_text else None
+    # `normalize_document_text`, not `.strip()`: a supplied text of nothing but
+    # zero-width characters is empty, and must neither count as supplied nor land in
+    # `ocr_text` (issue #87).
+    supplied = normalize_document_text(ocr_text) or None
     if supplied:
         # An agent transcription is prose off the page: anchors mean what they say.
         ocr_text, route = supplied, "ocr"
@@ -1156,7 +1167,9 @@ def ingest_study_dir(
         )
 
     metadata = _study.read_metadata(scan)
-    supplied = ocr_text.strip() if ocr_text else None
+    # Same guard as the file path: zero-width-only text is empty, so the generated
+    # study summary wins rather than an invisible character (issue #87).
+    supplied = normalize_document_text(ocr_text) or None
     text = supplied or _study.summary_text(scan, metadata)
 
     roster = _roster(conn)

@@ -303,6 +303,42 @@ def test_ingest_bom_only_ocr_text_file_stores_no_ocr_text(ready, capsys):
     assert shown.out == "" and "has no ocr_text stored" in shown.err
 
 
+def test_ingest_zero_width_only_ocr_text_file_stores_no_ocr_text(ready, capsys):
+    """One U+200B is not text (#87). No encoding fixes this - `utf-8-sig` has nothing
+    to strip - so `.strip()`, which only removes `.isspace()` characters, let it
+    through and reported ocr_text populated on an empty document."""
+    tmp_path = ready
+    scan = tmp_path / "scan.txt"
+    scan.write_bytes(b"some labs")
+    zwsp = tmp_path / "zwsp.txt"
+    zwsp.write_bytes(chr(0x200B).encode("utf-8"))
+
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"),
+                "--ocr-text-file", str(zwsp)) == 0
+    assert "no ocr_text stored" in capsys.readouterr().err
+    assert _run(tmp_path, "document", "show", "1", "--text") == 0
+    shown = capsys.readouterr()
+    assert shown.out == "" and "has no ocr_text stored" in shown.err
+
+
+def test_ingest_doubled_bom_ocr_text_file_stores_no_ocr_text(ready, capsys):
+    """`utf-8-sig` strips one BOM; the U+FEFF survivor is not `.isspace()` (#87)."""
+    tmp_path = ready
+    scan = tmp_path / "scan.txt"
+    scan.write_bytes(b"some labs")
+    bom = tmp_path / "doublebom.txt"
+    bom.write_bytes((chr(0xFEFF) * 2).encode("utf-8"))
+
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"),
+                "--ocr-text-file", str(bom)) == 0
+    assert "no ocr_text stored" in capsys.readouterr().err
+    assert _run(tmp_path, "document", "show", "1", "--text") == 0
+    shown = capsys.readouterr()
+    assert shown.out == "" and "has no ocr_text stored" in shown.err
+
+
 def test_ingest_strips_a_leading_bom_from_the_ocr_text_file(ready, capsys):
     """A BOM on a real transcription must not inflate the stored text (#78)."""
     tmp_path = ready
