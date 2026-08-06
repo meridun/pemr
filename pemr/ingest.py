@@ -2,7 +2,8 @@
 
 The deterministic first half of the ingestion pipeline (Architecture.md §4):
 
-    1. sha256 the raw bytes; if the hash is already in `document` -> duplicate, stop
+    1. sha256 the raw bytes; if the hash is already in `document` -> duplicate, stop;
+       if it carries a `document_tombstone` row -> tombstoned, stop (issue #80)
     2. copy the blob into sources/<sha[:2]>/<sha>.<ext> (immutable, content-addressed)
     3. insert a `document` row (category/provider left null for now)
 
@@ -52,7 +53,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
-from . import db, study as _study
+from . import db, study as _study, tombstones as _tombstones
 from .documents import normalize_document_text
 from .models import Document, Person
 
@@ -77,15 +78,30 @@ class OwnerMismatchError(IngestError):
 
 @dataclass(frozen=True)
 class IngestResult:
-    status: str  # "new" | "duplicate"
-    document: Document
+    status: str  # "new" | "duplicate" | "tombstoned"
+    # None on the tombstoned path: nothing was written, and there is no document to
+    # point at (the whole point of a tombstone is that the content is not on file).
+    document: Document | None = None
     # None on the duplicate path: a layer-1 duplicate returns before any check runs
-    # (nothing is written, so there is nothing to misfile).
+    # (nothing is written, so there is nothing to misfile). Also None when tombstoned.
     owner_check: "OwnerCheck | None" = None
+    # The `document_tombstone` row, on the tombstoned path only (issue #80).
+    tombstone: dict | None = None
 
     @property
     def is_duplicate(self) -> bool:
         return self.status == "duplicate"
+
+    @property
+    def is_tombstoned(self) -> bool:
+        """Whether the content was refused by an intentional-removal record (issue #80).
+
+        A benign, expected no-op with the same shape as ``duplicate`` — *not* an error.
+        The bulk sweep is the common case this exists to serve, and a sweep that starts
+        exiting non-zero on expected skips trains operators into `|| true`, re-burying
+        the signal.
+        """
+        return self.status == "tombstoned"
 
     @property
     def ocr_text_populated(self) -> bool:
@@ -94,7 +110,7 @@ class IngestResult:
         The `AGENTS.md` contract asks agents to populate `ocr_text` on every ingest
         (empty FTS otherwise); this lets a caller self-check without a follow-up read.
         """
-        return bool(self.document.ocr_text)
+        return bool(self.document and self.document.ocr_text)
 
 
 _READ_CHUNK = 1 << 20  # 1 MiB
@@ -906,12 +922,23 @@ def ingest_document(
     ocr: bool = False,
     ocr_text: str | None = None,
     force: bool = False,
+    tombstone_force: bool = True,
 ) -> IngestResult:
     """Ingest one document: hash, layer-1 dedup, owner check, blob store, insert row.
 
     On a content-hash hit (layer 1), the existing document is returned with
     status "duplicate" and nothing is written. Otherwise the blob is copied into
     the immutable content-addressed store and a new `document` row is inserted.
+
+    A hash carrying a `document_tombstone` row — a removal a human deliberately recorded
+    as permanent (issue #80) — returns status ``"tombstoned"`` with the row attached and
+    writes nothing. That is a benign expected skip, not an error: the bulk sweep is the
+    common case, and failing it would train operators to ignore the output. ``force=True``
+    ingests anyway and **does not lift the tombstone** — it is a one-shot override, so the
+    next sweep skips again; the row rides back on the ``"new"`` result so callers can warn.
+    ``tombstone_force=False`` withholds that override from ``force`` (the MCP surface
+    passes it: a tombstone *is* the human's already-recorded decision, so overriding it
+    is never an agent judgment call — unlike the owner check, which is a heuristic).
 
     A Google Drive pointer stub is refused up front (issue #66) — before hashing, so
     nothing is written and there is nothing to clean up. See :func:`is_pointer_stub`.
@@ -962,6 +989,13 @@ def ingest_document(
         # duplicate already filed under the wrong owner is `pemr document reassign`'s
         # job, not a reason to fail a no-op.
         return IngestResult(status="duplicate", document=existing)
+
+    # Removal memory (issue #80). Strictly *after* the `document` lookup: a live
+    # document means the content is filed, which is a different answer than "excluded",
+    # and `tombstone add` refuses the both-at-once state except via `--force` below.
+    tombstone = _tombstones.get_tombstone(conn, sha)
+    if tombstone is not None and not (force and tombstone_force):
+        return IngestResult(status="tombstoned", tombstone=tombstone)
 
     # Resolve the text *before* the blob copy so the owner check is pre-write. OCR
     # runs on `src` rather than the copied blob — identical bytes, same result.
@@ -1014,7 +1048,11 @@ def ingest_document(
         if blob_created:
             dest.unlink(missing_ok=True)
         raise
-    return IngestResult(status="new", document=document, owner_check=owner_check)
+    # `tombstone` is non-None here only on the `--force` override path: the row is
+    # deliberately *not* lifted (see the docstring), so callers warn and name the undo.
+    return IngestResult(
+        status="new", document=document, owner_check=owner_check, tombstone=tombstone
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1049,6 +1087,7 @@ def ingest_study_dir(
     provider: str | None = None,
     ocr_text: str | None = None,
     force: bool = False,
+    tombstone_force: bool = True,
 ) -> IngestResult:
     """Ingest a study *directory* as one document (issue #69).
 
@@ -1152,6 +1191,13 @@ def ingest_study_dir(
             # path exactly - only the work is wasted.
             return IngestResult(status="duplicate", document=existing)
 
+        # Same removal-memory check as the file path (issue #80) — a study's blob is a
+        # content-addressed archive like any other, so a tombstoned disc must not
+        # silently re-ingest either.
+        tombstone = _tombstones.get_tombstone(conn, sha)
+        if tombstone is not None and not (force and tombstone_force):
+            return IngestResult(status="tombstoned", tombstone=tombstone)
+
         dest = blob_dest(sources_dir, sha, STUDY_EXT)
         dest.parent.mkdir(parents=True, exist_ok=True)
         blob_created = not dest.exists()
@@ -1175,4 +1221,6 @@ def ingest_study_dir(
     finally:
         tmp_blob.unlink(missing_ok=True)
 
-    return IngestResult(status="new", document=document, owner_check=owner_check)
+    return IngestResult(
+        status="new", document=document, owner_check=owner_check, tombstone=tombstone
+    )

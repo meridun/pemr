@@ -17,6 +17,7 @@ EXPECTED_TABLES = {
     "condition",
     "allergy",
     "conflict",
+    "document_tombstone",
     "schema_migrations",
 }
 
@@ -40,6 +41,7 @@ ALL_MIGRATIONS = [
     "004_person_deactivate.sql",
     "005_dedup_occurrence.sql",
     "006_condition_allergy.sql",
+    "007_document_tombstone.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -126,7 +128,9 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
     )
     conn.commit()
 
-    assert db.migrate(conn) == ["006_condition_allergy.sql"]
+    assert db.migrate(conn) == [
+        "006_condition_allergy.sql", "007_document_tombstone.sql"
+    ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
     assert (a["substance"], a["reaction"], a["noted_on"]) == (

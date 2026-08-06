@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import (
     __version__, backup, db, dedup, documents, ingest, persons, query, render,
-    restore, study, verify,
+    restore, study, tombstones, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -614,15 +614,61 @@ def _cmd_document_reassign(args: argparse.Namespace) -> int:
     return _with_document_conn(args, work)
 
 
+def _warn_purge_without_tombstone(
+    report: "documents.RemoveReport", args: argparse.Namespace
+) -> None:
+    """`--purge-blob` over-promises without a tombstone (issue #80) — say so.
+
+    Purging deletes the stored scan, which reads final, but layer-1 identity is scoped
+    to the live `document` table: the next sweep over the unchanged source folder
+    re-ingests the file as new. The two flags stay **orthogonal** rather than
+    `--purge-blob` implying `--tombstone` — purging is disk hygiene ("this 400 MB scan
+    is junk"), tombstoning is content policy ("never file this again"), and conflating
+    them would make every space-reclaiming purge a permanent silent block, which is the
+    blanket ignore-list failure the design rejects. So: a warning, not a behaviour change.
+
+    Emitted on the **dry run too**: a warning that only appears after the irreversible
+    run is useless. Suppressed when a tombstone was asked for or already exists (no
+    nagging on a re-run). The git-history caveat is unconditional on `--tombstone` — the
+    blob may still be in a data repo's history, which no flag here can fix.
+    """
+    if not args.purge_blob:
+        return
+    if not (report.tombstoned or report.tombstone_existed):
+        print(
+            "warning: --purge-blob deletes the stored scan but does not prevent "
+            "re-ingest. The next\n"
+            "  sweep over the source folder will re-ingest this file as new. Add "
+            "--tombstone to\n"
+            "  record that the removal was intentional.",
+            file=sys.stderr,
+        )
+    if report.blob_purged:
+        print(
+            "note: if this blob was ever committed to a data repo, purging it here "
+            "does not\n  remove it from that repo's git history.",
+            file=sys.stderr,
+        )
+
+
 def _cmd_document_rm(args: argparse.Namespace) -> int:
     # The sources dir is only needed to delete the blob; keeping it (the default)
     # must not require configured paths.
     sources_dir = _resolve_sources_dir(args) if args.purge_blob else None
+    if (args.reason is not None or args.note is not None) and not args.tombstone:
+        # An argparse error (usage + rc=2), not a silent ignore: `--reason identifiers`
+        # without `--tombstone` reads as "I recorded why", and it would record nothing.
+        # The owning subparser is carried on the namespace so the usage line names
+        # `pemr document rm` rather than the top-level parser.
+        args.parser.error(
+            "--reason/--note only apply with --tombstone; nothing was written"
+        )
 
     def work(conn):
         report = documents.remove_document(
             conn, args.document_id, sources_dir=sources_dir,
-            purge_blob=args.purge_blob, apply=args.apply,
+            purge_blob=args.purge_blob, tombstone=args.tombstone,
+            reason=args.reason, note=args.note, apply=args.apply,
         )
         if args.json:
             _print_json({
@@ -637,7 +683,12 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
                 "conflicts_detached": report.conflicts_detached,
                 "blob_path": report.blob_path,
                 "blob_purged": report.blob_purged,
+                "tombstoned": report.tombstoned,
+                "tombstone_reason": report.tombstone_reason,
+                "tombstone_note": report.tombstone_note,
+                "tombstone_existed": report.tombstone_existed,
             })
+            _warn_purge_without_tombstone(report, args)
             return 0
         print(
             f"document #{report.document_id}  {_fmt(report.person_slug)}  "
@@ -664,6 +715,15 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
             print(f"  blob already gone: {report.blob_path}")
         else:
             print(f"  blob would be deleted: {report.blob_path}")
+        if report.tombstoned:
+            verb = "tombstone updated" if report.tombstone_existed else "tombstone recorded"
+            if not report.applied:
+                verb = (
+                    "would update tombstone" if report.tombstone_existed
+                    else "would record tombstone"
+                )
+            detail = f" (reason: {report.tombstone_reason})" if report.tombstone_reason else ""
+            print(f"  {verb}{detail}")
         if report.applied:
             print(f"removed document #{report.document_id}")
         else:
@@ -671,6 +731,97 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
                 "dry run: nothing was deleted - re-run with --apply "
                 "(back up first: `pemr backup`)"
             )
+        _warn_purge_without_tombstone(report, args)
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+# --- tombstones (intentional-removal memory, issue #80) ---------------------
+
+def _tombstone_row_line(row: dict) -> str:
+    """One `tombstone list` line. Truncated hash (full one is a `--json` concern)."""
+    live = row.get("live_document_id")
+    note = row["note"] or ""
+    if live:
+        marker = f"(live as document #{live})"
+        note = f"{note} {marker}".strip() if note else marker
+    return (
+        f"{row['sha256'][:12]}  {(row['removed_at'] or '')[:10]:10}  "
+        f"{('#' + str(row['document_id'])) if row['document_id'] else '-':5} "
+        f"{_fmt(row['reason']):12} {note}"
+    ).rstrip()
+
+
+def _cmd_document_tombstone_list(args: argparse.Namespace) -> int:
+    def work(conn):
+        rows = tombstones.list_tombstones(conn)
+        if args.json:
+            _print_json(rows)
+            return 0
+        if not rows:
+            print("no tombstones recorded")
+            return 0
+        print(f"{'sha256':12}  {'removed':10}  {'doc':5} {'reason':12} note")
+        for row in rows:
+            print(_tombstone_row_line(row))
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_tombstone_add(args: argparse.Namespace) -> int:
+    """Pre-emptive exclusion: record a hash without ingesting the content first.
+
+    Without this verb the only way to exclude a never-ingested file would be to ingest
+    it and then `rm --tombstone` — which copies the blob into `sources/` and inserts a
+    row, i.e. puts precisely the content the operator wants kept out of the store *into*
+    the store first. ``--file`` is the primary form and hashes the bytes here rather
+    than asking anyone to transcribe 64 hex characters (a typo'd hash is a tombstone
+    that silently matches nothing); it reads the file and does nothing else — no blob
+    copy, no `document` row, no owner check. ``--sha256`` is the forensic escape hatch
+    for when the file itself is gone.
+    """
+    if args.file is not None:
+        try:
+            sha = ingest.hash_file(args.file)
+        except OSError as exc:
+            print(f"error: cannot read {args.file}: {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            sha = tombstones.normalize_sha256(args.sha256)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    def work(conn):
+        row = tombstones.add_tombstone(
+            conn, sha, reason=args.reason, note=args.note
+        )
+        if args.json:
+            _print_json(row)
+            return 0
+        print(
+            f"tombstoned {row['sha256'][:12]} - {tombstones.describe(row)}. "
+            f"`pemr ingest` will refuse this content; lift it with "
+            f"`pemr document tombstone rm {row['sha256']}`"
+        )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+def _cmd_document_tombstone_rm(args: argparse.Namespace) -> int:
+    try:
+        sha = tombstones.normalize_sha256(args.sha256)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    def work(conn):
+        row = tombstones.remove_tombstone(conn, sha)
+        print(f"lifted tombstone {row['sha256'][:12]} - {tombstones.describe(row)}")
         return 0
 
     return _with_document_conn(args, work)
@@ -762,6 +913,23 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    if result.is_tombstoned:
+        # rc=0 and no `next:` line: an expected, benign skip with the same shape as
+        # `duplicate` (issue #80). Deliberately worded so a sweep log tells the two
+        # apart at a glance - that reporting gap is what the issue is about.
+        ts = result.tombstone or {}
+        print(
+            f"skipped: tombstoned {tombstones.describe(ts)} - nothing ingested"
+        )
+        if ts.get("note"):
+            print(f"  note: {ts['note']}")
+        print(
+            f"  sha256 {ts.get('sha256', '')[:12]}...  Lift with "
+            f"`pemr document tombstone rm {ts.get('sha256', '')}`,\n"
+            "  or ingest anyway with --force."
+        )
+        return 0
+
     doc = result.document
     if result.is_duplicate:
         print(
@@ -769,6 +937,15 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             f"(sha256 {doc.sha256[:12]}...) - nothing ingested"
         )
         return 0
+    if result.tombstone is not None:
+        print(
+            "warning: this content is tombstoned "
+            f"({tombstones.describe(result.tombstone)}) and was ingested anyway with "
+            "--force.\n  The tombstone was NOT lifted, so the next sweep will skip "
+            f"this file again. Undo with\n  `pemr document rm {result.document.document_id}"
+            " --apply`.",
+            file=sys.stderr,
+        )
     print(
         f"ingested document #{doc.document_id} (sha256 {doc.sha256[:12]}...) "
         f"-> sources/{doc.source_path}"
@@ -1286,6 +1463,35 @@ def _cmd_backup(args: argparse.Namespace) -> int:
 # Issue #55: restore (the other direction) + verify (DB + blob health)
 # --------------------------------------------------------------------------- #
 
+def _report_lost_tombstones(result: "restore.RestoreResult") -> None:
+    """Name the tombstones this restore drops (issue #80), and how to put them back.
+
+    A snapshot older than a tombstone loses it along with everything else recorded
+    since — correct, but the *consequence* is issue #80's bug resurrected: the next
+    sweep silently re-ingests a document a human deliberately excluded. Reported on
+    stderr because it is a caveat about a restore that otherwise succeeded, and capped
+    like every other problem list (`verify.PROBLEM_DISPLAY_LIMIT`).
+    """
+    lost = result.lost_tombstones
+    if not lost:
+        return
+    lines = [
+        f"note: {len(lost)} tombstone(s) in the current database are not in this "
+        "snapshot and will be lost:"
+    ]
+    for row in lost[:verify.PROBLEM_DISPLAY_LIMIT]:
+        lines.append(f"  {row['sha256'][:12]}... {tombstones.describe(row)}")
+    hidden = len(lost) - verify.PROBLEM_DISPLAY_LIMIT
+    if hidden > 0:
+        lines.append(f"  ... and {hidden} more (use --json for the full list)")
+    if result.rescue is not None:
+        lines.append(f"  They are preserved in the rescue copy {result.rescue.name}.")
+    lines.append(
+        "  Re-apply with `pemr document tombstone add --sha256 <hash> --reason <slug>`."
+    )
+    print("\n".join(lines), file=sys.stderr)
+
+
 def _cmd_restore(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args)
     try:
@@ -1309,12 +1515,14 @@ def _cmd_restore(args: argparse.Namespace) -> int:
             "rescue": str(result.rescue) if result.rescue else None,
             "cleared_sidecars": [str(p) for p in result.cleared_sidecars],
             "applied_migrations": result.applied_migrations,
+            "lost_tombstones": result.lost_tombstones,
             "report": report.as_dict() if report else None,
         })
         return 0
 
     if result.rescue:
         print(f"rescue copy of the previous database: {result.rescue}")
+    _report_lost_tombstones(result)
     for sidecar in result.cleared_sidecars:
         print(f"cleared stale sidecar {sidecar.name}")
     print(f"restored {result.db_path} from {result.snapshot}")
@@ -1508,8 +1716,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="also delete the stored scan (irreversible; kept by default)",
     )
     d_rm.add_argument("--sources", help="sources blob dir (overrides config)")
+    d_rm.add_argument(
+        "--tombstone", action="store_true",
+        help="record that this removal is permanent, so a later sweep refuses to "
+             "re-ingest the file (off by default: most removals are corrections)",
+    )
+    d_rm.add_argument(
+        "--reason",
+        help="short free-text slug for the tombstone, e.g. identifiers, not-medical, "
+             "wrong-household (needs --tombstone; not validated - no taxonomy)",
+    )
+    d_rm.add_argument(
+        "--note",
+        help="free text for the human, e.g. \"dad's 2019 insurance card\" - the only "
+             "recognisable label a tombstone carries (needs --tombstone)",
+    )
     d_rm.add_argument("--json", action="store_true", help="machine-readable output")
-    d_rm.set_defaults(func=_cmd_document_rm)
+    # `parser` rides along so the flag-combination check in the handler can raise a
+    # real argparse error against *this* subparser (usage line included).
+    d_rm.set_defaults(func=_cmd_document_rm, parser=d_rm)
+
+    # --- intentional-removal memory (issue #80) ---------------------------
+    d_tombstone = document_sub.add_parser(
+        "tombstone",
+        help="inspect, record and lift intentional-removal memory (layer-1 dedup)",
+    )
+    tombstone_sub = d_tombstone.add_subparsers(
+        dest="tombstone_command", required=True
+    )
+
+    t_list = tombstone_sub.add_parser(
+        "list", help="recorded tombstones, newest first"
+    )
+    t_list.add_argument("--json", action="store_true", help="machine-readable output")
+    t_list.set_defaults(func=_cmd_document_tombstone_list)
+
+    t_add = tombstone_sub.add_parser(
+        "add",
+        help="tombstone content without ingesting it (pre-emptive exclusion)",
+    )
+    # Exactly one: --file hashes the bytes here (no transcription, no typo'd hash);
+    # --sha256 is the forensic path for when the file itself is gone.
+    t_add_what = t_add.add_mutually_exclusive_group(required=True)
+    t_add_what.add_argument(
+        "--file", help="hash this file and tombstone it (nothing is ingested or copied)"
+    )
+    t_add_what.add_argument(
+        "--sha256", help="tombstone a bare content hash (64 hex characters)"
+    )
+    t_add.add_argument("--reason", help="short free-text slug, e.g. identifiers")
+    t_add.add_argument("--note", help="free text for the human")
+    t_add.add_argument("--json", action="store_true", help="machine-readable output")
+    t_add.set_defaults(func=_cmd_document_tombstone_add)
+
+    t_rm = tombstone_sub.add_parser("rm", help="lift a tombstone (full hash only)")
+    t_rm.add_argument("sha256", metavar="SHA256")
+    t_rm.set_defaults(func=_cmd_document_tombstone_rm)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
