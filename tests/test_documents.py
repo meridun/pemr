@@ -240,6 +240,79 @@ def test_set_text_unknown_document_raises(conn):
         documents.set_document_text(conn, 999, "text")
 
 
+# --- the emptiness predicate (issue #87) -------------------------------------
+#
+# `str.strip()` removes only characters where `.isspace()` is true, so a payload of
+# nothing but zero-width characters used to pass every guard and store one invisible
+# character - `has_ocr_text`/`ocr_text_populated` true on a document carrying no text.
+# Engine-level because MCP's `document_set_text` has no `force` to recover with.
+
+ZWSP = chr(0x200B)          # ZERO WIDTH SPACE
+ZWNJ = chr(0x200C)          # ZERO WIDTH NON-JOINER
+ZWJ = chr(0x200D)           # ZERO WIDTH JOINER
+BOM_CHAR = chr(0xFEFF)      # what a *doubled* BOM leaves behind: `utf-8-sig` eats one
+
+
+@pytest.mark.parametrize("text", ["", "   \n\t ", ZWSP, ZWNJ, ZWJ, BOM_CHAR,
+                                  BOM_CHAR * 2, "\x00", ZWSP + " " + BOM_CHAR])
+def test_normalize_document_text_treats_invisible_only_text_as_empty(text):
+    assert documents.normalize_document_text(text) == ""
+
+
+def test_normalize_document_text_handles_none():
+    assert documents.normalize_document_text(None) == ""
+
+
+def test_normalize_document_text_keeps_visible_text_and_its_interior():
+    # Only the two ends are touched: a zero-width joiner inside a word is part of
+    # the transcription, not padding (the contract is "no visible content is empty").
+    assert documents.normalize_document_text(
+        BOM_CHAR + "  sodium" + ZWJ + " 140  " + ZWSP
+    ) == "sodium" + ZWJ + " 140"
+
+
+def test_set_text_refuses_zero_width_only_text(seeded):
+    conn = seeded["conn"]
+    for empty in (ZWSP, BOM_CHAR * 2, ZWJ + ZWNJ, " " + ZWSP + " "):
+        with pytest.raises(ValueError):
+            documents.set_document_text(conn, seeded["doc"], empty, force=True)
+    assert documents.get_document_text(conn, seeded["doc"]) == "scan text"
+
+
+def test_set_text_strips_invisible_padding_from_what_it_stores(seeded):
+    """Normalise what gets *stored*, not just what gets rejected: a leading
+    zero-width character must never land in `ocr_text` either."""
+    conn = seeded["conn"]
+    documents.set_document_text(
+        conn, seeded["doc"], ZWSP + " cholesterol panel " + BOM_CHAR, force=True
+    )
+    assert documents.get_document_text(conn, seeded["doc"]) == "cholesterol panel"
+    view = documents.get_document_view(conn, seeded["doc"])
+    assert view["ocr_text_chars"] == len("cholesterol panel")
+
+
+def test_set_text_repairs_an_invisible_only_row_without_force(conn):
+    """The recovery half of the fix: an `ocr_text` of nothing but zero-widths (every
+    row ingested before this fix) counts as *unpopulated*, so it is repairable over
+    MCP - where `document_set_text` deliberately has no `force` (#87)."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=ZWSP)
+    view = documents.set_document_text(conn, doc, "Real transcription of the page.")
+    assert view["has_ocr_text"] is True
+    assert documents.get_document_text(conn, doc) == "Real transcription of the page."
+    assert _fts_text(conn, doc) == "Real transcription of the page."
+
+
+def test_set_text_still_refuses_a_visibly_populated_row_without_force(conn):
+    """The widened check must not widen into "replace anything": text with even one
+    visible character is still guarded by `force` (#87)."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff01", ocr_text=ZWSP + "a")
+    with pytest.raises(documents.OcrTextPresentError):
+        documents.set_document_text(conn, doc, "replacement")
+    assert documents.get_document_text(conn, doc) == ZWSP + "a"
+
+
 def test_set_text_leaves_records_and_keys_untouched(seeded):
     conn = seeded["conn"]
     before = [
@@ -854,6 +927,35 @@ def test_cli_document_set_text_rejects_a_bom_only_file(cli_ready, capsys):
     """
     text = cli_ready / "bomonly.txt"
     text.write_bytes(b"\xef\xbb\xbf")
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 1
+    assert "is empty - nothing to store" in capsys.readouterr().err
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
+def test_cli_document_set_text_rejects_a_zero_width_only_file(cli_ready, capsys):
+    """One U+200B is three bytes of nothing, not a transcription (#87).
+
+    Untouched by any encoding choice - `utf-8-sig` has nothing to strip - so this is
+    the guard's job, not the read path's (#78 fixed that half).
+    """
+    text = cli_ready / "zwsp.txt"
+    text.write_bytes(chr(0x200B).encode("utf-8"))
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "set-text", "1", "--force",
+                "--ocr-text-file", str(text)) == 1
+    assert "is empty - nothing to store" in capsys.readouterr().err
+    assert _run(cli_ready, "document", "show", "1", "--text") == 0
+    assert capsys.readouterr().out == "hba1c 5.7 percent\n"
+
+
+def test_cli_document_set_text_rejects_a_doubled_bom_file(cli_ready, capsys):
+    """`utf-8-sig` strips exactly one leading BOM; the survivor is U+FEFF, which
+    `str.strip()` then keeps (#87)."""
+    text = cli_ready / "doublebom.txt"
+    text.write_bytes((chr(0xFEFF) * 2).encode("utf-8"))
     capsys.readouterr()
     assert _run(cli_ready, "document", "set-text", "1", "--force",
                 "--ocr-text-file", str(text)) == 1
