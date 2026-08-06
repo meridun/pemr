@@ -291,6 +291,28 @@ def test_set_text_strips_invisible_padding_from_what_it_stores(seeded):
     assert view["ocr_text_chars"] == len("cholesterol panel")
 
 
+def test_set_text_repairs_an_invisible_only_row_without_force(conn):
+    """The recovery half of the fix: an `ocr_text` of nothing but zero-widths (every
+    row ingested before this fix) counts as *unpopulated*, so it is repairable over
+    MCP - where `document_set_text` deliberately has no `force` (#87)."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=ZWSP)
+    view = documents.set_document_text(conn, doc, "Real transcription of the page.")
+    assert view["has_ocr_text"] is True
+    assert documents.get_document_text(conn, doc) == "Real transcription of the page."
+    assert _fts_text(conn, doc) == "Real transcription of the page."
+
+
+def test_set_text_still_refuses_a_visibly_populated_row_without_force(conn):
+    """The widened check must not widen into "replace anything": text with even one
+    visible character is still guarded by `force` (#87)."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff01", ocr_text=ZWSP + "a")
+    with pytest.raises(documents.OcrTextPresentError):
+        documents.set_document_text(conn, doc, "replacement")
+    assert documents.get_document_text(conn, doc) == ZWSP + "a"
+
+
 def test_set_text_leaves_records_and_keys_untouched(seeded):
     conn = seeded["conn"]
     before = [
