@@ -487,17 +487,36 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
-def test_ocr_tesseract_is_an_alias_for_auto(ready, capsys):
-    """The old spelling keeps working — it selects the same extraction dispatcher."""
+def test_ocr_tesseract_is_rejected(ready, capsys):
+    """Issue #91: the misleading `tesseract` alias is gone; argparse names `auto`."""
     tmp_path = ready
     csv = tmp_path / "labs.csv"
     csv.write_text("test,value\nferritin,68\n", encoding="utf-8")
 
-    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
-                "--sources", str(tmp_path / "sources"), "--ocr", "tesseract") == 0
-    capsys.readouterr()
-    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
-    assert "#1" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+             "--sources", str(tmp_path / "sources"), "--ocr", "tesseract")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "auto" in err
+
+
+def test_ocr_help_names_only_auto_and_no_pdf_tesseract_claim(capsys):
+    """Issue #91: the alias is undiscoverable and the PDF route is described honestly.
+
+    `--ocr tesseract` was misleading in both directions: the value named after the
+    tool never reached it, and the help text claimed PDFs went "via tesseract" when
+    the `_ocr_pdf` branch (#70) uses the embedded text layer plus rendered-page OCR.
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ingest", "--help"])
+    # argparse wraps the help block, so compare on collapsed whitespace.
+    text = " ".join(capsys.readouterr().out.split())
+    assert "--ocr {auto}" in text
+    assert "alias" not in text
+    assert "images/PDF via tesseract" not in text
+    assert "PDF page by page (text layer + rendered-page OCR)" in text
 
 
 def test_unextractable_format_still_ingests_with_a_note(ready, capsys, monkeypatch):
