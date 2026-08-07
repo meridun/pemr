@@ -1229,14 +1229,39 @@ class RekeyChange:
 
 
 @dataclass
+class RekeyCollision:
+    """Two rows in one table that recompute onto a single ``dedup_key``.
+
+    Collected, not raised (issue #92): a collision in ``allergy`` says nothing about
+    ``condition``, so it blocks its own table and no other. ``kind`` names which of the
+    two causes it is — see :func:`rekey`.
+    """
+    record_type: str
+    row_id: int
+    label: str
+    clash_row_id: int
+    clash_label: str
+    kind: str               # "fused" (dictionary merges two facts) | "doubled" (data)
+    message: str            # full diagnosis, ready to print
+
+
+@dataclass
 class RekeyReport:
     scanned: dict[str, int] = field(default_factory=dict)      # type -> rows examined
     changes: list[RekeyChange] = field(default_factory=list)
+    collisions: list[RekeyCollision] = field(default_factory=list)
     applied: bool = False
 
+    @property
+    def blocked(self) -> list[str]:
+        """Record types left untouched because they hold at least one collision."""
+        return sorted({c.record_type for c in self.collisions})
 
-class RekeyCollisionError(Exception):
-    """Two rows recompute to one dedup_key — the dictionary would fuse distinct facts."""
+    def writable(self) -> list[RekeyChange]:
+        """The subset of :attr:`changes` that is safe to write: every table that has no
+        collision. This is what ``apply=True`` actually writes."""
+        blocked = set(self.blocked)
+        return [c for c in self.changes if c.record_type not in blocked]
 
 
 def rekey(
@@ -1253,16 +1278,26 @@ def rekey(
     tables and re-derives each key, so stored rows keep deduping after a dictionary
     edit. Values, provenance and row ids are untouched — only ``dedup_key`` moves.
 
-    Dry-run by default: pass ``apply=True`` to write. If two rows in a table recompute
-    to the same key nothing is written and :class:`RekeyCollisionError` is raised, with
-    a message that names which of the two causes it is:
+    Dry-run by default: pass ``apply=True`` to write. Two rows in one table that
+    recompute to the same key are a **collision**, and each one names which of the two
+    causes it is:
 
-    * the rows carry *different* payloads — the dictionary would merge two distinct
-      facts (typically two methods for one analyte off one draw): fix the dictionary;
-    * the rows carry the *same* payload — one fact was filed twice, once under a
-      pre-drift key, so it is the data that needs fixing. :func:`_assert_no_key_drift`
-      refuses the ingest that would create this state, so it should only be reachable
-      in a database that drifted before that guard existed.
+    * ``"fused"`` — the rows carry *different* payloads, so the dictionary would merge
+      two distinct facts (typically two methods for one analyte off one draw): fix the
+      dictionary;
+    * ``"doubled"`` — the rows carry the *same* payload, so one fact was filed twice,
+      once under a pre-drift key, and it is the data that needs fixing.
+      :func:`_assert_no_key_drift` refuses the ingest that would create this state, so
+      it should only be reachable in a database that drifted before that guard existed.
+
+    Collisions are **collected, never raised** (issue #92). The tables are scanned
+    independently, so a collision quarantines only its own table: scanning always covers
+    every table and reports every collision it finds (a dry run is a survey and must not
+    stop at the first problem), and ``apply=True`` writes
+    :meth:`RekeyReport.writable` — the changes of the tables that came out clean —
+    leaving the colliding tables on their stored keys and naming them in
+    :attr:`RekeyReport.blocked`. Callers surface a non-empty ``collisions`` as a failure;
+    partial progress with an explicit account of what was skipped beats all-or-nothing.
     """
     db.require_migrated(conn)
     report = RekeyReport(applied=False)
@@ -1281,28 +1316,38 @@ def rekey(
             key = occurrence_key(base, occurrence)
             clash = seen.get(key)
             if clash is not None:
+                label, clash_label = (_rekey_label(record_type, row),
+                                      _rekey_label(record_type, clash))
                 if _rows_equal(record_type, clash, payload):
                     # Same payload, two keys: not a dictionary fault at all - one fact
                     # was filed twice, once under a pre-drift key and once under the
                     # current one. Say so, because "fix the dictionary" is exactly the
                     # wrong advice here (`_assert_no_key_drift` now stops new ingests
                     # from reaching this state).
-                    raise RekeyCollisionError(
+                    kind, message = "doubled", (
                         f"{record_type}: {pk} {row[pk]} and {pk} {clash[pk]} "
-                        f"({_rekey_label(record_type, row)!r}) hold the SAME fact "
+                        f"({label!r}) hold the SAME fact "
                         "under two dedup_keys - it was filed a second time by an "
                         "ingest that ran against drifted keys before this rekey. The "
                         "dictionary is fine; the data is doubled. Drop the duplicate "
                         "(`pemr document rm` on the document that re-filed it, or "
-                        "resolve it by hand) and re-run; nothing was written"
+                        f"resolve it by hand) and re-run; {record_type} was not written"
                     )
-                raise RekeyCollisionError(
-                    f"{record_type}: {pk} {row[pk]} "
-                    f"({_rekey_label(record_type, row)!r}) and {pk} {clash[pk]} "
-                    f"({_rekey_label(record_type, clash)!r}) recompute to the same "
-                    "dedup_key - the dictionary maps two distinct facts onto one "
-                    "canonical name; nothing was written"
-                )
+                else:
+                    kind, message = "fused", (
+                        f"{record_type}: {pk} {row[pk]} ({label!r}) and "
+                        f"{pk} {clash[pk]} ({clash_label!r}) recompute to the same "
+                        "dedup_key - the dictionary maps two distinct facts onto one "
+                        f"canonical name; {record_type} was not written"
+                    )
+                report.collisions.append(RekeyCollision(
+                    record_type, row[pk], label, clash[pk], clash_label, kind, message,
+                ))
+                # Keep scanning: report-only mode is a survey, so the run must find
+                # every collision in every table rather than stop at the first. The
+                # first-seen row stays the incumbent for this key, so a third row on it
+                # is reported against the same anchor instead of chaining.
+                continue
             seen[key] = row
             if key != row["dedup_key"]:
                 report.changes.append(RekeyChange(
@@ -1310,20 +1355,21 @@ def rekey(
                     row["dedup_key"], key, base,
                 ))
 
-    if apply and report.changes:
+    writable = report.writable()
+    if apply and writable:
         # One transaction: a half-rekeyed table dedups inconsistently. Two passes,
         # because `UNIQUE(dedup_key)` is enforced per statement: if two rows swap keys
         # (or one takes a key another is about to vacate) a single-pass update trips
         # the index mid-flight. Park every moving row on a unique placeholder first.
         with conn:
-            for change in report.changes:
+            for change in writable:
                 conn.execute(
                     f"UPDATE {change.record_type} SET dedup_key = ? "
                     f"WHERE {change.record_type}_id = ?",
                     (f"rekey-pending-{change.record_type}-{change.row_id}",
                      change.row_id),
                 )
-            for change in report.changes:
+            for change in writable:
                 # dedup_base moves with the key: base and key are injective in each
                 # other for a fixed occurrence, so a changed key means a changed base.
                 conn.execute(

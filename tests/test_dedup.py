@@ -757,7 +757,7 @@ def test_rekey_is_idempotent(conn):
 
 def test_rekey_refuses_a_dictionary_that_fuses_two_facts(conn):
     """Two methods for one analyte off one draw (CMP ALB vs SPEP Albumin) must not be
-    merged by a synonym: the run aborts whole, leaving every stored key untouched."""
+    merged by a synonym: the colliding table keeps every stored key."""
     doc = _make_document(conn)
     dedup.commit_extraction(conn, doc, {"lab_result": [
         {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
@@ -766,12 +766,95 @@ def test_rekey_refuses_a_dictionary_that_fuses_two_facts(conn):
     before = {r["lab_result_id"]: r["dedup_key"]
               for r in conn.execute("SELECT lab_result_id, dedup_key FROM lab_result")}
 
-    with pytest.raises(dedup.RekeyCollisionError, match="same dedup_key"):
-        dedup.rekey(conn, _rekey_dict(alb="albumin"), apply=True)
+    report = dedup.rekey(conn, _rekey_dict(alb="albumin"), apply=True)
 
+    assert [c.kind for c in report.collisions] == ["fused"]
+    assert "same dedup_key" in report.collisions[0].message
+    assert report.blocked == ["lab_result"] and report.writable() == []
     after = {r["lab_result_id"]: r["dedup_key"]
              for r in conn.execute("SELECT lab_result_id, dedup_key FROM lab_result")}
     assert after == before
+
+
+def _collide_allergy_and_move_condition(conn):
+    """The issue-#92 repro: one table holds a collision, another holds clean work.
+
+    Two allergies the new dictionary fuses (different reactions, so it is a genuine
+    two-facts-into-one), plus a condition whose key merely moves."""
+    dedup.commit_extraction(conn, _make_document(conn), {
+        "allergy": [
+            {"substance": "PCN", "reaction": "rash"},
+            {"substance": "Penicillin", "reaction": "anaphylaxis"},
+        ],
+        "condition": [{"name": "T2DM", "status": "active"}],
+    }, dedup.load_dictionary(DICT_PATH))
+    return _rekey_dict(pcn="penicillin", t2dm="type 2 diabetes")
+
+
+def _keys(conn, record_type, label_column):
+    return {r[label_column]: r["dedup_key"]
+            for r in conn.execute(f"SELECT * FROM {record_type}")}
+
+
+def test_rekey_applies_the_clean_tables_and_skips_only_the_colliding_one(conn):
+    """Acceptance (issue #92): a collision in `allergy` must not block `condition`.
+    The tables are scanned independently, so one bad pair quarantines its own table."""
+    d_new = _collide_allergy_and_move_condition(conn)
+    allergies_before = _keys(conn, "allergy", "substance")
+
+    report = dedup.rekey(conn, d_new, apply=True)
+
+    assert report.applied is True
+    assert report.blocked == ["allergy"]
+    assert [(c.record_type, c.label) for c in report.writable()] \
+        == [("condition", "T2DM")]
+    # The clean table was written...
+    assert _keys(conn, "condition", "name")["T2DM"] == report.writable()[0].new_key
+    # ...and the colliding one kept every stored key.
+    assert _keys(conn, "allergy", "substance") == allergies_before
+
+
+def test_rekey_dry_run_reports_every_collision_instead_of_stopping_at_the_first(conn):
+    """Acceptance (issue #92): report-only mode is a survey — it writes nothing by
+    definition, so it must enumerate all collisions in all tables rather than abort on
+    the first and force a serial edit-and-rerun loop."""
+    d_new = _collide_allergy_and_move_condition(conn)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    d_new["alb"] = "albumin"
+    before = {t: _keys(conn, t, c) for t, c in
+              (("allergy", "substance"), ("lab_result", "test_name"),
+               ("condition", "name"))}
+
+    report = dedup.rekey(conn, d_new)
+
+    assert report.applied is False
+    assert report.blocked == ["allergy", "lab_result"]     # both, not just the first
+    assert {c.record_type for c in report.collisions} == {"allergy", "lab_result"}
+    assert [c.kind for c in report.collisions] == ["fused", "fused"]
+    assert [(c.record_type, c.label) for c in report.writable()] \
+        == [("condition", "T2DM")]
+    assert {t: _keys(conn, t, c) for t, c in
+            (("allergy", "substance"), ("lab_result", "test_name"),
+             ("condition", "name"))} == before          # a dry run writes nothing
+
+
+def test_rekey_reports_a_third_row_on_the_same_key_against_the_same_anchor(conn):
+    """Scanning continues past a collision within a table too, so a three-way fuse is
+    reported as two pairs rather than one — the survey has to show the whole scope."""
+    dedup.commit_extraction(conn, _make_document(conn), {"allergy": [
+        {"substance": "PCN", "reaction": "rash"},
+        {"substance": "Penicillin", "reaction": "anaphylaxis"},
+        {"substance": "Pen-G", "reaction": "hives"},
+    ]}, dedup.load_dictionary(DICT_PATH))
+
+    report = dedup.rekey(conn, _rekey_dict(pcn="penicillin", **{"pen-g": "penicillin"}))
+
+    assert len(report.collisions) == 2
+    assert {c.clash_label for c in report.collisions} == {"PCN"}   # one anchor, not a chain
+    assert {c.label for c in report.collisions} == {"Penicillin", "Pen-G"}
 
 
 def test_rekey_survives_two_rows_swapping_keys(conn):
@@ -824,7 +907,7 @@ def test_rekey_is_a_no_op_over_a_keep_both_family(conn):
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
 
     report = dedup.rekey(conn, d, apply=True)
-    assert report.changes == []            # no RekeyCollisionError, no key churn
+    assert report.changes == [] and report.collisions == []   # no collision, no churn
     keys = [r["dedup_key"] for r in conn.execute("SELECT * FROM lab_result")]
     assert len(set(keys)) == 2
 
@@ -975,9 +1058,10 @@ def test_rekey_names_a_doubled_fact_instead_of_blaming_the_dictionary(conn):
     dedup._insert_record(conn, "lab_result", row, pid, doc, "stale-base-0000")
     conn.commit()
 
-    with pytest.raises(dedup.RekeyCollisionError, match="SAME fact"):
-        dedup.rekey(conn, None)
-    # Still all-or-nothing, and the dry-run wrote nothing either.
+    report = dedup.rekey(conn, None)
+    assert [c.kind for c in report.collisions] == ["doubled"]
+    assert "SAME fact" in report.collisions[0].message
+    # The colliding table is still all-or-nothing, and the dry-run wrote nothing either.
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM lab_result WHERE dedup_key = 'stale-base-0000'"
@@ -992,8 +1076,9 @@ def test_rekey_still_blames_the_dictionary_when_it_fuses_distinct_facts(conn):
         {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
         {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
     ]}, dedup.load_dictionary(DICT_PATH))
-    with pytest.raises(dedup.RekeyCollisionError, match="two distinct facts"):
-        dedup.rekey(conn, _rekey_dict(alb="albumin"))
+    report = dedup.rekey(conn, _rekey_dict(alb="albumin"))
+    assert [c.kind for c in report.collisions] == ["fused"]
+    assert "two distinct facts" in report.collisions[0].message
 
 
 # --- allergy / condition typed rows (issue #63) -------------------------------

@@ -478,8 +478,9 @@ def fused(conn):
     # while its own staged key still names the a1c row.
     assert conflict["dedup_key"] == a1c["dedup_base"] != hba1c["dedup_base"]
     assert dedup._derive_base(conflict, _FUSED) == hba1c["dedup_base"]
-    with pytest.raises(dedup.RekeyCollisionError):
-        dedup.rekey(conn, _FUSED)          # the state itself: rekey cannot clear it
+    # The state itself: rekey cannot clear it — lab_result collides, so that table is
+    # skipped and stays on its stored keys.
+    assert dedup.rekey(conn, _FUSED).blocked == ["lab_result"]
     return conflict["conflict_id"]
 
 

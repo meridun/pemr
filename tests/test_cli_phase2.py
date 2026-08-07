@@ -422,26 +422,62 @@ def test_rekey_json_output(ready, capsys, tmp_path):
     assert change["label"] == "ZZT" and change["old_key"] != change["new_key"]
 
 
-def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
-    """Exit 1 with a pointed message when the dictionary would merge two facts."""
-    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
-    new = _dict_file(tmp_path, "fuse.toml", '"alb" = "albumin"\n')
+def _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old):
+    """Two lab rows a `"alb" = "albumin"` dictionary fuses, plus a condition whose key
+    merely moves under `"t2dm" = "type 2 diabetes"` — the issue-#92 shape at the CLI."""
     scan = tmp_path / "fuse-scan.txt"
     scan.write_bytes(b"alb 4.2 / albumin 3.6")
     assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
                 "--sources", str(tmp_path / "sources")) == 0
     doc = _document_id(tmp_path)[-1]["document_id"]
-    payload = _write_json(tmp_path, "fuse.json", {"lab_result": [
-        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
-        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
-    ]})
+    payload = _write_json(tmp_path, "fuse.json", {
+        "lab_result": [
+            {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+            {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+        ],
+        "condition": [{"name": "T2DM", "status": "active"}],
+    })
     assert _run(tmp_path, "commit-extraction", "--document", str(doc),
                 "--json", str(payload), "--dictionary", str(old)) == 0
     capsys.readouterr()
 
+
+def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
+    """Exit 1 with a pointed message when the dictionary would merge two facts — and
+    (issue #92) the fused table is skipped by name while the clean one still applies."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+
     assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
-    err = capsys.readouterr().err
-    assert "same dedup_key" in err and "nothing was written" in err
+    captured = capsys.readouterr()
+    assert "same dedup_key" in captured.err
+    assert "lab_result was not written" in captured.err
+    assert "left 1 table(s) on their stored keys: lab_result" in captured.err
+    # The unaffected table is rekeyed anyway: one collision, one blocked table.
+    assert "lab_result: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "rekeyed 1 row(s)" in captured.out
+
+    # Re-run: the condition is now current, so only the fused table is still outstanding.
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 1
+    out = capsys.readouterr().out
+    assert "dry run: no row outside the skipped table(s) needs a new key" in out
+
+
+def test_rekey_json_reports_collisions_and_skipped_tables(ready, capsys, tmp_path):
+    """`--json` keeps exit-code parity with the text mode and says which tables were
+    withheld, so an agent can tell a partial run from a clean one (issue #92)."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["skipped"] == ["lab_result"]
+    assert [c["kind"] for c in payload["collisions"]] == ["fused"]
+    assert [c["record_type"] for c in payload["changed"]] == ["lab_result", "condition"]
 
 
 # --- intake formats at the CLI (issue #66) ------------------------------------
@@ -603,6 +639,49 @@ def test_migrate_prints_the_rekey_followup_when_006_moves_rows(tmp_path, capsys)
     # ... and it is not repeated on a no-op re-run.
     assert _run(tmp_path, "migrate") == 0
     assert capsys.readouterr().out.strip() == "up to date"
+
+
+def test_migrated_006_rows_rekey_per_table_when_one_table_collides(tmp_path, capsys):
+    """The issue-#92 report verbatim: 006 carries the old observation keys forward, the
+    follow-up `rekey --apply` hits a collision in `allergy`, and the conditions — which
+    have no collision among them — must still be rekeyed rather than held hostage."""
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane-doe', 'Jane')")
+    for i, (sub, reaction) in enumerate((("PCN", "rash"),
+                                         ("Penicillin", "anaphylaxis")), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, value_text, dedup_key,"
+            " dedup_base) VALUES (1, 'allergy', ?, ?, ?, ?)",
+            (sub, reaction, f"a{i}", f"a{i}"))
+    for i, name in enumerate(("T2DM", "HTN"), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, dedup_key, dedup_base)"
+            " VALUES (1, 'condition', ?, ?, ?)", (name, f"c{i}", f"c{i}"))
+    conn.commit()
+    conn.close()
+    assert _run(tmp_path, "migrate") == 0
+    assert "4 allergy/condition row" in capsys.readouterr().out
+
+    new = _dict_file(tmp_path, "fuse006.toml",
+                     '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    captured = capsys.readouterr()
+    assert "allergy: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "condition: 2/2 key(s) change" in captured.out
+    assert "rekeyed 2 row(s)" in captured.out
+    assert "left 1 table(s) on their stored keys: allergy" in captured.err
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        # The carried-forward observation keys survive on the blocked table only.
+        assert sorted(r["dedup_key"] for r in
+                      conn.execute("SELECT dedup_key FROM allergy")) == ["a1", "a2"]
+        assert not [r for r in conn.execute("SELECT dedup_key FROM condition")
+                    if r["dedup_key"] in ("c1", "c2")]
+    finally:
+        conn.close()
 
 
 def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
