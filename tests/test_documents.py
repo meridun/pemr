@@ -556,6 +556,46 @@ def test_reassign_refused_on_dictionary_drift(seeded):
     assert "rekey" in str(exc.value)
 
 
+def test_reassign_across_a_partially_rekeyed_database(conn):
+    """A *partially* rekeyed database is a state that could not exist before issue #92
+    (`rekey` was all-or-nothing), so `reassign` — which recomputes keys through the same
+    function — gets exercised against it: the documents whose rows sit in a rekeyed
+    table move, and only the ones owning the skipped table's stale keys are refused."""
+    persons.add_person(conn, "jane-doe", "Jane Doe")
+    john = persons.add_person(conn, "john-doe", "John Doe")
+    fused = _insert_document(conn, 1, "ee55")
+    clean = _insert_document(conn, 1, "ff66")
+    # Two allergies the new dictionary merges (distinct reactions = two real facts)...
+    dedup.commit_extraction(conn, fused, {"allergy": [
+        {"substance": "PCN", "reaction": "rash"},
+        {"substance": "Penicillin", "reaction": "anaphylaxis"},
+    ]})
+    # ...and, on a second document, a condition whose key merely moves.
+    dedup.commit_extraction(conn, clean, {
+        "condition": [{"name": "T2DM", "status": "active"}]})
+
+    d_new = {"pcn": "penicillin", "t2dm": "type 2 diabetes"}
+    report = dedup.rekey(conn, d_new, apply=True)
+    assert report.blocked == ["allergy"]        # the partial state, as set up
+
+    moved = documents.reassign_document(conn, clean, "john-doe", d_new, apply=True)
+    assert moved.applied is True
+    assert conn.execute(
+        "SELECT person_id FROM condition"
+    ).fetchone()["person_id"] == john.person_id
+
+    stored = [r["dedup_key"] for r in conn.execute("SELECT dedup_key FROM allergy")]
+    with pytest.raises(documents.DictionaryDriftError) as exc:
+        documents.reassign_document(conn, fused, "john-doe", d_new, apply=True)
+    assert "rekey" in str(exc.value)
+    # Refused before any write: the skipped table keeps its keys and its owner.
+    assert [r["dedup_key"] for r in
+            conn.execute("SELECT dedup_key FROM allergy")] == stored
+    assert conn.execute(
+        "SELECT person_id FROM document WHERE document_id = ?", (fused,)
+    ).fetchone()["person_id"] == 1
+
+
 def test_reassign_unknown_document_and_slug(seeded):
     conn = seeded["conn"]
     with pytest.raises(documents.DocumentNotFoundError):
