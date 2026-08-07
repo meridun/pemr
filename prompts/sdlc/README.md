@@ -106,6 +106,14 @@ comfortably.
      note (what's already done + evidence, what remains) before continuing, then do only the gap.
      If the item is conclusively shipped already, PARK with the evidence (PR#, commit, observed
      behavior) for a human to close — don't march it through the remaining lanes.
+
+     Prior work need not come from the pipeline: a local or `origin` branch whose name reasonably
+     matches the issue or a child of it, work already fully or partially merged to
+     `<DEFAULT_BRANCH>`, and artifacts on a predecessor issue linked in the body (a clone's
+     original — clones copy the body, not the thread) are all reconcilable evidence, slotted into
+     the same hierarchy as their pipeline-native equivalents. Branches that are on neither local
+     nor `origin`, or whose names bear no reasonable relation to the issue, are **not
+     discoverable** — don't hunt for them.
    - **Worktree isolation.** Never work in the main checkout — it may hold human WIP or another
      worker. For any lane that touches a branch, use the issue-scoped worktree
      `<WORKTREE_ROOT>/<issue#>`: create it if missing (`git worktree add <WORKTREE_ROOT>/<issue#>

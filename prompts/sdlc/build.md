@@ -27,8 +27,13 @@ Decide the sub-case first (idempotency — schedulers fire on a clock, not on ne
 
 - **Branch already pushed, implementation complete, targeted tests green** → skip to **ADVANCE**. Do
   not rebuild.
-- **A branch exists but is incomplete** → continue on it in its worktree (merge
+- **A branch exists but is incomplete** — including a pre-existing branch intake or the plan named
+  (adopt it as-is; don't recut or rename it to the standard pattern — the issue link lives in the
+  body and comments, not the branch name) → continue on it in its worktree (merge
   `origin/<DEFAULT_BRANCH>` first per the README staleness rule; build owns conflict resolution).
+  If the branch isn't the pipeline's, post the README reconciliation note first: diff it against
+  the plan, state what's done with evidence and what remains, then build only the gap — extending
+  its existing tests rather than starting parallel ones.
   The reviewed plan stands — don't re-plan unless the merge invalidated it (spec-rot check below).
 - **Nothing started** → implement:
   - **Read the issue body's sections** — `## Requirements`, `## Acceptance criteria` (intake's),

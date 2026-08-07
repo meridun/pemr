@@ -58,6 +58,13 @@ Then pick the sub-case (idempotency — don't redo a built artifact):
   (below) and ADVANCE. If the body already carries a current `## Implementation plan`, verify it
   cheaply instead of rewriting — that's the done-artifact no-op.
 
+**Salvage sweep (cheap), before writing the plan:** check for pre-existing design or
+implementation notes — in the thread and body, on a predecessor issue linked in the body, and on
+any prior-work branch intake's summary named (read its log/diff, not just its name). Incorporate
+what still holds; reject the rest explicitly, one line each on why, so the queued reviewer sees
+the call. When a partial implementation exists, the plan covers the **gap**: record the branch and
+its HEAD alongside the Baseline, and mark in Touched what's already done vs remaining.
+
 **The implementation plan** is a section you append to the **issue body** (edit the body
 *preserving every existing section* — you own only your sections; see the README's issue
 anatomy). It is a **detailed plan, not code**. The boundary is **decisions vs. expression**: the
