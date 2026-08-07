@@ -350,16 +350,21 @@ a value already lost to a pre-fix collision: that needs the source document re-e
 is not collision-free. 006 promoted allergy/condition rows out of `observation`, but the new
 keys are a sha256 over dictionary-normalized fields — which SQL cannot compute — so the
 backfill carried each row's *old*, per-document key forward verbatim. Those rows sit on keys
-layer-2 dedup will never derive again, so re-committing an already-stored allergy or
-condition lands a **second row reported as `new`** — no duplicate, no conflict, no signal
-(issue #94, the mechanism behind #86's apparently duplicated condition bullets). Run the
-`pemr rekey` dry-run and then `pemr rekey --apply` against any **pre-006** database before
-its next allergy/condition `commit-extraction`. `pemr migrate` prints that follow-up when 006
-actually moves rows, so the step is signposted the moment it is owed — but nothing enforces
-it (a fresh `--create` has nothing to rekey, and prints nothing). Expect collisions here
-where the #71 migration had none: the old keys were per-document, so the same condition
-recorded by two documents recomputes onto one key. That quarantines its own table only
-(above), so the clean tables are still written and the fused pair is settled in the
+layer-2 dedup will never derive again, so skipping the rekey **blocks the next ingest rather
+than forking it**: a `commit-extraction` that re-states one of those facts hits the drift
+guard above, raises `DictionaryDriftError` naming `pemr rekey --apply`, and writes nothing
+(issue #94). Signposting and enforcement are two different mechanisms here — `pemr migrate`
+*signposts*, printing the follow-up when 006 actually moves rows (a fresh `--create` has
+nothing to rekey and prints nothing), while `commit-extraction` *enforces*, but only for the
+identity being re-filed: unrelated ingests still pass, so a database can run on stale keys
+indefinitely until one of them is restated. Run the `pemr rekey` dry-run and then `pemr rekey
+--apply` against any **pre-006** database before its next allergy/condition
+`commit-extraction`. Expect collisions here where the #71 migration had none: the old
+`observation` keys carried the assertion's `observed_at`, so one condition restated by three
+documents is three stored rows that all recompute onto the single date-free key 006 gave the
+type — the legacy shape behind #86's apparently duplicated condition bullets, correct storage
+under the old identity and a fused pair under the new one. A collision quarantines its own
+table only (above), so the clean tables are still written and the fusion is settled in the
 dictionary or the data before a re-run.
 
 The **measured value is deliberately *not* in the key** — temporal identity carries the
