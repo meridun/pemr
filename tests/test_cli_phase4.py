@@ -2,6 +2,7 @@
 stdout (the §5 redirect contract), --out file convenience, unknown-slug/appointment
 rc=1, and unmigrated-DB friendliness."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,76 @@ def test_render_unknown_appointment_is_friendly_rc1(ready, capsys):
     tmp_path, _ = ready
     assert _run(tmp_path, "render", "brief", "--appointment", "99999") == 1
     assert "99999" in capsys.readouterr().err
+
+
+def _commit_orders(tmp_path, sha, rows):
+    """Insert one document and commit `obs_type='order'` rows into it *through the CLI*
+    (`commit-extraction --json`), i.e. the way a real ingest session arrives."""
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    cur = conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ingested_at) "
+        "VALUES (?, ?, 'aa/x.pdf', '2026-01-01T00:00:00')", (sha, pid)
+    )
+    conn.commit()
+    doc = cur.lastrowid
+    conn.close()
+    payload = tmp_path / f"extract-{sha}.json"
+    payload.write_text(json.dumps(
+        {"observation": [dict(r, obs_type="order") for r in rows]}
+    ), encoding="utf-8")
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload)) == 0
+
+
+def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
+    """Issue #93, walked through the real CLI: an order restated by three documents is
+    one bullet carrying the latest detail plus the `+N earlier` disclosure; distinct and
+    qualifier-bearing items stay their own bullets; a timestamped row shows a bare date;
+    an undated row shows none; newest first, undated last. (Keyless rows are covered in
+    `tests/test_render.py` -- two undated ones collide on the storage dedup key, so that
+    case cannot be seeded through the commit path.)"""
+    tmp_path, _ = ready
+    _commit_orders(tmp_path, "sha-o1", [
+        {"key": "cervical collar", "value_text": "Dr. Smith, ortho",
+         "observed_at": "2026-01-05"},
+        {"key": "outpatient physical therapy", "observed_at": "2026-01-05"},
+    ])
+    _commit_orders(tmp_path, "sha-o2", [
+        {"key": "cervical collar", "value_text": "Dr. Adams, ortho",
+         "observed_at": "2026-02-01"},
+        {"key": "sleep study", "value_text": "home study",
+         "observed_at": "2026-02-01T09:30:00"},          # timestamp -> bare date
+    ])
+    _commit_orders(tmp_path, "sha-o3", [
+        {"key": "cervical collar", "value_text": "Dr. Jones, ortho",
+         "observed_at": "2026-06-14"},
+        {"key": "outpatient physical therapy (aquatic)", "observed_at": "2026-06-14"},
+        {"key": "wheelchair evaluation", "value_text": "seating clinic"},   # undated
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
+    lines = [ln for ln in section.splitlines() if ln.startswith("- ")]
+    assert lines == [
+        "- cervical collar - Dr. Jones, ortho  (ordered 2026-06-14; +2 earlier, "
+        "first 2026-01-05)",
+        "- outpatient physical therapy (aquatic)  (ordered 2026-06-14)",
+        "- sleep study - home study  (ordered 2026-02-01)",
+        "- outpatient physical therapy  (ordered 2026-01-05)",
+        "- wheelchair evaluation - seating clinic",
+    ]
+    # the collapse is render-only: every stored row survives, keys untouched
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order'"
+    ).fetchone()["n"] == 7
+    conn.close()
+    assert out.isascii()          # cp1252/cp437 console contract
 
 
 def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
