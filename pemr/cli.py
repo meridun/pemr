@@ -898,8 +898,8 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
                     doc_date=args.doc_date,
                     category=args.category,
                     provider=args.provider,
-                    # `tesseract` is a retained alias for `auto`: both mean "extract
-                    # by whatever route this file type allows" (ingest.extract_text).
+                    # `--ocr auto` means "extract by whatever route this file type
+                    # allows" (ingest.extract_text).
                     ocr=(args.ocr is not None),
                     ocr_text=ocr_text,
                     force=args.force,
@@ -1797,9 +1797,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--provider")
     p_ingest.add_argument(
         "--ocr",
-        choices=["auto", "tesseract"],
-        help="pre-fill ocr_text: text/.docx/.xlsx read natively, images/PDF via "
-             "tesseract (soft dependency). 'tesseract' is an alias for 'auto'",
+        choices=["auto"],
+        help="pre-fill ocr_text: text/.docx/.xlsx read natively, PDF page by page "
+             "(text layer + rendered-page OCR), other files via tesseract "
+             "(soft dependency)",
     )
     p_ingest.add_argument(
         "--ocr-text-file",

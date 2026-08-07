@@ -593,7 +593,7 @@ def test_cli_ingest_study_roundtrip(cli_ready, capsys):
 def test_cli_ingest_study_says_it_ignores_ocr(cli_ready, capsys):
     tmp_path = cli_ready
     assert _cli(tmp_path, "ingest", str(make_study(tmp_path / "disc")),
-                "--person", "jane-doe", "--study", "dicom", "--ocr", "tesseract",
+                "--person", "jane-doe", "--study", "dicom", "--ocr", "auto",
                 "--sources", str(tmp_path / "sources")) == 0
     assert "--ocr is ignored for --study dicom" in capsys.readouterr().err
 

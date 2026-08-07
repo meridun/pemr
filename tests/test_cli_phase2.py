@@ -487,17 +487,19 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
-def test_ocr_tesseract_is_an_alias_for_auto(ready, capsys):
-    """The old spelling keeps working — it selects the same extraction dispatcher."""
+def test_ocr_tesseract_is_rejected(ready, capsys):
+    """Issue #91: the misleading `tesseract` alias is gone; argparse names `auto`."""
     tmp_path = ready
     csv = tmp_path / "labs.csv"
     csv.write_text("test,value\nferritin,68\n", encoding="utf-8")
 
-    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
-                "--sources", str(tmp_path / "sources"), "--ocr", "tesseract") == 0
-    capsys.readouterr()
-    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
-    assert "#1" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+             "--sources", str(tmp_path / "sources"), "--ocr", "tesseract")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "auto" in err
 
 
 def test_unextractable_format_still_ingests_with_a_note(ready, capsys, monkeypatch):
