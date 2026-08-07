@@ -684,6 +684,61 @@ def test_migrated_006_rows_rekey_per_table_when_one_table_collides(tmp_path, cap
         conn.close()
 
 
+def test_post_006_stale_key_blocks_the_recommit_instead_of_forking_it(tmp_path, capsys):
+    """Pins the post-006 upgrade paragraph in `docs/Architecture.md` §3 (issue #94).
+
+    A pre-006 database carries its old per-document `observation` keys through 006, so
+    the next `commit-extraction` that re-states one of those facts is *refused* naming
+    `pemr rekey --apply` and writes nothing -- it does not silently fork a second row
+    (that was the pre-guard behaviour the doc used to describe). Enforcement is narrow:
+    an unrelated condition still commits while the stale key sits there, which is why
+    the doc has to tell operators to run the rekey rather than wait to be stopped.
+    """
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane") == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute(
+        "INSERT INTO observation (person_id, obs_type, key, observed_at, dedup_key,"
+        " dedup_base) VALUES (1, 'condition', 'Hypertension', '2024-01-02', 'c1', 'c1')"
+    )
+    conn.commit()
+    conn.close()
+    assert _run(tmp_path, "migrate") == 0
+    assert "1 allergy/condition row" in capsys.readouterr().out
+
+    note = tmp_path / "visit.txt"
+    note.write_bytes(b"problem list: hypertension")
+    assert _run(tmp_path, "ingest", str(note), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    capsys.readouterr()
+
+    same = _write_json(tmp_path, "same.json",
+                       {"condition": [{"name": "Hypertension", "status": "active"}]})
+    assert _run(tmp_path, "commit-extraction", "--document", "1", "--json", str(same)) == 1
+    err = capsys.readouterr().err
+    assert "no longer matches the current dictionary" in err
+    assert "rekey --apply" in err
+    conn = db.connect(tmp_path / "cli.db")
+    try:  # refused, not forked
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+    other = _write_json(tmp_path, "other.json",
+                        {"condition": [{"name": "Asthma", "status": "active"}]})
+    assert _run(tmp_path, "commit-extraction", "--document", "1", "--json",
+                str(other)) == 0
+    assert "1 new" in capsys.readouterr().out
+
+    # ... and the remedy the message names actually clears it.
+    assert _run(tmp_path, "rekey", "--apply") == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "commit-extraction", "--document", "1", "--json", str(same)) == 0
+    assert "0 new, 1 duplicate" in capsys.readouterr().out
+
+
 def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
     """Nothing moved, nothing to rekey - a note nobody must act on trains people to
     skip notes."""
