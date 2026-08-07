@@ -502,6 +502,23 @@ def test_ocr_tesseract_is_rejected(ready, capsys):
     assert "auto" in err
 
 
+def test_ocr_help_names_only_auto_and_no_pdf_tesseract_claim(capsys):
+    """Issue #91: the alias is undiscoverable and the PDF route is described honestly.
+
+    `--ocr tesseract` was misleading in both directions: the value named after the
+    tool never reached it, and the help text claimed PDFs went "via tesseract" when
+    the `_ocr_pdf` branch (#70) uses the embedded text layer plus rendered-page OCR.
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ingest", "--help"])
+    # argparse wraps the help block, so compare on collapsed whitespace.
+    text = " ".join(capsys.readouterr().out.split())
+    assert "--ocr {auto}" in text
+    assert "alias" not in text
+    assert "images/PDF via tesseract" not in text
+    assert "PDF page by page (text layer + rendered-page OCR)" in text
+
+
 def test_unextractable_format_still_ingests_with_a_note(ready, capsys, monkeypatch):
     from pemr import ingest as ingest_mod
 
