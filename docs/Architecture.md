@@ -320,8 +320,11 @@ scan therefore never stops at the first collision: it reports every collision in
 table — a dry run writes nothing by definition, so it has to be usable as a full survey —
 and `--apply` writes the tables that came out clean, leaves the colliding ones on their
 stored keys, and names them (`skipped: collision` per table, plus a `skipped` list in
-`--json`). Exit code is 1 whenever any collision was found, in both output modes: partial
-progress is fine, silent partial progress is not.
+`--json`). `--json`'s `changed` list is every key the scan computed as moving, not only
+the ones written — a row in a skipped table still shows up there, so a consumer must
+cross-reference `skipped` to tell written from withheld. Exit code is 1 whenever any
+collision was found, in both output modes: partial progress is fine, silent partial
+progress is not.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -404,11 +407,13 @@ The staged key names the family the conflict was actually staged against; the re
 exists only for the case where `rekey` has already moved that family off it. Preferring the
 derived base would misfire on a dictionary edit that **fuses two identities**: the derived
 base then holds a different, pre-existing family, and the resolution would overwrite (or
-join) an unrelated record while the conflict's own row went untouched — and `rekey` refuses
-to run in that state, so the database stays there. Conversely, numbering an admitted row on
-a stale base that no row carries would give it a key not derivable from its own columns,
-which collides the family on the next `rekey` and — because `rekey` is all-or-nothing across
-every table — blocks every later dictionary edit, `document reassign` included.
+join) an unrelated record while the conflict's own row went untouched — and `rekey` flags
+the fused pair as a collision and quarantines that table, leaving it on stored keys rather
+than writing the overwrite. Conversely, numbering an admitted row on a stale base that no
+row carries would give it a key not derivable from its own columns, which collides the
+family on the next `rekey`: a collision blocks only the table that holds it, not the whole
+run (issue #92), but that is still enough to block `--apply` and `document reassign` on
+that table until the collision is fixed.
 
 **Intra-payload collisions are rejected, not staged.** Two rows in *one* submission that
 derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
