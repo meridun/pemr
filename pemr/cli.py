@@ -1011,11 +1011,14 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except dedup.RekeyCollisionError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
     finally:
         conn.close()
+
+    # A collision blocks its own table only (issue #92), so it is a partial failure:
+    # the clean tables are reported (and, under --apply, written) and the exit code
+    # still says something was left undone. Same rc in --json mode as in text mode.
+    writable = report.writable()
+    rc = 1 if report.collisions else 0
 
     if args.json:
         _print_json({
@@ -1031,25 +1034,53 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                 }
                 for c in report.changes
             ],
+            # `changed` is every key that moves; `skipped` names the tables whose
+            # changes were withheld, so a consumer can tell written from withheld.
+            "skipped": report.blocked,
+            "collisions": [
+                {
+                    "record_type": c.record_type,
+                    "row_id": c.row_id,
+                    "label": c.label,
+                    "clash_row_id": c.clash_row_id,
+                    "clash_label": c.clash_label,
+                    "kind": c.kind,
+                    "message": c.message,
+                }
+                for c in report.collisions
+            ],
         })
-        return 0
+        return rc
 
     for record_type, count in report.scanned.items():
         changed = sum(1 for c in report.changes if c.record_type == record_type)
-        print(f"{record_type}: {changed}/{count} key(s) change")
+        blocked = " (skipped: collision)" if record_type in report.blocked else ""
+        print(f"{record_type}: {changed}/{count} key(s) change{blocked}")
     for c in report.changes:
         print(f"  {c.record_type} #{c.row_id}  {c.label}")
-    if not report.changes:
-        print("all dedup keys already match the current dictionary")
-        return 0
-    if report.applied:
-        print(f"rekeyed {len(report.changes)} row(s)")
-    else:
+
+    for collision in report.collisions:
+        print(f"error: {collision.message}", file=sys.stderr)
+    if report.collisions:
         print(
-            f"dry run: {len(report.changes)} row(s) would change - "
+            f"error: {len(report.collisions)} collision(s) left "
+            f"{len(report.blocked)} table(s) on their stored keys: "
+            f"{', '.join(report.blocked)} - fix the collisions above and re-run",
+            file=sys.stderr,
+        )
+
+    if not report.changes and not report.collisions:
+        print("all dedup keys already match the current dictionary")
+    elif report.applied:
+        print(f"rekeyed {len(writable)} row(s)")
+    elif writable:
+        print(
+            f"dry run: {len(writable)} row(s) would change - "
             "re-run with --apply (back up first: `pemr backup`)"
         )
-    return 0
+    else:
+        print("dry run: no row outside the skipped table(s) needs a new key")
+    return rc
 
 
 def _cmd_review_conflicts(args: argparse.Namespace) -> int:

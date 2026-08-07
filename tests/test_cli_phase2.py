@@ -422,26 +422,62 @@ def test_rekey_json_output(ready, capsys, tmp_path):
     assert change["label"] == "ZZT" and change["old_key"] != change["new_key"]
 
 
-def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
-    """Exit 1 with a pointed message when the dictionary would merge two facts."""
-    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
-    new = _dict_file(tmp_path, "fuse.toml", '"alb" = "albumin"\n')
+def _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old):
+    """Two lab rows a `"alb" = "albumin"` dictionary fuses, plus a condition whose key
+    merely moves under `"t2dm" = "type 2 diabetes"` — the issue-#92 shape at the CLI."""
     scan = tmp_path / "fuse-scan.txt"
     scan.write_bytes(b"alb 4.2 / albumin 3.6")
     assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
                 "--sources", str(tmp_path / "sources")) == 0
     doc = _document_id(tmp_path)[-1]["document_id"]
-    payload = _write_json(tmp_path, "fuse.json", {"lab_result": [
-        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
-        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
-    ]})
+    payload = _write_json(tmp_path, "fuse.json", {
+        "lab_result": [
+            {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
+            {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+        ],
+        "condition": [{"name": "T2DM", "status": "active"}],
+    })
     assert _run(tmp_path, "commit-extraction", "--document", str(doc),
                 "--json", str(payload), "--dictionary", str(old)) == 0
     capsys.readouterr()
 
+
+def test_rekey_refuses_a_fusing_dictionary(ready, capsys, tmp_path):
+    """Exit 1 with a pointed message when the dictionary would merge two facts — and
+    (issue #92) the fused table is skipped by name while the clean one still applies."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+
     assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
-    err = capsys.readouterr().err
-    assert "same dedup_key" in err and "nothing was written" in err
+    captured = capsys.readouterr()
+    assert "same dedup_key" in captured.err
+    assert "lab_result was not written" in captured.err
+    assert "left 1 table(s) on their stored keys: lab_result" in captured.err
+    # The unaffected table is rekeyed anyway: one collision, one blocked table.
+    assert "lab_result: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "rekeyed 1 row(s)" in captured.out
+
+    # Re-run: the condition is now current, so only the fused table is still outstanding.
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 1
+    out = capsys.readouterr().out
+    assert "dry run: no row outside the skipped table(s) needs a new key" in out
+
+
+def test_rekey_json_reports_collisions_and_skipped_tables(ready, capsys, tmp_path):
+    """`--json` keeps exit-code parity with the text mode and says which tables were
+    withheld, so an agent can tell a partial run from a clean one (issue #92)."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["skipped"] == ["lab_result"]
+    assert [c["kind"] for c in payload["collisions"]] == ["fused"]
+    assert [c["record_type"] for c in payload["changed"]] == ["lab_result", "condition"]
 
 
 # --- intake formats at the CLI (issue #66) ------------------------------------
