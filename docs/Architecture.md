@@ -346,6 +346,22 @@ refuse until the rekey is applied — `document reassign` and `commit-extraction
 keys through the same function, so they see the drift first. Rekeying does **not** recover
 a value already lost to a pre-fix collision: that needs the source document re-extracted.
 
+`rekey` is also a **required upgrade step after migration 006**, and unlike the #71 case it
+is not collision-free. 006 promoted allergy/condition rows out of `observation`, but the new
+keys are a sha256 over dictionary-normalized fields — which SQL cannot compute — so the
+backfill carried each row's *old*, per-document key forward verbatim. Those rows sit on keys
+layer-2 dedup will never derive again, so re-committing an already-stored allergy or
+condition lands a **second row reported as `new`** — no duplicate, no conflict, no signal
+(issue #94, the mechanism behind #86's apparently duplicated condition bullets). Run the
+`pemr rekey` dry-run and then `pemr rekey --apply` against any **pre-006** database before
+its next allergy/condition `commit-extraction`. `pemr migrate` prints that follow-up when 006
+actually moves rows, so the step is signposted the moment it is owed — but nothing enforces
+it (a fresh `--create` has nothing to rekey, and prints nothing). Expect collisions here
+where the #71 migration had none: the old keys were per-document, so the same condition
+recorded by two documents recomputes onto one key. That quarantines its own table only
+(above), so the clean tables are still written and the fused pair is settled in the
+dictionary or the data before a re-run.
+
 The **measured value is deliberately *not* in the key** — temporal identity carries the
 draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
 document gives one, date when it only gives a date), not truncated to the date. Two draws
