@@ -209,12 +209,96 @@ def test_summary_orders_and_referrals(seeded):
     """Non-medication `order` observations render under a dedicated section: item name
     with optional prescriber/instructions detail, placed after Allergies before Vitals."""
     md = render.render_summary(seeded, "jane-doe")
-    section = md.split("## Orders & Referrals")[1].split("##")[0]
-    assert "cervical collar - Dr. Smith, ortho" in section   # key - value_text
-    assert "outpatient physical therapy" in section          # bare item, no trailing detail
+    section = md.split("## Orders & Referrals")[1].split("\n## ")[0]
+    assert "- cervical collar - Dr. Smith, ortho  (ordered 2026-02-01)" in section
+    assert "outpatient physical therapy" in section          # bare item, no detail, undated
     assert "outpatient physical therapy - " not in section   # no dangling separator
+    assert "earlier" not in section                          # no group note on singletons
     # placement: after Allergies, before Latest Vitals (clinical-status block stays together)
     assert md.index("## Allergies") < md.index("## Orders & Referrals") < md.index("## Latest Vitals")
+
+
+def _seed_orders(conn, rows):
+    """Extra `obs_type='order'` observations on jane, committed as their own document
+    (the shape a second document restating an order arrives in)."""
+    dedup.commit_extraction(conn, _doc(conn, "jane-doe"), {
+        "observation": [dict(r, obs_type="order") for r in rows],
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def _orders_section(conn):
+    md = render.render_summary(conn, "jane-doe")
+    return md.split("## Orders & Referrals")[1].split("\n## ")[0]
+
+
+def test_summary_orders_group_repeated_item_and_disclose_the_collapse(seeded):
+    """Issue #93: one order restated across N documents rendered as N identical bullets.
+    It now folds to one bullet carrying the latest detail, and the collapse is *disclosed*
+    -- the count plus the span -- so a reader can never mistake it for a single order."""
+    _seed_orders(seeded, [
+        {"key": "cervical collar", "value_text": "Dr. Jones, ortho",
+         "observed_at": "2026-06-14"},
+        {"key": "cervical collar", "value_text": "Dr. Smith, ortho",
+         "observed_at": "2026-01-05"},
+    ])
+    section = _orders_section(seeded)
+    assert section.count("cervical collar") == 1        # three stored rows, one bullet
+    assert ("- cervical collar - Dr. Jones, ortho  "
+            "(ordered 2026-06-14; +2 earlier, first 2026-01-05)") in section
+    assert "outpatient physical therapy" in section           # distinct key stays distinct
+    # storage is untouched: the collapse is render-only and reversible
+    assert seeded.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order'"
+    ).fetchone()["n"] == 4
+
+
+def test_summary_orders_qualifier_keeps_its_own_bullet(seeded):
+    """Grouping is on `key_token`, so #71's qualifier-awareness carries over: aquatic PT
+    is a different order from plain outpatient PT, not a restatement of it."""
+    _seed_orders(seeded, [
+        {"key": "outpatient physical therapy (aquatic)", "observed_at": "2026-03-01"},
+    ])
+    section = _orders_section(seeded)
+    assert "- outpatient physical therapy (aquatic)  (ordered 2026-03-01)" in section
+    assert "- outpatient physical therapy\n" in section   # bare row untouched, ungrouped
+
+
+def test_summary_orders_keyless_rows_are_never_bucketed_together(seeded):
+    """An empty group token means "no identity", not "one shared identity": bucketing
+    every keyless row together would fabricate a merge. `value_text` is the fallback
+    identity, matching the display fallback."""
+    _seed_orders(seeded, [
+        {"value_text": "Dr. Ray, cardiology consult", "observed_at": "2026-04-01"},
+        {"observed_at": "2026-04-02"},          # neither item name nor detail
+        {"observed_at": "2026-04-03"},          # ... and another: two bullets, not one
+    ])
+    section = _orders_section(seeded)
+    assert "- Dr. Ray, cardiology consult  (ordered 2026-04-01)" in section
+    assert section.count("(unspecified)") == 2
+    assert "earlier" not in section
+
+
+def test_summary_orders_undated_earlier_row_keeps_the_count(seeded):
+    """A group whose earlier rows carry no date drops the `first <date>` clause but keeps
+    the disclosure -- the reader still learns the order was restated."""
+    _seed_orders(seeded, [
+        {"key": "outpatient physical therapy", "value_text": "8 sessions",
+         "observed_at": "2026-05-01"},
+    ])
+    section = _orders_section(seeded)
+    assert ("- outpatient physical therapy - 8 sessions  "
+            "(ordered 2026-05-01; +1 earlier)") in section
+    assert "first" not in section
+
+
+def test_summary_orders_newest_first_undated_last(seeded):
+    """Orders are actionable events, so the section leads with the most recent (the other
+    event sections' ordering), undated last then alphabetical."""
+    _seed_orders(seeded, [{"key": "sleep study", "observed_at": "2026-07-01"}])
+    section = _orders_section(seeded)
+    assert (section.index("sleep study")
+            < section.index("cervical collar")
+            < section.index("outpatient physical therapy"))
 
 
 def test_summary_latest_vitals_pick(seeded):
