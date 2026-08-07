@@ -467,7 +467,7 @@ For those you get a stderr note telling you to transcribe it yourself and pass
 `tesseract`, and a missing PDF backend all cost you the text, not the document. Extraction is
 capped at 32 MiB per file — `ocr_text` is mirrored into the FTS index, so an unbounded read is
 both a database-size problem and a decompression-bomb surface (a small `.docx` can declare a
-gigabyte of `word/document.xml`). `--ocr tesseract` is a retained alias for `--ocr auto`.
+gigabyte of `word/document.xml`).
 
 Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
 only to an agent transcription or a tesseract pass, never to natively-extracted text —
