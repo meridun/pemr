@@ -50,11 +50,13 @@ All inline, read-only (no code changes, no branches):
   issue covering the same thing is a close-as-dup; a partial overlap is a scope note.
 - **In-progress collision sweep** — does work on this already exist somewhere, even without a matching
   issue title? Three probes, cheap to expensive; stop as soon as one is conclusive:
-  1. **Remote branches:** `git fetch origin && git branch -r`. Branch names follow
+  1. **Local + remote branches:** `git fetch origin && git branch -a`. Branch names follow
      `<type>/<issue#>-<slug>` — scan for a slug that matches this issue's subject or an issue# whose
-     issue covers the same ground. On a candidate, `git log origin/<DEFAULT_BRANCH>..origin/<branch>
-     --oneline` and `git diff --name-only origin/<DEFAULT_BRANCH>...origin/<branch>` to see what it
-     actually changes.
+     issue covers the same ground (developer-cut branches may not follow the pattern; a reasonable
+     name match counts, an unrelated name doesn't — unpushed branches on other machines and
+     unrecognizably-named ones are not discoverable). On a candidate, `git log
+     origin/<DEFAULT_BRANCH>..origin/<branch> --oneline` and `git diff --name-only
+     origin/<DEFAULT_BRANCH>...origin/<branch>` to see what it actually changes.
   2. **Open PRs by touched paths:** `gh pr list --state open --json number,title,headRefName,files` —
      a PR touching the files this issue would touch is a collision even if the titles don't match.
   3. **In-flight issues in later lanes:** `gh issue list --label stage:build --json number,title`
@@ -62,7 +64,13 @@ All inline, read-only (no code changes, no branches):
      subsume or conflict with this one; read its body's `## Implementation plan`, not just its
      title.
 
-  Verdicts: same work in flight → close as dup linking the live item (or its issue). Partial overlap
+  Verdicts: a branch or PR that corresponds to **this** issue (or a child work item, or a
+  predecessor issue linked in the body) is **prior work, not a collision** — record the branch
+  name, its HEAD, and what its diff already implements in your summary comment and a one-line
+  pointer in `## Requirements`, so design plans the gap and build resumes it rather than
+  recutting. Work already partially merged to `<DEFAULT_BRANCH>` gets the same treatment: note
+  shipped-vs-missing in `## Requirements`; the AC still describes the full behavior. Otherwise:
+  same work in flight → close as dup linking the live item (or its issue). Partial overlap
   where this issue can't proceed until the in-flight work lands → comment "blocked by #n", apply the
   `blocked` label (the merge sweep flips it to `ready` when the blocker merges), and still EMIT
   normally on the rest of the triage. Mere adjacency → a scope note in the summary comment naming the
@@ -150,7 +158,8 @@ One-line result: `INTAKE: <#issue> → ADVANCE(design|verify)|PARK|CLOSE — <re
   possibly stale) overrides the cheap path — run the full WORK pass as if the artifacts didn't
   exist: dup-check again (including the closed-issue search — it may have shipped meanwhile),
   re-check docs, re-validate `## Requirements`/`## Acceptance criteria` in place, and note what
-  changed. **The in-thread instruction beats the idempotency shortcut.** A **reopened** issue is
+  changed. **The in-thread instruction beats the idempotency shortcut.** A **reopened** issue — or one
+  rewound to intake, cloned from a completed one, or enrolling in-flight developer work — is
   reconciled, not re-triaged from scratch: if the evidence (merged PR, code on `<DEFAULT_BRANCH>`)
   shows it already shipped, PARK with that evidence for a human to close rather than advancing it
   back into the pipeline.
