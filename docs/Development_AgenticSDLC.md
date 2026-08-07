@@ -8,7 +8,7 @@ for the stage graph and worker loop), document here:
 - What's been proven to actually work end-to-end vs. what's still untested, so future changes
   know which tails are load-bearing.
 
-Upstream source: `C:\Claude\agentic-sdlc` — last resynced **2026-08-06** at upstream `3e0db2d`
+Upstream source: `C:\Claude\agentic-sdlc` — last resynced **2026-08-06** at upstream `79ddc87`
 (prompts, CLI, tests; placeholder bindings live in
 [prompts/sdlc/PROFILE.md](../prompts/sdlc/PROFILE.md)).
 
