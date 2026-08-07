@@ -308,11 +308,20 @@ the rows it excluded on that basis (`other_assays`) instead of dropping them sil
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
 in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` re-derives
 every stored key under the current dictionary (dry-run by default, `--apply` to write,
-values and provenance untouched). It aborts whole if two rows would recompute to one key,
+values and provenance untouched). Two rows that recompute to one key are a **collision**,
 and the message names which of the two causes it is: *different* payloads mean the new
 synonym fuses two distinct facts (e.g. a CMP `ALB` and an SPEP `Albumin` off one draw) and
 the fix belongs in the dictionary; *identical* payloads mean one fact was filed twice, once
 under a pre-drift key, and the fix belongs in the data.
+
+**A collision quarantines its own table, not the run** (issue #92). The record tables are
+scanned independently, so a fused pair in `allergy` says nothing about `condition`. The
+scan therefore never stops at the first collision: it reports every collision in every
+table — a dry run writes nothing by definition, so it has to be usable as a full survey —
+and `--apply` writes the tables that came out clean, leaves the colliding ones on their
+stored keys, and names them (`skipped: collision` per table, plus a `skipped` list in
+`--json`). Exit code is 1 whenever any collision was found, in both output modes: partial
+progress is fine, silent partial progress is not.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -324,8 +333,8 @@ rekey --apply` to run. The check is deliberately narrow — unrelated drift else
 database is a maintenance chore, not a reason to refuse an ingest.
 
 `rekey` is also the whole **migration for the issue-#71 key change**, and it is safe by
-construction: a qualifier can only *add* precision, so two rows can never fuse and
-`RekeyCollisionError` is unreachable from that change alone. Procedure: `pemr rekey`
+construction: a qualifier can only *add* precision, so two rows can never fuse and a
+collision is unreachable from that change alone. Procedure: `pemr rekey`
 (dry-run) → read the moved labels → for any that should have stayed collapsed, add a full
 parenthesized synonym key → re-run the dry-run → `pemr rekey --apply`. Rows whose names
 carry no parenthetical do not move at all (the qualifier is folded into the existing key
