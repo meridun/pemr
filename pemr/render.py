@@ -23,7 +23,10 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
   * **orders**     -> ``observation`` rows with ``obs_type='order'`` for non-medication
     orders mined from the med-list section (DME, outpatient PT, referrals, consults):
     ``key`` = free-text item/order name (no canonical vocabulary), optional
-    ``value_text`` = instructions and/or prescriber/target specialty.
+    ``value_text`` = instructions and/or prescriber/target specialty. Rows are
+    **grouped at render time** by normalized ``key``, newest first, with the
+    collapse disclosed on the line (issue #93) -- the stored rows keep their dates
+    and stay distinct, because an order is an event, not a standing fact.
 
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
@@ -119,15 +122,6 @@ def _ref_range(row: sqlite3.Row | dict) -> str:
 # Read helpers (pure SELECTs; person already resolved to an id)
 # --------------------------------------------------------------------------- #
 
-def _observations(conn: sqlite3.Connection, person_id: int, obs_type: str) -> list[dict]:
-    rows = conn.execute(
-        "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
-        "ORDER BY COALESCE(key, ''), observed_at, observation_id",
-        (person_id, obs_type),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
 def _conditions(
     conn: sqlite3.Connection, person_id: int, statuses: tuple[str, ...] | str
 ) -> list[dict]:
@@ -191,6 +185,73 @@ def _latest_vitals(
     for r in rows:
         latest[key_token(r["key"], dictionary)] = dict(r)  # ascending -> last wins
     return [latest[k] for k in sorted(latest)]
+
+
+def _order_display(row: dict) -> str:
+    """Display name of an order row: the item name, falling back to the detail text and
+    then to an explicit placeholder (an unnamed order still has to be visible)."""
+    return row["key"] or row["value_text"] or "(unspecified)"
+
+
+def _grouped_orders(
+    conn: sqlite3.Connection, person_id: int, dictionary: dict[str, str] | None
+) -> list[dict]:
+    """``obs_type='order'`` rows folded to one entry per normalized item, newest first.
+
+    A repeated order/referral is restated by every document that mentions it, so a raw
+    row dump renders one identical bullet per document (issue #93). Orders are *events*,
+    not standing facts, so unlike conditions/allergies (issue #63) they must keep their
+    date in the storage dedup key -- a January CBC and a June CBC are two real orders.
+    The collapse therefore happens **here**, at render time: reversible, provenance
+    intact in the DB, and always disclosed by the ``+N earlier`` note on the line.
+
+    Grouped by :func:`key_token`, the same token the observation dedup key uses for
+    ``key`` (issue #71), so the render never disagrees with storage about what counts as
+    one item; ``value_text`` is the fallback identity for a keyless row, matching the
+    display fallback. A row with neither renders on its own -- bucketing all of those
+    together would fabricate a merge.
+
+    Each returned dict is the group's **latest** row (most recent ``observed_at``, then
+    highest ``observation_id``) plus ``group_count`` and ``group_first`` (earliest dated
+    ``observed_at`` among the *earlier* rows, ``""`` when none of them is dated).
+    """
+    rows = conn.execute(
+        "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
+        "ORDER BY observed_at, observation_id",
+        (person_id, OBS_ORDER),
+    ).fetchall()
+    groups: dict[object, list[dict]] = {}
+    for r in rows:
+        token = key_token(r["key"], dictionary) or key_token(r["value_text"], dictionary)
+        groups.setdefault(token or ("", r["observation_id"]), []).append(dict(r))
+
+    out = []
+    for members in groups.values():
+        latest = members[-1]                      # ascending -> last is the latest
+        earlier = sorted(
+            d for d in (_date_part(m["observed_at"]) for m in members[:-1]) if d
+        )
+        out.append(dict(latest, group_count=len(members),
+                        group_first=earlier[0] if earlier else ""))
+    # Two stable passes: alphabetical, then latest-date descending (undated sorts last,
+    # keeping its alphabetical order). Orders are actionable events, so recency leads --
+    # matching the other event sections rather than the vitals panel's fixed A-Z.
+    out.sort(key=lambda g: (_order_display(g).lower(), g["observation_id"]))
+    out.sort(key=lambda g: _date_part(g["observed_at"]), reverse=True)
+    return out
+
+
+def _order_line(row: dict) -> str:
+    detail = f" - {row['value_text']}" if row["key"] and row["value_text"] else ""
+    notes = []
+    when = _date_part(row["observed_at"])
+    if when:
+        notes.append(f"ordered {when}")
+    if row["group_count"] > 1:
+        first = f", first {row['group_first']}" if row["group_first"] else ""
+        notes.append(f"+{row['group_count'] - 1} earlier{first}")
+    note = f"  ({'; '.join(notes)})" if notes else ""
+    return f"- {_order_display(row)}{detail}{note}"
 
 
 def _abnormal_labs(conn: sqlite3.Connection, person_id: int) -> list[dict]:
@@ -337,9 +398,7 @@ def render_summary(
     ]
     allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id)]
     order_lines = [
-        f"- {o['key'] or o['value_text'] or '(unspecified)'}"
-        + (f" - {o['value_text']}" if o["key"] and o["value_text"] else "")
-        for o in _observations(conn, person_id, OBS_ORDER)
+        _order_line(o) for o in _grouped_orders(conn, person_id, dictionary)
     ]
 
     vital_lines = []
