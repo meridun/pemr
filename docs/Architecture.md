@@ -363,7 +363,7 @@ indefinitely until one of them is restated. Run the `pemr rekey` dry-run and the
 `observation` keys carried the assertion's `observed_at`, so one condition restated by three
 documents is three stored rows that all recompute onto the single date-free key 006 gave the
 type — the legacy shape behind #86's apparently duplicated condition bullets, correct storage
-under the old identity and a fused pair under the new one. A collision quarantines its own
+under the old identity and a three-way fusion under the new one. A collision quarantines its own
 table only (above), so the clean tables are still written and the fusion is settled in the
 dictionary or the data before a re-run.
 
