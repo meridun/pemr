@@ -641,6 +641,49 @@ def test_migrate_prints_the_rekey_followup_when_006_moves_rows(tmp_path, capsys)
     assert capsys.readouterr().out.strip() == "up to date"
 
 
+def test_migrated_006_rows_rekey_per_table_when_one_table_collides(tmp_path, capsys):
+    """The issue-#92 report verbatim: 006 carries the old observation keys forward, the
+    follow-up `rekey --apply` hits a collision in `allergy`, and the conditions — which
+    have no collision among them — must still be rekeyed rather than held hostage."""
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane-doe', 'Jane')")
+    for i, (sub, reaction) in enumerate((("PCN", "rash"),
+                                         ("Penicillin", "anaphylaxis")), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, value_text, dedup_key,"
+            " dedup_base) VALUES (1, 'allergy', ?, ?, ?, ?)",
+            (sub, reaction, f"a{i}", f"a{i}"))
+    for i, name in enumerate(("T2DM", "HTN"), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, dedup_key, dedup_base)"
+            " VALUES (1, 'condition', ?, ?, ?)", (name, f"c{i}", f"c{i}"))
+    conn.commit()
+    conn.close()
+    assert _run(tmp_path, "migrate") == 0
+    assert "4 allergy/condition row" in capsys.readouterr().out
+
+    new = _dict_file(tmp_path, "fuse006.toml",
+                     '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    captured = capsys.readouterr()
+    assert "allergy: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "condition: 2/2 key(s) change" in captured.out
+    assert "rekeyed 2 row(s)" in captured.out
+    assert "left 1 table(s) on their stored keys: allergy" in captured.err
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        # The carried-forward observation keys survive on the blocked table only.
+        assert sorted(r["dedup_key"] for r in
+                      conn.execute("SELECT dedup_key FROM allergy")) == ["a1", "a2"]
+        assert not [r for r in conn.execute("SELECT dedup_key FROM condition")
+                    if r["dedup_key"] in ("c1", "c2")]
+    finally:
+        conn.close()
+
+
 def test_migrate_of_a_fresh_database_has_no_rekey_followup(tmp_path, capsys):
     """Nothing moved, nothing to rekey - a note nobody must act on trains people to
     skip notes."""
