@@ -786,3 +786,116 @@ def test_keep_both_no_op_line_names_the_fields_it_filled(ready, capsys):
     finally:
         conn.close()
     assert (stored["reaction"], stored["criticality"]) == ("rash", "high")
+
+
+# --- issue #104: the curated lab-label synonyms, walked through the real CLI ---
+
+# (label as one document prints it, label as the other prints it) for every pair the
+# #104 curation has to converge. Same person, same draw, same value, two spellings:
+# the second document must land as a DUPLICATE, never as a second row. Some pairs
+# carry no dictionary line at all - the parenthesized ones ride identity()'s
+# redundant-alias rule and `Hemoglobin`/`hemoglobin` rides _collapse()'s casefold -
+# and they are listed here precisely so "no entry needed" stays a tested claim.
+_DICT_104_CLI_PAIRS: list[tuple[str, str]] = [
+    ("ALB", "Albumin"),
+    ("TPro", "Protein, Total (SPEP)"),
+    ("MG", "magnesium"),
+    ("BMG", "Beta-2 Microglobulin"),
+    ("BUN", "Urea Nitrogen (BUN)"),
+    ("CO2", "CO2 (Bicarbonate)"),
+    ("ALT", "ALT (SGPT)"),
+    ("AST", "AST (SGOT)"),
+    ("TSH", "TSH (Thyroid Stimulating Hormone)"),
+    ("Kappa", "Kappa Free Light Chains, Serum"),
+    ("Lambda", "Lambda Free Light Chain, Serum"),
+    ("K/L Ratio", "Kappa/Lambda Free Light Chain Ratio"),
+    ("LYM", "Lymphocytes (absolute)"),
+    ("NEU", "Neutrophils (absolute)"),
+    ("MONO", "Monocytes (absolute)"),
+    ("EO", "Eosinophils (absolute)"),
+    ("BAS", "Basophils (absolute)"),
+    ("LYM%", "Lymphocytes %"),
+    ("NEU%", "Neutrophils %"),
+    ("MON%", "Monocytes %"),
+    ("EO%", "Eosinophils %"),
+    ("BAS%", "Basophils %"),
+    ("IFE Interpretation, U", "IFE Interpretation:U"),
+    ("Hemoglobin", "hemoglobin"),
+    ("Protein,Total,Urine", "Protein, Total, Urine"),
+    ("Prot, 24hr Calculated", "Prot,24hr Calculated"),
+]
+
+# The other half of the bargain: labels off the SAME draw that the curation must leave
+# on keys of their own (issue #71's qualifier constraint plus the short codes #104
+# deliberately excluded). Every one of these has to commit as a new row.
+_DICT_104_CLI_DISTINCT: list[str] = [
+    "Albumin (SPEP)",
+    "Protein Electrophoresis Albumin Fraction",
+    "Bicarbonate",
+    "LDL cholesterol (direct)",
+    "LDL cholesterol (calculated)",
+    "estimated GFR (black)",
+    "estimated GFR (other)",
+    "M-Spike",
+    "M-Spike, %",
+    "Gran",
+    "LY",
+    "MO",
+]
+
+
+def test_curated_synonyms_dedup_across_documents_through_the_cli(ready, capsys):
+    """#104 end to end, against the shipped dictionary: one report prints the short
+    codes, the next prints the long forms, and layer-2 dedup has to see one draw
+    rather than two. A fork here is exactly the symptom the curation exists to fix -
+    rendered summaries repeating a row per spelling."""
+    tmp_path = ready
+    sources = tmp_path / "sources"
+    for i in (1, 2, 3):
+        scan = tmp_path / f"d{i}.txt"
+        scan.write_bytes(f"lab report {i}".encode())
+        assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                    "--sources", str(sources)) == 0
+    capsys.readouterr()
+
+    def _labs(names):
+        # Index-derived values, so the two documents state the SAME number for each
+        # pair (a duplicate, not a conflict) while every pair stays distinguishable.
+        return [{"test_name": name, "collected_at": "2026-01-02",
+                 "value_num": 1.0 + i, "unit": "g/dL"} for i, name in enumerate(names)]
+
+    pairs = len(_DICT_104_CLI_PAIRS)
+    short = _write_json(tmp_path, "short.json",
+                        {"lab_result": _labs([a for a, _ in _DICT_104_CLI_PAIRS])})
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(short)) == 0
+    assert f"{pairs} new, 0 duplicate" in capsys.readouterr().out
+
+    spelled = _write_json(tmp_path, "spelled.json",
+                          {"lab_result": _labs([b for _, b in _DICT_104_CLI_PAIRS])})
+    assert _run(tmp_path, "commit-extraction", "--document", "2",
+                "--json", str(spelled)) == 0
+    assert f"0 new, {pairs} duplicate" in capsys.readouterr().out
+
+    # ...and nothing over-collapsed: the qualifier-distinct labels off that same draw
+    # each still key on their own, so they commit as new rows rather than deduping
+    # into their stems.
+    distinct = _write_json(tmp_path, "distinct.json",
+                           {"lab_result": _labs(_DICT_104_CLI_DISTINCT)})
+    assert _run(tmp_path, "commit-extraction", "--document", "3",
+                "--json", str(distinct)) == 0
+    assert f"{len(_DICT_104_CLI_DISTINCT)} new, 0 duplicate" in capsys.readouterr().out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        rows, keys = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT dedup_key) FROM lab_result"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert rows == keys == pairs + len(_DICT_104_CLI_DISTINCT)
+
+    # The rows were keyed under the shipped dictionary, so `pemr rekey` (dry run) has
+    # nothing to move and no collision to report.
+    assert _run(tmp_path, "rekey") == 0
+    assert "all dedup keys already match the current dictionary" in capsys.readouterr().out
