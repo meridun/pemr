@@ -68,6 +68,9 @@
 "estimated gfr" = "egfr"
 "bun" = "bun"
 "blood urea nitrogen" = "bun"
+# The stem alone is enough: `Urea Nitrogen (BUN)` is a redundant alias and drops via
+# identity() rule 2 once `urea nitrogen` maps here, so it needs no full-label key.
+"urea nitrogen" = "bun"
 
 # --- Hematology ---
 "hemoglobin" = "hemoglobin"
@@ -92,6 +95,37 @@
 "red cell distribution width" = "rdw"
 "mpv" = "mpv"
 "mean platelet volume" = "mpv"
+
+# --- CBC differential ---
+# The absolute count and the percentage are two different measurements of one cell
+# line, so they get DIFFERENT canonical tokens on purpose — `%` and `(absolute)` are
+# qualifier-distinct (issue #71) and must never fuse. Report short codes pair with the
+# long forms the CSV prints; the `(absolute)` long forms need full-label keys (rule 1)
+# because the parenthetical is meaningful rather than a redundant alias.
+# Ambiguous short codes (`Gran`, `LY`, `MO`) and the bare `Lymphs`/`Eos` spellings stay
+# unmapped pending per-document verification.
+"lym" = "lymphocytes_abs"
+"lymphocytes (absolute)" = "lymphocytes_abs"
+"neu" = "neutrophils_abs"
+"neutrophils (absolute)" = "neutrophils_abs"
+"mono" = "monocytes_abs"
+"monocytes (absolute)" = "monocytes_abs"
+"eo" = "eosinophils_abs"
+"eosinophils (absolute)" = "eosinophils_abs"
+"bas" = "basophils_abs"
+"basophils (absolute)" = "basophils_abs"
+# Percent forms. `MONO` (absolute) vs `MON%` (percent) is the asymmetry the corpus
+# actually prints — not a typo.
+"lym%" = "lymphocytes_pct"
+"lymphocytes %" = "lymphocytes_pct"
+"neu%" = "neutrophils_pct"
+"neutrophils %" = "neutrophils_pct"
+"mon%" = "monocytes_pct"
+"monocytes %" = "monocytes_pct"
+"eo%" = "eosinophils_pct"
+"eosinophils %" = "eosinophils_pct"
+"bas%" = "basophils_pct"
+"basophils %" = "basophils_pct"
 
 # --- Inflammatory markers ---
 # ESR (erythrocyte sedimentation rate). Report labels vary by method, but ESR is a
@@ -119,8 +153,15 @@
 # different assay label and collapsing the two would fuse two rows from one draw.
 "co2" = "co2"
 "carbon dioxide" = "co2"
+# ...which is why the label some reports print in full gets a full-label key (rule 1)
+# instead: `CO2 (Bicarbonate)` IS the CMP total CO2, while a bare `Bicarbonate` row is
+# left to key on its own.
+"co2 (bicarbonate)" = "co2"
 "calcium" = "calcium"
 "ca" = "calcium"
+"magnesium" = "magnesium"
+# `mg` is only ever a test name here — units never route through the dictionary.
+"mg" = "magnesium"
 
 # --- Liver enzymes / bilirubin ---
 "alt" = "alt"
@@ -136,18 +177,31 @@
 "ldh" = "ldh"
 "lactate dehydrogenase" = "ldh"
 
-# --- Serum protein: still unmapped, but no longer unsafe ---
+# --- Serum protein ---
 # A CMP and an SPEP run off the SAME draw both report total protein (`TPro` /
 # `Protein, Total`) and albumin (`ALB` / `Albumin`) — different methods, slightly
-# different numbers, same person + same collected_at. This used to make mapping
-# `alb`->`albumin` / `tpro`->`protein_total` unsafe: it gave those two rows one dedup
-# key and the second landed as a staged CONFLICT.
+# different numbers, same person + same collected_at. Mapping `alb`->`albumin` used to
+# be unsafe for exactly that reason; issue #71's method-aware key fixed it, since the
+# SPEP row's `Albumin (SPEP)` label keys as `albumin (spep)`, distinct from the CMP's
+# bare `albumin`.
 #
-# Issue #71 supplied the method-aware key that block asked for: the SPEP row's
-# `Albumin (SPEP)` label now keys as `albumin (spep)`, distinct from the CMP's bare
-# `albumin`, so the mapping is safe to add. Curating it is a separate pass — add the
-# entries deliberately, alongside whatever full-label keys your reports' SPEP fraction
-# names need, then `pemr rekey`.
+# Total protein IS deliberately fused across the two methods (the SPEP carries the CMP
+# total protein forward — same-draw same-value evidence), whereas the separately
+# measured SPEP fraction labels (`Protein Electrophoresis Albumin Fraction`, the
+# globulin fractions) stay unmapped so they keep keys of their own.
+"alb" = "albumin"
+"albumin" = "albumin"
+"tpro" = "protein_total"
+"total protein" = "protein_total"
+"protein, total" = "protein_total"
+"protein, total (spep)" = "protein_total"
+"protein electrophoresis total protein" = "protein_total"
+# Urine total protein is a different analyte from the serum one, so it keeps its own
+# canonical token; the second key is the comma-spacing variant some reports print.
+"protein,total,urine" = "protein_total_urine"
+"protein, total, urine" = "protein_total_urine"
+"prot, 24hr calculated" = "protein_24hr"
+"prot,24hr calculated" = "protein_24hr"
 
 # --- Vitamins ---
 "vitamin d" = "vitamin_d_25oh"
@@ -166,10 +220,15 @@
 # hence the full-label key below rather than a global rule.
 "kappa" = "kappa_free_light_chain"
 "free kappa light chain" = "kappa_free_light_chain"
+"kappa free light chain, serum" = "kappa_free_light_chain"
+"kappa free light chains, serum" = "kappa_free_light_chain"
 "lambda" = "lambda_free_light_chain"
 "free lambda light chain" = "lambda_free_light_chain"
+"lambda free light chain, serum" = "lambda_free_light_chain"
+"lambda free light chains, serum" = "lambda_free_light_chain"
 "k/l ratio" = "kappa_lambda_ratio"
 "kappa/lambda ratio" = "kappa_lambda_ratio"
+"kappa/lambda free light chain ratio" = "kappa_lambda_ratio"
 "m-spike" = "m_spike"
 "m-spike (spep)" = "m_spike"
 "immunoglobulin g" = "igg"
@@ -183,6 +242,12 @@
 "b2 microglobulin" = "beta2_microglobulin"
 "beta2 microglobulin" = "beta2_microglobulin"
 "beta-2 microglobulin" = "beta2_microglobulin"
+"bmg" = "beta2_microglobulin"
+# Immunofixation interpretation, urine. Two spellings that differ only by a comma vs a
+# colon — punctuation is load-bearing in lab labels (`M-Spike` vs `M-Spike, %`), so the
+# normalizer does not strip it and these are enumerated instead.
+"ife interpretation, u" = "ife_interpretation_urine"
+"ife interpretation:u" = "ife_interpretation_urine"
 
 # --- observation obs_type conventions ---
 # Four obs_type families out of the generic `observation` table. Extraction

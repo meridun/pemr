@@ -174,6 +174,106 @@ _CORPUS_VARIANTS = [
 ]
 
 
+# Issue #104's bucket-A abbreviation/long-form pairs. Kept OUT of _CORPUS_VARIANTS on
+# purpose: test_real_corpus_overlap_dedups_not_splits commits every entry of that list
+# on one date with an index-derived value, so a pair whose canonical token is already
+# listed there would stage a spurious conflict.
+_DICT_104_VARIANTS: list[tuple[str, str]] = [
+    ("ALB", "Albumin"),
+    ("MG", "magnesium"),
+    ("TPro", "Total Protein"),
+    ("TPro", "Protein, Total"),
+    ("TPro", "Protein, Total (SPEP)"),
+    ("TPro", "Protein Electrophoresis Total Protein"),
+    ("Kappa", "Kappa Free Light Chain, Serum"),
+    ("Kappa", "Kappa Free Light Chains, Serum"),
+    ("Lambda", "Lambda Free Light Chain, Serum"),
+    ("Lambda", "Lambda Free Light Chains, Serum"),
+    ("K/L Ratio", "Kappa/Lambda Ratio"),
+    ("K/L Ratio", "Kappa/Lambda Free Light Chain Ratio"),
+    ("BMG", "Beta-2 Microglobulin"),
+    ("BUN", "Urea Nitrogen"),
+    ("CO2", "CO2 (Bicarbonate)"),
+    ("ALT", "ALT (SGPT)"),
+    ("AST", "AST (SGOT)"),
+    ("TSH", "TSH (Thyroid Stimulating Hormone)"),
+    ("LYM", "Lymphocytes (absolute)"),
+    ("NEU", "Neutrophils (absolute)"),
+    ("MONO", "Monocytes (absolute)"),
+    ("EO", "Eosinophils (absolute)"),
+    ("BAS", "Basophils (absolute)"),
+    ("LYM%", "Lymphocytes %"),
+    ("NEU%", "Neutrophils %"),
+    ("MON%", "Monocytes %"),
+    ("EO%", "Eosinophils %"),
+    ("BAS%", "Basophils %"),
+]
+
+
+def test_synonym_additions_share_key_token():
+    """Issue #104 acceptance: every curated abbreviation/long-form pair derives ONE
+    dedup identity, so the same analyte stops rendering as two rows."""
+    d = dedup.load_dictionary(DICT_PATH)
+    for short, long in _DICT_104_VARIANTS:
+        assert dedup.key_token(short, d) == dedup.key_token(long, d), (short, long)
+
+
+def test_redundant_parenthetical_needs_no_entry():
+    """These four are NOT in the dictionary and must not be: identity() rule 2 already
+    drops a parenthetical that maps to the same canonical token as its stem, so adding
+    full-label keys for them would be dead curation."""
+    d = dedup.load_dictionary(DICT_PATH)
+    for label in ("alt (sgpt)", "ast (sgot)",
+                  "tsh (thyroid stimulating hormone)", "urea nitrogen (bun)"):
+        assert label not in d, label
+    assert dedup.key_token("ALT (SGPT)", d) == dedup.key_token("ALT", d) == "alt"
+    assert dedup.key_token("AST (SGOT)", d) == dedup.key_token("AST", d) == "ast"
+    assert dedup.key_token("TSH (Thyroid Stimulating Hormone)", d) \
+        == dedup.key_token("TSH", d) == "tsh"
+    assert dedup.key_token("Urea Nitrogen (BUN)", d) \
+        == dedup.key_token("BUN", d) == "bun"
+
+
+def test_punctuation_distinct_labels_need_an_entry():
+    """Issue #104 bucket B, both halves. Case/whitespace-only variants converge for free
+    through _collapse(); only labels differing by real punctuation need a synonym line,
+    because stripping punctuation globally would fuse meaningful pairs (`M-Spike, %`)."""
+    d = dedup.load_dictionary(DICT_PATH)
+    # (a) already-converging: no dictionary entry involved at all.
+    for a, b in (("Hemoglobin", "hemoglobin"), ("bun", "BUN"), ("WBC", "wbc"),
+                 ("Hemoglobin A1c", "hemoglobin  a1c"), ("Kappa", "kappa")):
+        assert dedup.key_token(a, {}) == dedup.key_token(b, {}), (a, b)
+        assert dedup.key_token(a, d) == dedup.key_token(b, d), (a, b)
+    # (b) punctuation-distinct: converge only *because of* the entries added here.
+    for a, b in (("IFE Interpretation, U", "IFE Interpretation:U"),
+                 ("Protein,Total,Urine", "Protein, Total, Urine"),
+                 ("Prot, 24hr Calculated", "Prot,24hr Calculated")):
+        assert dedup.key_token(a, {}) != dedup.key_token(b, {}), (a, b)
+        assert dedup.key_token(a, d) == dedup.key_token(b, d), (a, b)
+
+
+def test_synonym_additions_keep_qualifier_distinct_labels_apart():
+    """The negative half of issue #104: growing the dictionary must not collapse any
+    pair issue #71 keeps apart, and must not quietly map the excluded short codes."""
+    d = dedup.load_dictionary(DICT_PATH)
+    for a, b in (
+        ("Albumin", "Albumin (SPEP)"),
+        ("Albumin", "Protein Electrophoresis Albumin Fraction"),
+        ("Lymphocytes %", "Lymphocytes (absolute)"),
+        ("Neutrophils %", "Neutrophils (absolute)"),
+        ("LDL cholesterol (direct)", "LDL cholesterol (calculated)"),
+        ("estimated GFR (black)", "estimated GFR (other)"),
+        ("CO2 (Bicarbonate)", "Bicarbonate"),
+        ("Protein, Total", "Protein, Total, Urine"),
+        ("M-Spike", "M-Spike, %"),
+    ):
+        assert dedup.key_token(a, d) != dedup.key_token(b, d), (a, b)
+    # Excluded ambiguous short codes gain no mapping (`hgb` keeps its existing one).
+    for code in ("gran", "ly", "mo"):
+        assert code not in d, code
+    assert d["hgb"] == "hemoglobin"
+
+
 def test_corpus_naming_variants_share_canonical_token():
     d = dedup.load_dictionary(DICT_PATH)
     for report, csv in _CORPUS_VARIANTS:
@@ -705,6 +805,19 @@ def _rekey_dict(**extra):
     return d
 
 
+# The canonical "one synonym fuses two same-draw facts" setup, in one place because
+# three tests need it. The SPEP albumin *fraction* is a separately measured quantity
+# from the CMP's `Albumin` and carries no parenthetical to keep it apart, so it is
+# deliberately absent from the shipped dictionary (issue #104's Out of scope) — which
+# is what makes it a valid fuse to construct here.
+_FUSING_ALBUMIN_PAIR = {"lab_result": [
+    {"test_name": "Protein Electrophoresis Albumin Fraction",
+     "collected_at": "2026-01-02", "value_num": 4.2},
+    {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+]}
+_FUSING_ALBUMIN_SYNONYM = {"protein electrophoresis albumin fraction": "albumin"}
+
+
 def test_rekey_dry_run_reports_without_writing(conn):
     doc = _make_document(conn)
     # Committed with the shipped dictionary, where "cl" has no synonym.
@@ -756,17 +869,17 @@ def test_rekey_is_idempotent(conn):
 
 
 def test_rekey_refuses_a_dictionary_that_fuses_two_facts(conn):
-    """Two methods for one analyte off one draw (CMP ALB vs SPEP Albumin) must not be
-    merged by a synonym: the colliding table keeps every stored key."""
+    """Two methods for one analyte off one draw (the SPEP albumin *fraction* vs a CMP
+    Albumin) must not be merged by a synonym: the colliding table keeps every stored
+    key. The pair doubles as a pin on that fraction label staying unmapped in the
+    shipped dictionary (issue #104) — mapping it is exactly this fuse."""
     doc = _make_document(conn)
-    dedup.commit_extraction(conn, doc, {"lab_result": [
-        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
-        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
-    ]}, dedup.load_dictionary(DICT_PATH))
+    dedup.commit_extraction(conn, doc, _FUSING_ALBUMIN_PAIR,
+                            dedup.load_dictionary(DICT_PATH))
     before = {r["lab_result_id"]: r["dedup_key"]
               for r in conn.execute("SELECT lab_result_id, dedup_key FROM lab_result")}
 
-    report = dedup.rekey(conn, _rekey_dict(alb="albumin"), apply=True)
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True)
 
     assert [c.kind for c in report.collisions] == ["fused"]
     assert "same dedup_key" in report.collisions[0].message
@@ -819,11 +932,9 @@ def test_rekey_dry_run_reports_every_collision_instead_of_stopping_at_the_first(
     definition, so it must enumerate all collisions in all tables rather than abort on
     the first and force a serial edit-and-rerun loop."""
     d_new = _collide_allergy_and_move_condition(conn)
-    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
-        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
-        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
-    ]}, dedup.load_dictionary(DICT_PATH))
-    d_new["alb"] = "albumin"
+    dedup.commit_extraction(conn, _make_document(conn), _FUSING_ALBUMIN_PAIR,
+                            dedup.load_dictionary(DICT_PATH))
+    d_new.update(_FUSING_ALBUMIN_SYNONYM)
     before = {t: _keys(conn, t, c) for t, c in
               (("allergy", "substance"), ("lab_result", "test_name"),
                ("condition", "name"))}
@@ -1070,13 +1181,12 @@ def test_rekey_names_a_doubled_fact_instead_of_blaming_the_dictionary(conn):
 
 def test_rekey_still_blames_the_dictionary_when_it_fuses_distinct_facts(conn):
     """The other cause keeps its own message: two *different* payloads recomputing onto
-    one key really is a dictionary that merges distinct facts."""
+    one key really is a dictionary that merges distinct facts (here the SPEP albumin
+    fraction fused with the CMP `Albumin` off one draw)."""
     doc = _make_document(conn)
-    dedup.commit_extraction(conn, doc, {"lab_result": [
-        {"test_name": "ALB", "collected_at": "2026-01-02", "value_num": 4.2},
-        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
-    ]}, dedup.load_dictionary(DICT_PATH))
-    report = dedup.rekey(conn, _rekey_dict(alb="albumin"))
+    dedup.commit_extraction(conn, doc, _FUSING_ALBUMIN_PAIR,
+                            dedup.load_dictionary(DICT_PATH))
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM))
     assert [c.kind for c in report.collisions] == ["fused"]
     assert "two distinct facts" in report.collisions[0].message
 
