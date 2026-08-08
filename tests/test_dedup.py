@@ -179,12 +179,10 @@ _CORPUS_VARIANTS = [
 # on one date with an index-derived value, so a pair whose canonical token is already
 # listed there would stage a spurious conflict.
 _DICT_104_VARIANTS: list[tuple[str, str]] = [
-    ("ALB", "Albumin"),
     ("MG", "magnesium"),
     ("TPro", "Total Protein"),
-    ("TPro", "Protein, Total"),
-    ("TPro", "Protein, Total (SPEP)"),
-    ("TPro", "Protein Electrophoresis Total Protein"),
+    ("Protein, Total", "Protein, Total (SPEP)"),
+    ("Protein, Total", "Protein Electrophoresis Total Protein"),
     ("Kappa", "Kappa Free Light Chain, Serum"),
     ("Kappa", "Kappa Free Light Chains, Serum"),
     ("Lambda", "Lambda Free Light Chain, Serum"),
@@ -198,7 +196,6 @@ _DICT_104_VARIANTS: list[tuple[str, str]] = [
     ("AST", "AST (SGOT)"),
     ("TSH", "TSH (Thyroid Stimulating Hormone)"),
     ("LYM", "Lymphocytes (absolute)"),
-    ("NEU", "Neutrophils (absolute)"),
     ("MONO", "Monocytes (absolute)"),
     ("EO", "Eosinophils (absolute)"),
     ("BAS", "Basophils (absolute)"),
@@ -259,6 +256,12 @@ def test_synonym_additions_keep_qualifier_distinct_labels_apart():
     for a, b in (
         ("Albumin", "Albumin (SPEP)"),
         ("Albumin", "Protein Electrophoresis Albumin Fraction"),
+        # Issue #106: SPEP renderings print the BARE labels, so the CMP short codes
+        # must not fuse with them, and `Neutrophils (absolute)` stays unmapped until
+        # the doubled corpus row can be dropped (issue #107).
+        ("ALB", "Albumin"),
+        ("TPro", "Protein, Total"),
+        ("NEU", "Neutrophils (absolute)"),
         ("Lymphocytes %", "Lymphocytes (absolute)"),
         ("Neutrophils %", "Neutrophils (absolute)"),
         ("LDL cholesterol (direct)", "LDL cholesterol (calculated)"),
