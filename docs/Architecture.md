@@ -310,8 +310,9 @@ in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` r
 every stored key under the current dictionary (dry-run by default, `--apply` to write,
 values and provenance untouched). Two rows that recompute to one key are a **collision**,
 and the message names which of the two causes it is: *different* payloads mean the new
-synonym fuses two distinct facts (e.g. a CMP `ALB` and an SPEP `Albumin` off one draw) and
-the fix belongs in the dictionary; *identical* payloads mean one fact was filed twice, once
+synonym fuses two distinct facts (e.g. a CMP `Albumin` and an SPEP `Protein
+Electrophoresis Albumin Fraction` off one draw) and the fix belongs in the dictionary;
+*identical* payloads mean one fact was filed twice, once
 under a pre-drift key, and the fix belongs in the data.
 
 **A collision quarantines its own table, not the run** (issue #92). The record tables are
