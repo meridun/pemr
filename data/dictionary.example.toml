@@ -107,7 +107,11 @@
 "lym" = "lymphocytes_abs"
 "lymphocytes (absolute)" = "lymphocytes_abs"
 "neu" = "neutrophils_abs"
-"neutrophils (absolute)" = "neutrophils_abs"
+# `Neutrophils (absolute)` is deliberately NOT mapped to `neutrophils_abs` yet: the
+# corpus holds a payload-degraded duplicate of one NEU row (a visit note quoting the
+# same-day lab), and fusing the labels collides them with no row-level removal verb to
+# resolve it (issue #107). Restore this mapping once #107 lands and the doubled row is
+# dropped.
 "mono" = "monocytes_abs"
 "monocytes (absolute)" = "monocytes_abs"
 "eo" = "eosinophils_abs"
@@ -179,23 +183,26 @@
 
 # --- Serum protein ---
 # A CMP and an SPEP run off the SAME draw both report total protein (`TPro` /
-# `Protein, Total`) and albumin (`ALB` / `Albumin`) — different methods, slightly
-# different numbers, same person + same collected_at. Mapping `alb`->`albumin` used to
-# be unsafe for exactly that reason; issue #71's method-aware key fixed it, since the
-# SPEP row's `Albumin (SPEP)` label keys as `albumin (spep)`, distinct from the CMP's
-# bare `albumin`.
+# `Protein, Total`) and albumin (`ALB` / `Albumin`) — different methods, different
+# numbers, different reference intervals, same person + same collected_at. Issue #71's
+# method-aware key only protects the case where the SPEP row carries a `(SPEP)`
+# qualifier; the real corpus prints the BARE labels (`Albumin`, `Protein, Total`) on
+# SPEP renderings, so fusing them with the CMP codes collides two assays off one draw
+# (issue #106). Over-splitting is the safe direction, so:
 #
-# Total protein IS deliberately fused across the two methods (the SPEP carries the CMP
-# total protein forward — same-draw same-value evidence), whereas the separately
-# measured SPEP fraction labels (`Protein Electrophoresis Albumin Fraction`, the
-# globulin fractions) stay unmapped so they keep keys of their own.
-"alb" = "albumin"
-"albumin" = "albumin"
+#   * `alb` is NOT mapped to `albumin`: the bare `albumin` label is ambiguous — some
+#     renderings use it for the CMP assay, others for the SPEP fraction — so the CMP
+#     code keeps its own token and the bare label keys on itself.
+#   * The SPEP total-protein spellings get their own token; only the unambiguous CMP
+#     spellings share `protein_total`.
+#
+# The separately measured SPEP fraction labels (`Protein Electrophoresis Albumin
+# Fraction`, the globulin fractions) stay unmapped so they keep keys of their own.
 "tpro" = "protein_total"
 "total protein" = "protein_total"
-"protein, total" = "protein_total"
-"protein, total (spep)" = "protein_total"
-"protein electrophoresis total protein" = "protein_total"
+"protein, total" = "protein_total_spep"
+"protein, total (spep)" = "protein_total_spep"
+"protein electrophoresis total protein" = "protein_total_spep"
 # Urine total protein is a different analyte from the serum one, so it keeps its own
 # canonical token; the second key is the comma-spacing variant some reports print.
 "protein,total,urine" = "protein_total_urine"

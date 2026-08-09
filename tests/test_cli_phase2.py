@@ -797,8 +797,8 @@ def test_keep_both_no_op_line_names_the_fields_it_filled(ready, capsys):
 # redundant-alias rule and `Hemoglobin`/`hemoglobin` rides _collapse()'s casefold -
 # and they are listed here precisely so "no entry needed" stays a tested claim.
 _DICT_104_CLI_PAIRS: list[tuple[str, str]] = [
-    ("ALB", "Albumin"),
-    ("TPro", "Protein, Total (SPEP)"),
+    ("TPro", "Total Protein"),
+    ("Protein, Total (SPEP)", "Protein Electrophoresis Total Protein"),
     ("MG", "magnesium"),
     ("BMG", "Beta-2 Microglobulin"),
     ("BUN", "Urea Nitrogen (BUN)"),
@@ -810,7 +810,6 @@ _DICT_104_CLI_PAIRS: list[tuple[str, str]] = [
     ("Lambda", "Lambda Free Light Chain, Serum"),
     ("K/L Ratio", "Kappa/Lambda Free Light Chain Ratio"),
     ("LYM", "Lymphocytes (absolute)"),
-    ("NEU", "Neutrophils (absolute)"),
     ("MONO", "Monocytes (absolute)"),
     ("EO", "Eosinophils (absolute)"),
     ("BAS", "Basophils (absolute)"),
@@ -829,6 +828,12 @@ _DICT_104_CLI_PAIRS: list[tuple[str, str]] = [
 # on keys of their own (issue #71's qualifier constraint plus the short codes #104
 # deliberately excluded). Every one of these has to commit as a new row.
 _DICT_104_CLI_DISTINCT: list[str] = [
+    # Issue #106: SPEP renderings print bare labels, so the CMP codes and the bare
+    # forms must stay apart; `Neutrophils (absolute)` is unmapped pending #107.
+    "ALB",
+    "Albumin",
+    "NEU",
+    "Neutrophils (absolute)",
     "Albumin (SPEP)",
     "Protein Electrophoresis Albumin Fraction",
     "Bicarbonate",
