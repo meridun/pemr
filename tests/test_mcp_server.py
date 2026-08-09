@@ -477,3 +477,13 @@ def test_server_info_advertises_pemr_version():
     opts = mcp_server.build_server()._mcp_server.create_initialization_options()
     assert opts.server_name == "pemr"
     assert opts.server_version == __version__
+
+
+def test_curation_verbs_are_not_on_the_mcp_surface():
+    """Trust boundary (issue #109, the `document rm` / `record rm` precedent): a
+    human's clinical verdict is CLI-only. AGENTS.md's blessed write set is
+    commit_extraction/person_add/person_edit/ingest/document_set_text, and
+    `record annotate` is deliberately not in it - read or write."""
+    surface = " ".join(mcp_server.TOOL_NAMES).lower()
+    for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
+        assert spelling not in surface, spelling

@@ -178,7 +178,11 @@ def query_meds(
 
 
 def query_timeline(
-    conn: sqlite3.Connection, slug: str, since: str | None = None
+    conn: sqlite3.Connection,
+    slug: str,
+    since: str | None = None,
+    *,
+    with_identity: bool = False,
 ) -> list[dict]:
     """Merged chronological event stream across the typed tables + observations.
 
@@ -188,17 +192,38 @@ def query_timeline(
     ``condition-resolved``); family-history rows contribute none.
     Events without a usable date are omitted (they cannot be placed on a timeline).
     ``since`` (a date) drops events strictly before it. Ordered oldest first.
+
+    ``with_identity=True`` additionally stamps ``record_type`` and ``dedup_base`` on
+    every event — the family identity `render_journal` needs to apply the `curation`
+    overlay (issue #109), which the event contract otherwise has no way to express.
+    Opt-in and **default-off** on purpose: ``dedup_base`` is one of
+    :data:`dedup.INTERNAL_COLUMNS`, deliberately stripped from the CLI ``--json`` and
+    MCP read payloads, so widening the default event shape would leak an unstable key
+    into both contracts.
     """
     person_id = resolve_person_id(conn, slug)
     events: list[dict] = []
 
-    def add(when: object, etype: str, summary: str, document_id: object) -> None:
+    def add(
+        when: object,
+        etype: str,
+        summary: str,
+        row: sqlite3.Row,
+        record_type: str,
+    ) -> None:
         d = _date_part(when)
         if not d:
             return
-        events.append(
-            {"date": d, "type": etype, "summary": summary, "document_id": document_id}
-        )
+        event = {
+            "date": d,
+            "type": etype,
+            "summary": summary,
+            "document_id": row["document_id"],
+        }
+        if with_identity:
+            event["record_type"] = record_type
+            event["dedup_base"] = row["dedup_base"]
+        events.append(event)
 
     for r in conn.execute(
         "SELECT * FROM lab_result WHERE person_id = ?", (person_id,)
@@ -207,20 +232,21 @@ def query_timeline(
         unit = f" {r['unit']}" if r["unit"] else ""
         flag = f" [{r['flag']}]" if r["flag"] else ""
         val = "" if value is None else f" {value}{unit}"
-        add(r["collected_at"], "lab", f"{r['test_name']}{val}{flag}".strip(), r["document_id"])
+        add(r["collected_at"], "lab", f"{r['test_name']}{val}{flag}".strip(), r,
+            "lab_result")
 
     for r in conn.execute(
         "SELECT * FROM medication WHERE person_id = ?", (person_id,)
     ).fetchall():
         dose = f" {r['dose']}" if r["dose"] else ""
-        add(r["started_on"], "med-start", f"started {r['name']}{dose}", r["document_id"])
-        add(r["ended_on"], "med-stop", f"stopped {r['name']}", r["document_id"])
+        add(r["started_on"], "med-start", f"started {r['name']}{dose}", r, "medication")
+        add(r["ended_on"], "med-stop", f"stopped {r['name']}", r, "medication")
 
     for r in conn.execute(
         "SELECT * FROM procedure WHERE person_id = ?", (person_id,)
     ).fetchall():
         outcome = f" - {r['outcome']}" if r["outcome"] else ""
-        add(r["performed_on"], "procedure", f"{r['name']}{outcome}", r["document_id"])
+        add(r["performed_on"], "procedure", f"{r['name']}{outcome}", r, "procedure")
 
     for r in conn.execute(
         "SELECT * FROM appointment WHERE person_id = ?", (person_id,)
@@ -228,7 +254,7 @@ def query_timeline(
         who = " ".join(p for p in (r["provider"], r["specialty"]) if p)
         why = r["reason"] or r["summary"] or ""
         summary = " - ".join(p for p in (who, why) if p) or "appointment"
-        add(r["scheduled_for"], "appointment", summary, r["document_id"])
+        add(r["scheduled_for"], "appointment", summary, r, "appointment")
 
     for r in conn.execute(
         "SELECT * FROM observation WHERE person_id = ?", (person_id,)
@@ -240,7 +266,7 @@ def query_timeline(
             parts.append(str(r["key"]))
         detail = " ".join(parts)
         val = "" if value is None else f" = {value}{unit}"
-        add(r["observed_at"], "observation", f"{detail}{val}".strip(), r["document_id"])
+        add(r["observed_at"], "observation", f"{detail}{val}".strip(), r, "observation")
 
     for r in conn.execute(
         "SELECT * FROM condition WHERE person_id = ?", (person_id,)
@@ -249,14 +275,14 @@ def query_timeline(
         # family history is deliberately absent from the timeline (issue #63).
         if enum_token(r["status"]) == "family-history":
             continue
-        add(r["onset_on"], "condition", f"{r['name']} ({r['status']})", r["document_id"])
-        add(r["resolved_on"], "condition-resolved", f"resolved {r['name']}",
-            r["document_id"])
+        add(r["onset_on"], "condition", f"{r['name']} ({r['status']})", r, "condition")
+        add(r["resolved_on"], "condition-resolved", f"resolved {r['name']}", r,
+            "condition")
 
     for r in conn.execute(
         "SELECT * FROM allergy WHERE person_id = ?", (person_id,)
     ).fetchall():
-        add(r["noted_on"], "allergy", f"{r['substance']} allergy", r["document_id"])
+        add(r["noted_on"], "allergy", f"{r['substance']} allergy", r, "allergy")
 
     if since:
         cutoff = _date_part(since)

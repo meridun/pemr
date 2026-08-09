@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import db, ingest
+from . import curation, db, dedup, ingest
 
 # Row counts reported, in a stable order. A table missing from the schema (a snapshot
 # predating its migration, checked before `restore` runs `migrate`) is simply omitted.
@@ -29,6 +29,7 @@ COUNTED_TABLES = (
     "person",
     "document",
     "document_tombstone",
+    "curation",
     "lab_result",
     "medication",
     "procedure",
@@ -57,6 +58,11 @@ class VerifyReport:
     blobs_mismatched: int = 0
     blobs_skipped: str | None = None  # why the blob pass was skipped, if it was
     problems: list[str] = field(default_factory=list)
+    #: Things a human should look at that are **not** failures. Until issue #109 every
+    #: string this module appended failed the report; the curation overlay introduces a
+    #: state that is worth surfacing and wrong to fail on (a verdict whose family was
+    #: legitimately removed is untidy, not corrupt), so the warn/fail split lives here.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -66,6 +72,8 @@ class VerifyReport:
         integrity, an un-migrated database, a missing or mismatched blob - so that list
         is the single source of truth. A *skipped* blob pass is deliberately not a
         problem: unconfigured or mid-sync `sources/` must not fail a restore.
+        :attr:`warnings` is deliberately *not* consulted: a warning is an observation,
+        and an observation that flips the exit code is a failure wearing a softer word.
         """
         return not self.problems
 
@@ -82,6 +90,7 @@ class VerifyReport:
                 "skipped": self.blobs_skipped,
             },
             "problems": list(self.problems),
+            "warnings": list(self.warnings),
             "ok": self.ok,
         }
 
@@ -135,6 +144,40 @@ def _check_blobs(
         report.blobs_ok += 1
 
 
+def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
+    """Warn about `curation` verdicts that no longer point at anything (issue #109).
+
+    The overlay deliberately has no FK to the row it annotates - a verdict has to
+    outlive `rekey`, re-ingest and `record rm` occurrence shifts - so nothing in the
+    schema notices when the last row of an annotated family is removed. The verdict is
+    then inert: it rules on a fact no document renders. That is untidy, not corrupt,
+    and usually intentional (the human removed the row *because* they ruled on it), so
+    it warns rather than fails. `pemr record annotate --clear` lifts it.
+    """
+    if not curation.has_table(conn):
+        return
+    for (record_type, base), verdict in curation.load_verdicts(conn).items():
+        short = str(base)[:12]
+        if record_type not in dedup.FIELD_SPECS:
+            # A hand-edited row can name any table; never build a query from it.
+            report.warnings.append(
+                f"curation verdict {record_type}/{short}... names an unknown record "
+                f"type (known: {', '.join(dedup.KNOWN_TYPES)})"
+            )
+            continue
+        if not dedup.load_family(conn, record_type, base):
+            report.warnings.append(
+                f"curation verdict {record_type}/{short}... has no live family "
+                "(removed?) - lift it with `pemr record annotate --clear`"
+            )
+        target = verdict.get("merged_into_base")
+        if target and not dedup.load_family(conn, record_type, target):
+            report.warnings.append(
+                f"curation verdict {record_type}/{short}... merges into "
+                f"{str(target)[:12]}..., which has no live family"
+            )
+
+
 def verify_report(
     conn: sqlite3.Connection, sources_dir: str | Path | None = None
 ) -> VerifyReport:
@@ -156,6 +199,8 @@ def verify_report(
         report.problems.append("database has no schema applied")
 
     report.row_counts = row_counts(conn)
+    if db.is_migrated(conn):
+        _check_curation(conn, report)
 
     if sources_dir is None:
         report.blobs_skipped = "no sources dir configured"
@@ -195,6 +240,14 @@ def format_report(report: VerifyReport) -> list[str]:
         for problem in report.problems[:PROBLEM_DISPLAY_LIMIT]:
             lines.append(f"  - {problem}")
         hidden = len(report.problems) - PROBLEM_DISPLAY_LIMIT
+        if hidden > 0:
+            lines.append(f"  ... and {hidden} more (use --json for the full list)")
+    # Only when non-empty: a clean database's console output is unchanged.
+    if report.warnings:
+        lines.append(f"warnings       {len(report.warnings)}")
+        for warning in report.warnings[:PROBLEM_DISPLAY_LIMIT]:
+            lines.append(f"  - {warning}")
+        hidden = len(report.warnings) - PROBLEM_DISPLAY_LIMIT
         if hidden > 0:
             lines.append(f"  ... and {hidden} more (use --json for the full list)")
     return lines
