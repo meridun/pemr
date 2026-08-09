@@ -61,13 +61,16 @@ Write tools (mutate the DB; the only tools that do):
 
 Read/write separation is also declared to the client via MCP `readOnlyHint` annotations.
 
-**Deletion — and clinical verdicts — are never an MCP tool.** `document rm`, `record rm` (the
-CLI's destructive verbs — the latter added by issue #107), and `record annotate` (issue #109) are
-deliberately excluded from the tool surface above. This is what keeps "an agent cannot delete PHI"
-true: removing a document or a single record row is a human-at-a-terminal action only, never
-something an agent can reach through this server. `record annotate` joins them for the adjacent
-reason — a `curation` verdict is a human's clinical judgment, and writing one can drop a record
-out of every generated document without deleting a row.
+**Deletion — and clinical verdicts, and unsourced writes — are never an MCP tool.** `document rm`,
+`record rm` (the CLI's destructive verbs — the latter added by issue #107), `record annotate`
+(issue #109), and `record assert` (issue #110) are deliberately excluded from the tool surface
+above. This is what keeps "an agent cannot delete PHI" true: removing a document or a single
+record row is a human-at-a-terminal action only, never something an agent can reach through this
+server. `record annotate` joins them for the adjacent reason — a `curation` verdict is a human's
+clinical judgment, and writing one can drop a record out of every generated document without
+deleting a row. `record assert` is the sharpest case of all — it is a *write*, not a deletion, and
+the only path in the system that can put a fact into the record with no external source; only a
+human at the CLI may vouch for one.
 
 ## MUST rules
 
