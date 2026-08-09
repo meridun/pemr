@@ -81,7 +81,8 @@ CREATE TABLE person (
 );
 ```
 
-Provenance — every structured row traces to a source document:
+Provenance — every structured row traces to a source document **or to a named human
+attestation** (issue #110; the three row states are spelled out below the typed tables):
 
 ```sql
 CREATE TABLE document (
@@ -238,6 +239,26 @@ CREATE TABLE observation (
 );
 ```
 
+**Attestation columns** (migration 009, issue #110). Every one of the seven typed tables
+above additionally carries `attested_by` / `attested_on` / `attested_at`, all nullable and
+all omitted from the DDL for readability. They are the second legal provenance: `document_id`
+was already nullable at the DB level, and this is what makes a NULL there *meaningful*
+rather than a bug. Written only by `record assert` (CLI-only — never an MCP tool), never
+accepted from an extraction JSON, and deliberately absent from `dedup.FIELD_SPECS`, so keys
+are bit-identical for attested and document-sourced rows alike. Unlike `curation` this is
+**not** an overlay: an attestation is the row's own provenance and dies with the row, so it
+lives in columns rather than a sibling table. Three states, all derived
+(`dedup.attestation_state`), none stored twice:
+
+| state | predicate | renders as |
+|---|---|---|
+| document-sourced | `attested_by IS NULL` | an ordinary fact |
+| live attestation | `attested_by IS NOT NULL AND document_id IS NULL` | tagged `(attested by <who> <date>; no source document)` in **every** section |
+| superseded | `attested_by IS NOT NULL AND document_id IS NOT NULL` | an ordinary fact; the attestation is retained as history |
+
+Supersession is therefore just the attested row acquiring a `document_id` — nothing is
+deleted and the attestation columns are never cleared. See §3 for when that happens.
+
 Promotion path: an `obs_type` that grows important graduates from `observation`
 into its own typed table via a migration. The generic table absorbs the long tail so
 you're never blocked waiting on schema work. `condition` and `allergy` are the worked
@@ -300,6 +321,29 @@ new/duplicate/conflict). A stated value never overwrites a stored one on that pa
 enrichment cannot launder a disagreement into a silent overwrite. The same reading governs
 `keep incoming` on these types: it writes the fields the incoming row states and leaves the
 rest as stored, so a one-field adjudication doesn't erase the row's other payload.
+
+**Document provenance outranks an attestation** (issue #110). An attested row keys exactly
+like a document-sourced one, so a later `commit-extraction` of the same fact lands in the
+same identity family and the ordinary duplicate/conflict split decides the outcome — no new
+comparison path:
+
+* **payloads agree** — the document confirms what the family attested. This is the
+  *duplicate* branch, where by construction there is nothing to adjudicate, so the row is
+  **promoted in place**: it takes the `document_id`, keeps its attestation columns as
+  history, and the commit reports it under a fifth bucket, `promoted`. Same reading as
+  enrichment above — a stored NULL under a stated incoming value is a gain, not a
+  disagreement; here the NULL is `document_id`.
+* **payloads differ** — unchanged: a conflict is staged for a human. There is no
+  justification for auto-resolving a disagreement, only for recording an agreement.
+  `keep incoming` then promotes the row (it already writes `document_id`), `keep existing`
+  leaves the attestation live, and `keep both` admits the document row as the next
+  occurrence beside it.
+
+The mirror case — `record assert` onto a family the record already holds — is **refused,
+not staged**: an equal payload reports "already recorded" and writes nothing, a differing
+one raises and names the stored row. Same reason `commit_extraction`'s pass 1 refuses two
+colliding rows of one submission: the human is at the keyboard, and a conflict staged
+against oneself has no independent provenance to adjudicate.
 
 `norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
 synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
@@ -616,6 +660,11 @@ pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attribut
                                                          # pure overlay - no record row is mutated; dry run by default
 pemr record annotate --list [<table>] [--json]           # current verdicts, newest first (orphans flagged)
 pemr record annotate <table> <base-or-id> --clear [--apply]      # lift one verdict
+pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
+                   --field NAME=VALUE [--field ...] [--apply]
+                                                         # commit a fact attested by a PERSON, with no
+                                                         # source document (§2 attestation); dry run by default
+pemr record assert --list [<table>] [--all] [--json]     # attested rows still needing a source document
 pemr document tombstone list [--json]                    # recorded intentional removals, newest first
 pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]
                                                          # pre-emptive exclusion; ingests and copies nothing
@@ -664,14 +713,16 @@ annotations expose the read/write split to the client.
 `commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
-`document rm`, `record rm` (issue #107) and `record annotate` (issue #109) are deliberately
-**absent** from `WRITE_TOOLS` — this is a rule, not an oversight. Deletion of PHI stays a
-human-at-a-terminal action; no MCP tool, and therefore no agent, can remove a record or a
-document. `record annotate` joins them for the adjacent reason: a `curation` verdict is a
-*human's clinical judgment*, recorded with attribution, and an agent that could write one could
-make a record disappear from every generated document without deleting a row. Any future
-destructive — or render-altering — verb should default to the same exclusion unless a human
-explicitly decides otherwise.
+`document rm`, `record rm` (issue #107), `record annotate` (issue #109) and `record assert`
+(issue #110) are deliberately **absent** from `WRITE_TOOLS` — this is a rule, not an
+oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and therefore no
+agent, can remove a record or a document. `record annotate` joins them for the adjacent
+reason: a `curation` verdict is a *human's clinical judgment*, recorded with attribution, and
+an agent that could write one could make a record disappear from every generated document
+without deleting a row. `record assert` is the sharpest case of all — it is a *write*, not a
+deletion, and the only path in the system that can put a fact into the record with no
+external source. Any future destructive — or render-altering, or unsourced — verb should
+default to the same exclusion unless a human explicitly decides otherwise.
 
 ---
 
