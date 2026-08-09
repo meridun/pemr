@@ -21,10 +21,13 @@ verdict changes output because the database changed, which is the point.
 
 **Keyed by ``(record_type, dedup_base)``**, not by row id and not by ``dedup_key``.
 ``dedup_base`` is the stable per-family identity across occurrence renumbering
-(Architecture.md §3), so a verdict survives `pemr rekey`, a re-ingest of the same
-document, and the occurrence shifts `record rm` (#107) leaves behind. One live verdict
-per family: re-annotating overwrites (last verdict wins), which is what "a human ruled"
-means — there is no verdict history here by design.
+(Architecture.md §3), so a verdict survives a re-ingest of the same document and the
+occurrence shifts `record rm` (#107) leaves behind. It does *not* survive every
+`pemr rekey`: a dictionary edit that changes this family's own canonical name moves its
+``dedup_base``, orphaning the verdict (`pemr verify` warns; `record annotate --clear`
+then re-annotate). One live verdict per family: re-annotating overwrites (last verdict
+wins), which is what "a human ruled" means — there is no verdict history here by
+design.
 
 The module imports :mod:`db` and :mod:`dedup` only, keeping the import graph acyclic;
 `render` and `verify` import *it*.

@@ -14,8 +14,11 @@
 --
 -- Keyed by (record_type, dedup_base), NOT by row id and NOT by dedup_key. `dedup_base`
 -- is the stable per-family identity across occurrence renumbering (Architecture.md §3),
--- so a verdict survives `pemr rekey`, a re-ingest of the same document, and the
--- occurrence shifts `record rm` (#107) produces. A row-id or dedup_key join would not.
+-- so a verdict survives a re-ingest of the same document and the occurrence shifts
+-- `record rm` (#107) produces. A row-id or dedup_key join would not. `pemr rekey` only
+-- preserves it when the family's own key fields are untouched: a dictionary edit that
+-- changes this family's canonical name moves its dedup_base too, orphaning the verdict
+-- (`pemr verify` warns; re-annotate after rekeying).
 --
 -- No FK to the row it annotates (the 007 document_tombstone precedent): the verdict has
 -- to outlive key churn and removals, including the removal of the family itself - an
