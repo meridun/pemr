@@ -111,8 +111,10 @@ CREATE TABLE document_tombstone (
 -- Recorded human verdicts over record families (issue #109). A pure overlay: no record
 -- row is ever mutated, and a family with no row here renders exactly as before. Keyed
 -- by (record_type, dedup_base) - the stable family identity of §3 - so a verdict
--- outlives occurrence renumbering and `record rm`. Like 007 it carries no FK to the row
--- it annotates, and `pemr verify` warns (never fails) on a verdict whose family is gone.
+-- outlives occurrence renumbering and `record rm`, but NOT a dictionary-driven `rekey`
+-- that renames the family itself: that moves `dedup_base` too, and orphans the verdict
+-- exactly like a removed row would. Like 007 it carries no FK to the row it annotates,
+-- and `pemr verify` warns (never fails) on a verdict whose family is gone either way.
 -- Written only by `record annotate`; read at render time by every generated document.
 CREATE TABLE curation (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
@@ -695,7 +697,10 @@ Every section is filtered at read time against the `curation` overlay (§2, issu
 `confirmed` renders unchanged. Both new sections are omitted entirely when empty, so a record
 with no verdicts renders byte-identically to before the overlay existed. This does not weaken
 the purity rule: the filter is a read, and output changes after a verdict because the
-*database* changed.
+*database* changed. One consequence of the read-time join: if a dictionary-driven `rekey`
+(§3) has renamed a family since its verdict was recorded, the join misses and the family
+renders as if unannotated — `pemr verify` flags the orphaned verdict, but nothing re-attaches
+it automatically.
 
 Because they regenerate from truth, they never drift. Old exports are disposable.
 

@@ -148,11 +148,13 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     """Warn about `curation` verdicts that no longer point at anything (issue #109).
 
     The overlay deliberately has no FK to the row it annotates - a verdict has to
-    outlive `rekey`, re-ingest and `record rm` occurrence shifts - so nothing in the
-    schema notices when the last row of an annotated family is removed. The verdict is
-    then inert: it rules on a fact no document renders. That is untidy, not corrupt,
-    and usually intentional (the human removed the row *because* they ruled on it), so
-    it warns rather than fails. `pemr record annotate --clear` lifts it.
+    outlive re-ingest, `record rm` occurrence shifts, and any `rekey` that leaves this
+    family's own key fields untouched - so nothing in the schema notices when the last
+    row of an annotated family is removed, or when a dictionary-driven rekey moves a
+    family onto a new `dedup_base`. Either way the verdict goes inert: it rules on a
+    fact no document renders. That is untidy, not corrupt, and often intentional (the
+    human removed the row *because* they ruled on it, or the rekey just relabeled it),
+    so it warns rather than fails. `pemr record annotate --clear` lifts it.
     """
     if not curation.has_table(conn):
         return
