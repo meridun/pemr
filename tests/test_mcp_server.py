@@ -487,3 +487,14 @@ def test_curation_verbs_are_not_on_the_mcp_surface():
     surface = " ".join(mcp_server.TOOL_NAMES).lower()
     for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
         assert spelling not in surface, spelling
+
+
+def test_record_assert_is_not_on_the_mcp_surface():
+    """Trust boundary (issue #110): `record assert` is the one path that can put a fact
+    in the record with no external source, so it is CLI-only - the same standing as
+    `document rm` / `record rm` / `record annotate`. AGENTS.md's blessed write set is
+    commit_extraction/person_add/person_edit/ingest/document_set_text."""
+    surface = " ".join(mcp_server.TOOL_NAMES).lower()
+    for spelling in ("assert", "attest", "record_assert", "attestation"):
+        assert spelling not in surface, spelling
+    assert "record_assert" not in mcp_server.WRITE_TOOLS

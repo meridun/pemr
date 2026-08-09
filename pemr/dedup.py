@@ -109,6 +109,14 @@ KNOWN_TYPES = tuple(FIELD_SPECS)
 # CLI `--json` and MCP read payloads (unstable, not part of either contract).
 INTERNAL_COLUMNS = ("dedup_key", "dedup_base", "dedup_occurrence")
 
+# Human-attestation provenance columns on every record table (migration 009, issue #110).
+# Deliberately NOT in :data:`INTERNAL_COLUMNS` — those are stripped from `--json`/MCP
+# payloads, and provenance is the one thing that must stay visible. Equally deliberately
+# NOT in :data:`FIELD_SPECS`: like ``document_id`` they are never accepted from an agent's
+# extraction JSON, and their absence from the specs is what keeps every dedup key
+# bit-identical for attested and document-sourced rows alike.
+ATTESTATION_COLUMNS = ("attested_by", "attested_on", "attested_at")
+
 # Date-typed fields per record type. These feed timeline sort / trends date math and
 # the dedup_key (via _date_only), all of which assume a lexically-sortable ISO date —
 # so validate_row enforces ISO on them, not just the base `str` type. A partial
@@ -526,6 +534,57 @@ def _type_names(types: object) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Attestation provenance (issue #110)
+# --------------------------------------------------------------------------- #
+
+def attestation_state(row: sqlite3.Row | dict) -> str:
+    """Which of the three provenance states a stored row is in (migration 009):
+
+        ``""``            document-sourced — the only state before this feature;
+        ``"attested"``    a live human attestation, still needing a source document;
+        ``"superseded"``  attested, and since backed by a real document.
+
+    The single place the predicates are written down, so nothing else has to re-derive
+    "is this row unsourced" from two nullable columns. A pre-009 row (a snapshot restored
+    from before the migration) has no attestation columns at all and reads as
+    document-sourced, which is exactly what it is.
+    """
+    row_map = dict(row)
+    if not (row_map.get("attested_by") or "").strip():
+        return ""
+    return "superseded" if row_map.get("document_id") is not None else "attested"
+
+
+def is_attested(row: sqlite3.Row | dict) -> bool:
+    """True for a **live** attestation — attested and not yet backed by a document.
+
+    This is the render/query predicate: a superseded row has real document provenance
+    now, so it renders as an ordinary fact (its attestation survives as history on the
+    row, not as a marker on the page).
+    """
+    return attestation_state(row) == "attested"
+
+
+def public_row(row: sqlite3.Row | dict) -> dict:
+    """A record row reduced to its published read contract (CLI ``--json`` / MCP).
+
+    :data:`INTERNAL_COLUMNS` always go — unstable key machinery, never part of either
+    contract. The attestation columns go only when they are **NULL**: a document-sourced
+    row keeps the exact key set it had before migration 009 (the additive-only
+    guarantee), while an attested row carries its provenance, which is the whole point of
+    the feature and must never be quietly stripped.
+
+    One function rather than one rule per front door: a payload that discloses provenance
+    at the CLI but not over MCP is the drift this feature can least afford.
+    """
+    return {
+        name: value for name, value in dict(row).items()
+        if name not in INTERNAL_COLUMNS
+        and not (name in ATTESTATION_COLUMNS and value is None)
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Commit extraction (new / duplicate / conflict split)
 # --------------------------------------------------------------------------- #
 
@@ -535,6 +594,8 @@ class CommitSummary:
     duplicate: list[tuple[str, str]] = field(default_factory=list)    # (type, dedup_key)
     enriched: list[tuple[str, int]] = field(default_factory=list)     # (type, row_id)
     conflict: list[tuple[str, int]] = field(default_factory=list)     # (type, conflict_id)
+    # Live attestations this commit backed with a real document (issue #110).
+    promoted: list[tuple[str, int]] = field(default_factory=list)     # (type, row_id)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -543,6 +604,7 @@ class CommitSummary:
             "duplicate": len(self.duplicate),
             "enriched": len(self.enriched),
             "conflict": len(self.conflict),
+            "promoted": len(self.promoted),
         }
 
 
@@ -807,16 +869,30 @@ def commit_extraction(
                     (f for f in family if _rows_equal(record_type, f, row)), None
                 )
                 if twin is not None:
+                    twin_id = int(twin[f"{record_type}_id"])
+                    # The document confirms a fact the family attested before it had a
+                    # source (issue #110). Payloads agree, so by construction there is
+                    # nothing to adjudicate: this is the duplicate path, and the stored
+                    # NULL being filled happens to be `document_id`. Framed exactly as
+                    # #63 framed enrichment — a stored NULL under a stated incoming value
+                    # is a GAIN, not a disagreement. A *differing* payload never reaches
+                    # here; it stages a conflict below, which is the honest handling of
+                    # "the document contradicts what we were told".
+                    promoted = is_attested(twin)
+                    if promoted:
+                        _promote_attestation(conn, record_type, twin_id, document_id)
+                        summary.promoted.append((record_type, twin_id))
                     # A standing fact whose stored row lacks a field this document
                     # states is not a duplicate to drop — fill the NULL in place
                     # (issue #63). Nothing to adjudicate, so no conflict is staged,
                     # but the write is reported rather than being invisible.
                     gains = _sparse_gains(record_type, twin, row)
-                    twin_id = int(twin[f"{record_type}_id"])
                     if gains:
                         _enrich_record(conn, record_type, twin_id, gains)
                         summary.enriched.append((record_type, twin_id))
-                    else:
+                    elif not promoted:
+                        # `duplicate` means "nothing was written". A promotion writes, so
+                        # it is reported under its own bucket instead of both.
                         summary.duplicate.append((record_type, twin["dedup_key"]))
                 else:
                     # Stage against occurrence 0: it is the row the conflict's
@@ -908,11 +984,19 @@ def _insert_record(
     document_id: int | None,
     base: str,
     occurrence: int = 0,
+    *,
+    attestation: tuple[str, str, str] | None = None,
 ) -> int:
+    """Insert one validated row. ``attestation`` is ``(by, on, at)`` for a row whose
+    provenance is a person rather than a document (issue #110); every other caller leaves
+    it ``None`` and the columns stay NULL, exactly as before migration 009."""
     columns = ["person_id", "document_id", "dedup_key", "dedup_base", "dedup_occurrence"]
     values: list[object] = [
         person_id, document_id, occurrence_key(base, occurrence), base, occurrence,
     ]
+    if attestation is not None:
+        columns.extend(ATTESTATION_COLUMNS)
+        values.extend(attestation)
     for name in FIELD_SPECS[record_type]:
         if name in row and row[name] is not None:
             columns.append(name)
@@ -923,6 +1007,36 @@ def _insert_record(
         values,
     )
     return int(cur.lastrowid)
+
+
+def _promote_attestation(
+    conn: sqlite3.Connection, record_type: str, row_id: int, document_id: int
+) -> None:
+    """Back a live attestation with the document that just confirmed it (issue #110).
+
+    Sets ``document_id`` on the attested row and touches nothing else — not the payload,
+    not the keys, not the attestation columns, which stay as the history of what the
+    record knew before the document arrived. The row simply stops being renderable as
+    unsourced.
+
+    Confined to ``NULL -> id`` on a row that carries ``attested_by``: this is the only
+    path outside conflict resolution that writes ``document_id`` onto a stored row, and it
+    can never overwrite an existing one. The complement of :func:`_enrich_record`, which
+    deliberately leaves provenance alone because there the NULL is a payload column; here
+    provenance *is* the NULL being filled. A rowcount other than 1 is an error, never a
+    silent success (the :func:`_overwrite_record` guard idiom).
+    """
+    cur = conn.execute(
+        f"UPDATE {record_type} SET document_id = ? "
+        f"WHERE {record_type}_id = ? AND document_id IS NULL "
+        "AND attested_by IS NOT NULL",
+        (document_id, row_id),
+    )
+    if cur.rowcount != 1:
+        raise ValidationError(
+            f"promoting {record_type} row {row_id} to document {document_id} matched no "
+            "live attestation - refusing to record the promotion"
+        )
 
 
 def _stage_conflict(
@@ -1437,6 +1551,11 @@ def _overwrite_record(
     didn't say", so a single-field adjudication ("criticality: low, not high") must not
     also erase the reaction and noted_on the incoming document simply didn't repeat
     (issue #63). Fields it *does* state win, which is what keep-incoming means.
+
+    When the anchor is a live attestation, writing ``document_id`` here **is** the
+    conflict-flow supersession (issue #110): the human ruled for the document, so the row
+    takes both its payload and its provenance, and the attestation columns stay behind as
+    history. No extra code path — the assignment was already unconditional.
     """
     sparse = record_type in _SPARSE_TYPES
     assignments = ["document_id = ?"]

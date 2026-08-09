@@ -211,3 +211,39 @@ def test_record_annotate_output_is_console_safe(ready, capsys):
     assert "warnings" in captured.out
     _assert_console_safe(captured.out)
     _assert_console_safe(captured.err)
+
+
+def test_record_assert_output_is_console_safe(ready, capsys):
+    """Issue #110's new CLI + render surface: the report block, the `--list` table, the
+    collision refusal, and the `(attested by ...)` marker in every render."""
+    with pytest.raises(SystemExit):
+        _run(ready, "record", "assert", "--help")
+    _assert_console_safe(capsys.readouterr().out)
+
+    argv = ("record", "assert", "medication", "--person", "jane-doe",
+            "--attributed-to", "Mom", "--date", "2026-08-09",
+            "--field", "name=Metformin", "--field", "dose=500 mg")
+    capsys.readouterr()
+    assert _run(ready, *argv) == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, *argv, "--apply") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, "record", "assert", "--list") == 0
+    out = capsys.readouterr().out
+    assert "needs source" in out
+    _assert_console_safe(out)
+
+    assert _run(ready, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "no source document" in out
+    _assert_console_safe(out)
+
+    assert _run(ready, "render", "journal", "--person", "jane-doe") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, *argv, "--field", "frequency=BID", "--apply") == 1
+    err = capsys.readouterr().err
+    assert "already holds this identity" in err
+    _assert_console_safe(err)

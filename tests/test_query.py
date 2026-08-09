@@ -238,6 +238,30 @@ def test_timeline_carries_provenance(seeded):
     assert any(e["document_id"] is not None for e in events)
 
 
+def test_timeline_stamps_attestation_only_on_attested_events(seeded):
+    """Issue #110: provenance travels with the event, but only when the row carries it -
+    a document-sourced record's event shape is unchanged, key for key."""
+    from pemr import attestations
+
+    before = query.query_timeline(seeded, "jane-doe")
+    assert all(
+        "attested_by" not in e and "attested_on" not in e for e in before
+    )
+
+    attestations.assert_record(
+        seeded, "medication", "jane-doe",
+        {"name": "Amlodipine", "started_on": "2026-03-01"},
+        attributed_to="Aunt Ada", attested_on="2026-03-02", apply=True,
+    )
+    after = query.query_timeline(seeded, "jane-doe")
+    attested = [e for e in after if "attested_by" in e]
+    assert [(e["attested_by"], e["attested_on"], e["document_id"]) for e in attested] == [
+        ("Aunt Ada", "2026-03-02", None)
+    ]
+    # Every pre-existing event is untouched.
+    assert [e for e in after if "attested_by" not in e] == before
+
+
 def test_timeline_with_identity_stamps_family_keys(seeded):
     """Issue #109: `render_journal` needs each event's family identity to apply the
     curation overlay, and an event otherwise carries none."""

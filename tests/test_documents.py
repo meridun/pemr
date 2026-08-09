@@ -541,7 +541,7 @@ def test_reassign_moves_a_keep_both_family_intact(seeded):
     summary = dedup.commit_extraction(
         conn, seeded["doc"], {"lab_result": [draw | {"value_num": 148}]}
     )
-    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0}
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0, "promoted": 0}
 
 
 def test_reassign_refused_on_dictionary_drift(seeded):

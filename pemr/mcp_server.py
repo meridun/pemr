@@ -403,10 +403,9 @@ def query(
             raise ToolError(f"unknown query kind '{kind}' (known: labs, meds, timeline)")
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
-    return [
-        {k: v for k, v in r.items() if k not in _dedup.INTERNAL_COLUMNS}
-        for r in rows
-    ]
+    # Same read contract the CLI's `--json` emits: internal key columns stripped, and
+    # attestation provenance carried only when the row actually has it (issue #110).
+    return [_dedup.public_row(r) for r in rows]
 
 
 def find(

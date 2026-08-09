@@ -44,6 +44,7 @@ ALL_MIGRATIONS = [
     "006_condition_allergy.sql",
     "007_document_tombstone.sql",
     "008_curation.sql",
+    "009_record_attestation.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -132,7 +133,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
 
     assert db.migrate(conn) == [
         "006_condition_allergy.sql", "007_document_tombstone.sql",
-        "008_curation.sql",
+        "008_curation.sql", "009_record_attestation.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -263,7 +264,9 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
     assert curation.has_table(conn) is False
     assert curation.load_verdicts(conn) == {}  # readable before the migration exists
 
-    assert db.migrate(conn) == ["008_curation.sql"]
+    assert db.migrate(conn) == [
+        "008_curation.sql", "009_record_attestation.sql",
+    ]
 
     assert curation.has_table(conn) is True
     cols = {row[1] for row in conn.execute("PRAGMA table_info(curation)").fetchall()}
@@ -272,3 +275,64 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
         "attributed_to", "created_at",
     }
     assert conn.execute("SELECT COUNT(*) AS n FROM person").fetchone()["n"] == 1
+
+
+def _migrate_through_008(conn, tmp_path):
+    """Apply every migration up to 008, leaving 009 pending (a 008-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre009"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "009":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_migration_009_adds_attestation_columns_to_every_record_table(conn):
+    """Issue #110: provenance lives on the row, so all seven typed tables gain the same
+    three nullable columns - a per-table check, because a table missed here is a table
+    whose attested rows could never be recorded."""
+    db.migrate(conn)
+    for table in RECORD_TABLES:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        assert {"attested_by", "attested_on", "attested_at"} <= cols, table
+
+
+def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
+    """The upgrade path: additive columns, so an existing database gains them without
+    touching a record row."""
+    from pemr import attestations
+
+    _migrate_through_008(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO lab_result (person_id, test_name, collected_at, dedup_key, "
+        "dedup_base) VALUES (1, 'HbA1c', '2026-01-01', 'k1', 'k1')"
+    )
+    conn.commit()
+    assert attestations.has_columns(conn) is False
+    assert attestations.list_attested(conn) == []   # readable before the migration
+
+    assert db.migrate(conn) == ["009_record_attestation.sql"]
+
+    assert attestations.has_columns(conn) is True
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["test_name"] == "HbA1c"
+    # A pre-009 row is document-sourced by construction: the new columns default to NULL.
+    assert (row["attested_by"], row["attested_on"], row["attested_at"]) == (
+        None, None, None
+    )
+
+
+def test_a_bare_insert_leaves_the_attestation_columns_null(conn):
+    db.migrate(conn)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO medication (person_id, name, dedup_key, dedup_base) "
+        "VALUES (1, 'Metformin', 'k1', 'k1')"
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM medication").fetchone()
+    assert row["attested_by"] is None and row["attested_at"] is None
