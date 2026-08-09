@@ -638,6 +638,11 @@ annotations expose the read/write split to the client.
 `commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
+`document rm` and `record rm` (issue #107) are deliberately **absent** from `WRITE_TOOLS` — this
+is a rule, not an oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and
+therefore no agent, can remove a record or a document. Any future destructive verb should default
+to the same exclusion unless a human explicitly decides otherwise.
+
 ---
 
 ## 6. Generated documents (DB → disposable output)
