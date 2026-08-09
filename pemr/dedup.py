@@ -867,6 +867,39 @@ def conflict_occurrences(
     return len(_conflict_family(conn, conflict, dictionary)[1])
 
 
+def conflicts_anchored_to_row(
+    conn: sqlite3.Connection,
+    record_type: str,
+    row: sqlite3.Row,
+    dictionary: dict[str, str] | None = None,
+) -> list[int]:
+    """Open conflict ids whose identity family contains ``row`` (issue #107).
+
+    The row-level counterpart of ``documents._conflicts_anchored_to``, which asks
+    the same question of a whole document with cheaper SQL. Cheaper, but coarser:
+    it matches on ``dedup_key`` and so misses a family whose occurrence 0 is
+    already gone. A single-row removal cannot afford that miss — the row it is
+    about to delete may *be* the anchor — so this walks each open conflict of the
+    type through :func:`_conflict_family`, the same resolution a real resolution
+    uses. Public because :mod:`pemr.records` needs the engine's own anchor logic
+    rather than a re-derivation of it.
+    """
+    if record_type not in FIELD_SPECS:
+        return []
+    pk = f"{record_type}_id"
+    row_id = int(row[pk])
+    ids: list[int] = []
+    for conflict in conn.execute(
+        "SELECT * FROM conflict WHERE status = 'open' AND record_type = ? "
+        "ORDER BY conflict_id",
+        (record_type,),
+    ).fetchall():
+        _, family = _conflict_family(conn, conflict, dictionary)
+        if any(int(member[pk]) == row_id for member in family):
+            ids.append(int(conflict["conflict_id"]))
+    return ids
+
+
 def _insert_record(
     conn: sqlite3.Connection,
     record_type: str,
@@ -1329,9 +1362,13 @@ def rekey(
                         f"({label!r}) hold the SAME fact "
                         "under two dedup_keys - it was filed a second time by an "
                         "ingest that ran against drifted keys before this rekey. The "
-                        "dictionary is fine; the data is doubled. Drop the duplicate "
-                        "(`pemr document rm` on the document that re-filed it, or "
-                        f"resolve it by hand) and re-run; {record_type} was not written"
+                        "dictionary is fine; the data is doubled. Drop whichever row "
+                        "is the degraded copy with "
+                        f"`pemr record rm {record_type} {row[pk]}` (or "
+                        f"`... {clash[pk]}`) - dry run first, then --apply - and "
+                        "re-run; `pemr document rm` is the whole-document option when "
+                        "the re-filing document holds nothing else worth keeping; "
+                        f"{record_type} was not written"
                     )
                 else:
                     kind, message = "fused", (
