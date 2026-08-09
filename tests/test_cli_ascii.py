@@ -168,3 +168,46 @@ def test_help_description_is_console_safe(capsys):
     out = capsys.readouterr().out
     assert "Personal EMR engine" in out
     _assert_console_safe(out)
+
+
+def test_record_annotate_output_is_console_safe(ready, capsys):
+    """Issue #109's new CLI + render surface: the verdict block, the `--list` table,
+    the `[DISPUTED: ...]` marker, the appendix heading and `verify`'s warning block."""
+    scan = ready / "scan.txt"
+    scan.write_bytes(b"visit note: glucose 95")
+    assert _run(ready, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(ready / "sources"), "--ocr-text-file", str(scan)) == 0
+    payload = ready / "extract.json"
+    payload.write_text(json.dumps({"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95,
+         "unit": "mg/dL"},
+    ]}), encoding="utf-8")
+    assert _run(ready, "commit-extraction", "--document", "1", "--json",
+                str(payload)) == 0
+
+    capsys.readouterr()
+    assert _run(ready, "record", "annotate", "lab_result", "1", "--status",
+                "disputed", "--note", "two sources disagree", "--apply") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, "record", "annotate", "--list") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, "render", "summary", "--person", "jane-doe") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+    assert _run(ready, "record", "annotate", "lab_result", "1", "--status",
+                "superseded", "--note", "corrected later", "--apply") == 0
+    capsys.readouterr()
+    assert _run(ready, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "## Superseded / corrected" in out
+    _assert_console_safe(out)
+
+    assert _run(ready, "record", "rm", "lab_result", "1", "--apply") == 0
+    capsys.readouterr()
+    assert _run(ready, "verify") == 0
+    captured = capsys.readouterr()
+    assert "warnings" in captured.out
+    _assert_console_safe(captured.out)
+    _assert_console_safe(captured.err)

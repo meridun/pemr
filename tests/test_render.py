@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, persons, query, render
+from pemr import curation, db, dedup, persons, query, render
 
 DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
 
@@ -539,3 +539,151 @@ def test_unknown_person_raises(seeded):
         render.render_summary(seeded, "nobody")
     with pytest.raises(query.PersonNotFoundError):
         render.render_journal(seeded, "nobody")
+
+
+# --- curation overlay (issue #109) --------------------------------------------
+#
+# The overlay is additive: with no verdicts every render is byte-identical to what it
+# was before it existed (the golden test below is the guard), and a verdict changes
+# output only through the four documented behaviours.
+
+def _annotate(conn, record_type, column, value, **kwargs):
+    """Record a verdict on the family holding one seeded row."""
+    base = conn.execute(
+        f"SELECT dedup_base FROM {record_type} WHERE {column} = ?", (value,)
+    ).fetchone()["dedup_base"]
+    kwargs.setdefault("note", "clinician ruled")
+    curation.annotate_record(conn, record_type, base, apply=True, **kwargs)
+    return base
+
+
+def _renders(conn):
+    d = dedup.load_dictionary(DICT_PATH)
+    return {
+        "summary": render.render_summary(conn, "jane-doe", dictionary=d),
+        "brief": render.render_brief(conn, _upcoming_appt_id(conn), dictionary=d),
+        "journal": render.render_journal(conn, "jane-doe"),
+    }
+
+
+def test_no_verdicts_renders_byte_identically(seeded):
+    """The load-bearing guarantee: the appendix and questions sections are *omitted*,
+    not rendered empty, so unannotated output is unchanged to the byte."""
+    before = _renders(seeded)
+    # An empty `curation` table is the state every existing database is in.
+    assert seeded.execute("SELECT COUNT(*) AS n FROM curation").fetchone()["n"] == 0
+    after = _renders(seeded)
+    assert after == before
+    for md in before.values():
+        assert "Superseded / corrected" not in md
+        assert "Questions for the Clinician" not in md
+        assert "DISPUTED" not in md
+
+
+@pytest.mark.parametrize("status", ["superseded", "erroneous-in-source"])
+def test_superseded_family_leaves_its_section_for_the_appendix(seeded, status):
+    _annotate(seeded, "condition", "name", "Appendicitis", status=status,
+              note="never actually confirmed")
+    out = _renders(seeded)
+    for name, md in out.items():
+        if name == "brief":
+            continue  # the brief has no past-medical-history section
+        assert "## Superseded / corrected" in md, name
+        assert "condition: Appendicitis" in md, name
+        assert "never actually confirmed" in md, name
+    # Gone from Past Medical History, but the row itself is untouched.
+    body = out["summary"].split("## Superseded / corrected")[0]
+    assert "Appendicitis" not in body
+    assert seeded.execute(
+        "SELECT COUNT(*) AS n FROM condition WHERE name = 'Appendicitis'"
+    ).fetchone()["n"] == 1
+
+
+def test_disputed_family_renders_in_place_with_a_marker(seeded):
+    _annotate(seeded, "allergy", "substance", "Sulfa", status="disputed",
+              note="two notes disagree on criticality")
+    out = _renders(seeded)
+    for name in ("summary", "brief"):
+        assert "- Sulfa" in out[name], name
+        assert "[DISPUTED: two notes disagree on criticality]" in out[name], name
+        assert "Superseded / corrected" not in out[name], name
+    # ... and reaches the brief's clinician questions, but not the summary's.
+    assert "## Questions for the Clinician" in out["brief"]
+    assert "allergy: Sulfa - two notes disagree on criticality" in out["brief"]
+    assert "Questions for the Clinician" not in out["summary"]
+
+
+def test_disputed_marker_reaches_the_journal(seeded):
+    _annotate(seeded, "condition", "name", "Type 2 Diabetes", status="disputed",
+              note="onset date contested")
+    md = render.render_journal(seeded, "jane-doe")
+    assert "[DISPUTED: onset date contested]" in md
+
+
+def test_merged_into_renders_only_the_target(seeded):
+    target = seeded.execute(
+        "SELECT dedup_base FROM lab_result WHERE test_name = 'LDL'"
+    ).fetchone()["dedup_base"]
+    _annotate(seeded, "lab_result", "test_name", "Glucose, fasting",
+              status="merged-into", merged_into_base=target,
+              note="same analyte, two spellings")
+    md = render.render_summary(seeded, "jane-doe",
+                               dictionary=dedup.load_dictionary(DICT_PATH))
+    body, appendix = md.split("## Superseded / corrected")
+    assert "Glucose, fasting" not in body
+    assert "LDL" in body                                     # the target still renders
+    assert "lab_result: Glucose, fasting" in appendix
+    assert f"merged into {target[:12]}..." in appendix
+
+
+def test_confirmed_changes_nothing_but_the_row_still_renders(seeded):
+    before = _renders(seeded)
+    _annotate(seeded, "allergy", "substance", "Penicillin", status="confirmed",
+              note="clinician agreed")
+    after = _renders(seeded)
+    assert after == before
+
+
+def test_superseded_vital_does_not_win_latest(seeded):
+    """Ordering guard: the curation pass runs before the latest-wins fold, so a
+    superseded reading cannot hide the good one behind it."""
+    plain = render.render_summary(seeded, "jane-doe",
+                                  dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "blood_pressure: 118.0 mmHg" in plain          # 2026 reading wins today
+
+    base = seeded.execute(
+        "SELECT dedup_base FROM observation WHERE obs_type='vital' AND "
+        "key='blood_pressure' AND value_num = 118"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "observation", base, status="superseded",
+                             note="transcription error", apply=True)
+
+    md = render.render_summary(seeded, "jane-doe",
+                               dictionary=dedup.load_dictionary(DICT_PATH))
+    body = md.split("## Superseded / corrected")[0]
+    assert "blood_pressure: 118.0 mmHg" not in body
+    assert "blood_pressure: 128.0 mmHg" in body           # the 2025 reading takes over
+
+
+def test_superseded_lab_does_not_consume_a_brief_slot(seeded):
+    """The brief's top-N cut happens after the curation pass, so a superseded lab
+    frees its slot rather than spending it."""
+    _annotate(seeded, "lab_result", "test_name", "Glucose, fasting",
+              status="erroneous-in-source", note="wrong patient's requisition")
+    md = render.render_brief(seeded, _upcoming_appt_id(seeded), recent_labs=1,
+                             dictionary=dedup.load_dictionary(DICT_PATH))
+    labs = md.split("## Recent Labs")[1].split("## ")[0]
+    assert "Glucose, fasting" not in labs
+    assert "LDL" in labs                                  # next-most-recent takes it
+
+
+def test_curated_renders_stay_ascii_and_read_only(seeded):
+    before = _row_counts(seeded)
+    _annotate(seeded, "allergy", "substance", "Sulfa", status="disputed",
+              note="two notes disagree")
+    _annotate(seeded, "condition", "name", "Chickenpox", status="superseded",
+              note="duplicate of a later note")
+    for md in _renders(seeded).values():
+        assert md.isascii(), f"non-ASCII would crash a cp437 console: {md!r}"
+        md.encode("cp437")
+    assert _row_counts(seeded) == before  # still a pure read

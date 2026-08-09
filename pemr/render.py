@@ -28,6 +28,17 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
     collapse disclosed on the line (issue #93) -- the stored rows keep their dates
     and stay distinct, because an order is an event, not a standing fact.
 
+**Curation overlay** (issue #109). Every section is filtered at read time against the
+``curation`` table, a pure overlay of recorded human verdicts keyed by
+``(record_type, dedup_base)``: ``superseded`` / ``erroneous-in-source`` /
+``merged-into`` families leave their section for a ``## Superseded / corrected``
+appendix, ``disputed`` families render in place with a ``[DISPUTED: ...]`` marker (and
+reach the brief's ``## Questions for the Clinician``), and ``confirmed`` renders exactly
+as before. Both new sections are **omitted entirely** when empty, so a record with no
+verdicts renders byte-identically to what it did before the overlay existed. This is
+still a pure function of DB state -- the filter is a read, and output changes after a
+verdict because the database changed.
+
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
 
@@ -43,7 +54,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-from . import db, query
+from . import curation, db, query
 from .dedup import enum_token, key_token
 
 # Observation obs_type conventions this layer reads (see module docstring).
@@ -119,11 +130,171 @@ def _ref_range(row: sqlite3.Row | dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Curation overlay (issue #109) -- a read-time filter, never a write
+# --------------------------------------------------------------------------- #
+
+class _CurationPass:
+    """One render's view of the `curation` overlay: the verdict map plus the two
+    out-of-band collections a render builds while filtering its sections.
+
+    One object rather than threading ``verdicts``/``appendix``/``disputed`` through
+    every read helper: a render touches ten sections and the three always travel
+    together. It is created once per render and is read-only with respect to the DB --
+    ``render`` never writes, and the overlay does not change that.
+
+    ``verdicts`` empty (the overwhelmingly common case, and every pre-008 snapshot) is
+    the fast path: :func:`_apply_curation` returns its rows untouched, no row is given a
+    ``_curation`` key, and both new sections are omitted -- which is what keeps output
+    byte-identical for unannotated data.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self.verdicts = curation.load_verdicts(conn)
+        # Keyed by (record_type, dedup_base) so a multi-occurrence family is listed
+        # once however many of its rows a section selected. Insertion-ordered.
+        self.appendix: dict[tuple[str, str], dict] = {}
+        self.disputed: dict[tuple[str, str], dict] = {}
+
+    def _entry(self, record_type: str, base: str, verdict: dict) -> dict:
+        label, family_size = curation.family_label(self.conn, record_type, base)
+        return dict(verdict, label=label, family_size=family_size)
+
+    def record(self, record_type: str, base: str, verdict: dict) -> None:
+        """File a family under the section its status sends it to, once.
+
+        ``confirmed`` is filed nowhere on purpose: it records agreement, so it neither
+        leaves its section nor raises a question.
+        """
+        if verdict["status"] in curation.APPENDIX_STATUSES:
+            bucket = self.appendix
+        elif verdict["status"] == "disputed":
+            bucket = self.disputed
+        else:
+            return
+        key = (record_type, base)
+        if key not in bucket:
+            bucket[key] = self._entry(record_type, base, verdict)
+
+
+def _apply_curation(
+    rows: list[dict], record_type: str, cur: "_CurationPass | None"
+) -> list[dict]:
+    """Filter one section's rows through the overlay, before any grouping.
+
+    Returns the rows that still render, stamping each annotated survivor with its
+    verdict under ``_curation``; families in :data:`curation.APPENDIX_STATUSES` are
+    dropped from the section and collected for the appendix instead.
+
+    Called immediately after each section's ``SELECT`` and **before** any latest-wins,
+    grouping or top-N logic, so a superseded reading can neither win "latest" nor
+    consume a slot in a truncated list.
+    """
+    if cur is None or not cur.verdicts:
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        base = row["dedup_base"]
+        verdict = cur.verdicts.get((record_type, base))
+        if verdict is None:
+            out.append(row)
+            continue
+        cur.record(record_type, base, verdict)
+        if verdict["status"] in curation.APPENDIX_STATUSES:
+            continue
+        row[curation.CURATION_FIELD] = verdict
+        out.append(row)
+    return out
+
+
+def _apply_curation_events(
+    events: list[dict], cur: "_CurationPass | None"
+) -> list[dict]:
+    """:func:`_apply_curation` for timeline events.
+
+    Same rule, different carrier: an event is a rendered sentence rather than a row, and
+    it only carries ``record_type``/``dedup_base`` when
+    :func:`query.query_timeline` was asked for them (``with_identity``). An event
+    without identity is passed through -- that is the no-verdicts fast path, where the
+    journal never asks for the extra keys in the first place.
+    """
+    if cur is None or not cur.verdicts:
+        return events
+    out: list[dict] = []
+    for event in events:
+        base = event.get("dedup_base")
+        if base is None:
+            out.append(event)
+            continue
+        record_type = event["record_type"]
+        verdict = cur.verdicts.get((record_type, base))
+        if verdict is None:
+            out.append(event)
+            continue
+        cur.record(record_type, base, verdict)
+        if verdict["status"] in curation.APPENDIX_STATUSES:
+            continue
+        event[curation.CURATION_FIELD] = verdict
+        out.append(event)
+    return out
+
+
+def _dispute_suffix(row: dict) -> str:
+    """``  [DISPUTED: <note>]`` for a disputed row, ``""`` otherwise.
+
+    A disputed fact stays in place -- silently moving it to an appendix would hide a
+    value a clinician is still acting on -- so every line builder marks it instead.
+    """
+    verdict = row.get(curation.CURATION_FIELD) if isinstance(row, dict) else None
+    if verdict is not None and verdict["status"] == "disputed":
+        return f"  [DISPUTED: {verdict['note']}]"
+    return ""
+
+
+def _appendix_section(entries: dict[tuple[str, str], dict]) -> str | None:
+    """The ``## Superseded / corrected`` section, or ``None`` when there is nothing
+    to say.
+
+    Deliberately **not** built with :func:`_section`: that helper's always-present
+    header is right for a clinical section whose emptiness is itself information, and
+    exactly wrong here -- an empty appendix on every unannotated record would break the
+    additive-only guarantee for output that has no verdicts at all.
+    """
+    if not entries:
+        return None
+    lines = []
+    for (record_type, _base), entry in entries.items():
+        label = entry["label"] or "(no live rows)"
+        lines.append(f"- {record_type}: {label}  [{curation.describe(entry)}]")
+    return _section("Superseded / corrected", lines)
+
+
+def _questions_section(entries: dict[tuple[str, str], dict]) -> str | None:
+    """The ``## Questions for the Clinician`` section, or ``None`` when empty.
+
+    A ``disputed`` verdict is a recorded "two sources disagree and a human has to
+    rule", so the brief -- the document actually handed over at the appointment --
+    surfaces it as a question rather than leaving it as an inline marker only.
+    """
+    if not entries:
+        return None
+    lines = []
+    for (record_type, _base), entry in entries.items():
+        label = entry["label"] or "(no live rows)"
+        who = f" ({entry['attributed_to']})" if entry.get("attributed_to") else ""
+        lines.append(f"- {record_type}: {label} - {entry['note']}{who}")
+    return _section("Questions for the Clinician", lines)
+
+
+# --------------------------------------------------------------------------- #
 # Read helpers (pure SELECTs; person already resolved to an id)
 # --------------------------------------------------------------------------- #
 
 def _conditions(
-    conn: sqlite3.Connection, person_id: int, statuses: tuple[str, ...] | str
+    conn: sqlite3.Connection,
+    person_id: int,
+    statuses: tuple[str, ...] | str,
+    cur: "_CurationPass | None" = None,
 ) -> list[dict]:
     """Condition rows in one status bucket, ordered by name.
 
@@ -136,10 +307,13 @@ def _conditions(
         "SELECT * FROM condition WHERE person_id = ? ORDER BY name, condition_id",
         (person_id,),
     ).fetchall()
-    return [dict(r) for r in rows if enum_token(r["status"]) in wanted]
+    rows = _apply_curation([dict(r) for r in rows], "condition", cur)
+    return [r for r in rows if enum_token(r["status"]) in wanted]
 
 
-def _allergies(conn: sqlite3.Connection, person_id: int) -> list[dict]:
+def _allergies(
+    conn: sqlite3.Connection, person_id: int, cur: "_CurationPass | None" = None
+) -> list[dict]:
     """Allergy rows, ``criticality='high'`` first then alphabetical -- the dangerous ones
     have to survive a skim of the list."""
     rows = conn.execute(
@@ -147,7 +321,8 @@ def _allergies(conn: sqlite3.Connection, person_id: int) -> list[dict]:
         (person_id,),
     ).fetchall()
     return sorted(
-        (dict(r) for r in rows), key=lambda r: enum_token(r["criticality"]) != "high"
+        _apply_curation([dict(r) for r in rows], "allergy", cur),
+        key=lambda r: enum_token(r["criticality"]) != "high",
     )
 
 
@@ -157,18 +332,21 @@ def _condition_line(row: dict, *, past: bool = False) -> str:
         f"  (resolved {row['resolved_on']})" if past and row["resolved_on"] else ""
     )
     note = f" - {row['note']}" if row["note"] else ""
-    return f"- {row['name']}{since}{resolved}{note}"
+    return f"- {row['name']}{since}{resolved}{note}{_dispute_suffix(row)}"
 
 
 def _allergy_line(row: dict) -> str:
     crit = f" [{str(row['criticality']).upper()}]" if row["criticality"] else ""
     reaction = f" - {row['reaction']}" if row["reaction"] else ""
     noted = f"  (noted {row['noted_on']})" if row["noted_on"] else ""
-    return f"- {row['substance']}{crit}{reaction}{noted}"
+    return f"- {row['substance']}{crit}{reaction}{noted}{_dispute_suffix(row)}"
 
 
 def _latest_vitals(
-    conn: sqlite3.Connection, person_id: int, dictionary: dict[str, str] | None
+    conn: sqlite3.Connection,
+    person_id: int,
+    dictionary: dict[str, str] | None,
+    cur: "_CurationPass | None" = None,
 ) -> list[dict]:
     """Most recent ``obs_type='vital'`` row per normalized ``key``. Rows are ordered so
     that, for a given key, the latest date (then highest id) wins deterministically.
@@ -181,9 +359,12 @@ def _latest_vitals(
         "ORDER BY observed_at, observation_id",
         (person_id, OBS_VITAL),
     ).fetchall()
+    # Curation runs before the latest-wins fold, so a superseded reading cannot win
+    # "latest" and hide the good one behind it.
+    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
     latest: dict[str, dict] = {}
-    for r in rows:
-        latest[key_token(r["key"], dictionary)] = dict(r)  # ascending -> last wins
+    for r in kept:
+        latest[key_token(r["key"], dictionary)] = r  # ascending -> last wins
     return [latest[k] for k in sorted(latest)]
 
 
@@ -194,7 +375,10 @@ def _order_display(row: dict) -> str:
 
 
 def _grouped_orders(
-    conn: sqlite3.Connection, person_id: int, dictionary: dict[str, str] | None
+    conn: sqlite3.Connection,
+    person_id: int,
+    dictionary: dict[str, str] | None,
+    cur: "_CurationPass | None" = None,
 ) -> list[dict]:
     """``obs_type='order'`` rows folded to one entry per normalized item, newest first.
 
@@ -220,10 +404,13 @@ def _grouped_orders(
         "ORDER BY observed_at, observation_id",
         (person_id, OBS_ORDER),
     ).fetchall()
+    # Before the grouping fold: a superseded order must not become the group's
+    # "latest" row and speak for the ones behind it.
+    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
     groups: dict[object, list[dict]] = {}
-    for r in rows:
+    for r in kept:
         token = key_token(r["key"], dictionary) or key_token(r["value_text"], dictionary)
-        groups.setdefault(token or ("", r["observation_id"]), []).append(dict(r))
+        groups.setdefault(token or ("", r["observation_id"]), []).append(r)
 
     out = []
     for members in groups.values():
@@ -251,10 +438,12 @@ def _order_line(row: dict) -> str:
         first = f", first {row['group_first']}" if row["group_first"] else ""
         notes.append(f"+{row['group_count'] - 1} earlier{first}")
     note = f"  ({'; '.join(notes)})" if notes else ""
-    return f"- {_order_display(row)}{detail}{note}"
+    return f"- {_order_display(row)}{detail}{note}{_dispute_suffix(row)}"
 
 
-def _abnormal_labs(conn: sqlite3.Connection, person_id: int) -> list[dict]:
+def _abnormal_labs(
+    conn: sqlite3.Connection, person_id: int, cur: "_CurationPass | None" = None
+) -> list[dict]:
     rows = conn.execute(
         # lab_result_id DESC breaks same-timestamp ties (a `--keep both` sibling shares
         # its date): newest-first ordering treats the later row id as the later point.
@@ -262,11 +451,15 @@ def _abnormal_labs(conn: sqlite3.Connection, person_id: int) -> list[dict]:
         "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
         (person_id,),
     ).fetchall()
-    return [dict(r) for r in rows if _is_abnormal(r)]
+    kept = _apply_curation([dict(r) for r in rows], "lab_result", cur)
+    return [r for r in kept if _is_abnormal(r)]
 
 
 def _open_appointments(
-    conn: sqlite3.Connection, person_id: int, today: str
+    conn: sqlite3.Connection,
+    person_id: int,
+    today: str,
+    cur: "_CurationPass | None" = None,
 ) -> list[dict]:
     """Upcoming (scheduled on/after ``today``) or open (no post-visit ``summary``)
     appointments -- the ones a summary reader still needs to act on."""
@@ -276,12 +469,12 @@ def _open_appointments(
         (person_id,),
     ).fetchall()
     out: list[dict] = []
-    for r in rows:
+    for r in _apply_curation([dict(x) for x in rows], "appointment", cur):
         d = _date_part(r["scheduled_for"])
         upcoming = bool(d) and d >= today
         is_open = not (r["summary"] or "").strip()
         if upcoming or is_open:
-            out.append(dict(r))
+            out.append(r)
     return out
 
 
@@ -364,6 +557,9 @@ def render_summary(
     ).fetchone()
     today = _date_part(now or datetime.now())
     counts = _row_counts(conn, person_id)
+    # Source rows stay a count of what is *stored*: the overlay hides nothing from the
+    # database, only from the sections below.
+    cur = _CurationPass(conn)
 
     header = (
         f"# Master Summary: {person['full_name']}\n\n"
@@ -377,47 +573,52 @@ def render_summary(
         f"conditions={counts['condition']}, allergies={counts['allergy']}\n"
     )
 
-    meds = query.query_meds(conn, slug, active=True, now=now)
+    meds = _apply_curation(
+        query.query_meds(conn, slug, active=True, now=now), "medication", cur
+    )
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
         since = f" (since {m['started_on']})" if m["started_on"] else ""
-        med_lines.append(f"- {m['name']}{dose}{freq}{since}")
+        med_lines.append(f"- {m['name']}{dose}{freq}{since}{_dispute_suffix(m)}")
 
     active_lines = [
-        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE)
+        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE, cur)
     ]
     past_lines = [
         _condition_line(c, past=True)
-        for c in _conditions(conn, person_id, CONDITION_PAST)
+        for c in _conditions(conn, person_id, CONDITION_PAST, cur)
     ]
     family_lines = [
-        f"- {c['relation'] or 'family'}: {c['name']}"
-        for c in _conditions(conn, person_id, CONDITION_FAMILY)
+        f"- {c['relation'] or 'family'}: {c['name']}{_dispute_suffix(c)}"
+        for c in _conditions(conn, person_id, CONDITION_FAMILY, cur)
     ]
-    allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id)]
+    allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
     order_lines = [
-        _order_line(o) for o in _grouped_orders(conn, person_id, dictionary)
+        _order_line(o) for o in _grouped_orders(conn, person_id, dictionary, cur)
     ]
 
     vital_lines = []
-    for v in _latest_vitals(conn, person_id, dictionary):
+    for v in _latest_vitals(conn, person_id, dictionary, cur):
         value = v["value_num"] if v["value_num"] is not None else v["value_text"]
         unit = f" {v['unit']}" if v["unit"] else ""
         when = f"  ({_date_part(v['observed_at'])})" if v["observed_at"] else ""
-        vital_lines.append(f"- {v['key']}: {_fmt(value)}{unit}{when}")
+        vital_lines.append(
+            f"- {v['key']}: {_fmt(value)}{unit}{when}{_dispute_suffix(v)}"
+        )
 
     lab_lines = []
-    for r in _abnormal_labs(conn, person_id):
+    for r in _abnormal_labs(conn, person_id, cur):
         flag = f" [{r['flag']}]" if r["flag"] else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{_ref_range(r)}"
+            f"{_lab_value(r)}{flag}{_ref_range(r)}{_dispute_suffix(r)}"
         )
 
     appt_lines = [
-        f"- {_appt_line(a)}" for a in _open_appointments(conn, person_id, today)
+        f"- {_appt_line(a)}{_dispute_suffix(a)}"
+        for a in _open_appointments(conn, person_id, today, cur)
     ]
 
     parts = [
@@ -435,6 +636,8 @@ def render_summary(
             "Open Conflicts", _open_conflict_lines(conn, person_id), empty="_none_"
         ),
     ]
+    # Omitted entirely when there are no verdicts -- see _appendix_section.
+    parts += [p for p in (_appendix_section(cur.appendix),) if p is not None]
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -473,6 +676,7 @@ def render_brief(
     person = conn.execute(
         "SELECT * FROM person WHERE person_id = ?", (person_id,)
     ).fetchone()
+    cur = _CurationPass(conn)
 
     header = (
         f"# Appointment Brief: {person['full_name']}\n\n"
@@ -486,12 +690,14 @@ def render_brief(
         f"- Reason: {appt['reason'] or '(none given)'}",
     ])
 
-    meds = query.query_meds(conn, person["slug"], active=True, now=now)
+    meds = _apply_curation(
+        query.query_meds(conn, person["slug"], active=True, now=now), "medication", cur
+    )
     med_lines = []
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
-        med_lines.append(f"- {m['name']}{dose}{freq}")
+        med_lines.append(f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}")
 
     # Recency stays the primary axis, but a single draw can carry a 50+ analyte panel —
     # a flat `LIMIT N` over `collected_at DESC, test_name` then returns the
@@ -500,11 +706,17 @@ def render_brief(
     # the brief is the doc handed to a clinician, and the out-of-range values are the
     # ones that must survive truncation. Abnormality is `_is_abnormal` (flag OR
     # reference interval), which SQL can't express, so the cut happens here.
-    lab_rows = conn.execute(
-        "SELECT * FROM lab_result WHERE person_id = ? "
-        "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
-        (person_id,),
-    ).fetchall()
+    lab_rows = _apply_curation(
+        [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM lab_result WHERE person_id = ? "
+                "ORDER BY collected_at DESC, test_name, lab_result_id DESC",
+                (person_id,),
+            ).fetchall()
+        ],
+        "lab_result",
+        cur,
+    )
     draw_rank = {
         ts: i for i, ts in enumerate(dict.fromkeys(r["collected_at"] for r in lab_rows))
     }
@@ -519,25 +731,37 @@ def render_brief(
         abnormal = f"  [!]{_ref_range(r)}" if _is_abnormal(r) else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{abnormal}"
+            f"{_lab_value(r)}{flag}{abnormal}{_dispute_suffix(r)}"
         )
 
-    proc_rows = conn.execute(
-        "SELECT * FROM procedure WHERE person_id = ? "
-        "ORDER BY performed_on DESC, procedure_id",
-        (person_id,),
-    ).fetchall()
-    obs_rows = conn.execute(
-        "SELECT * FROM observation WHERE person_id = ? "
-        "ORDER BY observed_at DESC, observation_id",
-        (person_id,),
-    ).fetchall()
+    proc_rows = _apply_curation(
+        [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM procedure WHERE person_id = ? "
+                "ORDER BY performed_on DESC, procedure_id",
+                (person_id,),
+            ).fetchall()
+        ],
+        "procedure",
+        cur,
+    )
+    obs_rows = _apply_curation(
+        [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM observation WHERE person_id = ? "
+                "ORDER BY observed_at DESC, observation_id",
+                (person_id,),
+            ).fetchall()
+        ],
+        "observation",
+        cur,
+    )
     ctx_lines = []
     for p in proc_rows:
         outcome = f" - {p['outcome']}" if p["outcome"] else ""
         ctx_lines.append(
             f"- {_date_part(p['performed_on']) or '(undated)'}  procedure: "
-            f"{p['name']}{outcome}"
+            f"{p['name']}{outcome}{_dispute_suffix(p)}"
         )
     for o in obs_rows:
         value = o["value_num"] if o["value_num"] is not None else o["value_text"]
@@ -545,11 +769,12 @@ def render_brief(
         detail = " ".join(p for p in (o["obs_type"], o["key"]) if p)
         ctx_lines.append(
             f"- {_date_part(o['observed_at']) or '(undated)'}  {detail}{val}"
+            f"{_dispute_suffix(o)}"
         )
 
-    brief_allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id)]
+    brief_allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
     brief_problem_lines = [
-        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE)
+        _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE, cur)
     ]
 
     conflict_lines = _open_conflict_lines(conn, person_id)
@@ -573,8 +798,15 @@ def render_brief(
         _section("Active Problems", brief_problem_lines),
         _section("Procedures & Observations", ctx_lines),
         _section("Open Conflicts", conflict_lines, empty="_none_"),
-        interaction,
     ]
+    # Both omitted entirely when empty, so an unannotated brief is byte-identical to
+    # what it was before the overlay existed. The clinician questions sit immediately
+    # before the interaction block: the last thing read is what to ask about.
+    parts += [
+        p for p in (_appendix_section(cur.appendix), _questions_section(cur.disputed))
+        if p is not None
+    ]
+    parts.append(interaction)
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -597,14 +829,24 @@ def render_journal(
     person = conn.execute(
         "SELECT * FROM person WHERE person_id = ?", (person_id,)
     ).fetchone()
-    events = query.query_timeline(conn, slug, since=since)
+    cur = _CurationPass(conn)
+    # `with_identity` is what makes the overlay reachable from here: a timeline event
+    # is a rendered sentence, not a row, so it carries no family identity by default.
+    events = query.query_timeline(
+        conn, slug, since=since, with_identity=bool(cur.verdicts)
+    )
+    events = _apply_curation_events(events, cur)
 
     header = (
         f"# Journal: {person['full_name']}\n\n"
         f"- Generated: {_generated_at(now)} (read-only view of DB state)\n"
     )
     if not events:
-        return header + "\n_No dated events on record._\n"
+        # An appendix can outlive the events: a journal whose every dated event was
+        # superseded still has to say where they went.
+        tail = _appendix_section(cur.appendix)
+        empty = header + "\n_No dated events on record._\n"
+        return empty if tail is None else empty + "\n" + tail
 
     # Provenance footnotes: assign a stable [^n] marker per referenced document, in
     # first-appearance order, and resolve each to a one-line source description.
@@ -624,7 +866,13 @@ def render_journal(
         ref = ""
         if e["document_id"] is not None:
             ref = f" [^{footnote_num[e['document_id']]}]"
-        lines.append(f"- **{e['type']}** -- {e['summary']}{ref}")
+        lines.append(f"- **{e['type']}** -- {e['summary']}{ref}{_dispute_suffix(e)}")
+
+    # Before the footnote block: footnotes are reference apparatus for the events
+    # above them and stay last.
+    appendix = _appendix_section(cur.appendix)
+    if appendix is not None:
+        lines.append("\n" + appendix.rstrip())
 
     if footnote_order:
         lines.append("\n---\n")
