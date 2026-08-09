@@ -107,6 +107,25 @@ CREATE TABLE document_tombstone (
   note        TEXT,                       -- free text: the only human-recognisable label
   document_id INTEGER                     -- the id it had; forensics only, not a FK
 );
+
+-- Recorded human verdicts over record families (issue #109). A pure overlay: no record
+-- row is ever mutated, and a family with no row here renders exactly as before. Keyed
+-- by (record_type, dedup_base) - the stable family identity of §3 - so a verdict
+-- outlives occurrence renumbering and `record rm`, but NOT a dictionary-driven `rekey`
+-- that renames the family itself: that moves `dedup_base` too, and orphans the verdict
+-- exactly like a removed row would. Like 007 it carries no FK to the row it annotates,
+-- and `pemr verify` warns (never fails) on a verdict whose family is gone either way.
+-- Written only by `record annotate`; read at render time by every generated document.
+CREATE TABLE curation (
+  record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
+  dedup_base       TEXT NOT NULL,   -- family identity: NOT dedup_key, NOT a row id
+  status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into
+  note             TEXT NOT NULL,   -- required: the why, and who said so
+  merged_into_base TEXT,            -- set iff status = 'merged-into'
+  attributed_to    TEXT,
+  created_at       TEXT NOT NULL,   -- ISO8601 UTC
+  PRIMARY KEY (record_type, dedup_base)
+);
 ```
 
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
@@ -590,6 +609,13 @@ pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--no
                                                          # --tombstone: also refuse to re-ingest this content (§3)
 pemr record rm <table> <id> [--apply]                    # delete ONE record row; its document and every
                                                          # other record it produced survive; dry run by default
+pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
+                     [--merged-into <base-or-id>] [--apply]
+                                                         # record a human verdict over a record FAMILY (§2 curation):
+                                                         # confirmed|superseded|erroneous-in-source|disputed|merged-into
+                                                         # pure overlay - no record row is mutated; dry run by default
+pemr record annotate --list [<table>] [--json]           # current verdicts, newest first (orphans flagged)
+pemr record annotate <table> <base-or-id> --clear [--apply]      # lift one verdict
 pemr document tombstone list [--json]                    # recorded intentional removals, newest first
 pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]
                                                          # pre-emptive exclusion; ingests and copies nothing
@@ -638,10 +664,14 @@ annotations expose the read/write split to the client.
 `commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
-`document rm` and `record rm` (issue #107) are deliberately **absent** from `WRITE_TOOLS` — this
-is a rule, not an oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and
-therefore no agent, can remove a record or a document. Any future destructive verb should default
-to the same exclusion unless a human explicitly decides otherwise.
+`document rm`, `record rm` (issue #107) and `record annotate` (issue #109) are deliberately
+**absent** from `WRITE_TOOLS` — this is a rule, not an oversight. Deletion of PHI stays a
+human-at-a-terminal action; no MCP tool, and therefore no agent, can remove a record or a
+document. `record annotate` joins them for the adjacent reason: a `curation` verdict is a
+*human's clinical judgment*, recorded with attribution, and an agent that could write one could
+make a record disappear from every generated document without deleting a row. Any future
+destructive — or render-altering — verb should default to the same exclusion unless a human
+explicitly decides otherwise.
 
 ---
 
@@ -659,6 +689,18 @@ to the same exclusion unless a human explicitly decides otherwise.
   questions. This is your "walk-in readiness" as a repeatable command.
 - **journal** — chronological event stream (documents + appointments + procedures)
   rendered as a narrative timeline.
+
+Every section is filtered at read time against the `curation` overlay (§2, issue #109):
+`superseded` / `erroneous-in-source` / `merged-into` families leave their section for a
+`## Superseded / corrected` appendix, `disputed` families render in place with a
+`[DISPUTED: <note>]` marker and reach the brief's `## Questions for the Clinician`, and
+`confirmed` renders unchanged. Both new sections are omitted entirely when empty, so a record
+with no verdicts renders byte-identically to before the overlay existed. This does not weaken
+the purity rule: the filter is a read, and output changes after a verdict because the
+*database* changed. One consequence of the read-time join: if a dictionary-driven `rekey`
+(§3) has renamed a family since its verdict was recorded, the join misses and the family
+renders as if unannotated — `pemr verify` flags the orphaned verdict, but nothing re-attaches
+it automatically.
 
 Because they regenerate from truth, they never drift. Old exports are disposable.
 
