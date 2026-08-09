@@ -18,8 +18,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import (
-    __version__, backup, curation, db, dedup, documents, ingest, persons, query,
-    records, render, restore, study, tombstones, verify,
+    __version__, attestations, backup, curation, db, dedup, documents, ingest, persons,
+    query, records, render, restore, study, tombstones, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -413,6 +413,7 @@ def _with_document_conn(args: argparse.Namespace, work):
             records.AnchoredConflictError,
             curation.CurationNotFoundError,
             curation.FamilyNotFoundError,
+            attestations.AttestationCollisionError,
             persons.PersonNotFoundError,
         ) as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1009,6 +1010,149 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
     return _with_document_conn(args, work)
 
 
+# --------------------------------------------------------------------------- #
+# human-attested records (`record assert`) - issue #110
+# --------------------------------------------------------------------------- #
+
+def _parse_field_args(
+    parser: argparse.ArgumentParser, table: str, raw: list[str] | None
+) -> dict:
+    """``--field NAME=VALUE`` repeats -> a payload dict for :mod:`dedup`.
+
+    Splits on the **first** ``=`` so a value may contain more (``--field
+    value_text=ratio=1.2``). Unknown and duplicated names are argparse misuse (rc=2 with
+    the usage line) rather than engine errors: they are typos in the command, and the
+    operator needs the field list right there. Numeric-spec fields are coerced, because
+    argparse hands everything over as text and ``value_num`` must not land as a string; a
+    value that will not coerce is passed through untouched so
+    :func:`dedup.validate_row` produces the type message instead of a worse one here.
+    """
+    spec = dedup.FIELD_SPECS[table]
+    payload: dict = {}
+    for item in raw or []:
+        name, sep, value = item.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            parser.error(f"--field expects NAME=VALUE, got {item!r}")
+        if name not in spec:
+            parser.error(
+                f"unknown {table} field '{name}' - known fields: "
+                f"{', '.join(spec)}"
+            )
+        if name in payload:
+            parser.error(f"--field {name} given twice")
+        types = spec[name][0]
+        if isinstance(types, tuple) and int in types:
+            try:
+                payload[name] = int(value)
+            except ValueError:
+                try:
+                    payload[name] = float(value)
+                except ValueError:
+                    payload[name] = value
+        else:
+            payload[name] = value
+    return payload
+
+
+def _attested_row_line(row: dict) -> str:
+    """One `--list` line: what was attested, by whom, and whether a source arrived."""
+    state = "needs source" if row["needs_source"] else f"document #{row['document_id']}"
+    return (
+        f"{row['record_type']:12}  #{row['row_id']:<6}  {_fmt(row['person']):12}  "
+        f"{(row['attested_on'] or '')[:10]:10}  {row['label']}  "
+        f"[{row['attested_by']}]  ({state})"
+    )
+
+
+def _print_attest_report(report: "attestations.AttestReport") -> None:
+    """The human block, shaped like `_cmd_record_rm`'s: the fact, then its provenance."""
+    label = report.label or report.record_type
+    print(f"{report.record_type}  {_fmt(report.person_slug)}  {label}")
+    for name, value in report.fields.items():
+        print(f"  {name}: {value}")
+    print(
+        f"  attested by {report.attributed_to} on {report.attested_on} "
+        "(no source document)"
+    )
+    if report.outcome == "duplicate":
+        print(
+            f"  already recorded: {report.record_type} #{report.row_id} "
+            f"({report.existing_provenance}) holds this exact fact"
+        )
+
+
+def _cmd_record_assert(args: argparse.Namespace) -> int:
+    """`record assert` — list attested rows, or commit one attested fact.
+
+    Two modes on one subparser, the `_cmd_record_annotate` shape: `--list` takes an
+    optional table and no payload; otherwise the table and at least one `--field` are
+    required. The handler owns the rules argparse cannot express across ``nargs='?'``.
+    """
+    parser = args.assert_parser
+    if args.list:
+        def work(conn):
+            rows = attestations.list_attested(
+                conn, args.table, include_superseded=args.all
+            )
+            if args.json:
+                _print_json(rows)
+                return 0
+            if not rows:
+                print("no attested records")
+                return 0
+            print(
+                f"{'type':12}  {'row':7}  {'person':12}  {'attested':10}  label  "
+                "[who]  (source)"
+            )
+            for row in rows:
+                print(_attested_row_line(row))
+            return 0
+
+        return _with_document_conn(args, work)
+
+    if args.table is None:
+        parser.error("a table is required unless --list is given")
+    if not args.field:
+        parser.error(
+            "at least one --field NAME=VALUE is required - the fact being attested"
+        )
+    if not args.person:
+        parser.error("--person is required")
+    if not args.attributed_to:
+        parser.error("--attributed-to is required: who is attesting this fact")
+    if not args.date:
+        parser.error("--date is required: when the attestation was made")
+
+    payload = _parse_field_args(parser, args.table, args.field)
+    dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+
+    def work(conn):
+        report = attestations.assert_record(
+            conn,
+            args.table,
+            args.person,
+            payload,
+            attributed_to=args.attributed_to,
+            attested_on=args.date,
+            dictionary=dictionary,
+            apply=args.apply,
+        )
+        if args.json:
+            _print_json(report.as_dict())
+            return 0
+        _print_attest_report(report)
+        if report.outcome == "duplicate":
+            print("nothing to do: the fact is already on record")
+        elif report.applied:
+            print(f"wrote {report.record_type} #{report.row_id}")
+        else:
+            print("dry run: nothing was written - re-run with --apply")
+        return 0
+
+    return _with_document_conn(args, work)
+
+
 def _report_owner_check(
     check: "ingest.OwnerCheck | None", person_slug: str, document_id: int
 ) -> None:
@@ -1176,6 +1320,13 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
         f"committed: {c['new']} new, {c['duplicate']} duplicate, "
         f"{c['enriched']} enriched, {c['conflict']} conflict"
     )
+    # Only when it happened, so an unattested commit's output is byte-identical to what
+    # it was before issue #110 (the additive-only rule).
+    if summary.promoted:
+        print(
+            f"note: {c['promoted']} attested record(s) now backed by this document - "
+            "the attestation is kept as history"
+        )
     if summary.conflict:
         print(
             f"note: {c['conflict']} conflict(s) staged - resolve with "
@@ -1353,7 +1504,12 @@ _HIDDEN_FIELDS = dedup.INTERNAL_COLUMNS
 
 
 def _clean(row: dict) -> dict:
-    return {k: v for k, v in row.items() if k not in _HIDDEN_FIELDS}
+    """Strip a record row down to its ``--json`` contract (:func:`dedup.public_row`).
+
+    Kept as a local alias because it reads at every call site; the rule itself lives in
+    `dedup` so the MCP read payload cannot drift from this one (issue #110).
+    """
+    return dedup.public_row(row)
 
 
 def _print_json(payload: object) -> None:
@@ -2042,6 +2198,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_annotate.add_argument("--json", action="store_true", help="machine-readable output")
     r_annotate.set_defaults(func=_cmd_record_annotate, annotate_parser=r_annotate)
+
+    # --- human-attested records (issue #110) ---
+    r_assert = record_sub.add_parser(
+        "assert",
+        help="record a fact attested by a person, with no source document yet "
+             "(dry run by default); CLI-only, never an agent write",
+    )
+    # Optional so `--list` can take an optional table and no payload; the handler
+    # enforces "table and --field unless --list" with the usage line.
+    r_assert.add_argument("table", nargs="?", choices=list(dedup.KNOWN_TYPES))
+    r_assert.add_argument("--person", help="owner slug, e.g. jane-doe")
+    r_assert.add_argument(
+        "--attributed-to", help="required: who is attesting this fact"
+    )
+    r_assert.add_argument(
+        "--date", help="required: when the attestation was made (ISO date)"
+    )
+    r_assert.add_argument(
+        "--field", action="append", metavar="NAME=VALUE",
+        help="one payload field; repeat for each (e.g. --field name=Metformin)",
+    )
+    r_assert.add_argument(
+        "--list", action="store_true",
+        help="list attested rows still needing a source document, and exit",
+    )
+    r_assert.add_argument(
+        "--all", action="store_true",
+        help="with --list: include attestations a document has since backed",
+    )
+    r_assert.add_argument(
+        "--apply", action="store_true", help="write the row (default: report only)"
+    )
+    r_assert.add_argument(
+        "--dictionary", help="synonym dictionary TOML (overrides default)"
+    )
+    r_assert.add_argument("--json", action="store_true", help="machine-readable output")
+    r_assert.set_defaults(func=_cmd_record_assert, assert_parser=r_assert)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"

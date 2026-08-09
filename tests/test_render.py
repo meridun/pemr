@@ -687,3 +687,147 @@ def test_curated_renders_stay_ascii_and_read_only(seeded):
         assert md.isascii(), f"non-ASCII would crash a cp437 console: {md!r}"
         md.encode("cp437")
     assert _row_counts(seeded) == before  # still a pure read
+
+
+# --- attested rows are never mistaken for document-sourced facts (issue #110) --
+
+_ATTESTED = {
+    "medication": {"name": "Amlodipine", "dose": "5 mg", "started_on": "2026-03-01"},
+    "condition": {"name": "Migraine", "status": "active", "onset_on": "2026-03-01"},
+    "allergy": {"substance": "Shellfish", "reaction": "hives"},
+    "lab_result": {"test_name": "Potassium", "collected_at": "2026-03-01",
+                   "value_num": 6.2, "unit": "mmol/L", "ref_high": 5.2},
+    "procedure": {"name": "Wisdom tooth extraction", "performed_on": "2026-03-01"},
+    "appointment": {"scheduled_for": "2099-06-01", "provider": "Dr. Attested",
+                    "specialty": "Neurology", "reason": "headaches"},
+    "observation": {"obs_type": "vital", "key": "pulse", "observed_at": "2026-03-01",
+                    "value_num": 72, "unit": "bpm"},
+}
+_ATTEST_MARKER = "(attested by Aunt Ada 2026-03-02; no source document)"
+
+
+def _attest_all(conn, slug="jane-doe"):
+    """One live attestation per typed table, plus one attested order row."""
+    from pemr import attestations
+
+    for record_type, payload in _ATTESTED.items():
+        attestations.assert_record(
+            conn, record_type, slug, dict(payload), attributed_to="Aunt Ada",
+            attested_on="2026-03-02", dictionary=dedup.load_dictionary(DICT_PATH),
+            apply=True,
+        )
+    attestations.assert_record(
+        conn, "observation", slug,
+        {"obs_type": "order", "key": "sleep study", "observed_at": "2026-03-01"},
+        attributed_to="Aunt Ada", attested_on="2026-03-02",
+        dictionary=dedup.load_dictionary(DICT_PATH), apply=True,
+    )
+
+
+def test_unattested_renders_are_byte_identical_to_today(seeded):
+    """The additive-only AC: a database with no attested rows renders exactly as it did
+    before migration 009. Captured before/after seeding attestations for *john*, whose
+    record stays untouched."""
+    d = dedup.load_dictionary(DICT_PATH)
+    before = (
+        render.render_summary(seeded, "john-doe", dictionary=d,
+                              now=datetime(2026, 6, 1)),
+        render.render_journal(seeded, "john-doe", now=datetime(2026, 6, 1)),
+    )
+    _attest_all(seeded)
+    after = (
+        render.render_summary(seeded, "john-doe", dictionary=d,
+                              now=datetime(2026, 6, 1)),
+        render.render_journal(seeded, "john-doe", now=datetime(2026, 6, 1)),
+    )
+    assert before == after
+    assert "attested" not in before[0] and "attested" not in before[1]
+
+
+def test_summary_marks_an_attested_row_in_every_section(seeded):
+    _attest_all(seeded)
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    marked = {
+        line.split("  ")[0].lstrip("- ")
+        for line in md.splitlines() if _ATTEST_MARKER in line
+    }
+    # Meds, active problems, allergies, orders, vitals, abnormal labs, appointments:
+    # every section that can show an attested row does, so none can render it bare.
+    for token in ("Amlodipine", "Migraine", "Shellfish", "sleep study", "pulse",
+                  "Potassium", "Dr. Attested"):
+        assert any(
+            token in line and _ATTEST_MARKER in line for line in md.splitlines()
+        ), token
+    assert marked  # sanity: the marker really is on rendered lines
+
+
+def test_brief_marks_an_attested_row_in_every_section(seeded):
+    _attest_all(seeded)
+    md = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), dictionary=dedup.load_dictionary(DICT_PATH),
+        recent_labs=50, now=datetime(2026, 6, 1),
+    )
+    for token in ("Amlodipine", "Potassium", "Shellfish", "Migraine",
+                  "Wisdom tooth extraction", "pulse"):
+        assert any(
+            token in line and _ATTEST_MARKER in line for line in md.splitlines()
+        ), token
+
+
+def test_journal_marks_an_attested_event_and_gives_it_no_footnote(seeded):
+    _attest_all(seeded)
+    md = render.render_journal(seeded, "jane-doe", now=datetime(2026, 6, 1))
+    line = next(l for l in md.splitlines() if "Amlodipine" in l)
+    assert _ATTEST_MARKER in line
+    assert "[^" not in line          # no document to cite
+
+
+def test_a_promoted_row_renders_without_the_marker(seeded):
+    """Once a document backs the fact it is an ordinary sourced row again; the
+    attestation survives on the row as history, not as a caveat on the page."""
+    _attest_all(seeded)
+    doc = _doc(seeded, "jane-doe")
+    summary = dedup.commit_extraction(
+        seeded, doc, {"medication": [dict(_ATTESTED["medication"])]},
+        dedup.load_dictionary(DICT_PATH),
+    )
+    assert summary.counts["promoted"] == 1
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Amlodipine" in l)
+    assert _ATTEST_MARKER not in line
+    assert "Migraine" in md and _ATTEST_MARKER in md      # the others are still marked
+
+
+def test_attested_marker_is_ascii(seeded):
+    _attest_all(seeded)
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    assert md.isascii()
+    md.encode("cp437")
+
+
+def test_a_disputed_attested_row_carries_both_markers(seeded):
+    """Provenance reads last: the verdict is about the fact, the suffix about where it
+    came from."""
+    from pemr import attestations, curation as _curation
+
+    _attest_all(seeded)
+    row_id = attestations.list_attested(seeded, "medication")[0]["row_id"]
+    _curation.annotate_record(
+        seeded, "medication", str(row_id), status="disputed",
+        note="pharmacy has no record", apply=True,
+    )
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Amlodipine" in l)
+    assert line.index("[DISPUTED:") < line.index("(attested by")

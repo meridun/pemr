@@ -193,6 +193,10 @@ def query_timeline(
     Events without a usable date are omitted (they cannot be placed on a timeline).
     ``since`` (a date) drops events strictly before it. Ordered oldest first.
 
+    An event off a **human-attested** row (issue #110) additionally carries
+    ``attested_by``/``attested_on``; a document-sourced event carries neither key, so an
+    unattested record's event shape is unchanged.
+
     ``with_identity=True`` additionally stamps ``record_type`` and ``dedup_base`` on
     every event — the family identity `render_journal` needs to apply the `curation`
     overlay (issue #109), which the event contract otherwise has no way to express.
@@ -220,6 +224,15 @@ def query_timeline(
             "summary": summary,
             "document_id": row["document_id"],
         }
+        # Attestation provenance (issue #110) travels with the event, but only when the
+        # row actually carries it: an unattested database's timeline JSON keeps its exact
+        # key set, which is the additive-only guarantee. Unlike `dedup_base` this needs no
+        # opt-in flag - provenance is part of the public event contract, and an event that
+        # silently dropped "no source document" would be the one failure this feature
+        # cannot have.
+        if _row_get(row, "attested_by"):
+            event["attested_by"] = row["attested_by"]
+            event["attested_on"] = _row_get(row, "attested_on")
         if with_identity:
             event["record_type"] = record_type
             event["dedup_base"] = row["dedup_base"]
