@@ -18,6 +18,7 @@ EXPECTED_TABLES = {
     "allergy",
     "conflict",
     "document_tombstone",
+    "curation",
     "schema_migrations",
 }
 
@@ -42,6 +43,7 @@ ALL_MIGRATIONS = [
     "005_dedup_occurrence.sql",
     "006_condition_allergy.sql",
     "007_document_tombstone.sql",
+    "008_curation.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -129,7 +131,8 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
     conn.commit()
 
     assert db.migrate(conn) == [
-        "006_condition_allergy.sql", "007_document_tombstone.sql"
+        "006_condition_allergy.sql", "007_document_tombstone.sql",
+        "008_curation.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -234,3 +237,38 @@ def test_foreign_keys_enforced(conn):
             "INSERT INTO lab_result (person_id, test_name, collected_at, dedup_key)"
             " VALUES (999, 'hba1c', '2026-01-01', 'k1')"
         )
+
+
+def _migrate_through_007(conn, tmp_path):
+    """Apply every migration up to 007, leaving 008 pending (a 007-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre008"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "008":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
+    """The upgrade path for the curation overlay (issue #109): the table is additive,
+    so an existing database gains it without touching a single record row."""
+    from pemr import curation
+
+    _migrate_through_007(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.commit()
+    assert curation.has_table(conn) is False
+    assert curation.load_verdicts(conn) == {}  # readable before the migration exists
+
+    assert db.migrate(conn) == ["008_curation.sql"]
+
+    assert curation.has_table(conn) is True
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(curation)").fetchall()}
+    assert cols == {
+        "record_type", "dedup_base", "status", "note", "merged_into_base",
+        "attributed_to", "created_at",
+    }
+    assert conn.execute("SELECT COUNT(*) AS n FROM person").fetchone()["n"] == 1

@@ -18,8 +18,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import (
-    __version__, backup, db, dedup, documents, ingest, persons, query, records,
-    render, restore, study, tombstones, verify,
+    __version__, backup, curation, db, dedup, documents, ingest, persons, query,
+    records, render, restore, study, tombstones, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -411,6 +411,8 @@ def _with_document_conn(args: argparse.Namespace, work):
             documents.OcrTextPresentError,
             records.RecordNotFoundError,
             records.AnchoredConflictError,
+            curation.CurationNotFoundError,
+            curation.FamilyNotFoundError,
             persons.PersonNotFoundError,
         ) as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -887,6 +889,121 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
                 "dry run: nothing was deleted - re-run with --apply "
                 "(back up first: `pemr backup`)"
             )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+# --------------------------------------------------------------------------- #
+# recorded human verdicts (`record annotate`) - issue #109
+# --------------------------------------------------------------------------- #
+
+def _curation_row_line(row: dict) -> str:
+    """One `--list` line: identity, verdict, and whether the family still exists."""
+    orphan = "  (orphaned: no live family)" if not row["family_size"] else ""
+    return (
+        f"{row['record_type']:12}  {str(row['dedup_base'])[:12]}  "
+        f"{(row['created_at'] or '')[:10]:10}  {row['label']}  "
+        f"[{curation.describe(row)}]{orphan}"
+    )
+
+
+def _print_curation_report(report: "curation.CurationReport") -> None:
+    """The human block shared by annotate and clear, shaped like `_cmd_record_rm`'s."""
+    family = (
+        f"{report.family_size} row(s)" if report.family_size
+        else "no live rows (orphaned verdict)"
+    )
+    print(
+        f"{report.record_type}  {report.label or '(no live family)'}  "
+        f"base {report.dedup_base[:12]}  ({family})"
+    )
+    print(f"  status: {report.status}")
+    print(f"  note: {report.note}")
+    if report.attributed_to:
+        print(f"  attributed to: {report.attributed_to}")
+    if report.merged_into_base:
+        print(f"  merged into: {report.merged_into_base[:12]}")
+    if report.previous is not None and report.action != "clear":
+        print(f"  replaces: {curation.describe(report.previous)}")
+
+
+def _cmd_record_annotate(args: argparse.Namespace) -> int:
+    """`record annotate` — list, clear, or record one family's verdict.
+
+    Three modes on one subparser rather than three verbs: the positionals differ only
+    in whether they are present, and `--list`/`--clear` read as flags on the noun the
+    operator already has in hand. The handler owns the "table and target are required
+    unless --list" rule, because argparse cannot express it across `nargs='?'`.
+    """
+    parser = args.annotate_parser
+    if args.list:
+        if args.target is not None:
+            parser.error("--list takes an optional table, not a target")
+
+        def work(conn):
+            rows = curation.list_curation(conn, args.table)
+            if args.json:
+                _print_json(rows)
+                return 0
+            if not rows:
+                print("no curation verdicts recorded")
+                return 0
+            print(f"{'type':12}  {'base':12}  {'recorded':10}  label  [verdict]")
+            for row in rows:
+                print(_curation_row_line(row))
+            return 0
+
+        return _with_document_conn(args, work)
+
+    if args.table is None or args.target is None:
+        parser.error("table and target are required unless --list is given")
+
+    if args.clear:
+        def work(conn):
+            report = curation.clear_curation(
+                conn, args.table, args.target, apply=args.apply
+            )
+            if args.json:
+                _print_json(report.as_dict())
+                return 0
+            _print_curation_report(report)
+            if report.applied:
+                print(
+                    f"cleared curation verdict for {report.record_type} "
+                    f"{report.dedup_base[:12]}"
+                )
+            else:
+                print("dry run: nothing was written - re-run with --apply")
+            return 0
+
+        return _with_document_conn(args, work)
+
+    if args.status is None or args.note is None:
+        parser.error("--status and --note are required to record a verdict")
+
+    def work(conn):
+        report = curation.annotate_record(
+            conn,
+            args.table,
+            args.target,
+            status=args.status,
+            note=args.note,
+            attributed_to=args.attributed_to,
+            merged_into_base=args.merged_into,
+            apply=args.apply,
+        )
+        if args.json:
+            _print_json(report.as_dict())
+            return 0
+        _print_curation_report(report)
+        if report.applied:
+            print(
+                f"annotated {report.record_type} {report.dedup_base[:12]} "
+                f"({report.action})"
+            )
+        else:
+            print("dry run: nothing was written - re-run with --apply")
         return 0
 
     return _with_document_conn(args, work)
@@ -1890,6 +2007,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_rm.add_argument("--json", action="store_true", help="machine-readable output")
     r_rm.set_defaults(func=_cmd_record_rm)
+
+    # --- recorded human verdicts (curation overlay, issue #109) ---
+    r_annotate = record_sub.add_parser(
+        "annotate",
+        help="record a human verdict over a record family (dry run by default); "
+             "source rows are never mutated",
+    )
+    # Both optional so `--list` can take an optional table and no target; the handler
+    # enforces "table and target unless --list" with the usage line.
+    r_annotate.add_argument(
+        "table", nargs="?", choices=list(dedup.KNOWN_TYPES)
+    )
+    r_annotate.add_argument("target", nargs="?", metavar="BASE-OR-ID")
+    r_annotate.add_argument(
+        "--status", choices=list(curation.STATUSES), help="the verdict"
+    )
+    r_annotate.add_argument(
+        "--note", help="required: why the verdict was made, and who said so"
+    )
+    r_annotate.add_argument("--attributed-to", help="who made the call")
+    r_annotate.add_argument(
+        "--merged-into", metavar="BASE-OR-ID",
+        help="target family, required with --status merged-into",
+    )
+    r_annotate.add_argument(
+        "--list", action="store_true", help="list current verdicts and exit"
+    )
+    r_annotate.add_argument(
+        "--clear", action="store_true", help="lift the verdict on this family"
+    )
+    r_annotate.add_argument(
+        "--apply", action="store_true", help="write the verdict (default: report only)"
+    )
+    r_annotate.add_argument("--json", action="store_true", help="machine-readable output")
+    r_annotate.set_defaults(func=_cmd_record_annotate, annotate_parser=r_annotate)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"

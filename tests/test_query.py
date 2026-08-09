@@ -238,6 +238,30 @@ def test_timeline_carries_provenance(seeded):
     assert any(e["document_id"] is not None for e in events)
 
 
+def test_timeline_with_identity_stamps_family_keys(seeded):
+    """Issue #109: `render_journal` needs each event's family identity to apply the
+    curation overlay, and an event otherwise carries none."""
+    plain = query.query_timeline(seeded, "jane-doe")
+    tagged = query.query_timeline(seeded, "jane-doe", with_identity=True)
+
+    assert len(tagged) == len(plain)
+    assert all({"record_type", "dedup_base"} <= set(e) for e in tagged)
+    assert all(e["dedup_base"] for e in tagged)
+    assert {e["record_type"] for e in tagged} <= set(dedup.KNOWN_TYPES)
+    # Same events, same order, same values - identity is purely additive.
+    assert [
+        {k: v for k, v in e.items() if k not in ("record_type", "dedup_base")}
+        for e in tagged
+    ] == plain
+
+
+def test_timeline_default_shape_is_unchanged(seeded):
+    """Default-off is load-bearing: `dedup_base` is an INTERNAL_COLUMN, deliberately
+    absent from the CLI `--json` and MCP payloads."""
+    for e in query.query_timeline(seeded, "jane-doe"):
+        assert set(e) == {"date", "type", "summary", "document_id"}
+
+
 def test_timeline_summaries_are_ascii_safe(seeded):
     """§4 cp1252/cp437 console lesson: human-table summaries must be ASCII-only, or
     they crash on a non-UTF-8 Windows console (regression for the em-dash bounce —
