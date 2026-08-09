@@ -39,6 +39,12 @@ verdicts renders byte-identically to what it did before the overlay existed. Thi
 still a pure function of DB state -- the filter is a read, and output changes after a
 verdict because the database changed.
 
+**Attested rows** (issue #110). A row whose provenance is a named human rather than a
+document (`pemr record assert`) is tagged wherever it renders, by :func:`_attest_suffix` at
+every line builder: ``(attested by <who> <date>; no source document)``. It must never read
+as a document-sourced fact. Once a document backs it the row is promoted and renders
+unmarked, like any other sourced fact.
+
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
 
@@ -55,7 +61,7 @@ import sqlite3
 from datetime import datetime
 
 from . import curation, db, query
-from .dedup import enum_token, key_token
+from .dedup import enum_token, is_attested, key_token
 
 # Observation obs_type conventions this layer reads (see module docstring).
 OBS_VITAL = "vital"
@@ -251,6 +257,27 @@ def _dispute_suffix(row: dict) -> str:
     return ""
 
 
+def _attest_suffix(row: dict) -> str:
+    """``  (attested by <who> <date>; no source document)`` for a live attestation,
+    ``""`` otherwise (issue #110).
+
+    The single most important failure mode this feature can have is an unsourced fact
+    rendering identically to a document-sourced one, so the mitigation is structural: one
+    predicate (:func:`dedup.is_attested`), one suffix builder, appended at **every** line
+    builder that renders a typed-table row. A *superseded* attestation is deliberately
+    unmarked - a real document backs it now, and its attestation survives as history on
+    the row, not as a caveat on the page.
+
+    Placed after :func:`_dispute_suffix` wherever both apply: the verdict is about the
+    fact, provenance is about where the fact came from, and provenance reads last.
+    """
+    if not isinstance(row, dict) or not is_attested(row):
+        return ""
+    when = str(row.get("attested_on") or "").strip()
+    stamp = f" {when}" if when else ""
+    return f"  (attested by {row['attested_by']}{stamp}; no source document)"
+
+
 def _appendix_section(entries: dict[tuple[str, str], dict]) -> str | None:
     """The ``## Superseded / corrected`` section, or ``None`` when there is nothing
     to say.
@@ -332,14 +359,20 @@ def _condition_line(row: dict, *, past: bool = False) -> str:
         f"  (resolved {row['resolved_on']})" if past and row["resolved_on"] else ""
     )
     note = f" - {row['note']}" if row["note"] else ""
-    return f"- {row['name']}{since}{resolved}{note}{_dispute_suffix(row)}"
+    return (
+        f"- {row['name']}{since}{resolved}{note}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+    )
 
 
 def _allergy_line(row: dict) -> str:
     crit = f" [{str(row['criticality']).upper()}]" if row["criticality"] else ""
     reaction = f" - {row['reaction']}" if row["reaction"] else ""
     noted = f"  (noted {row['noted_on']})" if row["noted_on"] else ""
-    return f"- {row['substance']}{crit}{reaction}{noted}{_dispute_suffix(row)}"
+    return (
+        f"- {row['substance']}{crit}{reaction}{noted}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+    )
 
 
 def _latest_vitals(
@@ -438,7 +471,12 @@ def _order_line(row: dict) -> str:
         first = f", first {row['group_first']}" if row["group_first"] else ""
         notes.append(f"+{row['group_count'] - 1} earlier{first}")
     note = f"  ({'; '.join(notes)})" if notes else ""
-    return f"- {_order_display(row)}{detail}{note}{_dispute_suffix(row)}"
+    # `_grouped_orders` folds a group to its newest member, so the suffix describes the
+    # displayed row - the same rule `_dispute_suffix` already follows here.
+    return (
+        f"- {_order_display(row)}{detail}{note}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+    )
 
 
 def _abnormal_labs(
@@ -581,7 +619,9 @@ def render_summary(
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
         since = f" (since {m['started_on']})" if m["started_on"] else ""
-        med_lines.append(f"- {m['name']}{dose}{freq}{since}{_dispute_suffix(m)}")
+        med_lines.append(
+            f"- {m['name']}{dose}{freq}{since}{_dispute_suffix(m)}{_attest_suffix(m)}"
+        )
 
     active_lines = [
         _condition_line(c) for c in _conditions(conn, person_id, CONDITION_ACTIVE, cur)
@@ -591,7 +631,8 @@ def render_summary(
         for c in _conditions(conn, person_id, CONDITION_PAST, cur)
     ]
     family_lines = [
-        f"- {c['relation'] or 'family'}: {c['name']}{_dispute_suffix(c)}"
+        f"- {c['relation'] or 'family'}: {c['name']}"
+        f"{_dispute_suffix(c)}{_attest_suffix(c)}"
         for c in _conditions(conn, person_id, CONDITION_FAMILY, cur)
     ]
     allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
@@ -605,7 +646,8 @@ def render_summary(
         unit = f" {v['unit']}" if v["unit"] else ""
         when = f"  ({_date_part(v['observed_at'])})" if v["observed_at"] else ""
         vital_lines.append(
-            f"- {v['key']}: {_fmt(value)}{unit}{when}{_dispute_suffix(v)}"
+            f"- {v['key']}: {_fmt(value)}{unit}{when}"
+            f"{_dispute_suffix(v)}{_attest_suffix(v)}"
         )
 
     lab_lines = []
@@ -613,11 +655,12 @@ def render_summary(
         flag = f" [{r['flag']}]" if r["flag"] else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{_ref_range(r)}{_dispute_suffix(r)}"
+            f"{_lab_value(r)}{flag}{_ref_range(r)}"
+            f"{_dispute_suffix(r)}{_attest_suffix(r)}"
         )
 
     appt_lines = [
-        f"- {_appt_line(a)}{_dispute_suffix(a)}"
+        f"- {_appt_line(a)}{_dispute_suffix(a)}{_attest_suffix(a)}"
         for a in _open_appointments(conn, person_id, today, cur)
     ]
 
@@ -697,7 +740,9 @@ def render_brief(
     for m in meds:
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
-        med_lines.append(f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}")
+        med_lines.append(
+            f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}{_attest_suffix(m)}"
+        )
 
     # Recency stays the primary axis, but a single draw can carry a 50+ analyte panel —
     # a flat `LIMIT N` over `collected_at DESC, test_name` then returns the
@@ -731,7 +776,7 @@ def render_brief(
         abnormal = f"  [!]{_ref_range(r)}" if _is_abnormal(r) else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{abnormal}{_dispute_suffix(r)}"
+            f"{_lab_value(r)}{flag}{abnormal}{_dispute_suffix(r)}{_attest_suffix(r)}"
         )
 
     proc_rows = _apply_curation(
@@ -761,7 +806,7 @@ def render_brief(
         outcome = f" - {p['outcome']}" if p["outcome"] else ""
         ctx_lines.append(
             f"- {_date_part(p['performed_on']) or '(undated)'}  procedure: "
-            f"{p['name']}{outcome}{_dispute_suffix(p)}"
+            f"{p['name']}{outcome}{_dispute_suffix(p)}{_attest_suffix(p)}"
         )
     for o in obs_rows:
         value = o["value_num"] if o["value_num"] is not None else o["value_text"]
@@ -769,7 +814,7 @@ def render_brief(
         detail = " ".join(p for p in (o["obs_type"], o["key"]) if p)
         ctx_lines.append(
             f"- {_date_part(o['observed_at']) or '(undated)'}  {detail}{val}"
-            f"{_dispute_suffix(o)}"
+            f"{_dispute_suffix(o)}{_attest_suffix(o)}"
         )
 
     brief_allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
@@ -866,7 +911,12 @@ def render_journal(
         ref = ""
         if e["document_id"] is not None:
             ref = f" [^{footnote_num[e['document_id']]}]"
-        lines.append(f"- **{e['type']}** -- {e['summary']}{ref}{_dispute_suffix(e)}")
+        # An attested event has no document_id, so it takes no [^n] footnote marker and
+        # the suffix is the only thing that says where the fact came from (issue #110).
+        lines.append(
+            f"- **{e['type']}** -- {e['summary']}{ref}"
+            f"{_dispute_suffix(e)}{_attest_suffix(e)}"
+        )
 
     # Before the footnote block: footnotes are reference apparatus for the events
     # above them and stay last.
