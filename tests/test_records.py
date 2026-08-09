@@ -468,3 +468,113 @@ def test_cli_record_rm_refusal_writes_nothing(cli_ready, capsys):
                 "--apply") == 1
     assert "review-conflicts" in capsys.readouterr().err
     assert _cli_count(cli_ready, "lab_result") == 2
+
+
+# --- smoke: the operator loop, end to end through the CLI --------------------
+
+
+_DICT_BASE = '[synonyms]\n"neu" = "neutrophils_abs"\n'
+_DICT_FUSED = _DICT_BASE + '"neutrophils (absolute)" = "neutrophils_abs"\n'
+
+
+def _ingest(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_bytes(text)
+    assert _run(tmp_path, "ingest", str(path), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"),
+                "--ocr-text-file", str(path)) == 0
+
+
+def _commit(tmp_path, name, document, payload, dictionary):
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run(tmp_path, "commit-extraction", "--document", str(document),
+                "--json", str(path), "--dictionary", str(dictionary)) == 0
+
+
+def test_cli_smoke_walks_the_whole_doubled_collision_loop(tmp_path, capsys):
+    """The issue's operator story, driven entirely through the CLI with a real
+    dictionary edit (issue #107).
+
+    The engine-level end-to-end test builds the doubled row with `dedup._insert_record`;
+    this one earns it the way an operator does — two documents, then a synonym addition
+    that fuses their labels — and then walks `rekey` (doubled, quarantined table) ->
+    `record rm` (dry run, then --apply) -> `rekey --apply` (clean), proving the AC's
+    claim that resolving a doubled fact inside a multi-record document needs no direct
+    SQL edit and costs the document none of its other records.
+    """
+    base = tmp_path / "base.toml"
+    base.write_text(_DICT_BASE, encoding="utf-8")
+    fused = tmp_path / "fused.toml"
+    fused.write_text(_DICT_FUSED, encoding="utf-8")
+
+    assert _run(tmp_path, "migrate", "--create") == 0
+    assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane") == 0
+    _ingest(tmp_path, "visit.txt", b"visit note: neu 3.1, glucose 95, metformin")
+    _ingest(tmp_path, "lab.txt", b"lab report: Neutrophils (absolute) 3.1")
+    # The visit note quotes the lab's neutrophil count and holds three other records;
+    # the lab report states the same fact under its long-form label.
+    _commit(tmp_path, "visit.json", 1, {
+        "lab_result": [
+            {"test_name": "NEU", "collected_at": "2026-01-02", "value_num": 3.1,
+             "unit": "10*9/L"},
+            {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95,
+             "unit": "mg/dL"},
+        ],
+        "medication": [{"name": "Metformin", "dose": "500 mg"}],
+        "condition": [{"name": "Type 2 Diabetes", "status": "active"}],
+    }, base)
+    _commit(tmp_path, "lab.json", 2, {
+        "lab_result": [{"test_name": "Neutrophils (absolute)",
+                        "collected_at": "2026-01-02", "value_num": 3.1,
+                        "unit": "10*9/L"}],
+    }, base)
+    quoted = _cli_row_id(tmp_path, "lab_result", "test_name", "NEU")
+    filed = _cli_row_id(tmp_path, "lab_result", "test_name", "Neutrophils (absolute)")
+    glucose = _cli_row_id(tmp_path, "lab_result", "test_name", "Glucose")
+
+    # 1. The synonym addition fuses the two labels: rekey quarantines the table and
+    #    hands back a runnable command for each candidate row.
+    capsys.readouterr()
+    assert _run(tmp_path, "rekey", "--dictionary", str(fused)) == 1
+    rekey_out = capsys.readouterr()
+    message = rekey_out.out + rekey_out.err
+    assert "SAME fact" in message
+    # Both candidate rows are named, one of them as a directly runnable command.
+    assert f"pemr record rm lab_result {filed}" in message
+    assert f"`... {quoted}`" in message
+    assert "pemr document rm" in message
+
+    # 2. Dry run on the quoted copy - the one inside the multi-record visit note,
+    #    exactly the row `document rm` could not take on its own.
+    assert _run(tmp_path, "record", "rm", "lab_result", str(quoted),
+                "--dictionary", str(fused)) == 0
+    dry = capsys.readouterr().out
+    assert "dry run: nothing was deleted - re-run with --apply" in dry
+    assert _cli_count(tmp_path, "lab_result") == 3
+
+    # 3. --apply takes that row and nothing else - the visit note keeps its glucose,
+    #    its medication and its condition.
+    assert _run(tmp_path, "record", "rm", "lab_result", str(quoted), "--apply",
+                "--dictionary", str(fused)) == 0
+    assert f"removed lab_result #{quoted}" in capsys.readouterr().out
+    assert _cli_count(tmp_path, "lab_result") == 2
+    assert _cli_count(tmp_path, "medication") == 1
+    assert _cli_count(tmp_path, "condition") == 1
+    assert _cli_count(tmp_path, "document") == 2
+
+    # 4. The collision is gone: rekey moves the surviving row onto the fused key.
+    assert _run(tmp_path, "rekey", "--dictionary", str(fused), "--apply") == 0
+    assert "rekeyed 1 row(s)" in capsys.readouterr().out
+    assert _run(tmp_path, "rekey", "--dictionary", str(fused)) == 0
+
+    # 5. No orphaned FTS row, and the visit note's own text is still searchable.
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        assert sorted(_fts_ids(conn, "lab_result")) == sorted([glucose, filed])
+        assert sorted(_fts_ids(conn, "document")) == [1, 2]
+    finally:
+        conn.close()
+
+    # 6. And the database is still internally consistent.
+    assert _run(tmp_path, "verify", "--sources", str(tmp_path / "sources")) == 0
