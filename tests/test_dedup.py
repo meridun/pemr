@@ -257,8 +257,9 @@ def test_synonym_additions_keep_qualifier_distinct_labels_apart():
         ("Albumin", "Albumin (SPEP)"),
         ("Albumin", "Protein Electrophoresis Albumin Fraction"),
         # Issue #106: SPEP renderings print the BARE labels, so the CMP short codes
-        # must not fuse with them, and `Neutrophils (absolute)` stays unmapped until
-        # the doubled corpus row can be dropped (issue #107).
+        # must not fuse with them. `Neutrophils (absolute)` stays unmapped until the
+        # doubled corpus row is actually dropped in the data repo with
+        # `pemr record rm lab_result <id>` (the verb landed with issue #107).
         ("ALB", "Albumin"),
         ("TPro", "Protein, Total"),
         ("NEU", "Neutrophils (absolute)"),
