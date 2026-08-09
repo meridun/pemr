@@ -109,9 +109,10 @@
 "neu" = "neutrophils_abs"
 # `Neutrophils (absolute)` is deliberately NOT mapped to `neutrophils_abs` yet: the
 # corpus holds a payload-degraded duplicate of one NEU row (a visit note quoting the
-# same-day lab), and fusing the labels collides them with no row-level removal verb to
-# resolve it (issue #107). Restore this mapping once #107 lands and the doubled row is
-# dropped.
+# same-day lab), and fusing the labels collides them. The removal verb now exists —
+# `pemr record rm lab_result <id>` (issue #107) drops the degraded row without touching
+# the visit note's other records. Restore this mapping in the data repo once the
+# operator has run it there and `pemr rekey --apply` comes back clean.
 "mono" = "monocytes_abs"
 "monocytes (absolute)" = "monocytes_abs"
 "eo" = "eosinophils_abs"

@@ -412,12 +412,21 @@ purpose: the family is one indexed lookup instead of probing `hash(base|1)`, `ha
 **A conflict's key is the family base, not a row's key.** `conflict.dedup_key` always
 holds the `dedup_base`, and the conflict is anchored to the family's lowest surviving
 occurrence. Resolutions therefore address that row by **primary key** — never by
-`WHERE dedup_key = conflict.dedup_key`. Once occurrence 0 is gone (`document rm` or
-`document reassign` of the document that owned it) the anchor's own key is
+`WHERE dedup_key = conflict.dedup_key`. Once occurrence 0 is gone (`document rm`,
+`document reassign` of the document that owned it, or `record rm` of that one row) the
+anchor's own key is
 `hash(base | n)`, so a key-targeted write would match nothing while the conflict was
 stamped `resolved`, silently discarding the staged value. If nothing is left in the family
 at all, `keep incoming` **refuses** rather than reporting a success that wrote nothing;
 `keep both` still admits the staged row, at occurrence 0.
+
+The three removers treat an anchored open conflict differently, and the difference is
+whether the conflict is still resolvable afterwards. `document rm` **deletes** it: the
+document its staged payload came from is going away too, so there is nothing left to keep.
+`record rm` (issue #107) **refuses** when the row it would delete is the last of the
+conflict's family, because there the document survives — `keep both` is still a live
+resolution, and no dry run could undo destroying an `incoming_json`. When a sibling
+survives, `record rm` allows the removal and reports which conflicts re-anchor.
 
 The stored `conflict.dedup_key` is also only the *current* base while the dictionary holds
 still: `rekey` rewrites keys on the record tables and does not touch the `conflict` table,
@@ -579,6 +588,8 @@ pemr document reassign <id> --person <slug> [--apply]    # move a misfiled docum
 pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--note ...]]
                                                          # delete a document + records; dry run by default
                                                          # --tombstone: also refuse to re-ingest this content (§3)
+pemr record rm <table> <id> [--apply]                    # delete ONE record row; its document and every
+                                                         # other record it produced survive; dry run by default
 pemr document tombstone list [--json]                    # recorded intentional removals, newest first
 pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]
                                                          # pre-emptive exclusion; ingests and copies nothing
@@ -626,6 +637,11 @@ annotations expose the read/write split to the client.
 **call tools, not reinvent** — and specifically: never write to the DB except through
 `commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
+
+`document rm` and `record rm` (issue #107) are deliberately **absent** from `WRITE_TOOLS` — this
+is a rule, not an oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and
+therefore no agent, can remove a record or a document. Any future destructive verb should default
+to the same exclusion unless a human explicitly decides otherwise.
 
 ---
 

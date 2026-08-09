@@ -18,8 +18,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import (
-    __version__, backup, db, dedup, documents, ingest, persons, query, render,
-    restore, study, tombstones, verify,
+    __version__, backup, db, dedup, documents, ingest, persons, query, records,
+    render, restore, study, tombstones, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -409,6 +409,8 @@ def _with_document_conn(args: argparse.Namespace, work):
             documents.DictionaryDriftError,
             documents.ReassignCollisionError,
             documents.OcrTextPresentError,
+            records.RecordNotFoundError,
+            records.AnchoredConflictError,
             persons.PersonNotFoundError,
         ) as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -822,6 +824,69 @@ def _cmd_document_tombstone_rm(args: argparse.Namespace) -> int:
     def work(conn):
         row = tombstones.remove_tombstone(conn, sha)
         print(f"lifted tombstone {row['sha256'][:12]} - {tombstones.describe(row)}")
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+# --------------------------------------------------------------------------- #
+# row-level record repair (`record rm`) - issue #107
+# --------------------------------------------------------------------------- #
+
+def _cmd_record_rm(args: argparse.Namespace) -> int:
+    dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+
+    def work(conn):
+        report = records.remove_record(
+            conn, args.table, args.row_id, dictionary, apply=args.apply
+        )
+        if args.json:
+            _print_json({
+                "record_type": report.record_type,
+                "row_id": report.row_id,
+                "person": report.person_slug,
+                "document_id": report.document_id,
+                "label": report.label,
+                "fields": report.fields,
+                "dedup_key": report.dedup_key,
+                "dedup_base": report.dedup_base,
+                "dedup_occurrence": report.dedup_occurrence,
+                "family_size": report.family_size,
+                "family_remaining": report.family_remaining,
+                "conflicts_reanchored": report.conflicts_reanchored,
+                "applied": report.applied,
+            })
+            return 0
+        print(
+            f"{report.record_type} #{report.row_id}  {_fmt(report.person_slug)}  "
+            f"{report.label}"
+        )
+        for name, value in report.fields.items():
+            if value is not None:
+                print(f"  {name}: {value}")
+        owner = (
+            f"#{report.document_id}" if report.document_id is not None else "none"
+        )
+        print(f"  document: {owner} (kept, with its other records)")
+        remain = "remain" if report.applied else "would remain"
+        print(
+            f"  identity: occurrence {report.dedup_occurrence} of "
+            f"{report.family_size} in its family ({report.family_remaining} "
+            f"{remain})"
+        )
+        if report.conflicts_reanchored:
+            ids = ", ".join(f"#{cid}" for cid in report.conflicts_reanchored)
+            print(
+                f"  open conflict(s) {ids} re-anchor to the lowest surviving "
+                "occurrence"
+            )
+        if report.applied:
+            print(f"removed {report.record_type} #{report.row_id}")
+        else:
+            print(
+                "dry run: nothing was deleted - re-run with --apply "
+                "(back up first: `pemr backup`)"
+            )
         return 0
 
     return _with_document_conn(args, work)
@@ -1803,6 +1868,28 @@ def build_parser() -> argparse.ArgumentParser:
     t_rm = tombstone_sub.add_parser("rm", help="lift a tombstone (full hash only)")
     t_rm.add_argument("sha256", metavar="SHA256")
     t_rm.set_defaults(func=_cmd_document_tombstone_rm)
+
+    # --- row-level record repair (doubled-fact escape hatch, issue #107) ---
+    p_record = sub.add_parser(
+        "record", help="inspect and repair individual records"
+    )
+    record_sub = p_record.add_subparsers(dest="record_command", required=True)
+
+    r_rm = record_sub.add_parser(
+        "rm",
+        help="delete one record row, leaving its document and every other record "
+             "it produced intact (dry run by default)",
+    )
+    r_rm.add_argument("table", choices=list(dedup.KNOWN_TYPES))
+    r_rm.add_argument("row_id", type=int, metavar="ID")
+    r_rm.add_argument(
+        "--apply", action="store_true", help="write the delete (default: report only)"
+    )
+    r_rm.add_argument(
+        "--dictionary", help="synonym dictionary TOML (overrides default)"
+    )
+    r_rm.add_argument("--json", action="store_true", help="machine-readable output")
+    r_rm.set_defaults(func=_cmd_record_rm)
 
     p_ingest = sub.add_parser(
         "ingest", help="ingest a document (hash, blob store, layer-1 dedup)"
