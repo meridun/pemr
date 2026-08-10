@@ -413,6 +413,7 @@ def _with_document_conn(args: argparse.Namespace, work):
             records.AnchoredConflictError,
             curation.CurationNotFoundError,
             curation.FamilyNotFoundError,
+            curation.RowNotFoundError,
             attestations.AttestationCollisionError,
             persons.PersonNotFoundError,
         ) as exc:
@@ -899,26 +900,47 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
 # recorded human verdicts (`record annotate`) - issue #109
 # --------------------------------------------------------------------------- #
 
+def _curation_scope(row: dict) -> str:
+    """`family` or `row #<id>` — the scope column shared by `--list` and the report."""
+    record_id = row.get("record_id") or 0
+    return f"row #{record_id}" if record_id else curation.SCOPE_FAMILY
+
+
 def _curation_row_line(row: dict) -> str:
-    """One `--list` line: identity, verdict, and whether the family still exists."""
-    orphan = "  (orphaned: no live family)" if not row["family_size"] else ""
+    """One `--list` line: identity, scope, verdict, and whether the target still exists.
+
+    The scope column is not cosmetic (issue #114): a family verdict and a row verdict on
+    the same family are two different rulings, and `--clear` needs `--row` for exactly
+    one of them.
+    """
+    if not row["family_size"]:
+        orphan = (
+            "  (orphaned: no live row)" if row.get("record_id")
+            else "  (orphaned: no live family)"
+        )
+    else:
+        orphan = ""
     return (
         f"{row['record_type']:12}  {str(row['dedup_base'])[:12]}  "
-        f"{(row['created_at'] or '')[:10]:10}  {row['label']}  "
-        f"[{curation.describe(row)}]{orphan}"
+        f"{_curation_scope(row):10}  {(row['created_at'] or '')[:10]:10}  "
+        f"{row['label']}  [{curation.describe(row)}]{orphan}"
     )
 
 
 def _print_curation_report(report: "curation.CurationReport") -> None:
     """The human block shared by annotate and clear, shaped like `_cmd_record_rm`'s."""
-    family = (
-        f"{report.family_size} row(s)" if report.family_size
-        else "no live rows (orphaned verdict)"
-    )
+    if report.family_size:
+        family = f"{report.family_size} row(s)"
+    elif report.record_id:
+        family = "no live row (orphaned verdict)"
+    else:
+        family = "no live rows (orphaned verdict)"
+    gone = "(no live row)" if report.record_id else "(no live family)"
     print(
-        f"{report.record_type}  {report.label or '(no live family)'}  "
+        f"{report.record_type}  {report.label or gone}  "
         f"base {report.dedup_base[:12]}  ({family})"
     )
+    print(f"  scope: {_curation_scope(report.as_dict())}")
     print(f"  status: {report.status}")
     print(f"  note: {report.note}")
     if report.attributed_to:
@@ -930,17 +952,23 @@ def _print_curation_report(report: "curation.CurationReport") -> None:
 
 
 def _cmd_record_annotate(args: argparse.Namespace) -> int:
-    """`record annotate` — list, clear, or record one family's verdict.
+    """`record annotate` — list, clear, or record one verdict (family- or row-scoped).
 
     Three modes on one subparser rather than three verbs: the positionals differ only
     in whether they are present, and `--list`/`--clear` read as flags on the noun the
     operator already has in hand. The handler owns the "table and target are required
     unless --list" rule, because argparse cannot express it across `nargs='?'`.
+
+    `--row` (issue #114) narrows both the write and the clear to one row; without it
+    every path behaves exactly as it did under #109, which is why row scope is opt-in
+    rather than inferred from a digit-shaped target.
     """
     parser = args.annotate_parser
     if args.list:
         if args.target is not None:
             parser.error("--list takes an optional table, not a target")
+        if args.row:
+            parser.error("--row scopes a verdict to one row; it has no meaning with --list")
 
         def work(conn):
             rows = curation.list_curation(conn, args.table)
@@ -950,7 +978,10 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
             if not rows:
                 print("no curation verdicts recorded")
                 return 0
-            print(f"{'type':12}  {'base':12}  {'recorded':10}  label  [verdict]")
+            print(
+                f"{'type':12}  {'base':12}  {'scope':10}  {'recorded':10}  "
+                "label  [verdict]"
+            )
             for row in rows:
                 print(_curation_row_line(row))
             return 0
@@ -963,16 +994,19 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
     if args.clear:
         def work(conn):
             report = curation.clear_curation(
-                conn, args.table, args.target, apply=args.apply
+                conn, args.table, args.target, row=args.row, apply=args.apply
             )
             if args.json:
                 _print_json(report.as_dict())
                 return 0
             _print_curation_report(report)
             if report.applied:
+                target = (
+                    f"row #{report.record_id}" if report.record_id
+                    else report.dedup_base[:12]
+                )
                 print(
-                    f"cleared curation verdict for {report.record_type} "
-                    f"{report.dedup_base[:12]}"
+                    f"cleared curation verdict for {report.record_type} {target}"
                 )
             else:
                 print("dry run: nothing was written - re-run with --apply")
@@ -992,6 +1026,7 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
             note=args.note,
             attributed_to=args.attributed_to,
             merged_into_base=args.merged_into,
+            row=args.row,
             apply=args.apply,
         )
         if args.json:
@@ -999,9 +1034,12 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
             return 0
         _print_curation_report(report)
         if report.applied:
+            target = (
+                f"row #{report.record_id}" if report.record_id
+                else report.dedup_base[:12]
+            )
             print(
-                f"annotated {report.record_type} {report.dedup_base[:12]} "
-                f"({report.action})"
+                f"annotated {report.record_type} {target} ({report.action})"
             )
         else:
             print("dry run: nothing was written - re-run with --apply")
@@ -2191,7 +2229,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--list", action="store_true", help="list current verdicts and exit"
     )
     r_annotate.add_argument(
-        "--clear", action="store_true", help="lift the verdict on this family"
+        "--clear", action="store_true", help="lift the verdict on this target"
+    )
+    r_annotate.add_argument(
+        "--row", action="store_true",
+        help="scope the verdict to this ROW only, not its whole dedup family "
+             "(target must be a row id); also selects a row verdict for --clear",
     )
     r_annotate.add_argument(
         "--apply", action="store_true", help="write the verdict (default: report only)"

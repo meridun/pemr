@@ -109,24 +109,36 @@ CREATE TABLE document_tombstone (
   document_id INTEGER                     -- the id it had; forensics only, not a FK
 );
 
--- Recorded human verdicts over record families (issue #109). A pure overlay: no record
--- row is ever mutated, and a family with no row here renders exactly as before. Keyed
--- by (record_type, dedup_base) - the stable family identity of §3 - so a verdict
--- outlives occurrence renumbering and `record rm`, but NOT a dictionary-driven `rekey`
--- that renames the family itself: that moves `dedup_base` too, and orphans the verdict
--- exactly like a removed row would. Like 007 it carries no FK to the row it annotates,
--- and `pemr verify` warns (never fails) on a verdict whose family is gone either way.
--- Written only by `record annotate`; read at render time by every generated document.
+-- Recorded human verdicts over records (issues #109, #114). A pure overlay: no record
+-- row is ever mutated, and a record with no row here renders exactly as before. A
+-- verdict is scoped either to a whole dedup FAMILY (record_id = 0, keyed by the stable
+-- family identity of §3) or to a single ROW (record_id > 0). Family scope outlives
+-- occurrence renumbering and `record rm` but NOT a dictionary-driven `rekey` that
+-- renames the family: that moves `dedup_base` and orphans the verdict. Row scope
+-- resolves by (record_type, record_id) alone and therefore DOES survive that rekey -
+-- `rekey` never renumbers a row id - so its stored dedup_base is a breadcrumb only,
+-- never a resolution key. Row scope exists for the `--keep both` family holding two
+-- live rows, where a family verdict would hide the occurrence it says should win. Row
+-- wins over family for its own row. Like 007 the table carries no FK to what it
+-- annotates, and `pemr verify` warns (never fails) on a verdict whose family - or row -
+-- is gone. Written only by `record annotate`; read at render time by every generated
+-- document.
 CREATE TABLE curation (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
-  dedup_base       TEXT NOT NULL,   -- family identity: NOT dedup_key, NOT a row id
+  dedup_base       TEXT NOT NULL,   -- family identity; a breadcrumb when record_id <> 0
+  record_id        INTEGER NOT NULL DEFAULT 0,  -- 0 = family scope; else <record_type>_id
   status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into
   note             TEXT NOT NULL,   -- required: the why, and who said so
-  merged_into_base TEXT,            -- set iff status = 'merged-into'
+  merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY
   attributed_to    TEXT,
   created_at       TEXT NOT NULL,   -- ISO8601 UTC
-  PRIMARY KEY (record_type, dedup_base)
+  PRIMARY KEY (record_type, dedup_base, record_id)
 );
+-- One live verdict per row, whatever base it was recorded under (the PK cannot say this:
+-- its dedup_base member is a breadcrumb). 0 rather than NULL for family scope because
+-- SQLite treats NULLs as distinct in a unique index.
+CREATE UNIQUE INDEX idx_curation_row ON curation(record_type, record_id)
+  WHERE record_id <> 0;
 ```
 
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
@@ -654,12 +666,14 @@ pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--no
 pemr record rm <table> <id> [--apply]                    # delete ONE record row; its document and every
                                                          # other record it produced survive; dry run by default
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
-                     [--merged-into <base-or-id>] [--apply]
+                     [--merged-into <base-or-id>] [--row] [--apply]
                                                          # record a human verdict over a record FAMILY (§2 curation):
                                                          # confirmed|superseded|erroneous-in-source|disputed|merged-into
+                                                         # --row: scope it to that ROW only (a keep-both family holds
+                                                         #        two live rows; row scope beats family scope there)
                                                          # pure overlay - no record row is mutated; dry run by default
-pemr record annotate --list [<table>] [--json]           # current verdicts, newest first (orphans flagged)
-pemr record annotate <table> <base-or-id> --clear [--apply]      # lift one verdict
+pemr record annotate --list [<table>] [--json]           # current verdicts, newest first (scope + orphans flagged)
+pemr record annotate <table> <base-or-id> [--row] --clear [--apply]   # lift one verdict, in the named scope
 pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
                    --field NAME=VALUE [--field ...] [--apply]
                                                          # commit a fact attested by a PERSON, with no
@@ -741,17 +755,20 @@ default to the same exclusion unless a human explicitly decides otherwise.
 - **journal** — chronological event stream (documents + appointments + procedures)
   rendered as a narrative timeline.
 
-Every section is filtered at read time against the `curation` overlay (§2, issue #109):
-`superseded` / `erroneous-in-source` / `merged-into` families leave their section for a
-`## Superseded / corrected` appendix, `disputed` families render in place with a
-`[DISPUTED: <note>]` marker and reach the brief's `## Questions for the Clinician`, and
+Every section is filtered at read time against the `curation` overlay (§2, issues #109 and
+#114): `superseded` / `erroneous-in-source` / `merged-into` leave their section for a
+`## Superseded / corrected` appendix, `disputed` renders in place with a
+`[DISPUTED: <note>]` marker and reaches the brief's `## Questions for the Clinician`, and
 `confirmed` renders unchanged. Both new sections are omitted entirely when empty, so a record
 with no verdicts renders byte-identically to before the overlay existed. This does not weaken
 the purity rule: the filter is a read, and output changes after a verdict because the
-*database* changed. One consequence of the read-time join: if a dictionary-driven `rekey`
-(§3) has renamed a family since its verdict was recorded, the join misses and the family
-renders as if unannotated — `pemr verify` flags the orphaned verdict, but nothing re-attaches
-it automatically.
+*database* changed. Resolution is **per row**: a row-scoped verdict affects only its own
+occurrence — the sibling of a `--keep both` pair renders untouched — and beats the family
+verdict for that row. One consequence of the read-time join: if a dictionary-driven `rekey`
+(§3) has renamed a family since its verdict was recorded, a *family*-scoped verdict's join
+misses and the family renders as if unannotated (`pemr verify` flags the orphan; nothing
+re-attaches it automatically). A *row*-scoped verdict is immune — it joins on the row id,
+which `rekey` never renumbers — and is orphaned only by the removal of its row.
 
 Because they regenerate from truth, they never drift. Old exports are disposable.
 

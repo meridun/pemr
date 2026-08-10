@@ -118,6 +118,8 @@ def test_annotate_writes_a_verdict_and_touches_no_record_row(seeded):
     assert curation.get_verdict(conn, "lab_result", report.dedup_base) == {
         "record_type": "lab_result",
         "dedup_base": report.dedup_base,
+        "record_id": 0,
+        "scope": "family",
         "status": "erroneous-in-source",
         "note": "requisition coding artifact",
         "merged_into_base": None,
@@ -405,7 +407,10 @@ def test_verdict_covers_a_later_keep_both_sibling(seeded):
     _second_occurrence(seeded)
 
     assert curation.family_label(conn, "lab_result", base)[1] == 2
-    assert curation.load_verdicts(conn)[("lab_result", base)]["status"] == "superseded"
+    assert (
+        curation.load_verdicts(conn).family[("lab_result", base)]["status"]
+        == "superseded"
+    )
 
 
 def test_verdict_survives_a_no_drift_rekey(seeded):
@@ -419,6 +424,212 @@ def test_verdict_survives_a_no_drift_rekey(seeded):
     report = dedup.rekey(conn, None, apply=True)
     assert not report.collisions
     assert curation.get_verdict(conn, "lab_result", base) is not None
+
+
+# --- row scope: one occurrence of a multi-row family (issue #114) -------------
+
+
+def _occurrence_ids(conn, base):
+    """``(occurrence 0 id, occurrence 1 id)`` for a two-row lab_result family."""
+    rows = conn.execute(
+        "SELECT lab_result_id FROM lab_result WHERE dedup_base = ? "
+        "ORDER BY dedup_occurrence", (base,)
+    ).fetchall()
+    return tuple(int(r["lab_result_id"]) for r in rows)
+
+
+def test_annotate_row_scopes_the_verdict_to_a_single_row(seeded):
+    """The case that forced #114: a `--keep both` family holds two *live* rows, and a
+    family-scoped verdict on the loser hides the winner too."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+
+    report = curation.annotate_record(
+        conn, "lab_result", str(occ1), status="superseded",
+        note="loser of an earlier keep-both", row=True, apply=True,
+    )
+
+    assert report.scope == curation.SCOPE_ROW and report.record_id == occ1
+    assert report.dedup_base == base       # stored as the breadcrumb
+    assert report.label == "Glucose" and report.family_size == 2
+    stored = curation.get_verdict(conn, "lab_result", base, record_id=occ1)
+    assert stored["scope"] == "row" and stored["record_id"] == occ1
+    # No family verdict was created as a side effect: the sibling is untouched.
+    assert curation.get_verdict(conn, "lab_result", base) is None
+    assert _curation_count(conn) == 1
+
+
+def test_family_scope_is_unchanged_and_stores_the_sentinel(seeded):
+    """AC 3, the backward-compatibility pin: with no `row=True` anywhere, storage is
+    bit-identical to #109's - one row, `record_id = 0`, resolvable by base."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    report = curation.annotate_record(
+        conn, "lab_result", base, status="superseded", note="whole family", apply=True
+    )
+    assert report.scope == curation.SCOPE_FAMILY
+    assert report.record_id == curation.FAMILY_SCOPE
+    stored = conn.execute("SELECT * FROM curation").fetchone()
+    assert stored["record_id"] == 0 and stored["dedup_base"] == base
+    verdicts = curation.load_verdicts(conn)
+    assert verdicts.rows == {} and set(verdicts.family) == {("lab_result", base)}
+    # Every row of the family sees it.
+    for record_id in _occurrence_ids(conn, base):
+        assert verdicts.for_row("lab_result", base, record_id)["note"] == "whole family"
+
+
+def test_a_row_verdict_wins_over_its_family_verdict_for_that_row_only(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed",
+                            note="the family is contested", apply=True)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="this occurrence lost", row=True, apply=True)
+
+    verdicts = curation.load_verdicts(conn)
+    assert len(verdicts) == 2                       # both scopes coexist
+    assert verdicts.for_row("lab_result", base, occ1)["status"] == "superseded"
+    assert verdicts.for_row("lab_result", base, occ0)["status"] == "disputed"
+    # A carrier with no row identity can still only see the family verdict.
+    assert verdicts.for_row("lab_result", base, None)["status"] == "disputed"
+
+
+def test_re_annotating_a_row_overwrites_only_that_row(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="disputed",
+                            note="first", row=True, now="2026-01-01T00:00:00+00:00",
+                            apply=True)
+    second = curation.annotate_record(
+        conn, "lab_result", str(occ1), status="superseded", note="second", row=True,
+        now="2026-02-02T00:00:00+00:00", apply=True,
+    )
+    assert second.action == "overwrite" and second.previous["note"] == "first"
+    assert _curation_count(conn) == 1
+    live = curation.get_verdict(conn, "lab_result", base, record_id=occ1)
+    assert live["status"] == "superseded"
+    assert live["created_at"] == "2026-02-02T00:00:00+00:00"
+
+
+def test_resolve_row_requires_a_live_row_id(seeded):
+    conn = seeded["conn"]
+    row_id = _row_id(conn, "lab_result", "test_name", "Glucose")
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    assert curation.resolve_row(conn, "lab_result", str(row_id)) == (row_id, base)
+    with pytest.raises(curation.RowNotFoundError, match="no lab_result with id 9999"):
+        curation.resolve_row(conn, "lab_result", "9999")
+    with pytest.raises(ValueError, match="drop --row"):
+        curation.resolve_row(conn, "lab_result", base)
+
+
+def test_row_and_family_verdicts_are_cleared_independently(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed",
+                            note="family", apply=True)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="row", row=True, apply=True)
+
+    cleared = curation.clear_curation(conn, "lab_result", str(occ1), row=True,
+                                      apply=True)
+    assert cleared.scope == "row" and cleared.record_id == occ1
+    assert curation.get_verdict(conn, "lab_result", base, record_id=occ1) is None
+    assert curation.get_verdict(conn, "lab_result", base)["note"] == "family"
+
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="row again", row=True, apply=True)
+    curation.clear_curation(conn, "lab_result", base, apply=True)
+    assert curation.get_verdict(conn, "lab_result", base) is None
+    assert curation.get_verdict(
+        conn, "lab_result", base, record_id=occ1
+    )["note"] == "row again"
+
+
+def test_clearing_an_empty_scope_is_an_error_not_a_success(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed",
+                            note="family only", apply=True)
+    with pytest.raises(curation.CurationNotFoundError, match="row-scoped"):
+        curation.clear_curation(conn, "lab_result", str(occ1), row=True, apply=True)
+    with pytest.raises(ValueError, match="drop --row"):
+        curation.clear_curation(conn, "lab_result", base, row=True, apply=True)
+    assert _curation_count(conn) == 1
+
+
+def test_list_curation_reports_scope_for_both_kinds(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed", note="fam",
+                            now="2026-01-01T00:00:00+00:00", apply=True)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="row", row=True, now="2026-02-01T00:00:00+00:00",
+                            apply=True)
+
+    rows = curation.list_curation(conn)
+    assert [r["scope"] for r in rows] == ["row", "family"]     # newest first
+    assert rows[0]["record_id"] == occ1 and rows[1]["record_id"] == 0
+    assert all(r["label"] == "Glucose" and r["family_size"] == 2 for r in rows)
+
+
+def test_a_row_verdict_survives_the_rekey_that_orphans_a_family_verdict(seeded):
+    """The rekey answer AC 8 asks to *document*, pinned as behaviour: `rekey` rewrites
+    dedup_key/dedup_base but never renumbers a row id, so a row-scoped verdict follows
+    its row while the family-scoped one on the same family goes inert."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed",
+                            note="family", apply=True)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="row", row=True, apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+    assert not report.collisions and report.changes
+
+    new_base = _base(conn, "lab_result", "test_name", "Glucose")
+    assert new_base != base
+    # The family verdict is orphaned - its base names nothing live.
+    assert curation.family_label(conn, "lab_result", base) == ("", 0)
+    # The row verdict still resolves, by row id; its stored base is now a stale
+    # breadcrumb that nothing resolves on.
+    live = curation.get_verdict(conn, "lab_result", "", record_id=occ1)
+    assert live["status"] == "superseded" and live["dedup_base"] == base
+    assert curation.load_verdicts(conn).for_row(
+        "lab_result", new_base, occ1
+    )["status"] == "superseded"
+    # `--list` re-reads the live base off the row, so it is not reported as an orphan.
+    entry = next(r for r in curation.list_curation(conn) if r["record_id"] == occ1)
+    assert entry["label"] == "Glucose" and entry["family_size"] == 2
+
+    warnings = verify.verify_report(conn).warnings
+    assert any("has no live family" in w for w in warnings)
+    assert not any("names no live row" in w for w in warnings)
+
+
+def test_re_annotating_a_row_after_a_rekey_collapses_the_stale_breadcrumb(seeded):
+    """The delete-by-(record_type, record_id) write path: the second verdict carries the
+    new base, and the row must still hold exactly one."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="disputed",
+                            note="before", row=True, apply=True)
+    dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+    new_base = _base(conn, "lab_result", "test_name", "Glucose")
+
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="after", row=True, apply=True)
+
+    assert _curation_count(conn) == 1
+    live = curation.get_verdict(conn, "lab_result", "", record_id=occ1)
+    assert live["dedup_base"] == new_base and live["note"] == "after"
 
 
 # --- verify integration ------------------------------------------------------
@@ -448,6 +659,29 @@ def test_verify_is_silent_about_warnings_when_there_are_none(seeded):
     report = verify.verify_report(seeded["conn"])
     assert report.warnings == []
     assert not any(line.startswith("warnings") for line in verify.format_report(report))
+
+
+def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
+    """AC 7: the row-scope twin of the family orphan warning. Only the row's removal
+    can orphan a row-scoped verdict, so that is the state `verify` has to name - and it
+    names the row, because `--clear` needs `--row` to lift it."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="loser", row=True, apply=True)
+    assert verify.verify_report(conn).warnings == []
+
+    records.remove_record(conn, "lab_result", occ1, apply=True)
+
+    report = verify.verify_report(conn)
+    assert report.ok is True and report.problems == []
+    assert any("row #" in w and "names no live row" in w for w in report.warnings)
+    # The sibling family is still live, so the *family* warning must not fire.
+    assert not any("has no live family" in w for w in report.warnings)
+    # And the orphan is liftable without a live row to name it by.
+    curation.clear_curation(conn, "lab_result", str(occ1), row=True, apply=True)
+    assert _curation_count(conn) == 0
 
 
 def test_verify_warns_about_a_dangling_merge_target(seeded):
@@ -550,7 +784,7 @@ def test_cli_annotate_json_shape_is_stable(cli_ready, capsys):
     expected = {
         "record_type", "dedup_base", "status", "note", "attributed_to",
         "created_at", "merged_into_base", "label", "family_size", "previous",
-        "action", "applied",
+        "action", "applied", "record_id", "scope",
     }
     capsys.readouterr()
     assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
@@ -655,6 +889,110 @@ def test_cli_annotate_clear_without_a_verdict_fails_friendly(cli_ready, capsys):
     assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
                 "--clear", "--apply") == 1
     assert "error: no curation verdict" in capsys.readouterr().err
+
+
+# --- CLI surface: row scope (issue #114) -------------------------------------
+
+
+def _cli_second_occurrence(tmp_path):
+    """Re-file the CLI fixture's Glucose fact as occurrence 1, and return
+    ``(base, occurrence 0 id, occurrence 1 id)`` — the keep-both shape."""
+    conn = _cli_conn(tmp_path)
+    try:
+        base = _base(conn, "lab_result", "test_name", "Glucose")
+        person_id = int(conn.execute(
+            "SELECT person_id FROM lab_result WHERE dedup_base = ?", (base,)
+        ).fetchone()["person_id"])
+        doc2 = _insert_document(conn, person_id, "bb22cc33dd44ee55")
+        conn.execute(
+            "INSERT INTO lab_result (person_id, document_id, test_name, collected_at, "
+            "value_num, unit, dedup_key, dedup_base, dedup_occurrence) "
+            "VALUES (?, ?, 'Glucose', '2026-01-02', 95, 'mg/dL', ?, ?, 1)",
+            (person_id, doc2, dedup.occurrence_key(base, 1), base),
+        )
+        conn.commit()
+        return (base, *_occurrence_ids(conn, base))
+    finally:
+        conn.close()
+
+
+def test_cli_annotate_row_dry_run_then_apply(cli_ready, capsys):
+    _base_hex, _occ0, occ1 = _cli_second_occurrence(cli_ready)
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--status", "superseded", "--note", "loser of a keep-both") == 0
+    out = capsys.readouterr().out
+    assert f"scope: row #{occ1}" in out
+    assert "dry run: nothing was written - re-run with --apply" in out
+    assert _cli_curation_count(cli_ready) == 0
+
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--status", "superseded", "--note", "loser of a keep-both",
+                "--apply") == 0
+    out = capsys.readouterr().out
+    assert f"annotated lab_result row #{occ1} (create)" in out
+    assert _cli_curation_count(cli_ready) == 1
+
+
+def test_cli_annotate_row_json_carries_scope(cli_ready, capsys):
+    _base_hex, _occ0, occ1 = _cli_second_occurrence(cli_ready)
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--status", "disputed", "--note", "one occurrence only", "--json",
+                "--apply") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scope"] == "row" and payload["record_id"] == occ1
+
+    assert _run(cli_ready, "record", "annotate", "--list", "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["scope"], r["record_id"]) for r in rows] == [("row", occ1)]
+
+
+def test_cli_annotate_list_shows_the_scope_column(cli_ready, capsys):
+    _base_hex, _occ0, occ1 = _cli_second_occurrence(cli_ready)
+    cond = _cli_row_id(cli_ready, "condition", "name", "Prediabetes")
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--status", "superseded", "--note", "a", "--apply") == 0
+    assert _run(cli_ready, "record", "annotate", "condition", str(cond),
+                "--status", "disputed", "--note", "b", "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "annotate", "--list") == 0
+    out = capsys.readouterr().out
+    assert "scope" in out.splitlines()[0]
+    assert f"row #{occ1}" in out and "family" in out
+
+
+def test_cli_annotate_clear_row_leaves_the_family_verdict(cli_ready, capsys):
+    base, _occ0, occ1 = _cli_second_occurrence(cli_ready)
+    assert _run(cli_ready, "record", "annotate", "lab_result", base,
+                "--status", "disputed", "--note", "family", "--apply") == 0
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--status", "superseded", "--note", "row", "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(occ1), "--row",
+                "--clear", "--apply") == 0
+    assert f"cleared curation verdict for lab_result row #{occ1}" in (
+        capsys.readouterr().out
+    )
+    assert _cli_curation_count(cli_ready) == 1
+
+
+def test_cli_annotate_row_misuse_is_friendly(cli_ready, capsys):
+    base, _occ0, _occ1 = _cli_second_occurrence(cli_ready)
+    with pytest.raises(SystemExit) as exc:
+        _run(cli_ready, "record", "annotate", "--list", "--row")
+    assert exc.value.code == 2
+
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "annotate", "lab_result", base, "--row",
+                "--status", "disputed", "--note", "x", "--apply") == 1
+    assert "drop --row" in capsys.readouterr().err
+
+    assert _run(cli_ready, "record", "annotate", "lab_result", "9999", "--row",
+                "--status", "disputed", "--note", "x", "--apply") == 1
+    assert "no lab_result with id 9999" in capsys.readouterr().err
+    assert _cli_curation_count(cli_ready) == 0
 
 
 # --- the integration drill from the issue ------------------------------------

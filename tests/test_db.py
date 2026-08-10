@@ -45,6 +45,7 @@ ALL_MIGRATIONS = [
     "007_document_tombstone.sql",
     "008_curation.sql",
     "009_record_attestation.sql",
+    "010_curation_row_scope.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -134,6 +135,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
     assert db.migrate(conn) == [
         "006_condition_allergy.sql", "007_document_tombstone.sql",
         "008_curation.sql", "009_record_attestation.sql",
+        "010_curation_row_scope.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -262,17 +264,18 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
     conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
     conn.commit()
     assert curation.has_table(conn) is False
-    assert curation.load_verdicts(conn) == {}  # readable before the migration exists
+    assert not curation.load_verdicts(conn)  # readable before the migration exists
 
     assert db.migrate(conn) == [
         "008_curation.sql", "009_record_attestation.sql",
+        "010_curation_row_scope.sql",
     ]
 
     assert curation.has_table(conn) is True
     cols = {row[1] for row in conn.execute("PRAGMA table_info(curation)").fetchall()}
     assert cols == {
-        "record_type", "dedup_base", "status", "note", "merged_into_base",
-        "attributed_to", "created_at",
+        "record_type", "dedup_base", "record_id", "status", "note",
+        "merged_into_base", "attributed_to", "created_at",
     }
     assert conn.execute("SELECT COUNT(*) AS n FROM person").fetchone()["n"] == 1
 
@@ -315,7 +318,9 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
     assert attestations.has_columns(conn) is False
     assert attestations.list_attested(conn) == []   # readable before the migration
 
-    assert db.migrate(conn) == ["009_record_attestation.sql"]
+    assert db.migrate(conn) == [
+        "009_record_attestation.sql", "010_curation_row_scope.sql",
+    ]
 
     assert attestations.has_columns(conn) is True
     row = conn.execute("SELECT * FROM lab_result").fetchone()
@@ -324,6 +329,87 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
     assert (row["attested_by"], row["attested_on"], row["attested_at"]) == (
         None, None, None
     )
+
+
+def _migrate_through_009(conn, tmp_path):
+    """Apply every migration up to 009, leaving 010 pending (a 009-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre010"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "010":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_path):
+    """Issue #114's table rebuild is the only destructive-shaped DDL in this repo's
+    history (001-009 are pure CREATE / ADD COLUMN), so the round trip is the test: every
+    009-era verdict must come out the other side byte-for-byte, `created_at` included,
+    and family-scoped by definition."""
+    from pemr import curation
+
+    _migrate_through_009(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, status, note, attributed_to, "
+        "created_at) VALUES ('lab_result', 'base-a', 'disputed', 'two sources', "
+        "'Dr Who', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, status, note, "
+        "merged_into_base, created_at) VALUES ('condition', 'base-b', 'merged-into', "
+        "'same episode', 'base-c', '2026-02-02T00:00:00+00:00')"
+    )
+    conn.commit()
+    before = [dict(r) for r in conn.execute(
+        "SELECT * FROM curation ORDER BY dedup_base"
+    ).fetchall()]
+
+    assert db.migrate(conn) == ["010_curation_row_scope.sql"]
+
+    after = [dict(r) for r in conn.execute(
+        "SELECT * FROM curation ORDER BY dedup_base"
+    ).fetchall()]
+    assert [{k: v for k, v in r.items() if k != "record_id"} for r in after] == before
+    assert [r["record_id"] for r in after] == [0, 0]   # 008 verdicts were family-scoped
+    verdicts = curation.load_verdicts(conn)
+    assert len(verdicts.family) == 2 and verdicts.rows == {}
+
+
+def test_migration_010_lets_scopes_coexist_but_pins_one_verdict_per_row(conn):
+    """The two uniqueness rules #114 needs, which 008's PK could not express: a family
+    verdict and a row verdict may share a base (that is the precedence case), and two
+    rows may be annotated inside one family - but a row may carry only one verdict,
+    whatever base it was recorded under (the partial index, which also collapses the
+    stale-breadcrumb duplicate a rekey could otherwise produce)."""
+    db.migrate(conn)
+    for record_type, base, record_id in [
+        ("lab_result", "base-a", 0),   # family scope
+        ("lab_result", "base-a", 7),   # a row inside it
+        ("lab_result", "base-a", 8),   # its sibling, ruled separately
+    ]:
+        conn.execute(
+            "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+            "created_at) VALUES (?, ?, ?, 'disputed', 'why', '2026-01-01T00:00:00')",
+            (record_type, base, record_id),
+        )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):   # same row, a different base
+        conn.execute(
+            "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+            "created_at) VALUES ('lab_result', 'base-z', 7, 'disputed', 'why', "
+            "'2026-01-01T00:00:00')"
+        )
+    with pytest.raises(sqlite3.IntegrityError):   # negative scope sentinel
+        conn.execute(
+            "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+            "created_at) VALUES ('lab_result', 'base-a', -1, 'disputed', 'why', "
+            "'2026-01-01T00:00:00')"
+        )
 
 
 def test_a_bare_insert_leaves_the_attestation_columns_null(conn):

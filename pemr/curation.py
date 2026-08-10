@@ -1,4 +1,4 @@
-"""Recorded human verdicts on record families — `pemr record annotate` (issue #109).
+"""Recorded human verdicts on records — `pemr record annotate` (issues #109, #114).
 
 Some record states are not resolvable by deterministic tooling over documents. Two
 source documents contradict each other and the extraction is faithful to both. A row is
@@ -10,7 +10,7 @@ at this and ruled" — so the question reopens on every re-render and re-extract
 This module is that missing durable state: one small overlay table, and the verbs that
 write it.
 
-    annotate_record  -- record (or overwrite) one family's verdict, dry-run by default
+    annotate_record  -- record (or overwrite) one verdict, dry-run by default
     list_curation    -- every verdict, newest first
     clear_curation   -- lift one verdict, dry-run by default
     load_verdicts    -- the whole table as a lookup, for the render/verify hot path
@@ -19,15 +19,39 @@ write it.
 state: it just reads two tables per section instead of one, and re-rendering after a
 verdict changes output because the database changed, which is the point.
 
-**Keyed by ``(record_type, dedup_base)``**, not by row id and not by ``dedup_key``.
+**Two scopes** (issue #114). A verdict names either a whole dedup **family** or a
+single **row**:
+
+*Family scope* — keyed by ``(record_type, dedup_base)``, stored with ``record_id = 0``.
 ``dedup_base`` is the stable per-family identity across occurrence renumbering
-(Architecture.md §3), so a verdict survives a re-ingest of the same document and the
+(Architecture.md §3), so the verdict survives a re-ingest of the same document and the
 occurrence shifts `record rm` (#107) leaves behind. It does *not* survive every
 `pemr rekey`: a dictionary edit that changes this family's own canonical name moves its
 ``dedup_base``, orphaning the verdict (`pemr verify` warns; `record annotate --clear`
-then re-annotate). One live verdict per family: re-annotating overwrites (last verdict
-wins), which is what "a human ruled" means — there is no verdict history here by
-design.
+then re-annotate).
+
+*Row scope* — ``--row``, keyed by ``(record_type, record_id)`` **alone**. It exists for
+the family a ``--keep both`` conflict resolution left holding two *live* rows: a
+family-scoped ``superseded`` there hides the winner along with the loser. A row-scoped
+verdict affects only its own occurrence; siblings render as if unannotated unless they
+carry their own verdict. `rekey` rewrites ``dedup_key``/``dedup_base`` but never
+renumbers a row id (:func:`dedup.rekey`: "Values, provenance and row ids are
+untouched"), so a row-scoped verdict genuinely **survives** the dictionary-driven rekey
+that orphans a family-scoped one; it is orphaned only by the removal of its row. The
+``dedup_base`` stored beside it is a *breadcrumb* — which family it ruled in, at
+annotate time — that may go stale after such a rekey and is never consulted for
+resolution: every reader re-reads the live base off the row.
+
+**Precedence**: a row-scoped verdict wins over its family's verdict, for that row only —
+resolved in exactly one place, :meth:`VerdictMap.for_row`, so render, journal and verify
+cannot drift apart.
+
+Row scope is **opt-in** and never inferred from the token's shape: :func:`resolve_base`
+has accepted a bare row id as "the family containing this row" since #109, and flipping
+that would silently change the meaning of commands already recorded in a curation ledger.
+
+One live verdict per target: re-annotating overwrites (last verdict wins), which is what
+"a human ruled" means — there is no verdict history here by design.
 
 The module imports :mod:`db` and :mod:`dedup` only, keeping the import graph acyclic;
 `render` and `verify` import *it*.
@@ -41,7 +65,7 @@ of.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import db, dedup
@@ -68,13 +92,31 @@ APPENDIX_STATUSES: tuple[str, ...] = (
 #: The key a rendered row carries its verdict under, when it has one.
 CURATION_FIELD = "_curation"
 
+#: ``curation.record_id`` for a family-scoped verdict (migration 010). A sentinel rather
+#: than NULL: SQLite treats NULLs as distinct in a unique index, so a nullable scope
+#: column would silently permit duplicate family verdicts on one base.
+FAMILY_SCOPE = 0
+
+#: The scope vocabulary — `--list` / `--json` / the report block all speak it, and like
+#: :data:`STATUSES` it has exactly one source of truth.
+SCOPE_FAMILY = "family"
+SCOPE_ROW = "row"
+
 
 class CurationNotFoundError(ValueError):
-    """Raised when a family carries no verdict (friendly rc=1 at the CLI)."""
+    """Raised when the named target carries no verdict (friendly rc=1 at the CLI)."""
 
 
 class FamilyNotFoundError(ValueError):
     """Raised when a base-or-id token does not resolve to a live family."""
+
+
+class RowNotFoundError(ValueError):
+    """Raised when a ``--row`` token does not name a live row.
+
+    Distinct from :class:`FamilyNotFoundError` so the CLI can say "drop ``--row`` to
+    annotate the whole family" — the two failures have different fixes.
+    """
 
 
 @dataclass
@@ -91,11 +133,13 @@ class CurationReport:
     attributed_to: str | None = None
     created_at: str = ""
     merged_into_base: str | None = None
-    label: str = ""                    # which fact is being ruled on (occurrence 0)
+    label: str = ""                    # which fact is being ruled on
     family_size: int = 0
     previous: dict | None = None       # the verdict this one replaces, if any
     action: str = "create"             # "create" | "overwrite" | "clear"
     applied: bool = False
+    record_id: int = FAMILY_SCOPE      # 0 = family scope; else the annotated row
+    scope: str = SCOPE_FAMILY          # SCOPE_FAMILY | SCOPE_ROW (derived from record_id)
 
     def as_dict(self) -> dict:
         return {
@@ -111,7 +155,55 @@ class CurationReport:
             "previous": self.previous,
             "action": self.action,
             "applied": self.applied,
+            # Appended, never inserted: the --json key set is a contract, and #114 may
+            # only widen it (Architecture.md's additive-only rule).
+            "record_id": self.record_id,
+            "scope": self.scope,
         }
+
+
+@dataclass
+class VerdictMap:
+    """Every stored verdict, partitioned by scope — the render/verify lookup.
+
+    Replaces #109's bare ``{(record_type, dedup_base): verdict}`` dict, which had no way
+    to express "this row but not its sibling". Still **one query**: the partition happens
+    in Python, because a per-row SELECT is exactly what this map exists to avoid.
+
+    Falsy when empty, so render's no-verdicts fast path (and its
+    ``with_identity=bool(...)`` journal call) keeps working unchanged.
+    """
+
+    family: dict[tuple[str, str], dict] = field(default_factory=dict)
+    rows: dict[tuple[str, int], dict] = field(default_factory=dict)
+
+    def for_row(
+        self, record_type: str, base: str | None, record_id: int | None
+    ) -> dict | None:
+        """The verdict that applies to one row: **row scope wins over family scope**.
+
+        The single precedence site (issue #114). Render, journal and verify all resolve
+        through here, so the rule cannot drift between them. ``record_id`` may be None
+        (a carrier without row identity — an event from a ``with_identity=False``
+        timeline), in which case only the family verdict can apply.
+        """
+        if record_id:
+            hit = self.rows.get((record_type, int(record_id)))
+            if hit is not None:
+                return hit
+        if base is None:
+            return None
+        return self.family.get((record_type, base))
+
+    def all(self) -> list[dict]:
+        """Every verdict, both scopes — for `verify` and `--list`."""
+        return [*self.family.values(), *self.rows.values()]
+
+    def __bool__(self) -> bool:
+        return bool(self.family or self.rows)
+
+    def __len__(self) -> int:
+        return len(self.family) + len(self.rows)
 
 
 def _now(now: str | None = None) -> str:
@@ -130,9 +222,15 @@ def _require_type(record_type: str) -> None:
 
 
 def _row_view(row: sqlite3.Row) -> dict:
+    # `record_id` is read defensively rather than by subscript: `render`/`verify` must
+    # keep working against a pre-010 snapshot (the `has_table` precedent), where the
+    # column does not exist and every verdict is family-scoped by definition.
+    record_id = int(row["record_id"]) if "record_id" in row.keys() else FAMILY_SCOPE
     return {
         "record_type": row["record_type"],
         "dedup_base": row["dedup_base"],
+        "record_id": record_id,
+        "scope": SCOPE_ROW if record_id else SCOPE_FAMILY,
         "status": row["status"],
         "note": row["note"],
         "merged_into_base": row["merged_into_base"],
@@ -154,29 +252,51 @@ def has_table(conn: sqlite3.Connection) -> bool:
 
 
 def get_verdict(
-    conn: sqlite3.Connection, record_type: str, base: str
+    conn: sqlite3.Connection,
+    record_type: str,
+    base: str,
+    *,
+    record_id: int = FAMILY_SCOPE,
 ) -> dict | None:
-    """The live verdict for one family, or None."""
+    """The live verdict for one family (default) or one row, or None.
+
+    With ``record_id > 0`` the ``base`` argument is deliberately **ignored**: a
+    row-scoped verdict resolves by row id alone, and its stored base is a breadcrumb
+    that a `rekey` may have left stale.
+    """
     if not has_table(conn):
         return None
-    row = conn.execute(
-        "SELECT * FROM curation WHERE record_type = ? AND dedup_base = ?",
-        (record_type, base),
-    ).fetchone()
+    if record_id:
+        row = conn.execute(
+            "SELECT * FROM curation WHERE record_type = ? AND record_id = ?",
+            (record_type, int(record_id)),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM curation WHERE record_type = ? AND dedup_base = ? "
+            "AND record_id = 0",
+            (record_type, base),
+        ).fetchone()
     return _row_view(row) if row is not None else None
 
 
-def load_verdicts(conn: sqlite3.Connection) -> dict[tuple[str, str], dict]:
-    """Every verdict as ``{(record_type, dedup_base): verdict}`` — one query.
+def load_verdicts(conn: sqlite3.Connection) -> VerdictMap:
+    """Every verdict as a :class:`VerdictMap` — one query, both scopes.
 
     The render/verify hot path: a document render touches every section, and a
-    per-family lookup would be one SELECT per row. Returns ``{}`` when the table is
-    absent (pre-008 snapshot), so callers need no second guard.
+    per-row lookup would be one SELECT per row. Returns an empty (falsy) map when the
+    table is absent (pre-008 snapshot), so callers need no second guard.
     """
+    out = VerdictMap()
     if not has_table(conn):
-        return {}
-    rows = conn.execute("SELECT * FROM curation").fetchall()
-    return {(r["record_type"], r["dedup_base"]): _row_view(r) for r in rows}
+        return out
+    for r in conn.execute("SELECT * FROM curation").fetchall():
+        view = _row_view(r)
+        if view["record_id"]:
+            out.rows[(view["record_type"], view["record_id"])] = view
+        else:
+            out.family[(view["record_type"], view["dedup_base"])] = view
+    return out
 
 
 def family_label(conn: sqlite3.Connection, record_type: str, base: str) -> tuple[str, int]:
@@ -195,6 +315,34 @@ def family_label(conn: sqlite3.Connection, record_type: str, base: str) -> tuple
     if not family:
         return "", 0
     return dedup._rekey_label(record_type, family[0]), len(family)
+
+
+def row_label(
+    conn: sqlite3.Connection, record_type: str, record_id: int
+) -> tuple[str, str, int]:
+    """``(label, live_base, family_size)`` for one row — :func:`family_label`'s row twin.
+
+    The label comes off the annotated row itself, not off occurrence 0: the whole point
+    of row scope is that the siblings are different facts. ``live_base`` is re-read here
+    rather than taken from the verdict, because a `rekey` may have moved the family since
+    the verdict was recorded and the stored base is only a breadcrumb.
+
+    A removed row reports ``("", "", 0)`` rather than raising — the orphan case `list`
+    and `verify` both have to describe.
+    """
+    _require_type(record_type)
+    pk = f"{record_type}_id"
+    row = conn.execute(
+        f"SELECT * FROM {record_type} WHERE {pk} = ?", (int(record_id),)
+    ).fetchone()
+    if row is None:
+        return "", "", 0
+    base = row["dedup_base"]
+    return (
+        dedup._rekey_label(record_type, row),
+        base,
+        len(dedup.load_family(conn, record_type, base)),
+    )
 
 
 def resolve_base(conn: sqlite3.Connection, record_type: str, token: str) -> str:
@@ -238,6 +386,42 @@ def resolve_base(conn: sqlite3.Connection, record_type: str, token: str) -> str:
     return token
 
 
+def resolve_row(
+    conn: sqlite3.Connection, record_type: str, token: str
+) -> tuple[int, str]:
+    """Resolve a ``--row`` token to ``(record_id, live dedup_base)``.
+
+    Only a row id will do here: a ``dedup_base`` literal names a family, and silently
+    row-scoping it would rule on whichever occurrence happened to be first. The base is
+    returned alongside because the write stores it as a breadcrumb (which family this
+    verdict ruled in), never as a resolution key.
+
+    Raises :class:`RowNotFoundError` when the id names no live row, ``ValueError`` when
+    the token is not a row id at all.
+    """
+    _require_type(record_type)
+    token = (token or "").strip()
+    if not token:
+        raise RowNotFoundError(
+            f"no {record_type} target given - pass a row id with --row"
+        )
+    if not token.isdigit():
+        raise ValueError(
+            f"--row needs a {record_type} row id, not a dedup_base "
+            f"({token[:12]}...) - a base names a whole family; drop --row to annotate it"
+        )
+    pk = f"{record_type}_id"
+    row = conn.execute(
+        f"SELECT dedup_base FROM {record_type} WHERE {pk} = ?", (int(token),)
+    ).fetchone()
+    if row is None:
+        raise RowNotFoundError(
+            f"no {record_type} with id {token} - row ids come from `pemr rekey`'s "
+            "collision report, or `pemr query`"
+        )
+    return int(token), row["dedup_base"]
+
+
 def annotate_record(
     conn: sqlite3.Connection,
     record_type: str,
@@ -247,10 +431,15 @@ def annotate_record(
     note: str,
     attributed_to: str | None = None,
     merged_into_base: str | None = None,
+    row: bool = False,
     now: str | None = None,
     apply: bool = False,
 ) -> CurationReport:
-    """Record one family's verdict; dry-run by default (``apply=True`` writes).
+    """Record one verdict; dry-run by default (``apply=True`` writes).
+
+    ``row=True`` scopes the verdict to the single row ``token`` names, instead of to its
+    whole dedup family (issue #114). Opt-in on purpose: without it the behaviour — and
+    the stored row — is bit-identical to #109's.
 
     Validation is deliberately front-loaded, because the write is an upsert that
     silently replaces the previous verdict: an unknown status or a dangling
@@ -266,7 +455,8 @@ def annotate_record(
     merged into itself would render nowhere at all).
 
     Raises ``ValueError`` for an unknown ``record_type``/``status``/empty note or a bad
-    merge target, and :class:`FamilyNotFoundError` when the target does not resolve.
+    merge target, :class:`FamilyNotFoundError` when a family target does not resolve, and
+    :class:`RowNotFoundError` when a ``--row`` target does not.
     """
     db.require_migrated(conn)
     _require_type(record_type)
@@ -281,7 +471,10 @@ def annotate_record(
             "a curation note is required - it records why the verdict was made and "
             "who made it; nothing was written"
         )
-    base = resolve_base(conn, record_type, token)
+    if row:
+        record_id, base = resolve_row(conn, record_type, token)
+    else:
+        record_id, base = FAMILY_SCOPE, resolve_base(conn, record_type, token)
 
     merge_target = (merged_into_base or "").strip() or None
     if status == "merged-into":
@@ -303,12 +496,17 @@ def annotate_record(
             f"'{status}'; nothing was written"
         )
 
-    previous = get_verdict(conn, record_type, base)
-    label, family_size = family_label(conn, record_type, base)
+    previous = get_verdict(conn, record_type, base, record_id=record_id)
+    if record_id:
+        label, _live_base, family_size = row_label(conn, record_type, record_id)
+    else:
+        label, family_size = family_label(conn, record_type, base)
     stamp = _now(now)
     report = CurationReport(
         record_type=record_type,
         dedup_base=base,
+        record_id=record_id,
+        scope=SCOPE_ROW if record_id else SCOPE_FAMILY,
         status=status,
         note=cleaned_note,
         attributed_to=(attributed_to or "").strip() or None,
@@ -321,24 +519,33 @@ def annotate_record(
     )
 
     if apply:
-        # UPSERT, the `tombstones.add_tombstone` idiom: one live verdict per family,
-        # last verdict wins, and a re-run of the same command is a safe no-op-shaped
-        # write. created_at is refreshed - it stamps *this* verdict, not the first one.
+        # DELETE-by-scope then INSERT, where #109 upserted: since 010 there are two
+        # disjoint uniqueness rules - the PK for family scope, the partial index for row
+        # scope - and one ON CONFLICT target cannot name both. (A row-scoped
+        # re-annotate after a rekey can collide with both at once: same row id, new
+        # base.) The observable semantics are unchanged - one live verdict per target,
+        # last verdict wins - and the delete additionally collapses a stale-base copy.
+        # created_at is refreshed: it stamps *this* verdict, not the first one.
         with conn:
+            if record_id:
+                conn.execute(
+                    "DELETE FROM curation WHERE record_type = ? AND record_id = ?",
+                    (record_type, record_id),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM curation WHERE record_type = ? AND dedup_base = ? "
+                    "AND record_id = 0",
+                    (record_type, base),
+                )
             conn.execute(
                 """
                 INSERT INTO curation
-                  (record_type, dedup_base, status, note, merged_into_base,
+                  (record_type, dedup_base, record_id, status, note, merged_into_base,
                    attributed_to, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(record_type, dedup_base) DO UPDATE SET
-                  status           = excluded.status,
-                  note             = excluded.note,
-                  merged_into_base = excluded.merged_into_base,
-                  attributed_to    = excluded.attributed_to,
-                  created_at       = excluded.created_at
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (record_type, base, status, cleaned_note, merge_target,
+                (record_type, base, record_id, status, cleaned_note, merge_target,
                  report.attributed_to, stamp),
             )
     report.applied = apply
@@ -350,11 +557,15 @@ def list_curation(
 ) -> list[dict]:
     """Every verdict (optionally one record type), newest first.
 
-    Each entry carries ``label`` and ``family_size``. ``family_size == 0`` is an
-    **orphan**: the family it rules on is gone (a `record rm` of every occurrence, or a
-    restore from a snapshot that never had it). Surfaced rather than hidden, the
-    ``tombstones.list_tombstones`` ``live_document_id`` precedent — `pemr verify` warns
-    about the same state.
+    Each entry carries ``scope``, ``record_id``, ``label`` and ``family_size``.
+    ``family_size == 0`` is an **orphan**: the target it rules on is gone — the whole
+    family for a family-scoped verdict, the single row for a row-scoped one. Surfaced
+    rather than hidden, the ``tombstones.list_tombstones`` ``live_document_id``
+    precedent — `pemr verify` warns about the same state.
+
+    A row-scoped entry is labelled from its **row**, whose live ``dedup_base`` is re-read
+    here: after a `rekey` the stored base is stale, and resolving on it would make a
+    perfectly live row verdict look orphaned.
     """
     db.require_migrated(conn)
     if record_type is not None:
@@ -366,15 +577,19 @@ def list_curation(
     if record_type is not None:
         sql += " WHERE record_type = ?"
         params = (record_type,)
-    sql += " ORDER BY created_at DESC, record_type, dedup_base"
+    sql += " ORDER BY created_at DESC, record_type, dedup_base, record_id"
     out: list[dict] = []
     for row in conn.execute(sql, params).fetchall():
         view = _row_view(row)
-        if view["record_type"] in dedup.FIELD_SPECS:
-            label, size = family_label(conn, view["record_type"], view["dedup_base"])
-        else:
+        if view["record_type"] not in dedup.FIELD_SPECS:
             # A hand-edited row can name anything; never build a query from it.
             label, size = "", 0
+        elif view["record_id"]:
+            label, _live_base, size = row_label(
+                conn, view["record_type"], view["record_id"]
+            )
+        else:
+            label, size = family_label(conn, view["record_type"], view["dedup_base"])
         view["label"] = label
         view["family_size"] = size
         out.append(view)
@@ -386,14 +601,21 @@ def clear_curation(
     record_type: str,
     token: str,
     *,
+    row: bool = False,
     apply: bool = False,
 ) -> CurationReport:
-    """Lift one family's verdict; dry-run by default.
+    """Lift one verdict — a family's, or with ``row=True`` a single row's; dry-run by
+    default.
 
-    The target is resolved leniently on purpose: a row id still needs a live row, but a
-    ``dedup_base`` literal is accepted even when the family is gone, because clearing an
-    **orphaned** verdict (the one `pemr verify` warns about) is exactly a case where no
-    live row exists to name it by.
+    Targeting mirrors :func:`annotate_record`, and clearing one scope never touches the
+    other: a family verdict and a row verdict may legitimately coexist on the same
+    family (that is the precedence case), so a `--clear` that took both would silently
+    lift a ruling the operator never named.
+
+    The target is resolved leniently on purpose, in both scopes: a ``dedup_base``
+    literal is accepted even when the family is gone, and a ``--row`` id even when the
+    row is gone, because clearing an **orphaned** verdict (the one `pemr verify` warns
+    about) is exactly a case where nothing live names it.
 
     Raises :class:`CurationNotFoundError` when there is no verdict to lift — a typo
     must not read as success.
@@ -401,20 +623,36 @@ def clear_curation(
     db.require_migrated(conn)
     _require_type(record_type)
     token = (token or "").strip()
-    if token.isdigit():
-        base = resolve_base(conn, record_type, token)
+    if row:
+        if not token.isdigit():
+            raise ValueError(
+                f"--row needs a {record_type} row id, not a dedup_base "
+                f"({token[:12]}...) - drop --row to clear the family's verdict"
+            )
+        record_id = int(token)
+        existing = get_verdict(conn, record_type, "", record_id=record_id)
+        if existing is None:
+            raise CurationNotFoundError(
+                f"no row-scoped curation verdict for {record_type} row #{record_id} - "
+                "see `pemr record annotate --list`"
+            )
+        base = existing["dedup_base"]
+        label, _live_base, family_size = row_label(conn, record_type, record_id)
     else:
-        base = token
-    existing = get_verdict(conn, record_type, base)
-    if existing is None:
-        raise CurationNotFoundError(
-            f"no curation verdict for {record_type} {base[:12]}... - see "
-            "`pemr record annotate --list`"
-        )
-    label, family_size = family_label(conn, record_type, base)
+        record_id = FAMILY_SCOPE
+        base = resolve_base(conn, record_type, token) if token.isdigit() else token
+        existing = get_verdict(conn, record_type, base)
+        if existing is None:
+            raise CurationNotFoundError(
+                f"no curation verdict for {record_type} {base[:12]}... - see "
+                "`pemr record annotate --list`"
+            )
+        label, family_size = family_label(conn, record_type, base)
     report = CurationReport(
         record_type=record_type,
         dedup_base=base,
+        record_id=record_id,
+        scope=SCOPE_ROW if record_id else SCOPE_FAMILY,
         status=existing["status"],
         note=existing["note"],
         attributed_to=existing["attributed_to"],
@@ -427,10 +665,17 @@ def clear_curation(
     )
     if apply:
         with conn:
-            conn.execute(
-                "DELETE FROM curation WHERE record_type = ? AND dedup_base = ?",
-                (record_type, base),
-            )
+            if record_id:
+                conn.execute(
+                    "DELETE FROM curation WHERE record_type = ? AND record_id = ?",
+                    (record_type, record_id),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM curation WHERE record_type = ? AND dedup_base = ? "
+                    "AND record_id = 0",
+                    (record_type, base),
+                )
     report.applied = apply
     return report
 

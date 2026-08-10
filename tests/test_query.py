@@ -262,19 +262,22 @@ def test_timeline_stamps_attestation_only_on_attested_events(seeded):
     assert [e for e in after if "attested_by" not in e] == before
 
 
-def test_timeline_with_identity_stamps_family_keys(seeded):
-    """Issue #109: `render_journal` needs each event's family identity to apply the
-    curation overlay, and an event otherwise carries none."""
+def test_timeline_with_identity_stamps_family_and_row_keys(seeded):
+    """Issues #109/#114: `render_journal` needs each event's family identity to apply
+    the curation overlay and its **row** id to apply a row-scoped verdict; an event
+    otherwise carries neither."""
     plain = query.query_timeline(seeded, "jane-doe")
     tagged = query.query_timeline(seeded, "jane-doe", with_identity=True)
 
     assert len(tagged) == len(plain)
-    assert all({"record_type", "dedup_base"} <= set(e) for e in tagged)
+    assert all({"record_type", "dedup_base", "record_id"} <= set(e) for e in tagged)
     assert all(e["dedup_base"] for e in tagged)
+    assert all(isinstance(e["record_id"], int) and e["record_id"] > 0 for e in tagged)
     assert {e["record_type"] for e in tagged} <= set(dedup.KNOWN_TYPES)
     # Same events, same order, same values - identity is purely additive.
+    identity = ("record_type", "dedup_base", "record_id")
     assert [
-        {k: v for k, v in e.items() if k not in ("record_type", "dedup_base")}
+        {k: v for k, v in e.items() if k not in identity}
         for e in tagged
     ] == plain
 
