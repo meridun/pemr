@@ -29,6 +29,7 @@ import json
 import re
 import sqlite3
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -1381,16 +1382,17 @@ class CollisionResolver(Protocol):
     ) -> dict | None:
         """The verdict settling this pair's identity, or None if none does."""
 
-    def rebase(
+    def narrow(
         self,
         conn: sqlite3.Connection,
         record_type: str,
         verdict: dict,
-        new_base: str,
+        covered_row_ids: Iterable[int],
         base_map: dict[str, str],
-    ) -> str:
-        """Keep ``verdict`` attached to the surviving family; caller-managed
-        transaction. Returns ``"unchanged"`` | ``"rebased"`` | ``"kept"``."""
+    ) -> tuple[str, list[int]]:
+        """Pin ``verdict`` to the rows it already covered, so resolution cannot widen
+        it over the row that survived; caller-managed transaction. Returns
+        ``(action, pinned_row_ids)`` with action ``"unchanged"`` | ``"narrowed"``."""
 
 
 @dataclass
@@ -1418,6 +1420,12 @@ class RekeyResolution:
     key: a row left behind would stay permanently drifted, and
     :func:`_assert_no_key_drift` would refuse the next ingest deriving that identity
     while this very command reported clean.
+
+    Resolution merges a judged family into a larger one, so the authorizing verdict is
+    **narrowed** to the rows it already covered rather than moved onto the surviving
+    base: a ruling keeps exactly the extension it had when it was made, and the row that
+    was never judged stays live in its own section. ``covered_row_ids`` is that
+    extension; ``narrowed_row_ids`` is what the write actually pinned.
     """
     record_type: str
     row_id: int
@@ -1432,8 +1440,14 @@ class RekeyResolution:
     new_base: str           # the surviving family both rows land in
     new_occurrence: int     # occurrence the clash row takes under new_base
     message: str            # full account, ready to print
-    # "unchanged" | "rebased" | "kept", filled in by the write; "" on a dry run.
+    # Rows the verdict covered before this rekey — its extension at ruling time. For a
+    # row-scoped verdict, the one row it names.
+    covered_row_ids: list[int] = field(default_factory=list)
+    # "unchanged" | "narrowed" | "withheld", filled in by the write; "" on a dry run,
+    # which writes nothing.
     verdict_action: str = ""
+    # The rows a "narrowed" write pinned the verdict to (empty for every other action).
+    narrowed_row_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -1537,8 +1551,11 @@ def rekey(
     is filed as the next free occurrence of the surviving family — the shape a
     ``--keep both`` conflict resolution produces — and reported in
     :attr:`RekeyReport.resolved` instead of :attr:`RekeyReport.collisions`, so the table
-    still writes. Under ``apply=True`` the verdict that authorized it follows its family
-    onto the surviving ``dedup_base`` in the *same* transaction as the keys. With
+    still writes. Under ``apply=True`` the authorizing verdict is **narrowed to row
+    scope** in the *same* transaction as the keys, pinned to exactly the rows it covered
+    before the merge: the surviving family is bigger than the one the human ruled on, so
+    a verdict carried over wholesale would extend a ruling over a row nobody judged and
+    (for the appendix statuses) pull that live row out of its rendered section. With
     ``resolver=None`` (the default) every collision blocks, exactly as before.
     """
     db.require_migrated(conn)
@@ -1546,10 +1563,10 @@ def rekey(
     # Stored dedup_base -> recomputed base, per table: how a family verdict's merge
     # target is followed when the target family moved in this same run.
     base_maps: dict[str, dict[str, str]] = {}
-    # (record_type, verdict, surviving base, resolution) — the re-bases the write block
-    # owes. Kept beside the report rather than inside it so RekeyResolution stays a
-    # plain, serializable account of what happened.
-    pending_rebases: list[tuple[str, dict, str, RekeyResolution]] = []
+    # (record_type, verdict, resolution) — the narrowings the write block owes. Kept
+    # beside the report rather than inside it so RekeyResolution stays a plain,
+    # serializable account of what happened (the raw verdict dict is not part of it).
+    pending_narrowings: list[tuple[str, dict, RekeyResolution]] = []
 
     for record_type in KNOWN_TYPES:
         pk = f"{record_type}_id"
@@ -1565,6 +1582,10 @@ def rekey(
         entries: list[_RekeyEntry] = []
         by_base: dict[str, list[_RekeyEntry]] = {}
         base_map: dict[str, str] = {}
+        # Stored dedup_base -> the row ids filed under it *before* this rekey: a
+        # family-scoped verdict's extension at ruling time, which is what a resolution
+        # narrows it to rather than widening it over the family that survives.
+        stored_family: dict[str, list[int]] = {}
         for row in rows:
             payload = {name: row[name] for name in FIELD_SPECS[record_type]}
             # The occurrence is a stored column, so an admitted repeat (`--keep both`)
@@ -1578,6 +1599,7 @@ def rekey(
             entries.append(entry)
             by_base.setdefault(base, []).append(entry)
             base_map[row["dedup_base"]] = base
+            stored_family.setdefault(row["dedup_base"], []).append(entry.row_id)
         base_maps[record_type] = base_map
 
         # Pass 2 (adjudicate): first-seen wins the key; anything landing on a taken one
@@ -1602,13 +1624,13 @@ def rekey(
             verdict = (None if resolver is None
                        else resolver.covering(record_type, entry.row, clash.row))
             if verdict is not None:
+                covered = ([int(verdict["record_id"])] if verdict["record_id"]
+                           else stored_family.get(verdict["dedup_base"], []))
                 resolution = _resolve_clash(
                     report, record_type, pk, entry, clash, kind, verdict,
-                    by_base[entry.base], seen, label, clash_label,
+                    by_base[entry.base], seen, label, clash_label, covered,
                 )
-                pending_rebases.append(
-                    (record_type, verdict, entry.base, resolution)
-                )
+                pending_narrowings.append((record_type, verdict, resolution))
                 continue
 
             if kind == "doubled":
@@ -1646,13 +1668,28 @@ def rekey(
             # first-seen row stays the incumbent for this key, so a third row on it
             # is reported against the same anchor instead of chaining.
 
+    # A resolved pair in a table that *also* holds an unresolved collision is withheld
+    # with the rest of that table (`writable()` is per-table, not per-row). The account
+    # has to say so: the adjudication message alone would describe a write that never
+    # happened.
+    blocked = set(report.blocked)
+    for resolution in report.resolved:
+        if resolution.record_type in blocked:
+            resolution.message += (
+                f" - withheld: {resolution.record_type} still holds an unresolved "
+                "collision, so nothing in this table was written"
+            )
+            # Recorded here, not in the write block: a fully blocked run has nothing
+            # writable and never enters it, and the account must still say why.
+            if apply:
+                resolution.verdict_action = "withheld"
+
     writable = report.writable()
     if apply and writable:
         # One transaction: a half-rekeyed table dedups inconsistently. Two passes,
         # because `UNIQUE(dedup_key)` is enforced per statement: if two rows swap keys
         # (or one takes a key another is about to vacate) a single-pass update trips
         # the index mid-flight. Park every moving row on a unique placeholder first.
-        blocked = set(report.blocked)
         with conn:
             for change in writable:
                 conn.execute(
@@ -1679,14 +1716,24 @@ def rekey(
                     values,
                 )
             # Same transaction as the keys they authorized: a committed rekey whose
-            # authorizing verdict was left orphaned is the failure this seam exists to
-            # avoid. Skipped for a blocked table, whose changes were withheld anyway.
-            for rec_type, verdict, new_base, resolution in pending_rebases:
-                if rec_type in blocked:
+            # authorizing verdict was left in the wrong shape is the failure this seam
+            # exists to avoid. Skipped for a blocked table, whose changes were withheld
+            # anyway - recorded as "withheld" so the account never implies otherwise.
+            # One verdict may settle several clashes at once (two occurrences of a
+            # judged family landing on two occurrences of the surviving one), so the
+            # narrowing is done once per verdict and reported on every resolution it
+            # authorized - narrowing twice would find its own first pass and no-op.
+            done: dict[tuple[str, str, int], tuple[str, list[int]]] = {}
+            for rec_type, verdict, resolution in pending_narrowings:
+                if rec_type in blocked:      # already recorded as "withheld" above
                     continue
-                resolution.verdict_action = resolver.rebase(
-                    conn, rec_type, verdict, new_base, base_maps[rec_type],
-                )
+                ident = (rec_type, verdict["dedup_base"], verdict["record_id"])
+                if ident not in done:
+                    done[ident] = resolver.narrow(
+                        conn, rec_type, verdict, resolution.covered_row_ids,
+                        base_maps[rec_type],
+                    )
+                resolution.verdict_action, resolution.narrowed_row_ids = done[ident]
     report.applied = apply
     return report
 
@@ -1703,6 +1750,7 @@ def _resolve_clash(
     seen: dict[str, _RekeyEntry],
     label: str,
     clash_label: str,
+    covered_row_ids: list[int],
 ) -> RekeyResolution:
     """File a verdict-settled clash as the next free occurrence of its family.
 
@@ -1725,11 +1773,13 @@ def _resolve_clash(
     seen[entry.key] = entry
 
     scope = "row" if verdict["record_id"] else "family"
+    # Present tense, not past: whether this actually lands depends on `apply` and on the
+    # rest of the table coming out clean, and the caller appends that verdict.
     message = (
         f"{record_type}: {pk} {entry.row_id} ({label!r}) and {pk} {clash.row_id} "
         f"({clash_label!r}) recompute to the same dedup_key ({kind}), but a "
         f"{scope}-scoped '{verdict['status']}' verdict already settles the pair - "
-        f"{pk} {entry.row_id} was filed as occurrence {occurrence} of "
+        f"{pk} {entry.row_id} takes occurrence {occurrence} of "
         f"{entry.base[:12]}..., the surviving family"
     )
     report.changes.append(RekeyChange(
@@ -1742,6 +1792,7 @@ def _resolve_clash(
         status=verdict["status"], scope=scope, record_id=verdict["record_id"],
         verdict_base=verdict["dedup_base"], new_base=entry.base,
         new_occurrence=occurrence, message=message,
+        covered_row_ids=sorted(covered_row_ids),
     )
     report.resolved.append(resolution)
     return resolution

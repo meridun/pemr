@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from pemr import cli, db, verify
+from pemr import cli, db, render, verify
 
 
 def _run(tmp_path, *argv):
@@ -775,12 +775,24 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
 ):
     """AC7, the case the issue was filed from: the 006 backfill parks the allergy table
     on its old keys, and the operator has already ruled the colliding pair one allergy.
-    That verdict answers the collision, so the table finally rekeys and rc drops to 0."""
+    That verdict answers the collision, so the table finally rekeys and rc drops to 0.
+
+    And the ruling keeps exactly the extension it had: `Penicillin` was never judged, so
+    running a maintenance command must not take a live, high-criticality allergy out of
+    the Allergies section (the regression this issue was re-decided over)."""
     pcn_id, penicillin_id = _stage_006_allergy_collision(tmp_path, capsys)
     assert _run(tmp_path, "record", "annotate", "allergy", str(pcn_id),
                 "--status", "merged-into", "--merged-into", str(penicillin_id),
                 "--note", "one allergy, two spellings", "--apply") == 0
     capsys.readouterr()
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        before = render.render_summary(conn, "jane-doe")
+    finally:
+        conn.close()
+    assert "- Penicillin - anaphylaxis" in before
+    assert "allergy: PCN" in before.split("## Superseded / corrected")[1]
 
     new = _dict_file(tmp_path, "fuse006.toml",
                      '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
@@ -790,6 +802,7 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
     assert "allergy: 2/2 key(s) change" in captured.out
     assert "(skipped: collision)" not in captured.out
     assert "1 collision(s) resolved by verdict" in captured.out
+    assert "was narrowed to row scope on allergy row 1" in captured.out
     assert "rekeyed 4 row(s)" in captured.out
 
     conn = db.connect(tmp_path / "cli.db")
@@ -801,7 +814,14 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
         assert rows[pcn_id]["dedup_base"] == rows[penicillin_id]["dedup_base"]
         assert (rows[pcn_id]["dedup_occurrence"],
                 rows[penicillin_id]["dedup_occurrence"]) == (0, 1)
-        assert verify.verify_report(conn).warnings == []
+        # The verdict still covers PCN and only PCN: Penicillin stays where it was.
+        after = render.render_summary(conn, "jane-doe")
+        assert "- Penicillin - anaphylaxis" in after
+        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+        # Nothing orphaned; the narrowing surfaces as a re-affirm notice instead.
+        warnings = verify.verify_report(conn).warnings
+        assert not any("no live family" in w for w in warnings)
+        assert [w for w in warnings if "a rekey moved it" in w]
     finally:
         conn.close()
     # Idempotent: the follow-up run has nothing left to do.

@@ -1275,6 +1275,107 @@ def test_rekey_is_idempotent_after_a_resolved_collision(conn):
     assert (again.changes, again.collisions, again.resolved) == ([], [], [])
 
 
+def _extra_occurrence(conn, row_id, value_num):
+    """A second live row in ``row_id``'s family — the state `--keep both` leaves behind.
+
+    Same identity fields (so it recomputes onto the same base), same ``dedup_base``, next
+    occurrence. Returns its row id."""
+    row = _lab_rows(conn)[row_id]
+    occurrence = int(row["dedup_occurrence"]) + 1
+    cur = conn.execute(
+        "INSERT INTO lab_result (person_id, document_id, test_name, collected_at, "
+        "value_num, dedup_key, dedup_base, dedup_occurrence) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (row["person_id"], row["document_id"], row["test_name"], row["collected_at"],
+         value_num, dedup.occurrence_key(row["dedup_base"], occurrence),
+         row["dedup_base"], occurrence),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _curation_rows(conn):
+    return conn.execute("SELECT COUNT(*) AS n FROM curation").fetchone()["n"]
+
+
+def test_a_family_verdict_narrows_onto_every_row_it_covered(conn):
+    """The re-decided rule: a resolving family verdict is pinned to *exactly* the rows it
+    covered when it was made — all of them when the family holds two live occurrences —
+    and never reaches the row that only joined the family through this merge."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    peaf_occ1_id = _extra_occurrence(conn, peaf_id, 4.4)
+    resolver = _rule(conn, peaf_id, "superseded")           # family scope
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == []
+    assert [(r.verdict_action, r.covered_row_ids, r.narrowed_row_ids)
+            for r in report.resolved] == [
+        ("narrowed", [peaf_id, peaf_occ1_id], [peaf_id, peaf_occ1_id])]
+    verdicts = curation.load_verdicts(conn)
+    assert verdicts.family == {}                            # nothing family-scoped left
+    survivor = _lab_rows(conn)[peaf_id]["dedup_base"]
+    for row_id in (peaf_id, peaf_occ1_id):
+        assert verdicts.for_row("lab_result", survivor, row_id)["scope"] == "row"
+    # The row the merge brought in was never judged and still is not.
+    assert verdicts.for_row("lab_result", survivor, albumin_id) is None
+
+
+def test_one_verdict_settling_two_clashes_is_narrowed_once(conn):
+    """Two occurrences of a judged family landing on two occurrences of the surviving
+    one: the verdict authorizes both resolutions, so it is narrowed once and every
+    resolution reports the same pinned rows — narrowing twice would find its own first
+    pass and silently no-op."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    peaf_occ1_id = _extra_occurrence(conn, peaf_id, 4.4)
+    albumin_occ1_id = _extra_occurrence(conn, albumin_id, 3.9)
+    resolver = _rule(conn, peaf_id, "superseded")           # family scope
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == []
+    assert [r.row_id for r in report.resolved] == [albumin_id, albumin_occ1_id]
+    assert [(r.verdict_action, r.narrowed_row_ids) for r in report.resolved] == [
+        ("narrowed", [peaf_id, peaf_occ1_id])] * 2
+    assert _curation_rows(conn) == 2                        # one per pinned row
+    rows = _lab_rows(conn)
+    survivor = rows[peaf_id]["dedup_base"]
+    assert {r["dedup_base"] for r in rows.values()} == {survivor}
+    assert sorted(int(r["dedup_occurrence"]) for r in rows.values()) == [0, 1, 2, 3]
+
+
+def test_a_resolution_in_a_quarantined_table_is_reported_as_withheld(conn):
+    """Audit's advisory: a resolved pair in a table that also holds an *unresolved*
+    collision is withheld with the rest of the table, so its account must not describe a
+    write that never happened — and the verdict is not narrowed either."""
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Protein Electrophoresis Albumin Fraction",
+         "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+        {"test_name": "ALBX", "collected_at": "2026-01-02", "value_num": 3.9},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    peaf_id, albumin_id, albx_id = (int(r["lab_result_id"]) for r in conn.execute(
+        "SELECT lab_result_id FROM lab_result ORDER BY lab_result_id"))
+    # Family scope on the *clash* row's own family, so it settles that pair only.
+    resolver = _rule(conn, albumin_id, "superseded")
+    before = _keys(conn, "lab_result", "test_name")
+
+    report = dedup.rekey(conn, _rekey_dict(albx="albumin", **_FUSING_ALBUMIN_SYNONYM),
+                         apply=True, resolver=resolver)
+
+    assert [(c.row_id, c.clash_row_id) for c in report.collisions] \
+        == [(albx_id, peaf_id)]
+    assert [(r.row_id, r.verdict_action, r.narrowed_row_ids)
+            for r in report.resolved] == [(albumin_id, "withheld", [])]
+    assert "withheld: lab_result still holds an unresolved collision" \
+        in report.resolved[0].message
+    assert _keys(conn, "lab_result", "test_name") == before
+    # The ruling is exactly as the human left it: still family-scoped, untouched.
+    assert curation.load_verdicts(conn).rows == {}
+
+
 def test_a_third_row_on_a_resolved_key_still_blocks_when_unverdicted(conn):
     """Quarantine granularity is untouched (#92): one settled pair does not license the
     unsettled third row that lands on the same key, and the table withholds everything —
