@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from pemr import cli, db
+from pemr import cli, db, verify
 
 
 def _run(tmp_path, *argv):
@@ -480,6 +480,67 @@ def test_rekey_json_reports_collisions_and_skipped_tables(ready, capsys, tmp_pat
     assert [c["record_type"] for c in payload["changed"]] == ["lab_result", "condition"]
 
 
+# --- collisions a recorded verdict settles (issue #116) -----------------------
+
+def _row_ids(tmp_path, record_type):
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return [int(r[0]) for r in conn.execute(
+            f"SELECT {record_type}_id FROM {record_type} ORDER BY {record_type}_id")]
+    finally:
+        conn.close()
+
+
+def test_rekey_reports_a_verdict_resolved_collision_in_text_and_json(
+    ready, capsys, tmp_path
+):
+    """AC6. A collision the operator already ruled on is a `note`, not an `error`: the
+    table writes, both output modes say which pair was settled and by what, and the exit
+    code is 0 because nothing is left for the operator to fix."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id),
+                "--status", "superseded", "--note", "one assay, two labels",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["collisions"] == [] and payload["skipped"] == []
+    assert [(r["row_id"], r["clash_row_id"], r["kind"], r["status"], r["scope"],
+             r["new_occurrence"]) for r in payload["resolved"]] == [
+        (albumin_id, alb_id, "fused", "superseded", "family", 1)]
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "lab_result: 2/2 key(s) change" in captured.out
+    assert "(skipped: collision)" not in captured.out
+    assert "note: lab_result: lab_result_id" in captured.out
+    assert "family-scoped 'superseded' verdict already settles the pair" in captured.out
+    assert "1 collision(s) resolved by verdict" in captured.out
+    assert "rekeyed 3 row(s)" in captured.out
+    assert captured.out.isascii()               # issue #23
+
+
+def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
+    """The same seed with no verdict recorded: `resolved` is empty, the table is still
+    skipped by name and the exit code is still 1 (the #92 contract, unwidened)."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved"] == []
+    assert payload["skipped"] == ["lab_result"]
+    assert [c["kind"] for c in payload["collisions"]] == ["fused"]
+
+
 # --- intake formats at the CLI (issue #66) ------------------------------------
 
 def test_ingest_refuses_a_google_drive_pointer_stub(ready, capsys):
@@ -682,6 +743,82 @@ def test_migrated_006_rows_rekey_per_table_when_one_table_collides(tmp_path, cap
                     if r["dedup_key"] in ("c1", "c2")]
     finally:
         conn.close()
+
+
+def _stage_006_allergy_collision(tmp_path, capsys):
+    """The real-world #116 trigger: a pre-006 database whose carried-forward
+    per-document allergy keys collide onto one dictionary-derived key after 006, with
+    conditions alongside that merely move. Returns the two allergy row ids."""
+    staged = _stage_pre_006(tmp_path)
+    assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
+    conn = db.connect(tmp_path / "cli.db")
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane-doe', 'Jane')")
+    for i, (sub, reaction) in enumerate((("PCN", "rash"),
+                                         ("Penicillin", "anaphylaxis")), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, value_text, dedup_key,"
+            " dedup_base) VALUES (1, 'allergy', ?, ?, ?, ?)",
+            (sub, reaction, f"a{i}", f"a{i}"))
+    for i, name in enumerate(("T2DM", "HTN"), start=1):
+        conn.execute(
+            "INSERT INTO observation (person_id, obs_type, key, dedup_key, dedup_base)"
+            " VALUES (1, 'condition', ?, ?, ?)", (name, f"c{i}", f"c{i}"))
+    conn.commit()
+    conn.close()
+    assert _run(tmp_path, "migrate") == 0
+    capsys.readouterr()
+    return _row_ids(tmp_path, "allergy")
+
+
+def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
+    tmp_path, capsys
+):
+    """AC7, the case the issue was filed from: the 006 backfill parks the allergy table
+    on its old keys, and the operator has already ruled the colliding pair one allergy.
+    That verdict answers the collision, so the table finally rekeys and rc drops to 0."""
+    pcn_id, penicillin_id = _stage_006_allergy_collision(tmp_path, capsys)
+    assert _run(tmp_path, "record", "annotate", "allergy", str(pcn_id),
+                "--status", "merged-into", "--merged-into", str(penicillin_id),
+                "--note", "one allergy, two spellings", "--apply") == 0
+    capsys.readouterr()
+
+    new = _dict_file(tmp_path, "fuse006.toml",
+                     '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "allergy: 2/2 key(s) change" in captured.out
+    assert "(skipped: collision)" not in captured.out
+    assert "1 collision(s) resolved by verdict" in captured.out
+    assert "rekeyed 4 row(s)" in captured.out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        rows = {int(r["allergy_id"]): r
+                for r in conn.execute("SELECT * FROM allergy")}
+        # The carried-forward keys are gone from both rows, and the pair is one family.
+        assert not {r["dedup_key"] for r in rows.values()} & {"a1", "a2"}
+        assert rows[pcn_id]["dedup_base"] == rows[penicillin_id]["dedup_base"]
+        assert (rows[pcn_id]["dedup_occurrence"],
+                rows[penicillin_id]["dedup_occurrence"]) == (0, 1)
+        assert verify.verify_report(conn).warnings == []
+    finally:
+        conn.close()
+    # Idempotent: the follow-up run has nothing left to do.
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 0
+    assert "all dedup keys already match" in capsys.readouterr().out
+
+
+def test_migrated_006_collision_still_blocks_without_a_verdict(tmp_path, capsys):
+    """The same staging with no verdict recorded is the unchanged #92 behaviour — the
+    regression guard for the AC7 case above."""
+    _stage_006_allergy_collision(tmp_path, capsys)
+    new = _dict_file(tmp_path, "fuse006.toml",
+                     '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    captured = capsys.readouterr()
+    assert "allergy: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "left 1 table(s) on their stored keys: allergy" in captured.err
 
 
 def test_post_006_stale_key_blocks_the_recommit_instead_of_forking_it(tmp_path, capsys):

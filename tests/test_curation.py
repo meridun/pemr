@@ -632,6 +632,173 @@ def test_re_annotating_a_row_after_a_rekey_collapses_the_stale_breadcrumb(seeded
     assert live["dedup_base"] == new_base and live["note"] == "after"
 
 
+# --- the rekey collision seam (issue #116) -----------------------------------
+
+def _fusing_ids(conn):
+    """``(HbA1c id, Glucose id)`` — the pair `{"glucose": "hba1c"}` fuses.
+
+    `rekey` scans by primary key, so HbA1c is the incumbent that keeps occurrence 0 and
+    Glucose is the clash a verdict has to settle."""
+    return (_row_id(conn, "lab_result", "test_name", "HbA1c"),
+            _row_id(conn, "lab_result", "test_name", "Glucose"))
+
+
+def test_resolving_statuses_are_only_merged_into_and_superseded():
+    """The constant guard. `confirmed`/`disputed`/`erroneous-in-source` rule on a row's
+    content; only these two say two rows are one fact, which is what a collision asks."""
+    assert curation.RESOLVING_STATUSES == ("merged-into", "superseded")
+    assert set(curation.RESOLVING_STATUSES) <= set(curation.STATUSES)
+
+
+def test_a_resolving_verdict_follows_its_family_onto_the_surviving_base(seeded):
+    """AC5. The verdict that authorized the rekey is re-pointed at the family that
+    survived it — by UPDATE, so the human's words and timestamp survive verbatim — and
+    `pemr verify` has nothing new to warn about."""
+    conn = seeded["conn"]
+    _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    hba1c_base = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", glucose_base, status="superseded",
+                            note="restated as the A1c", attributed_to="Dr Who",
+                            now="2026-01-01T00:00:00+00:00", apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["rebased"]
+    assert _curation_count(conn) == 1               # moved, not copied
+    moved = curation.get_verdict(conn, "lab_result", hba1c_base)
+    assert (moved["status"], moved["note"], moved["attributed_to"],
+            moved["created_at"]) == ("superseded", "restated as the A1c", "Dr Who",
+                                     "2026-01-01T00:00:00+00:00")
+    assert curation.get_verdict(conn, "lab_result", glucose_base) is None
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_an_existing_verdict_on_the_surviving_family_is_not_overwritten(seeded):
+    """Never destroy a human ruling: if the surviving base already carries one, the
+    incumbent wins and the moved-off verdict is left exactly where it is — reported, not
+    touched, and never auto-cleared."""
+    conn = seeded["conn"]
+    _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    hba1c_base = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", hba1c_base, status="confirmed",
+                            note="incumbent", now="2026-01-01T00:00:00+00:00",
+                            apply=True)
+    curation.annotate_record(conn, "lab_result", glucose_base, status="superseded",
+                            note="the resolver", now="2026-02-01T00:00:00+00:00",
+                            apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["kept"]
+    assert _curation_count(conn) == 2               # nothing deleted, nothing rewritten
+    incumbent = curation.get_verdict(conn, "lab_result", hba1c_base)
+    assert (incumbent["status"], incumbent["note"], incumbent["created_at"]) == \
+        ("confirmed", "incumbent", "2026-01-01T00:00:00+00:00")
+    assert curation.get_verdict(
+        conn, "lab_result", glucose_base)["note"] == "the resolver"
+    # Left behind on a dead base, it is the ordinary orphan `verify` already warns about.
+    assert any("has no live family" in w for w in verify.verify_report(conn).warnings)
+
+
+def test_a_resolved_merge_verdict_follows_a_target_family_that_also_moved(seeded):
+    """A merge pointer is re-pointed too, through the same run's base map: the target
+    family moved under this very dictionary edit, and leaving the pointer behind would
+    trade one `verify` warning for another."""
+    conn = seeded["conn"]
+    doc2 = _insert_document(conn, seeded["jane"].person_id, "cc33dd44ee55ff66")
+    dedup.commit_extraction(conn, doc2, {"lab_result": [
+        {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}]})
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    zzt_base = _base(conn, "lab_result", "test_name", "ZZT")
+    curation.annotate_record(conn, "lab_result", glucose_base, status="merged-into",
+                            note="filed under the zonulin panel",
+                            merged_into_base=zzt_base, apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c", "zzt": "zonulin"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["rebased"]
+    new_zzt = _base(conn, "lab_result", "test_name", "ZZT")
+    assert new_zzt != zzt_base                       # the target moved in this same run
+    moved = curation.get_verdict(
+        conn, "lab_result", _base(conn, "lab_result", "test_name", "HbA1c"))
+    assert moved["merged_into_base"] == new_zzt
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_a_merge_verdict_whose_target_is_the_surviving_family_completes_the_merge(
+    seeded
+):
+    """The common shape of the real trigger: the pair is merged into *each other*, so
+    after the rekey the verdict's base and its merge target are the same family.
+
+    `annotate_record` refuses a self-merge typed by a human (the family would render
+    nowhere), but reaching it this way is the merge having actually completed — both
+    rows are one family now. Nothing consumes `merged_into_base` for placement
+    (`APPENDIX_STATUSES` does that), `verify` sees a live target, and the alternative —
+    leaving the pointer on the dead base — is the orphan warning AC5 forbids."""
+    conn = seeded["conn"]
+    _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    hba1c_base = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", glucose_base, status="merged-into",
+                            note="the same draw, restated", merged_into_base=hba1c_base,
+                            apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["rebased"]
+    moved = curation.get_verdict(conn, "lab_result", hba1c_base)
+    assert moved["dedup_base"] == moved["merged_into_base"] == hba1c_base
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_a_row_scoped_verdict_needs_no_rebase(seeded):
+    """Row scope resolves by row id, which `rekey` never renumbers, so there is nothing
+    to move — and its stored base stays the deliberately stale breadcrumb 010 describes."""
+    conn = seeded["conn"]
+    _hba1c_id, glucose_id = _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="superseded",
+                            note="this occurrence only", row=True, apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["unchanged"]
+    live = curation.get_verdict(conn, "lab_result", "", record_id=glucose_id)
+    assert live["dedup_base"] == glucose_base
+    new_base = _base(conn, "lab_result", "test_name", "Glucose")
+    assert new_base != glucose_base
+    assert curation.load_verdicts(conn).for_row(
+        "lab_result", new_base, glucose_id)["status"] == "superseded"
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_a_row_verdict_shadows_its_familys_resolving_verdict(seeded):
+    """`covering` resolves through :meth:`VerdictMap.for_row` rather than adding a second
+    precedence site: a row-scoped non-resolving verdict shadows the resolving family
+    verdict on the same row, so the collision still blocks."""
+    conn = seeded["conn"]
+    _hba1c_id, glucose_id = _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", glucose_base, status="superseded",
+                            note="the family is settled", apply=True)
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="disputed",
+                            note="but not this row", row=True, apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert report.resolved == []
+    assert [c.kind for c in report.collisions] == ["fused"]
+
+
 # --- verify integration ------------------------------------------------------
 
 

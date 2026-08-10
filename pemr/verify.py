@@ -160,6 +160,11 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     resolves by row id, so a rekey no longer orphans it - only the row's removal does.
     Its stored `dedup_base` is a breadcrumb that may legitimately be stale, so the family
     check is deliberately skipped for it.
+
+    One family-scoped verdict is likewise never orphaned by a rekey: the one that
+    *resolved* a rekey collision (#116) follows its family onto the surviving base in the
+    same transaction as the keys it authorized, so this check has nothing to say about
+    it. The general story above is unchanged for every other family verdict.
     """
     if not curation.has_table(conn):
         return

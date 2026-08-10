@@ -30,7 +30,10 @@ single **row**:
 occurrence shifts `record rm` (#107) leaves behind. It does *not* survive every
 `pemr rekey`: a dictionary edit that changes this family's own canonical name moves its
 ``dedup_base``, orphaning the verdict (`pemr verify` warns; `record annotate --clear`
-then re-annotate).
+then re-annotate). The one exception is the verdict that *resolved* a rekey collision
+(issue #116, :class:`CollisionResolver`): it follows its family onto the surviving base
+in the same transaction as the keys it authorized, because a committed rekey whose
+authorizing ruling was left orphaned is a worse state than the one it fixed.
 
 *Row scope* — ``--row``, keyed by ``(record_type, record_id)`` **alone**. It exists for
 the family a ``--keep both`` conflict resolution left holding two *live* rows: a
@@ -103,6 +106,17 @@ APPENDIX_STATUSES: tuple[str, ...] = (
     "superseded",
     "erroneous-in-source",
     "merged-into",
+)
+
+#: The statuses that say "a human settled *which fact this is*" — and therefore the only
+#: ones that may resolve a `pemr rekey` collision (issue #116). ``confirmed`` records
+#: agreement with the row as filed, ``disputed`` records that the question is still open,
+#: and ``erroneous-in-source`` rules on the *content* of one row without saying anything
+#: about its identity relative to another — none of the three settles "these two rows are
+#: one fact", which is the question a collision asks.
+RESOLVING_STATUSES: tuple[str, ...] = (
+    "merged-into",
+    "superseded",
 )
 
 #: The key a rendered row carries its verdict under, when it has one.
@@ -741,6 +755,101 @@ def clear_curation(
                 )
     report.applied = apply
     return report
+
+
+# --------------------------------------------------------------------------- #
+# The `pemr rekey` collision seam (issue #116)
+# --------------------------------------------------------------------------- #
+
+class CollisionResolver:
+    """The overlay half of :class:`dedup.CollisionResolver` — the seam `rekey` asks
+    "did a human already settle this pair?" through.
+
+    Injected rather than imported: this module imports :mod:`dedup`, so ``dedup`` cannot
+    import it back. ``dedup`` declares the shape as a ``Protocol`` and the CLI builds the
+    implementation, which keeps every `curation`-table SQL statement here (the
+    :func:`retire_row_verdicts` precedent) and keeps the import graph acyclic.
+    """
+
+    def __init__(self, verdicts: VerdictMap) -> None:
+        self._verdicts = verdicts
+
+    def covering(
+        self, record_type: str, row: sqlite3.Row, clash: sqlite3.Row
+    ) -> dict | None:
+        """The verdict that settles a collision between two rows, or None.
+
+        Either row, either scope: the operator annotated whichever of the pair they were
+        looking at, and a family verdict on one is as much a ruling on the pair as a row
+        verdict on the other. Resolution runs through :meth:`VerdictMap.for_row`, so the
+        row-over-family precedence rule stays defined in exactly one place.
+
+        The **stored** ``dedup_base`` is the lookup key, not the recomputed one: the
+        human ruled on the family as it exists today, before this rekey moves it.
+        """
+        pk = f"{record_type}_id"
+        for candidate in (row, clash):
+            verdict = self._verdicts.for_row(
+                record_type, candidate["dedup_base"], candidate[pk]
+            )
+            if verdict is not None and verdict["status"] in RESOLVING_STATUSES:
+                return verdict
+        return None
+
+    def rebase(
+        self,
+        conn: sqlite3.Connection,
+        record_type: str,
+        verdict: dict,
+        new_base: str,
+        base_map: dict[str, str],
+    ) -> str:
+        """Keep a collision-resolving verdict attached to the family that survived.
+
+        Returns ``"unchanged"`` | ``"rebased"`` | ``"kept"``. **Caller-managed
+        transaction** (the :func:`retire_row_verdicts` precedent): `rekey` writes the keys
+        and this re-base in one ``with conn:``, because a committed rekey whose
+        authorizing verdict was left orphaned is the exact failure the seam exists to
+        avoid.
+
+        A *row-scoped* verdict needs nothing: it resolves by row id, which `rekey` never
+        renumbers, and its stored base is a breadcrumb deliberately left stale (migration
+        010). A *family-scoped* one follows its family onto ``new_base``, and follows its
+        ``merged_into_base`` through ``base_map`` when the merge target moved in this same
+        run.
+
+        Only ever an ``UPDATE`` of the two identity pointers, so ``status``, ``note``,
+        ``attributed_to`` and ``created_at`` survive verbatim — this is the same human
+        ruling, not a new one. And if the surviving base already carries a family verdict,
+        the incumbent wins and this one is left exactly where it is (``"kept"``): a
+        verdict is a human's, and nothing here may overwrite or delete one.
+        """
+        if verdict["record_id"]:
+            return "unchanged"
+        base = verdict["dedup_base"]
+        target = verdict["merged_into_base"]
+        new_target = base_map.get(target, target) if target else target
+        if base == new_base and new_target == target:
+            return "unchanged"
+        if base != new_base and get_verdict(conn, record_type, new_base) is not None:
+            return "kept"
+        conn.execute(
+            "UPDATE curation SET dedup_base = ?, merged_into_base = ? "
+            "WHERE record_type = ? AND dedup_base = ? AND record_id = 0",
+            (new_base, new_target, record_type, base),
+        )
+        return "rebased"
+
+
+def collision_resolver(conn: sqlite3.Connection) -> CollisionResolver:
+    """Build the resolver `pemr rekey` adjudicates its collisions through.
+
+    One :func:`load_verdicts` query up front (the render/verify hot-path idiom) — a rekey
+    scans every row of every table, and a per-collision SELECT would be the wrong shape.
+    A pre-008 snapshot yields an empty map, hence a resolver that resolves nothing, which
+    is exactly today's behaviour.
+    """
+    return CollisionResolver(load_verdicts(conn))
 
 
 def describe(verdict: dict) -> str:

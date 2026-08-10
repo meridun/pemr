@@ -399,8 +399,28 @@ stored keys, and names them (`skipped: collision` per table, plus a `skipped` li
 `--json`). `--json`'s `changed` list is every key the scan computed as moving, not only
 the ones written — a row in a skipped table still shows up there, so a consumer must
 cross-reference `skipped` to tell written from withheld. Exit code is 1 whenever any
-collision was found, in both output modes: partial progress is fine, silent partial
-progress is not.
+**blocking** collision was found, in both output modes: partial progress is fine, silent
+partial progress is not.
+
+**A collision a human already ruled on is settled, not blocking** (issue #116). Many
+collisions are exactly the pair the curation overlay exists to answer: a `merged-into` or
+`superseded` verdict says "these two are one fact", which is the question the guard is
+stuck on. So `rekey` consults the overlay — through an injected resolver, because
+`curation` imports `dedup` and not the reverse — and a clash covered by such a verdict on
+**either** row at **either** scope stops being blocking. The clash row is filed as the
+next free *occurrence* of the surviving family (the `--keep both` shape; leaving it on its
+stored key would strand it permanently drifted while `rekey` itself reported clean), and
+the verdict that authorized this follows its family onto the surviving `dedup_base` in the
+same transaction as the keys, so `pemr verify` gains no orphan warning. Only
+`merged-into`/`superseded` resolve — `confirmed`, `disputed` and `erroneous-in-source`
+rule on a row's content, not on its identity against another row — and a table holding any
+*unresolved* collision still withholds every change in it, resolved pairs included. Both
+output modes distinguish the two: a resolved pair is a `note:` line and an entry in
+`--json`'s `resolved` list, a blocked one stays `error:` plus `skipped`. A run whose every
+collision was verdict-resolved therefore exits **0**. If the surviving base already carries
+its own family verdict, the incumbent wins and the moved-off verdict is left exactly where
+it is and named in the output — a recorded human ruling is never overwritten, deleted, or
+auto-cleared here.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -441,7 +461,11 @@ documents is three stored rows that all recompute onto the single date-free key 
 type — the legacy shape behind #86's apparently duplicated condition bullets, correct storage
 under the old identity and a three-way fusion under the new one. A collision quarantines its own
 table only (above), so the clean tables are still written and the fusion is settled in the
-dictionary or the data before a re-run.
+dictionary or the data before a re-run — or, where a `merged-into`/`superseded` verdict has
+already been recorded on the pair, it is settled by that verdict and the table writes
+(above, issue #116). That is the common case for this migration's collisions: the rows are
+the *same* standing fact restated by several documents, which is precisely what those two
+statuses record.
 
 The **measured value is deliberately *not* in the key** — temporal identity carries the
 draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
