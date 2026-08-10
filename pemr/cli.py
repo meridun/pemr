@@ -1464,7 +1464,9 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                     "record_id": r.record_id,
                     "new_base": r.new_base,
                     "new_occurrence": r.new_occurrence,
+                    "covered_row_ids": r.covered_row_ids,
                     "verdict_action": r.verdict_action,
+                    "narrowed_row_ids": r.narrowed_row_ids,
                     "message": r.message,
                 }
                 for r in report.resolved
@@ -1480,16 +1482,20 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
         print(f"  {c.record_type} #{c.row_id}  {c.label}")
 
     # A note, not an error: the operator has nothing to fix here, but they do need to
-    # see why a table that holds a collision was written anyway.
+    # see why a table that holds a collision was written anyway - and, when a ruling's
+    # scope was narrowed to keep it off a row it never judged, they need to be told
+    # loudly enough to re-affirm or re-rule it.
     for resolution in report.resolved:
         print(f"note: {resolution.message}")
-        if resolution.verdict_action == "kept":
+        if resolution.verdict_action == "narrowed":
+            rows = ", ".join(str(r) for r in resolution.narrowed_row_ids)
             print(
-                f"note: {resolution.record_type} "
-                f"{resolution.new_base[:12]}... already carried its own family verdict, "
-                f"so the resolving one stayed on {resolution.verdict_base[:12]}... - "
-                "lift it with `pemr record annotate --clear "
-                f"{resolution.record_type} {resolution.verdict_base}` if it is now stale"
+                f"note: the family verdict on {resolution.verdict_base[:12]}... was "
+                f"narrowed to row scope on {resolution.record_type} "
+                f"{'rows' if len(resolution.narrowed_row_ids) > 1 else 'row'} {rows} - "
+                "the rows it already covered - so it does not extend over the rest of "
+                f"{resolution.new_base[:12]}...; re-affirm or re-rule it with "
+                f"`pemr record annotate --row {resolution.record_type} <id>`"
             )
     if report.resolved:
         print(f"{len(report.resolved)} collision(s) resolved by verdict")

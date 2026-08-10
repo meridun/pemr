@@ -409,18 +409,31 @@ stuck on. So `rekey` consults the overlay — through an injected resolver, beca
 `curation` imports `dedup` and not the reverse — and a clash covered by such a verdict on
 **either** row at **either** scope stops being blocking. The clash row is filed as the
 next free *occurrence* of the surviving family (the `--keep both` shape; leaving it on its
-stored key would strand it permanently drifted while `rekey` itself reported clean), and
-the verdict that authorized this follows its family onto the surviving `dedup_base` in the
-same transaction as the keys, so `pemr verify` gains no orphan warning. Only
+stored key would strand it permanently drifted while `rekey` itself reported clean). Only
 `merged-into`/`superseded` resolve — `confirmed`, `disputed` and `erroneous-in-source`
 rule on a row's content, not on its identity against another row — and a table holding any
-*unresolved* collision still withholds every change in it, resolved pairs included. Both
+*unresolved* collision still withholds every change in it, resolved pairs included (its
+resolutions say exactly that, rather than describing a write that did not happen). Both
 output modes distinguish the two: a resolved pair is a `note:` line and an entry in
 `--json`'s `resolved` list, a blocked one stays `error:` plus `skipped`. A run whose every
-collision was verdict-resolved therefore exits **0**. If the surviving base already carries
-its own family verdict, the incumbent wins and the moved-off verdict is left exactly where
-it is and named in the output — a recorded human ruling is never overwritten, deleted, or
-auto-cleared here.
+collision was verdict-resolved therefore exits **0**.
+
+**A verdict's scope never widens across that merge.** Resolution joins a judged family to
+an unjudged one, so the surviving family is *larger* than the one the human ruled on.
+Carrying the family verdict over wholesale would silently extend the ruling to a row nobody
+judged — and for the appendix statuses that resolve collisions, that pulls a live row out
+of its clinical section (a `merged-into` on one spelling of an allergy taking the other,
+canonical spelling out of `## Allergies`). So the authorizing family verdict is **narrowed
+to row scope** instead, pinned to exactly the rows whose stored `dedup_base` was its own,
+in the same transaction as the keys: the ruling keeps precisely the extension it had when
+it was made, the merged-in row keeps rendering where it was, and nothing is orphaned.
+Criticality-blind by construction — no live row silently leaves its rendered section,
+whatever it records. The conversion is announced, never silent: `resolved` names the pinned
+rows in both output modes, and `pemr verify` notices a row verdict whose family breadcrumb
+a rekey left stale, pointing at `pemr record annotate --row` to re-affirm or re-rule. A
+recorded human ruling is only ever re-pointed or scope-narrowed within its original
+extension here — never overwritten, deleted, or auto-cleared; a row that already carries
+its own row-scoped verdict is skipped for the same reason.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
