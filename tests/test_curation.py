@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from pemr import cli, curation, db, dedup, persons, records, verify
+from pemr import cli, curation, db, dedup, documents, persons, records, verify
 
 RECORDS = {
     "lab_result": [
@@ -662,9 +662,13 @@ def test_verify_is_silent_about_warnings_when_there_are_none(seeded):
 
 
 def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
-    """AC 7: the row-scope twin of the family orphan warning. Only the row's removal
-    can orphan a row-scoped verdict, so that is the state `verify` has to name - and it
-    names the row, because `--clear` needs `--row` to lift it."""
+    """AC 7: the row-scope twin of the family orphan warning - the **backstop**.
+
+    Since the row-id-reuse fix, the two write paths that delete a record row retire the
+    verdict themselves, so this state can only be reached some other way (a hand-edited
+    or restored database). It still has to be named, and named by row, because `--clear`
+    needs `--row` to lift it.
+    """
     conn = seeded["conn"]
     base = _second_occurrence(seeded)
     _occ0, occ1 = _occurrence_ids(conn, base)
@@ -672,7 +676,9 @@ def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
                             note="loser", row=True, apply=True)
     assert verify.verify_report(conn).warnings == []
 
-    records.remove_record(conn, "lab_result", occ1, apply=True)
+    # Straight to the table, behind the write paths' backs - the only way here now.
+    conn.execute("DELETE FROM lab_result WHERE lab_result_id = ?", (occ1,))
+    conn.commit()
 
     report = verify.verify_report(conn)
     assert report.ok is True and report.problems == []
@@ -682,6 +688,105 @@ def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
     # And the orphan is liftable without a live row to name it by.
     curation.clear_curation(conn, "lab_result", str(occ1), row=True, apply=True)
     assert _curation_count(conn) == 0
+
+
+# --- row ids are reusable, so removing the row retires its verdict (issue #114) ---
+
+
+def _max_row_id(conn, record_type):
+    return int(conn.execute(
+        f"SELECT MAX({record_type}_id) AS n FROM {record_type}"
+    ).fetchone()["n"])
+
+
+def test_record_rm_retires_the_row_verdict_and_keeps_the_family_one(seeded):
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", base, status="disputed",
+                            note="two sources disagree", apply=True)
+    curation.annotate_record(conn, "lab_result", str(occ1), row=True,
+                            status="superseded", note="the keep-both loser", apply=True)
+
+    report = records.remove_record(conn, "lab_result", occ1, apply=True)
+
+    assert [v["record_id"] for v in report.curation_retired] == [occ1]
+    assert curation.get_verdict(conn, "lab_result", "", record_id=occ1) is None
+    # The family verdict survives on purpose: dedup_base is content-derived, so it has
+    # no reuse hazard and occurrence 0 is still there for it to rule on.
+    family = curation.get_verdict(conn, "lab_result", base)
+    assert family is not None and family["status"] == "disputed"
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_record_rm_dry_run_names_the_verdict_it_would_lift(seeded):
+    """The dry run is `record rm`'s whole safety mechanism, and a recorded clinical
+    ruling going away is part of the blast radius it promises to be truthful about."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), row=True,
+                            status="superseded", note="the keep-both loser", apply=True)
+
+    report = records.remove_record(conn, "lab_result", occ1)
+
+    assert report.applied is False
+    assert [v["note"] for v in report.curation_retired] == ["the keep-both loser"]
+    assert curation.get_verdict(conn, "lab_result", "", record_id=occ1) is not None
+
+
+def test_a_reused_row_id_does_not_inherit_the_removed_rows_verdict(seeded):
+    """The regression this whole retirement rule exists for.
+
+    Record ids are plain rowid aliases (INTEGER PRIMARY KEY, no AUTOINCREMENT), so
+    deleting the highest-id row hands that id to the next insert. Before the fix, the
+    stale row-scoped verdict re-attached to the new, unrelated record - and `verify`
+    went *quiet* about it, because the id resolved again.
+    """
+    conn = seeded["conn"]
+    glucose = _row_id(conn, "lab_result", "test_name", "Glucose")
+    assert glucose == _max_row_id(conn, "lab_result")   # the reuse precondition
+    curation.annotate_record(conn, "lab_result", str(glucose), row=True,
+                            status="superseded", note="loser of a keep-both", apply=True)
+
+    records.remove_record(conn, "lab_result", glucose, apply=True)
+    doc2 = _insert_document(conn, seeded["jane"].person_id, "cc33dd44ee55ff66")
+    dedup.commit_extraction(conn, doc2, {"lab_result": [
+        {"test_name": "Creatinine", "collected_at": "2026-02-02", "value_num": 0.9,
+         "unit": "mg/dL"},
+    ]})
+    recycled = _row_id(conn, "lab_result", "test_name", "Creatinine")
+    assert recycled == glucose          # SQLite handed the id straight back
+
+    verdicts = curation.load_verdicts(conn)
+    base = _base(conn, "lab_result", "test_name", "Creatinine")
+    assert verdicts.for_row("lab_result", base, recycled) is None
+    assert _curation_count(conn) == 0
+    assert not any("curation" in w for w in verify.verify_report(conn).warnings)
+
+
+def test_document_rm_retires_the_row_verdicts_of_the_rows_it_deletes(seeded):
+    """`document rm` cascades to every row the document produced, freeing every one of
+    those ids - the same hazard as `record rm`, at document scale."""
+    conn = seeded["conn"]
+    glucose = _row_id(conn, "lab_result", "test_name", "Glucose")
+    cond_base = _base(conn, "condition", "name", "Type 2 Diabetes")
+    curation.annotate_record(conn, "lab_result", str(glucose), row=True,
+                            status="superseded", note="row scope", apply=True)
+    curation.annotate_record(conn, "condition", cond_base, status="disputed",
+                            note="family scope", apply=True)
+
+    dry = documents.remove_document(conn, seeded["doc"])
+    assert [v["record_id"] for v in dry.curation_retired] == [glucose]
+    assert curation.get_verdict(conn, "lab_result", "", record_id=glucose) is not None
+
+    report = documents.remove_document(conn, seeded["doc"], apply=True)
+
+    assert [v["record_id"] for v in report.curation_retired] == [glucose]
+    assert curation.get_verdict(conn, "lab_result", "", record_id=glucose) is None
+    # The family verdict outlives the cascade: `dedup_base` is content-derived, so a
+    # re-ingest of the same document re-attaches it, which is the point of family scope.
+    assert curation.get_verdict(conn, "condition", cond_base) is not None
 
 
 def test_verify_warns_about_a_dangling_merge_target(seeded):
@@ -993,6 +1098,66 @@ def test_cli_annotate_row_misuse_is_friendly(cli_ready, capsys):
                 "--status", "disputed", "--note", "x", "--apply") == 1
     assert "no lab_result with id 9999" in capsys.readouterr().err
     assert _cli_curation_count(cli_ready) == 0
+
+
+def test_cli_record_rm_names_and_lifts_the_row_verdict(cli_ready, capsys):
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(target), "--row",
+                "--status", "superseded", "--note", "loser of a keep-both",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "rm", "lab_result", str(target)) == 0
+    out = capsys.readouterr().out
+    assert "curation verdict (row scope) would be lifted" in out
+    assert "loser of a keep-both" in out
+    assert _cli_curation_count(cli_ready) == 1        # dry run wrote nothing
+
+    assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--apply") == 0
+    assert "curation verdict (row scope) lifted" in capsys.readouterr().out
+    assert _cli_curation_count(cli_ready) == 0
+
+
+def test_cli_a_reused_row_id_is_not_filed_under_the_superseded_appendix(
+    cli_ready, capsys
+):
+    """The end-to-end shape of the regression: annotate the highest-id row, remove it,
+    ingest something else onto the recycled id, and the new fact must render in its own
+    section rather than under a stranger's verdict."""
+    target = _cli_row_id(cli_ready, "condition", "name", "Prediabetes")
+    assert _run(cli_ready, "record", "annotate", "condition", str(target), "--row",
+                "--status", "superseded", "--note", "loser of a keep-both",
+                "--apply") == 0
+    assert _run(cli_ready, "record", "rm", "condition", str(target), "--apply") == 0
+
+    scan2 = cli_ready / "scan2.txt"
+    scan2.write_bytes(b"visit note: anaphylaxis, epinephrine plan in place")
+    assert _run(cli_ready, "ingest", str(scan2), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources"), "--ocr-text-file",
+                str(scan2)) == 0
+    payload = cli_ready / "extract2.json"
+    payload.write_text(json.dumps({"condition": [
+        {"name": "Anaphylaxis - epinephrine plan", "status": "active",
+         "onset_on": "2025-05-05"},
+    ]}), encoding="utf-8")
+    assert _run(cli_ready, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+    recycled = _cli_row_id(cli_ready, "condition", "name",
+                           "Anaphylaxis - epinephrine plan")
+    assert recycled == target       # SQLite handed the id straight back
+
+    capsys.readouterr()
+    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
+    summary = capsys.readouterr().out
+    assert "Anaphylaxis - epinephrine plan" in summary
+    assert "## Superseded / corrected" not in summary
+    assert "loser of a keep-both" not in summary
+
+    capsys.readouterr()
+    assert _run(cli_ready, "verify") == 0
+    out = capsys.readouterr().out
+    assert "names no live row" not in out
+    assert not any(line.startswith("warnings") for line in out.splitlines())
 
 
 # --- the integration drill from the issue ------------------------------------

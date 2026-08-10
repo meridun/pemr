@@ -10,10 +10,12 @@ at this and ruled" — so the question reopens on every re-render and re-extract
 This module is that missing durable state: one small overlay table, and the verbs that
 write it.
 
-    annotate_record  -- record (or overwrite) one verdict, dry-run by default
-    list_curation    -- every verdict, newest first
-    clear_curation   -- lift one verdict, dry-run by default
-    load_verdicts    -- the whole table as a lookup, for the render/verify hot path
+    annotate_record      -- record (or overwrite) one verdict, dry-run by default
+    list_curation        -- every verdict, newest first
+    clear_curation       -- lift one verdict, dry-run by default
+    load_verdicts        -- the whole table as a lookup, for the render/verify hot path
+    row_verdicts_for     -- the row-scoped verdicts naming a set of rows
+    retire_row_verdicts  -- ... and drop them, for the row-removal write paths
 
 **Pure overlay.** No record row is ever written. `render` stays a pure function of DB
 state: it just reads two tables per section instead of one, and re-rendering after a
@@ -42,6 +44,19 @@ that orphans a family-scoped one; it is orphaned only by the removal of its row.
 annotate time — that may go stale after such a rekey and is never consulted for
 resolution: every reader re-reads the live base off the row.
 
+**Removing the row retires the verdict.** A ``dedup_base`` is content-derived, so a
+family verdict re-attaching to a re-ingested identical fact is correct. A row id is not:
+every record table is ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so deleting the
+highest-id row frees that id for the **next insert** — a surviving row-scoped verdict
+would silently re-target an unrelated new record, filing a live clinical fact under a
+note about a different one, and `pemr verify`'s orphan warning goes quiet the moment the
+id is reused. So the two write paths that can delete a record row —
+:func:`records.remove_record` and :func:`documents.remove_document` — disclose any
+row-scoped verdict naming a doomed row in their dry run and lift it, in the same
+transaction as the delete (:func:`row_verdicts_for`, :func:`retire_row_verdicts`). The
+window is closed where it opens; `verify`'s warning stays as the backstop for a verdict
+orphaned some other way.
+
 **Precedence**: a row-scoped verdict wins over its family's verdict, for that row only —
 resolved in exactly one place, :meth:`VerdictMap.for_row`, so render, journal and verify
 cannot drift apart.
@@ -65,6 +80,7 @@ of.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -297,6 +313,53 @@ def load_verdicts(conn: sqlite3.Connection) -> VerdictMap:
         else:
             out.family[(view["record_type"], view["dedup_base"])] = view
     return out
+
+
+def row_verdicts_for(
+    conn: sqlite3.Connection, record_type: str, record_ids: Iterable[int]
+) -> list[dict]:
+    """The **row-scoped** verdicts naming any of ``record_ids``, newest first.
+
+    What a row-removal write path has to disclose before it deletes: those rows' ids are
+    about to become free for reuse, so the verdicts naming them are about to become
+    hazardous (see the module docstring). Family-scoped verdicts are deliberately not
+    returned — ``dedup_base`` is content-derived and survives the removal legitimately.
+
+    One query, intersected in Python: `curation` holds one row per human ruling, so it is
+    always the small side, while ``record_ids`` can be every row of a large document.
+    """
+    _require_type(record_type)
+    wanted = {int(rid) for rid in record_ids if int(rid)}
+    if not wanted or not has_table(conn):
+        return []
+    rows = conn.execute(
+        "SELECT * FROM curation WHERE record_type = ? AND record_id <> 0 "
+        "ORDER BY created_at DESC, record_id",
+        (record_type,),
+    ).fetchall()
+    return [v for v in (_row_view(r) for r in rows) if v["record_id"] in wanted]
+
+
+def retire_row_verdicts(
+    conn: sqlite3.Connection, record_type: str, record_ids: Iterable[int]
+) -> list[dict]:
+    """Lift the row-scoped verdicts naming ``record_ids``; return what was lifted.
+
+    **Caller-managed transaction** (the :func:`tombstones.add_tombstone`
+    ``conn_managed`` precedent): the caller is deleting the rows themselves, and a
+    delete that commits without retiring the verdict is the exact failure this closes,
+    so both must land in one ``with conn:``.
+
+    Deletes by ``(record_type, record_id)`` — never by ``dedup_base``, which is a
+    breadcrumb a `rekey` may have left stale — and touches no family-scoped verdict.
+    """
+    doomed = row_verdicts_for(conn, record_type, record_ids)
+    for verdict in doomed:
+        conn.execute(
+            "DELETE FROM curation WHERE record_type = ? AND record_id = ?",
+            (record_type, verdict["record_id"]),
+        )
+    return doomed
 
 
 def family_label(conn: sqlite3.Connection, record_type: str, base: str) -> tuple[str, int]:
