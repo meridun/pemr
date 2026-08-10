@@ -165,7 +165,10 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     (#116) announces itself: a family verdict that settles a `rekey` collision is pinned
     to exactly the rows it already covered - so the merged-in row it never judged keeps
     rendering in its own clinical section - and this is where the human is told to
-    re-affirm or re-rule. Re-annotating collapses the breadcrumb and the notice with it.
+    re-affirm or re-rule. Re-annotating collapses the breadcrumb and the notice with it -
+    including for `merged-into`, whose re-affirm names the row's own (post-rekey) family,
+    which :func:`curation.annotate_record` accepts at row scope precisely so this notice
+    can be answered without downgrading or lifting the ruling.
     """
     if not curation.has_table(conn):
         return

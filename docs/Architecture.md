@@ -435,6 +435,15 @@ recorded human ruling is only ever re-pointed or scope-narrowed within its origi
 extension here — never overwritten, deleted, or auto-cleared; a row that already carries
 its own row-scoped verdict is skipped for the same reason.
 
+That re-affirm has to be *runnable*, which is why `--merged-into` may name the annotated
+row's own family at **row** scope. A `merged-into` narrowing is the common shape, and the
+same rekey that narrows the ruling also moves its row into the merge target — so by the
+time the operator answers the notice there is no third family left to name. At row scope
+the pointer still means something (this occurrence is absorbed into the family it sits in;
+it moves to the appendix while its siblings keep rendering live), so it is accepted. At
+**family** scope a self-merge would leave the fact rendering nowhere at all, and stays
+refused.
+
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
 fact would land a *second* row reported as `new` — no duplicate, no conflict, no signal at
