@@ -28,11 +28,12 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
     collapse disclosed on the line (issue #93) -- the stored rows keep their dates
     and stay distinct, because an order is an event, not a standing fact.
 
-**Curation overlay** (issue #109). Every section is filtered at read time against the
-``curation`` table, a pure overlay of recorded human verdicts keyed by
-``(record_type, dedup_base)``: ``superseded`` / ``erroneous-in-source`` /
-``merged-into`` families leave their section for a ``## Superseded / corrected``
-appendix, ``disputed`` families render in place with a ``[DISPUTED: ...]`` marker (and
+**Curation overlay** (issues #109, #114). Every section is filtered at read time against
+the ``curation`` table, a pure overlay of recorded human verdicts scoped to a whole dedup
+family or to a **single row** (:meth:`curation.VerdictMap.for_row` resolves per row, row
+scope winning over family scope): ``superseded`` / ``erroneous-in-source`` /
+``merged-into`` leave their section for a ``## Superseded / corrected``
+appendix, ``disputed`` renders in place with a ``[DISPUTED: ...]`` marker (and
 reach the brief's ``## Questions for the Clinician``), and ``confirmed`` renders exactly
 as before. Both new sections are **omitted entirely** when empty, so a record with no
 verdicts renders byte-identically to what it did before the overlay existed. This is
@@ -157,17 +158,32 @@ class _CurationPass:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.verdicts = curation.load_verdicts(conn)
-        # Keyed by (record_type, dedup_base) so a multi-occurrence family is listed
-        # once however many of its rows a section selected. Insertion-ordered.
-        self.appendix: dict[tuple[str, str], dict] = {}
-        self.disputed: dict[tuple[str, str], dict] = {}
+        # Keyed by (record_type, dedup_base, record_id) so a multi-occurrence family is
+        # listed once however many of its rows a section selected -- while two rows of
+        # one family carrying *different* row-scoped verdicts (issue #114) are two
+        # entries rather than one swallowing the other. Insertion-ordered.
+        self.appendix: dict[tuple[str, str, int], dict] = {}
+        self.disputed: dict[tuple[str, str, int], dict] = {}
 
-    def _entry(self, record_type: str, base: str, verdict: dict) -> dict:
-        label, family_size = curation.family_label(self.conn, record_type, base)
+    def _entry(self, verdict: dict) -> dict:
+        record_type = verdict["record_type"]
+        if verdict["record_id"]:
+            label, _live_base, family_size = curation.row_label(
+                self.conn, record_type, verdict["record_id"]
+            )
+        else:
+            label, family_size = curation.family_label(
+                self.conn, record_type, verdict["dedup_base"]
+            )
         return dict(verdict, label=label, family_size=family_size)
 
-    def record(self, record_type: str, base: str, verdict: dict) -> None:
-        """File a family under the section its status sends it to, once.
+    def record(self, verdict: dict) -> None:
+        """File a verdict under the section its status sends it to, once.
+
+        Identity comes off the verdict itself rather than off the row that matched it:
+        the key must be the verdict's *scope* (family or this one row), and passing the
+        matching row's id alongside a family-scoped verdict would split one family into
+        an appendix line per occurrence.
 
         ``confirmed`` is filed nowhere on purpose: it records agreement, so it neither
         leaves its section nor raises a question.
@@ -178,9 +194,9 @@ class _CurationPass:
             bucket = self.disputed
         else:
             return
-        key = (record_type, base)
+        key = (verdict["record_type"], verdict["dedup_base"], verdict["record_id"])
         if key not in bucket:
-            bucket[key] = self._entry(record_type, base, verdict)
+            bucket[key] = self._entry(verdict)
 
 
 def _apply_curation(
@@ -189,8 +205,14 @@ def _apply_curation(
     """Filter one section's rows through the overlay, before any grouping.
 
     Returns the rows that still render, stamping each annotated survivor with its
-    verdict under ``_curation``; families in :data:`curation.APPENDIX_STATUSES` are
-    dropped from the section and collected for the appendix instead.
+    verdict under ``_curation``; rows whose verdict is in
+    :data:`curation.APPENDIX_STATUSES` are dropped from the section and collected for the
+    appendix instead.
+
+    Resolution is **per row**, not per family (issue #114): a row-scoped verdict applies
+    to its own occurrence and a family-scoped one to every row that has no verdict of its
+    own, all decided in :meth:`curation.VerdictMap.for_row`. Every section selects
+    ``SELECT *``, so the row id needed for that is already in hand.
 
     Called immediately after each section's ``SELECT`` and **before** any latest-wins,
     grouping or top-N logic, so a superseded reading can neither win "latest" nor
@@ -200,12 +222,13 @@ def _apply_curation(
         return rows
     out: list[dict] = []
     for row in rows:
-        base = row["dedup_base"]
-        verdict = cur.verdicts.get((record_type, base))
+        verdict = cur.verdicts.for_row(
+            record_type, row["dedup_base"], row.get(f"{record_type}_id")
+        )
         if verdict is None:
             out.append(row)
             continue
-        cur.record(record_type, base, verdict)
+        cur.record(verdict)
         if verdict["status"] in curation.APPENDIX_STATUSES:
             continue
         row[curation.CURATION_FIELD] = verdict
@@ -219,7 +242,7 @@ def _apply_curation_events(
     """:func:`_apply_curation` for timeline events.
 
     Same rule, different carrier: an event is a rendered sentence rather than a row, and
-    it only carries ``record_type``/``dedup_base`` when
+    it only carries ``record_type``/``dedup_base``/``record_id`` when
     :func:`query.query_timeline` was asked for them (``with_identity``). An event
     without identity is passed through -- that is the no-verdicts fast path, where the
     journal never asks for the extra keys in the first place.
@@ -233,11 +256,11 @@ def _apply_curation_events(
             out.append(event)
             continue
         record_type = event["record_type"]
-        verdict = cur.verdicts.get((record_type, base))
+        verdict = cur.verdicts.for_row(record_type, base, event.get("record_id"))
         if verdict is None:
             out.append(event)
             continue
-        cur.record(record_type, base, verdict)
+        cur.record(verdict)
         if verdict["status"] in curation.APPENDIX_STATUSES:
             continue
         event[curation.CURATION_FIELD] = verdict
@@ -278,7 +301,7 @@ def _attest_suffix(row: dict) -> str:
     return f"  (attested by {row['attested_by']}{stamp}; no source document)"
 
 
-def _appendix_section(entries: dict[tuple[str, str], dict]) -> str | None:
+def _appendix_section(entries: dict[tuple[str, str, int], dict]) -> str | None:
     """The ``## Superseded / corrected`` section, or ``None`` when there is nothing
     to say.
 
@@ -290,13 +313,13 @@ def _appendix_section(entries: dict[tuple[str, str], dict]) -> str | None:
     if not entries:
         return None
     lines = []
-    for (record_type, _base), entry in entries.items():
+    for (record_type, _base, _record_id), entry in entries.items():
         label = entry["label"] or "(no live rows)"
         lines.append(f"- {record_type}: {label}  [{curation.describe(entry)}]")
     return _section("Superseded / corrected", lines)
 
 
-def _questions_section(entries: dict[tuple[str, str], dict]) -> str | None:
+def _questions_section(entries: dict[tuple[str, str, int], dict]) -> str | None:
     """The ``## Questions for the Clinician`` section, or ``None`` when empty.
 
     A ``disputed`` verdict is a recorded "two sources disagree and a human has to
@@ -306,7 +329,7 @@ def _questions_section(entries: dict[tuple[str, str], dict]) -> str | None:
     if not entries:
         return None
     lines = []
-    for (record_type, _base), entry in entries.items():
+    for (record_type, _base, _record_id), entry in entries.items():
         label = entry["label"] or "(no live rows)"
         who = f" ({entry['attributed_to']})" if entry.get("attributed_to") else ""
         lines.append(f"- {record_type}: {label} - {entry['note']}{who}")

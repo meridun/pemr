@@ -42,7 +42,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import db, dedup, tombstones
+from . import curation, db, dedup, tombstones
 from .persons import PersonNotFoundError, get_person
 
 
@@ -161,6 +161,29 @@ def _record_counts(conn: sqlite3.Connection, document_id: int) -> dict[str, int]
         ).fetchone()
         counts[record_type] = int(row["n"])
     return counts
+
+
+def _doomed_row_verdicts(
+    conn: sqlite3.Connection, document_id: int
+) -> list[dict]:
+    """Row-scoped curation verdicts naming a row this document owns (issue #114).
+
+    The cascade frees every one of those row ids for reuse, so the verdicts have to go
+    with the rows — same reason `record rm` retires its one row's verdict, at document
+    scale. Family-scoped verdicts are untouched: ``dedup_base`` is content-derived, so a
+    re-ingest of the same document legitimately re-attaches them.
+    """
+    doomed: list[dict] = []
+    for record_type in dedup.KNOWN_TYPES:
+        pk = f"{record_type}_id"
+        ids = [
+            int(r[pk])
+            for r in conn.execute(
+                f"SELECT {pk} FROM {record_type} WHERE document_id = ?", (document_id,)
+            ).fetchall()
+        ]
+        doomed.extend(curation.row_verdicts_for(conn, record_type, ids))
+    return doomed
 
 
 def _conflicts_cited_by(conn: sqlite3.Connection, document_id: int) -> list[int]:
@@ -553,6 +576,8 @@ class RemoveReport:
     conflicts_deleted: int = 0      # open conflicts raised by this document
     conflicts_anchored: int = 0     # open conflicts staged against its rows (also deleted)
     conflicts_detached: int = 0     # resolved conflicts, document_id nulled
+    # Row-scoped curation verdicts on the doomed rows - lifted with them (issue #114).
+    curation_retired: list[dict] = field(default_factory=list)
     # Absolute when a ``sources_dir`` was passed, else the store-relative
     # `sources/<shard>/<sha><ext>` form `pemr ingest` echoes. The CLI only resolves a
     # sources dir for `--purge-blob`, so its `blob kept:` line is always the latter.
@@ -597,8 +622,12 @@ def remove_document(
     owns (:func:`_conflicts_anchored_to`) are deleted too and counted separately — the
     row they were staged against is going away, so leaving them would strand a conflict
     whose only remaining resolution is `keep both` (`keep incoming` refuses loudly once
-    the family is empty — :func:`dedup._anchor_row`). Every count is in the dry-run
-    report: the blast radius is the safety
+    the family is empty — :func:`dedup._anchor_row`). Row-scoped curation verdicts
+    (`record annotate --row`, issue #114) naming a doomed row are lifted with it, because
+    the row id becomes reusable the moment the row is gone and a surviving verdict would
+    re-attach to whatever lands on it; family-scoped verdicts are kept, since
+    ``dedup_base`` is content-derived and re-attaches to a re-ingest on purpose. Every
+    count is in the dry-run report: the blast radius is the safety
     mechanism here, so it has to be truthful.
 
     The scan under ``sources_dir`` is **kept** unless ``purge_blob`` is set — it is the
@@ -646,6 +675,9 @@ def remove_document(
         "SELECT COUNT(*) AS n FROM conflict WHERE document_id = ? AND status != 'open'",
         (document_id,),
     ).fetchone()["n"])
+    # Every row this document owns is about to be deleted, freeing its id for reuse, so
+    # the row-scoped verdicts naming those rows go with them (issue #114).
+    report.curation_retired = _doomed_row_verdicts(conn, document_id)
     report.tombstoned = tombstone
     report.tombstone_reason = reason
     report.tombstone_note = note
@@ -671,6 +703,17 @@ def remove_document(
                 (document_id,),
             )
             for record_type in dedup.KNOWN_TYPES:
+                # Verdicts first, while their rows are still there to be matched - and
+                # in this same transaction, because a cascade that commits without
+                # retiring them leaves ids free to be reused under a stale ruling.
+                curation.retire_row_verdicts(
+                    conn,
+                    record_type,
+                    [
+                        v["record_id"] for v in report.curation_retired
+                        if v["record_type"] == record_type
+                    ],
+                )
                 conn.execute(
                     f"DELETE FROM {record_type} WHERE document_id = ?", (document_id,)
                 )
