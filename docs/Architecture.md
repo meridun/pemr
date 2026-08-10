@@ -770,6 +770,17 @@ misses and the family renders as if unannotated (`pemr verify` flags the orphan;
 re-attaches it automatically). A *row*-scoped verdict is immune — it joins on the row id,
 which `rekey` never renumbers — and is orphaned only by the removal of its row.
 
+That immunity has a price, and it is a rule rather than a caveat: **a row-scoped verdict is
+identified by a reusable row id, so removing the row must retire the verdict.** Record ids
+are plain rowid aliases (no `AUTOINCREMENT`), so deleting the highest-id row frees that id
+for the next insert, and a verdict left behind would re-attach to an unrelated new record —
+pulling a live clinical fact into the superseded appendix under a note about a different one,
+with `verify`'s orphan warning silent because the id resolves again. Both write paths that
+delete a record row (`record rm`, `document rm`) therefore name any row-scoped verdict on the
+doomed rows in their dry run and lift it in the same transaction as the delete. Family scope
+needs no such rule: `dedup_base` is content-derived, so re-attaching to a re-ingest of the
+same fact is the intended behaviour.
+
 Because they regenerate from truth, they never drift. Old exports are disposable.
 
 ---

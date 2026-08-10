@@ -418,6 +418,9 @@ def test_cli_record_rm_json_shape_is_stable(cli_ready, capsys):
         "record_type", "row_id", "person", "document_id", "label", "fields",
         "dedup_key", "dedup_base", "dedup_occurrence", "family_size",
         "family_remaining", "conflicts_reanchored", "applied",
+        # Appended by #114: the row-scoped curation verdicts retired with the row.
+        # Appended, never inserted - the --json key set is a contract.
+        "curation_retired",
     }
     capsys.readouterr()
     assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--json") == 0

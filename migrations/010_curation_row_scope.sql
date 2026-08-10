@@ -32,8 +32,19 @@
 -- script in one BEGIN/COMMIT. Every 008-era verdict is family-scoped by definition, so the
 -- backfill (record_id = 0) is lossless and nothing needs re-annotating.
 --
+-- Still no FK to the row (the 007 document_tombstone precedent), but row scope needs a
+-- guarantee family scope never did: a record id is a plain rowid alias (INTEGER PRIMARY
+-- KEY, no AUTOINCREMENT - migrations 001/006), so deleting the highest-id row frees that id
+-- for the next insert. A row-scoped verdict left behind would silently re-target an
+-- unrelated new record, and `pemr verify`'s orphan warning goes quiet exactly then. So the
+-- two write paths that delete a record row - records.remove_record and
+-- documents.remove_document - retire the row-scoped verdicts naming those rows, in the same
+-- transaction as the delete. Family scope has no such hazard: dedup_base is content-derived,
+-- so re-attaching to a re-ingested identical fact is intentional.
+--
 -- 008's three CHECKs are carried verbatim; the orphan story is unchanged (no FK, `pemr
--- verify` warns rather than the schema erasing), and now covers "names no live row" too.
+-- verify` warns rather than the schema erasing), and now covers "names no live row" too -
+-- the backstop for a verdict orphaned some way other than those two write paths.
 
 CREATE TABLE curation_new (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python

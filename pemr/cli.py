@@ -687,6 +687,8 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
                 "conflicts_deleted": report.conflicts_deleted,
                 "conflicts_anchored": report.conflicts_anchored,
                 "conflicts_detached": report.conflicts_detached,
+                # Appended, never inserted: the --json key set is a contract.
+                "curation_retired": report.curation_retired,
                 "blob_path": report.blob_path,
                 "blob_purged": report.blob_purged,
                 "tombstoned": report.tombstoned,
@@ -713,6 +715,14 @@ def _cmd_document_rm(args: argparse.Namespace) -> int:
             )
         if report.conflicts_detached:
             print(f"  conflicts detached (resolved): {report.conflicts_detached}")
+        for verdict in report.curation_retired:
+            # Row-scoped verdicts on the doomed rows (issue #114) - named rather than
+            # counted, for the same reason `record rm` names its one.
+            lifted = "lifted" if report.applied else "would be lifted"
+            print(
+                f"  curation verdict (row scope) {lifted}: {verdict['record_type']} "
+                f"#{verdict['record_id']}  {curation.describe(verdict)}"
+            )
         if not args.purge_blob:
             print(f"  blob kept: {report.blob_path}")
         elif report.blob_purged:
@@ -858,6 +868,8 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
                 "family_size": report.family_size,
                 "family_remaining": report.family_remaining,
                 "conflicts_reanchored": report.conflicts_reanchored,
+                # Appended, never inserted: the --json key set is a contract.
+                "curation_retired": report.curation_retired,
                 "applied": report.applied,
             })
             return 0
@@ -883,6 +895,14 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
             print(
                 f"  open conflict(s) {ids} re-anchor to the lowest surviving "
                 "occurrence"
+            )
+        for verdict in report.curation_retired:
+            # Named, not counted: a row-scoped verdict is a recorded human ruling, and
+            # the dry run is the only chance to notice it is going away (issue #114).
+            lifted = "lifted" if report.applied else "would be lifted"
+            print(
+                f"  curation verdict (row scope) {lifted}: "
+                f"{curation.describe(verdict)}"
             )
         if report.applied:
             print(f"removed {report.record_type} #{report.row_id}")

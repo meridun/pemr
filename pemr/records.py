@@ -29,6 +29,14 @@ resolution and the conflict's ``incoming_json`` is still worth something — no 
 run could undo destroying it. So: removal is refused when it would empty the
 conflict's identity family, and allowed (with the conflict re-anchoring itself to
 the lowest surviving occurrence) when a sibling remains.
+
+**Row-scoped curation verdicts are retired with the row** (issue #114). A record
+id is a plain rowid alias — no ``AUTOINCREMENT`` on any record table — so removing
+the highest-id row frees that id for the next insert, and a `record annotate --row`
+verdict left behind would re-attach to whatever unrelated record lands on it. The
+dry run names the verdict; ``apply`` lifts it in the same transaction as the delete
+(:func:`curation.retire_row_verdicts`). Family-scoped verdicts are untouched:
+``dedup_base`` is content-derived, so re-attachment there is intentional.
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, dedup
+from . import curation, db, dedup
 
 
 class RecordNotFoundError(ValueError):
@@ -66,6 +74,9 @@ class RecordRemoveReport:
     family_size: int = 0          # rows sharing this dedup_base, including this one
     family_remaining: int = 0     # ... after the removal
     conflicts_reanchored: list[int] = field(default_factory=list)
+    # Row-scoped curation verdicts naming this row - lifted with it (issue #114), and
+    # named in the dry run because a recorded clinical judgment is going away.
+    curation_retired: list[dict] = field(default_factory=list)
     applied: bool = False
 
 
@@ -91,13 +102,16 @@ def remove_record(
     Dry-run by default: pass ``apply=True`` to write. The dry run *is* the safety
     mechanism (there is no undo and no tombstone — a record row has no content
     hash to key one on), so the report has to be truthful about the blast radius:
-    the row's payload, its position in its identity family, and any open conflict
-    the removal re-anchors.
+    the row's payload, its position in its identity family, any open conflict
+    the removal re-anchors, and any row-scoped curation verdict it retires.
 
-    Deliberately narrow. It touches exactly one row: the document survives with
-    every other record it produced, ``dedup_key``s are neither recomputed nor
+    Deliberately narrow. It touches exactly one record row: the document survives
+    with every other record it produced, ``dedup_key``s are neither recomputed nor
     renumbered (deletion is key-neutral), and the ``conflict`` table is never
-    written. That makes it composable with the collision it exists to resolve —
+    written. The one thing outside the row it does write is the row's own
+    ``curation`` verdict, and only the row-scoped one (issue #114 — see the module
+    docstring: the id becomes reusable, the verdict must not outlive it). That makes
+    it composable with the collision it exists to resolve —
     `pemr rekey` names the two row ids, `pemr record rm` drops the degraded one,
     `pemr rekey --apply` then runs clean.
 
@@ -156,6 +170,9 @@ def remove_record(
     # occurrence on its next resolution (`dedup._anchor_row`) - allowed, but the
     # report says so out loud because the anchor moving is not obvious.
     report.conflicts_reanchored = anchored
+    # The row id is about to become reusable, so any row-scoped verdict naming it is
+    # about to become a mis-render waiting for the next insert (issue #114).
+    report.curation_retired = curation.row_verdicts_for(conn, record_type, [row_id])
 
     if apply:
         # record_fts follows via the per-table AFTER DELETE triggers (migrations
@@ -167,5 +184,8 @@ def remove_record(
                 raise RecordNotFoundError(
                     f"no {record_type} with id {row_id} - nothing was deleted"
                 )
+            # Same transaction as the delete: a commit that dropped the row but kept
+            # its verdict is exactly the state that mis-renders once the id is reused.
+            curation.retire_row_verdicts(conn, record_type, [row_id])
     report.applied = apply
     return report
