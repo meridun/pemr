@@ -426,14 +426,23 @@ of its clinical section (a `merged-into` on one spelling of an allergy taking th
 canonical spelling out of `## Allergies`). So the authorizing family verdict is **narrowed
 to row scope** instead, pinned to exactly the rows whose stored `dedup_base` was its own,
 in the same transaction as the keys: the ruling keeps precisely the extension it had when
-it was made, the merged-in row keeps rendering where it was, and nothing is orphaned.
-Criticality-blind by construction — no live row silently leaves its rendered section,
-whatever it records. The conversion is announced, never silent: `resolved` names the pinned
-rows in both output modes, and `pemr verify` notices a row verdict whose family breadcrumb
-a rekey left stale, pointing at `pemr record annotate --row` to re-affirm or re-rule. A
-recorded human ruling is only ever re-pointed or scope-narrowed within its original
-extension here — never overwritten, deleted, or auto-cleared; a row that already carries
-its own row-scoped verdict is skipped for the same reason.
+it was made, the merged-in row keeps rendering where it was, and the verdict that *resolved*
+the collision is never orphaned. That guarantee is scoped to the resolving verdict only: a
+clash covered by verdicts on **both** colliding families still resolves through exactly one
+of them (`covering()` returns a single verdict — row scope over family scope), and the
+*other* family's verdict is not carried anywhere. Its rows move out from under it the same
+way an unrelated dictionary-driven rekey has always been able to orphan a family verdict
+(documented since migration 008) — `rekey`'s own output says nothing about it, and `pemr
+verify` is the only signal (`curation verdict ... has no live family (removed?)`). The
+direction is over-reporting, not data loss: no fact disappears, but a row a human had ruled
+out of its clinical section can be promoted back into it until the operator re-rules or
+clears the stale verdict. Criticality-blind by construction — no live row silently leaves
+its rendered section, whatever it records. The conversion is announced, never silent:
+`resolved` names the pinned rows in both output modes, and `pemr verify` notices a row
+verdict whose family breadcrumb a rekey left stale, pointing at `pemr record annotate --row`
+to re-affirm or re-rule. A recorded human ruling is only ever re-pointed or scope-narrowed
+within its original extension here — never overwritten, deleted, or auto-cleared; a row that
+already carries its own row-scoped verdict is skipped for the same reason.
 
 That re-affirm has to be *runnable*, which is why `--merged-into` may name the annotated
 row's own family at **row** scope. A `merged-into` narrowing is the common shape, and the
