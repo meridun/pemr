@@ -767,23 +767,46 @@ def test_a_reused_row_id_does_not_inherit_the_removed_rows_verdict(seeded):
 
 def test_document_rm_retires_the_row_verdicts_of_the_rows_it_deletes(seeded):
     """`document rm` cascades to every row the document produced, freeing every one of
-    those ids - the same hazard as `record rm`, at document scale."""
+    those ids - the same hazard as `record rm`, at document scale.
+
+    Two *different* record types carry a row verdict here on purpose:
+    :func:`documents._doomed_row_verdicts` sweeps ``dedup.KNOWN_TYPES``, and a sweep
+    narrowed to one type would leave the freed ids of every other type unguarded while
+    still passing a single-type assertion.
+    """
     conn = seeded["conn"]
     glucose = _row_id(conn, "lab_result", "test_name", "Glucose")
+    prediabetes = _row_id(conn, "condition", "name", "Prediabetes")
     cond_base = _base(conn, "condition", "name", "Type 2 Diabetes")
     curation.annotate_record(conn, "lab_result", str(glucose), row=True,
                             status="superseded", note="row scope", apply=True)
+    curation.annotate_record(conn, "condition", str(prediabetes), row=True,
+                            status="erroneous-in-source", note="row scope, other type",
+                            apply=True)
     curation.annotate_record(conn, "condition", cond_base, status="disputed",
                             note="family scope", apply=True)
 
+    def _retired(report):
+        return sorted(
+            (v["record_type"], v["record_id"]) for v in report.curation_retired
+        )
+
+    expected = sorted(
+        [("lab_result", glucose), ("condition", prediabetes)]
+    )
+
     dry = documents.remove_document(conn, seeded["doc"])
-    assert [v["record_id"] for v in dry.curation_retired] == [glucose]
+    assert _retired(dry) == expected
     assert curation.get_verdict(conn, "lab_result", "", record_id=glucose) is not None
+    assert curation.get_verdict(
+        conn, "condition", "", record_id=prediabetes
+    ) is not None
 
     report = documents.remove_document(conn, seeded["doc"], apply=True)
 
-    assert [v["record_id"] for v in report.curation_retired] == [glucose]
+    assert _retired(report) == expected
     assert curation.get_verdict(conn, "lab_result", "", record_id=glucose) is None
+    assert curation.get_verdict(conn, "condition", "", record_id=prediabetes) is None
     # The family verdict outlives the cascade: `dedup_base` is content-derived, so a
     # re-ingest of the same document re-attaches it, which is the point of family scope.
     assert curation.get_verdict(conn, "condition", cond_base) is not None
