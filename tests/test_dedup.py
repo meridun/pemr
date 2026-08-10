@@ -3,7 +3,7 @@ new/duplicate/conflict split via commit_extraction."""
 
 import pytest
 
-from pemr import db, dedup, persons
+from pemr import curation, db, dedup, persons
 
 DICT_PATH = __import__("pathlib").Path(__file__).resolve().parent.parent \
     / "data" / "dictionary.example.toml"
@@ -1104,6 +1104,201 @@ def test_rekey_moves_dedup_base_with_the_key(conn):
     dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"), apply=True)
     row = conn.execute("SELECT * FROM lab_result").fetchone()
     assert row["dedup_base"] == row["dedup_key"]   # occurrence 0: base IS the key
+
+
+# --- rekey collisions a recorded verdict settles (issue #116) -----------------
+
+def _fusing_pair(conn):
+    """The fusing albumin pair, committed. Returns ``(incumbent id, clash id)``.
+
+    Row ids are the scan order (`rekey` sorts by primary key), so the first-committed
+    row is the incumbent that keeps occurrence 0 and the second is the clash."""
+    dedup.commit_extraction(conn, _make_document(conn), _FUSING_ALBUMIN_PAIR,
+                            dedup.load_dictionary(DICT_PATH))
+    return tuple(int(r["lab_result_id"]) for r in conn.execute(
+        "SELECT lab_result_id FROM lab_result ORDER BY lab_result_id"))
+
+
+def _lab_rows(conn):
+    return {int(r["lab_result_id"]): r
+            for r in conn.execute("SELECT * FROM lab_result")}
+
+
+def _rule(conn, target, status, **kwargs):
+    """Record one verdict and hand back the resolver `rekey` adjudicates through."""
+    curation.annotate_record(conn, "lab_result", str(target), status=status,
+                             note="a clinician ruled on this pair", apply=True,
+                             **kwargs)
+    return curation.collision_resolver(conn)
+
+
+def test_a_merged_into_verdict_resolves_a_fused_collision(conn):
+    """AC1. The pair the dictionary fuses is exactly the pair a human already merged,
+    so the collision is answered rather than blocking: both rows land in the surviving
+    family, the later one as its next occurrence, and the table writes."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "merged-into",
+                     merged_into_base=_lab_rows(conn)[albumin_id]["dedup_base"])
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == [] and report.blocked == []
+    assert [(r.row_id, r.clash_row_id, r.kind, r.status, r.scope, r.new_occurrence)
+            for r in report.resolved] == [
+        (albumin_id, peaf_id, "fused", "merged-into", "family", 1)]
+    rows = _lab_rows(conn)
+    survivor = rows[peaf_id]["dedup_base"]
+    assert rows[albumin_id]["dedup_base"] == survivor        # one family now
+    assert (rows[peaf_id]["dedup_occurrence"],
+            rows[albumin_id]["dedup_occurrence"]) == (0, 1)
+    assert rows[peaf_id]["dedup_key"] == survivor            # occurrence 0 IS the base
+    assert rows[albumin_id]["dedup_key"] == dedup.occurrence_key(survivor, 1)
+
+
+def test_a_superseded_row_verdict_resolves_a_collision(conn):
+    """AC2. Either row, either scope: the verdict here is row-scoped and recorded on the
+    *clash* row, not the incumbent, and still answers the pair."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, albumin_id, "superseded", row=True)
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == []
+    assert [(r.scope, r.record_id, r.status, r.verdict_action)
+            for r in report.resolved] == [
+        ("row", albumin_id, "superseded", "unchanged")]
+    rows = _lab_rows(conn)
+    assert rows[albumin_id]["dedup_base"] == rows[peaf_id]["dedup_base"]
+
+
+def test_an_unverdicted_collision_still_blocks_its_table(conn):
+    """AC3 — the #92 regression. A resolver that finds nothing changes nothing: the
+    table stays on its stored keys and the collision is reported as before."""
+    _fusing_pair(conn)
+    before = _keys(conn, "lab_result", "test_name")
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert report.resolved == []
+    assert [c.kind for c in report.collisions] == ["fused"]
+    assert report.blocked == ["lab_result"] and report.writable() == []
+    assert _keys(conn, "lab_result", "test_name") == before
+
+
+@pytest.mark.parametrize("status", ["confirmed", "disputed", "erroneous-in-source"])
+def test_a_non_resolving_verdict_does_not_resolve_a_collision(conn, status):
+    """AC4. Only `merged-into`/`superseded` say "these two are one fact"; the other
+    three rule on a row's content, not on its identity against another row."""
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, status)
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.resolved == []
+    assert [c.kind for c in report.collisions] == ["fused"]
+    assert report.blocked == ["lab_result"]
+
+
+def _doubled_pair(conn):
+    """One fact filed twice, the second copy under a pre-drift key — the `doubled`
+    shape, which no dictionary edit is needed to reach."""
+    payload = {"test_name": "ZZT", "collected_at": "2026-01-02", "value_num": 108}
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [payload]},
+                            dedup.load_dictionary(DICT_PATH))
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    conn.execute(
+        "INSERT INTO lab_result (person_id, document_id, test_name, collected_at, "
+        "value_num, dedup_key, dedup_base, dedup_occurrence) "
+        "VALUES (?, ?, 'ZZT', '2026-01-02', 108, 'stale-key', 'stale-key', 0)",
+        (pid, _make_document(conn)),
+    )
+    conn.commit()
+    return tuple(int(r["lab_result_id"]) for r in conn.execute(
+        "SELECT lab_result_id FROM lab_result ORDER BY lab_result_id"))
+
+
+def test_a_doubled_collision_is_resolved_too(conn):
+    """`kind` is diagnostic, never eligibility: a covering verdict answers a doubled
+    pair (same fact, two keys) exactly as it answers a fused one."""
+    first_id, second_id = _doubled_pair(conn)
+    resolver = _rule(conn, first_id, "superseded")
+
+    report = dedup.rekey(conn, dedup.load_dictionary(DICT_PATH), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == []
+    assert [(r.row_id, r.kind) for r in report.resolved] == [(second_id, "doubled")]
+    rows = _lab_rows(conn)
+    assert rows[second_id]["dedup_base"] == rows[first_id]["dedup_base"]
+    assert rows[second_id]["dedup_occurrence"] == 1
+
+
+def test_rekey_without_a_resolver_blocks_every_collision(conn):
+    """`resolver=None` is the default and is today's behaviour byte-for-byte — the
+    verdict is in the database and is simply never consulted."""
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    _rule(conn, peaf_id, "superseded")
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True)
+
+    assert report.resolved == []
+    assert [c.kind for c in report.collisions] == ["fused"]
+
+
+def test_a_resolved_collision_leaves_no_key_drift(conn):
+    """The reason a resolved clash is rekeyed rather than left on its stored key: a row
+    left behind would be permanently drifted, and `_assert_no_key_drift` would refuse
+    every later ingest of that identity while `rekey` itself reported clean."""
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "superseded")
+    d_new = _rekey_dict(**_FUSING_ALBUMIN_SYNONYM)
+    dedup.rekey(conn, d_new, apply=True, resolver=resolver)
+
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    payloads = [{name: row[name] for name in dedup.FIELD_SPECS["lab_result"]}
+                for row in _lab_rows(conn).values()]
+    dedup._assert_no_key_drift(conn, "lab_result", payloads, pid, d_new)  # no raise
+
+
+def test_rekey_is_idempotent_after_a_resolved_collision(conn):
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "superseded")
+    d_new = _rekey_dict(**_FUSING_ALBUMIN_SYNONYM)
+    assert len(dedup.rekey(conn, d_new, apply=True, resolver=resolver).resolved) == 1
+
+    again = dedup.rekey(conn, d_new, apply=True,
+                        resolver=curation.collision_resolver(conn))
+    assert (again.changes, again.collisions, again.resolved) == ([], [], [])
+
+
+def test_a_third_row_on_a_resolved_key_still_blocks_when_unverdicted(conn):
+    """Quarantine granularity is untouched (#92): one settled pair does not license the
+    unsettled third row that lands on the same key, and the table withholds everything —
+    the resolved change included."""
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Protein Electrophoresis Albumin Fraction",
+         "collected_at": "2026-01-02", "value_num": 4.2},
+        {"test_name": "Albumin", "collected_at": "2026-01-02", "value_num": 3.6},
+        {"test_name": "ALBX", "collected_at": "2026-01-02", "value_num": 3.9},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    peaf_id, albumin_id, albx_id = (int(r["lab_result_id"]) for r in conn.execute(
+        "SELECT lab_result_id FROM lab_result ORDER BY lab_result_id"))
+    # Row-scoped on the clash row, so it rules on that row and no other.
+    resolver = _rule(conn, albumin_id, "superseded", row=True)
+    before = _keys(conn, "lab_result", "test_name")
+
+    report = dedup.rekey(conn, _rekey_dict(albx="albumin", **_FUSING_ALBUMIN_SYNONYM),
+                         apply=True, resolver=resolver)
+
+    assert [r.row_id for r in report.resolved] == [albumin_id]
+    assert [(c.row_id, c.clash_row_id) for c in report.collisions] \
+        == [(albx_id, peaf_id)]
+    assert report.blocked == ["lab_result"] and report.writable() == []
+    assert _keys(conn, "lab_result", "test_name") == before
 
 
 # --- ingest-before-rekey drift guard ------------------------------------------
