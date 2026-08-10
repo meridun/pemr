@@ -197,9 +197,11 @@ def query_timeline(
     ``attested_by``/``attested_on``; a document-sourced event carries neither key, so an
     unattested record's event shape is unchanged.
 
-    ``with_identity=True`` additionally stamps ``record_type`` and ``dedup_base`` on
-    every event — the family identity `render_journal` needs to apply the `curation`
-    overlay (issue #109), which the event contract otherwise has no way to express.
+    ``with_identity=True`` additionally stamps ``record_type``, ``dedup_base`` and
+    ``record_id`` on every event — the family identity `render_journal` needs to apply
+    the `curation` overlay (issue #109), plus the row identity a **row-scoped** verdict
+    resolves by (issue #114); without the row id the journal could only ever apply the
+    family verdict, and would hide a sibling the operator deliberately left alone.
     Opt-in and **default-off** on purpose: ``dedup_base`` is one of
     :data:`dedup.INTERNAL_COLUMNS`, deliberately stripped from the CLI ``--json`` and
     MCP read payloads, so widening the default event shape would leak an unstable key
@@ -236,6 +238,7 @@ def query_timeline(
         if with_identity:
             event["record_type"] = record_type
             event["dedup_base"] = row["dedup_base"]
+            event["record_id"] = row[f"{record_type}_id"]
         events.append(event)
 
     for r in conn.execute(

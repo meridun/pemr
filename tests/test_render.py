@@ -689,6 +689,93 @@ def test_curated_renders_stay_ascii_and_read_only(seeded):
     assert _row_counts(seeded) == before  # still a pure read
 
 
+# --- row-scoped verdicts over a multi-row family (issue #114) ------------------
+
+
+def _keep_both_sibling(conn, value_num=205.0):
+    """File a second *live* occurrence of Jane's fasting glucose — the shape an earlier
+    `--keep both` conflict resolution leaves behind — and return
+    ``(base, occurrence 0 id, occurrence 1 id)``."""
+    row = conn.execute(
+        "SELECT lab_result_id, person_id, document_id, dedup_base FROM lab_result "
+        "WHERE test_name = 'Glucose, fasting'"
+    ).fetchone()
+    base = row["dedup_base"]
+    cur = conn.execute(
+        "INSERT INTO lab_result (person_id, document_id, test_name, collected_at, "
+        "value_num, unit, ref_high, dedup_key, dedup_base, dedup_occurrence) "
+        "VALUES (?, ?, 'Glucose, fasting', '2026-01-01', ?, 'mg/dL', 100, ?, ?, 1)",
+        (row["person_id"], row["document_id"], value_num,
+         dedup.occurrence_key(base, 1), base),
+    )
+    conn.commit()
+    return base, int(row["lab_result_id"]), int(cur.lastrowid)
+
+
+def test_a_row_scoped_verdict_hides_one_occurrence_and_spares_its_sibling(seeded):
+    """The bug that forced #114: a family-scoped `superseded` on a keep-both family
+    removes the row the verdict says should *win*. Row scope is the fix, and the
+    family-scoped contrast below is why it had to exist."""
+    base, _occ0, occ1 = _keep_both_sibling(seeded)
+    curation.annotate_record(seeded, "lab_result", str(occ1), status="superseded",
+                             note="loser of an earlier keep-both", row=True, apply=True)
+
+    md = render.render_summary(seeded, "jane-doe",
+                               dictionary=dedup.load_dictionary(DICT_PATH))
+    body, appendix = md.split("## Superseded / corrected")
+    assert "200.0" in body                  # the sibling renders normally
+    assert "205.0" not in body              # the annotated occurrence does not
+    # Listed once, not once per row of the family.
+    assert appendix.count("lab_result: Glucose, fasting") == 1
+    assert "loser of an earlier keep-both" in appendix
+
+    # The contrast: the same verdict at family scope takes both rows with it.
+    curation.clear_curation(seeded, "lab_result", str(occ1), row=True, apply=True)
+    curation.annotate_record(seeded, "lab_result", base, status="superseded",
+                             note="the whole family", apply=True)
+    body = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH)
+    ).split("## Superseded / corrected")[0]
+    assert "200.0" not in body and "205.0" not in body
+
+
+def test_a_row_verdict_overrides_its_family_verdict_at_render_time(seeded):
+    """Precedence, end to end: the family is disputed, one occurrence is superseded.
+    The superseded row leaves for the appendix; its sibling renders in place, marked."""
+    base, _occ0, occ1 = _keep_both_sibling(seeded)
+    curation.annotate_record(seeded, "lab_result", base, status="disputed",
+                             note="two sources disagree", apply=True)
+    curation.annotate_record(seeded, "lab_result", str(occ1), status="superseded",
+                             note="this one is the transcription error", row=True,
+                             apply=True)
+
+    md = render.render_summary(seeded, "jane-doe",
+                               dictionary=dedup.load_dictionary(DICT_PATH))
+    body, appendix = md.split("## Superseded / corrected")
+    assert "200.0" in body
+    assert "[DISPUTED: two sources disagree]" in body
+    assert "205.0" not in body
+    assert "this one is the transcription error" in appendix
+    # One appendix line: the row verdict's, not one per row of the family.
+    assert appendix.count("lab_result: Glucose, fasting") == 1
+
+
+def test_a_row_scoped_verdict_filters_only_its_own_journal_event(seeded):
+    """The journal resolves per row too, via the `record_id` `with_identity` now
+    stamps: without it a row verdict could only ever be applied family-wide."""
+    _base, _occ0, occ1 = _keep_both_sibling(seeded)
+    before = render.render_journal(seeded, "jane-doe")
+    assert before.count("Glucose, fasting") == 2
+
+    curation.annotate_record(seeded, "lab_result", str(occ1), status="superseded",
+                             note="loser", row=True, apply=True)
+
+    md = render.render_journal(seeded, "jane-doe")
+    timeline = md.split("## Superseded / corrected")[0]
+    assert timeline.count("Glucose, fasting") == 1
+    assert "205.0" not in timeline and "200.0" in timeline
+
+
 # --- attested rows are never mistaken for document-sourced facts (issue #110) --
 
 _ATTESTED = {

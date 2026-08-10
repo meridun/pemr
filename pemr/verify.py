@@ -145,7 +145,7 @@ def _check_blobs(
 
 
 def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
-    """Warn about `curation` verdicts that no longer point at anything (issue #109).
+    """Warn about `curation` verdicts that no longer point at anything (issues #109, #114).
 
     The overlay deliberately has no FK to the row it annotates - a verdict has to
     outlive re-ingest, `record rm` occurrence shifts, and any `rekey` that leaves this
@@ -155,10 +155,18 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     fact no document renders. That is untidy, not corrupt, and often intentional (the
     human removed the row *because* they ruled on it, or the rekey just relabeled it),
     so it warns rather than fails. `pemr record annotate --clear` lifts it.
+
+    A **row-scoped** verdict (#114) is checked against its row, not its family: it
+    resolves by row id, so a rekey no longer orphans it - only the row's removal does.
+    Its stored `dedup_base` is a breadcrumb that may legitimately be stale, so the family
+    check is deliberately skipped for it.
     """
     if not curation.has_table(conn):
         return
-    for (record_type, base), verdict in curation.load_verdicts(conn).items():
+    for verdict in curation.load_verdicts(conn).all():
+        record_type = verdict["record_type"]
+        base = verdict["dedup_base"]
+        record_id = verdict["record_id"]
         short = str(base)[:12]
         if record_type not in dedup.FIELD_SPECS:
             # A hand-edited row can name any table; never build a query from it.
@@ -167,15 +175,31 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
                 f"type (known: {', '.join(dedup.KNOWN_TYPES)})"
             )
             continue
-        if not dedup.load_family(conn, record_type, base):
+        if record_id:
+            pk = f"{record_type}_id"
+            live = conn.execute(
+                f"SELECT 1 FROM {record_type} WHERE {pk} = ?", (record_id,)
+            ).fetchone()
+            if live is None:
+                report.warnings.append(
+                    f"curation verdict {record_type} row #{record_id} names no live "
+                    "row (removed?) - lift it with `pemr record annotate --clear --row`"
+                )
+        elif not dedup.load_family(conn, record_type, base):
             report.warnings.append(
                 f"curation verdict {record_type}/{short}... has no live family "
                 "(removed?) - lift it with `pemr record annotate --clear`"
             )
         target = verdict.get("merged_into_base")
         if target and not dedup.load_family(conn, record_type, target):
+            # The merge target is always a family, in either scope (`--merged-into`
+            # names a `dedup_base`), so this check is scope-independent.
+            ident = (
+                f"{record_type} row #{record_id}" if record_id
+                else f"{record_type}/{short}..."
+            )
             report.warnings.append(
-                f"curation verdict {record_type}/{short}... merges into "
+                f"curation verdict {ident} merges into "
                 f"{str(target)[:12]}..., which has no live family"
             )
 
