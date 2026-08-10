@@ -536,9 +536,16 @@ def annotate_record(
     table is the why and who said so, and a verdict with no reason is a verdict nobody
     can audit later.
 
-    ``merged_into_base`` is set iff ``status='merged-into'``, must name a live family
-    of the same ``record_type``, and must not be the annotated family itself (a family
-    merged into itself would render nowhere at all).
+    ``merged_into_base`` is set iff ``status='merged-into'``, and must name a live family
+    of the same ``record_type``. At **family** scope it must not be the annotated family
+    itself: a family merged into itself would render nowhere at all. At **row** scope it
+    may be — "this occurrence is absorbed into the family it sits in" is a coherent
+    ruling (the row moves to the appendix, its siblings keep rendering live), and it is
+    exactly the state :meth:`CollisionResolver.narrow` produces when it pins a
+    collision-resolving ``merged-into`` family verdict to its rows (#116): the same rekey
+    that narrows the verdict also moves those rows into the merge target. Refusing it
+    here would make `pemr verify`'s "re-affirm it" notice impossible to follow for the
+    one status that most often carries it.
 
     Raises ``ValueError`` for an unknown ``record_type``/``status``/empty note or a bad
     merge target, :class:`FamilyNotFoundError` when a family target does not resolve, and
@@ -570,7 +577,7 @@ def annotate_record(
                 "--merged-into <BASE-OR-ID>; nothing was written"
             )
         merge_target = resolve_base(conn, record_type, merge_target)
-        if merge_target == base:
+        if merge_target == base and not record_id:
             raise ValueError(
                 f"cannot merge {record_type} {base[:12]}... into itself - the merged "
                 "family renders only under its target, so this would hide it "

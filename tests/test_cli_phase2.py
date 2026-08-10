@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from pemr import cli, db, render, verify
+from pemr import cli, curation, db, render, verify
 
 
 def _run(tmp_path, *argv):
@@ -827,6 +827,52 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
     # Idempotent: the follow-up run has nothing left to do.
     assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 0
     assert "all dedup keys already match" in capsys.readouterr().out
+
+
+def test_the_re_affirm_notice_from_a_narrowing_is_runnable(tmp_path, capsys):
+    """The narrowing is announced so the human can re-affirm or re-rule (#116's ruling) —
+    which is only true if the command the notice names actually runs. For `merged-into`,
+    the dominant real-world shape, the same rekey has already moved the ruled row into
+    its merge target, so the re-affirm names the row's own family by necessity.
+
+    Continues the AC7 scenario above through that follow-up: rc 0, the notice clears, and
+    the ruling keeps its status, its merge pointer and its extension."""
+    pcn_id, penicillin_id = _stage_006_allergy_collision(tmp_path, capsys)
+    assert _run(tmp_path, "record", "annotate", "allergy", str(pcn_id),
+                "--status", "merged-into", "--merged-into", str(penicillin_id),
+                "--note", "one allergy, two spellings", "--apply") == 0
+    new = _dict_file(tmp_path, "fuse006.toml",
+                     '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    capsys.readouterr()
+
+    # The notice's own instruction, run as the operator would: same row, same ruling.
+    assert _run(tmp_path, "record", "annotate", "allergy", str(pcn_id), "--row",
+                "--status", "merged-into", "--merged-into", str(penicillin_id),
+                "--note", "re-affirmed after the rekey", "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert f"annotated allergy row #{pcn_id}" in captured.out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        verdict = curation.get_verdict(conn, "allergy", "", record_id=pcn_id)
+        assert verdict["status"] == "merged-into"
+        assert verdict["note"] == "re-affirmed after the rekey"
+        live = conn.execute(
+            "SELECT dedup_base FROM allergy WHERE allergy_id = ?", (pcn_id,)
+        ).fetchone()["dedup_base"]
+        assert verdict["merged_into_base"] == live
+        assert verdict["dedup_base"] == live          # breadcrumb collapsed
+        warnings = verify.verify_report(conn).warnings
+        assert not any("a rekey moved it" in w or "no live family" in w
+                       for w in warnings)
+        # Extension unchanged: PCN in the appendix, Penicillin still live.
+        after = render.render_summary(conn, "jane-doe")
+        assert "- Penicillin - anaphylaxis" in after
+        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+    finally:
+        conn.close()
 
 
 def test_migrated_006_collision_still_blocks_without_a_verdict(tmp_path, capsys):
