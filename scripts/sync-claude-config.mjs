@@ -57,6 +57,21 @@ async function listFilesRecursive(dir) {
   return files;
 }
 
+// CRLF -> LF only. A lone `\r` is deliberately left alone: nothing in the mirror
+// set uses classic-Mac endings, and a blanket `\r` strip would corrupt a literal
+// carriage return inside content.
+export function normalizeEol(text) {
+  return text.replace(/\r\n/g, '\n');
+}
+
+// Line-ending-agnostic comparison. Git may materialize the mirrors with CRLF in a
+// fresh worktree/clone (core.autocrlf=true, no .gitattributes) while the script
+// regenerates them with LF, so strict equality false-positives as "out of date".
+// A missing destination (existing === null) is deliberately NOT in sync.
+export function isInSync(existing, content) {
+  return typeof existing === 'string' && normalizeEol(existing) === normalizeEol(content);
+}
+
 async function writeIfChanged(destPath, content) {
   let existing = null;
   try {
@@ -65,7 +80,7 @@ async function writeIfChanged(destPath, content) {
     // destination doesn't exist yet
   }
 
-  if (existing === content) {
+  if (isInSync(existing, content)) {
     return;
   }
 
@@ -77,7 +92,8 @@ async function writeIfChanged(destPath, content) {
   }
 
   await fs.mkdir(path.dirname(destPath), { recursive: true });
-  await fs.writeFile(destPath, content, 'utf8');
+  // Write LF on disk so the next --check pass (in any checkout) stays stable.
+  await fs.writeFile(destPath, normalizeEol(content), 'utf8');
   console.log(`Wrote ${relPath}`);
 }
 
@@ -159,10 +175,17 @@ async function syncAgents() {
   }
 }
 
-await syncSkills();
-await syncAgents();
+async function main() {
+  await syncSkills();
+  await syncAgents();
 
-if (CHECK_MODE && outOfDate) {
-  console.error('\n.claude/ mirrors are out of date. Run `npm run sync:claude-config`.');
-  process.exit(1);
+  if (CHECK_MODE && outOfDate) {
+    console.error('\n.claude/ mirrors are out of date. Run `npm run sync:claude-config`.');
+    process.exit(1);
+  }
+}
+
+// Only run when invoked directly, so tests can import the pure helpers.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }
