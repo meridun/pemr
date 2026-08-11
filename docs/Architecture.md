@@ -127,7 +127,7 @@ CREATE TABLE curation (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
   dedup_base       TEXT NOT NULL,   -- family identity; a breadcrumb when record_id <> 0
   record_id        INTEGER NOT NULL DEFAULT 0,  -- 0 = family scope; else <record_type>_id
-  status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into
+  status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
   note             TEXT NOT NULL,   -- required: the why, and who said so
   merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY
   attributed_to    TEXT,
@@ -390,6 +390,12 @@ Electrophoresis Albumin Fraction` off one draw) and the fix belongs in the dicti
 *identical* payloads mean one fact was filed twice, once
 under a pre-drift key, and the fix belongs in the data.
 
+There is a third case the dictionary cannot fix (issue #122). When the colliding labels
+are generic *extraction placeholders* — `diagnosis`, `diagnosis 2`,
+`past_medical_history 3` — they are synonyms of nothing, so there is no dictionary entry
+to narrow, and nothing in the data to drop either: both rows are real and different. That
+one is settled by a `distinct` verdict (below), not by an edit anywhere.
+
 **A collision quarantines its own table, not the run** (issue #92). The record tables are
 scanned independently, so a fused pair in `allergy` says nothing about `condition`. The
 scan therefore never stops at the first collision: it reports every collision in every
@@ -402,21 +408,40 @@ cross-reference `skipped` to tell written from withheld. Exit code is 1 whenever
 **blocking** collision was found, in both output modes: partial progress is fine, silent
 partial progress is not.
 
-**A collision a human already ruled on is settled, not blocking** (issue #116). Many
-collisions are exactly the pair the curation overlay exists to answer: a `merged-into` or
-`superseded` verdict says "these two are one fact", which is the question the guard is
-stuck on. So `rekey` consults the overlay — through an injected resolver, because
-`curation` imports `dedup` and not the reverse — and a clash covered by such a verdict on
-**either** row at **either** scope stops being blocking. The clash row is filed as the
-next free *occurrence* of the surviving family (the `--keep both` shape; leaving it on its
-stored key would strand it permanently drifted while `rekey` itself reported clean). Only
-`merged-into`/`superseded` resolve — `confirmed`, `disputed` and `erroneous-in-source`
-rule on a row's content, not on its identity against another row — and a table holding any
-*unresolved* collision still withholds every change in it, resolved pairs included (its
-resolutions say exactly that, rather than describing a write that did not happen). Both
-output modes distinguish the two: a resolved pair is a `note:` line and an entry in
-`--json`'s `resolved` list, a blocked one stays `error:` plus `skipped`. A run whose every
-collision was verdict-resolved therefore exits **0**.
+**A collision a human already ruled on is settled, not blocking** (issues #116, #122).
+Many collisions are exactly the pair the curation overlay exists to answer. So `rekey`
+consults the overlay — through an injected resolver, because `curation` imports `dedup`
+and not the reverse — and a clash covered by a **resolving** verdict on **either** row at
+**either** scope stops being blocking. The clash row is filed as the next free
+*occurrence* of the shared family (the `--keep both` shape; leaving it on its stored key
+would strand it permanently drifted while `rekey` itself reported clean).
+
+Resolving verdicts come in two kinds, and they answer the identity question opposite ways:
+
+- **one fact** — `merged-into` / `superseded`: the pair is a single fact filed twice;
+- **two facts** — `distinct` (issue #122): the rows are genuinely different, and only
+  their generic extracted labels recompute onto one key.
+
+Both take the *same* write, because occurrence numbering is already the representation of
+"two live rows on one identity". What differs is rendering, and it differs by omission:
+`distinct` is deliberately **not** one of the appendix statuses, so neither row leaves its
+clinical section — they render as two live siblings, exactly like a `--keep both` pair.
+That absence is the whole guarantee, and `tests/test_curation.py` asserts the two tuples
+stay disjoint.
+
+`confirmed`, `disputed` and `erroneous-in-source` resolve nothing — they rule on a row's
+content, not on its identity against another row — and a table holding any *unresolved*
+collision still withholds every change in it, resolved pairs included (its resolutions say
+exactly that, rather than describing a write that did not happen). All three cases are
+distinguishable in output: a resolved pair is a `note:` line naming which way it was
+settled plus an entry in `--json`'s `resolved` list carrying `settlement`
+(`"merged"` | `"distinct"`), a blocked one stays `error:` plus `skipped`. A run whose
+every collision was verdict-resolved therefore exits **0**.
+
+A resolving verdict is **unary** — it names one row or one family, never a counterpart —
+so like `superseded` since #116 it settles any collision its target takes part in,
+including one that would otherwise have blocked. Every resolution is reported with both
+row ids, the status and the scope, so the reach of a ruling is stated rather than assumed.
 
 **A verdict's scope never widens across that merge.** Resolution joins a judged family to
 an unjudged one, so the surviving family is *larger* than the one the human ruled on.
@@ -766,7 +791,9 @@ pemr record rm <table> <id> [--apply]                    # delete ONE record row
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
                      [--merged-into <base-or-id>] [--row] [--apply]
                                                          # record a human verdict over a record FAMILY (§2 curation):
-                                                         # confirmed|superseded|erroneous-in-source|disputed|merged-into
+                                                         # confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
+                                                         # distinct: two rows that recompute to one dedup_key are TWO facts
+                                                         #        (generic extracted labels); unblocks `rekey`, both stay live
                                                          # --row: scope it to that ROW only (a keep-both family holds
                                                          #        two live rows; row scope beats family scope there)
                                                          # pure overlay - no record row is mutated; dry run by default
@@ -857,7 +884,8 @@ Every section is filtered at read time against the `curation` overlay (§2, issu
 #114): `superseded` / `erroneous-in-source` / `merged-into` leave their section for a
 `## Superseded / corrected` appendix, `disputed` renders in place with a
 `[DISPUTED: <note>]` marker and reaches the brief's `## Questions for the Clinician`, and
-`confirmed` renders unchanged. Both new sections are omitted entirely when empty, so a record
+`confirmed` — and `distinct` (§3, issue #122), whose whole point is that both rows stay
+live — render unchanged. Both new sections are omitted entirely when empty, so a record
 with no verdicts renders byte-identically to before the overlay existed. This does not weaken
 the purity rule: the filter is a read, and output changes after a verdict because the
 *database* changed. Resolution is **per row**: a row-scoped verdict affects only its own

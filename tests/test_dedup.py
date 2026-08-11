@@ -1469,6 +1469,134 @@ def test_a_third_row_on_a_resolved_key_still_blocks_when_unverdicted(conn):
     assert _keys(conn, "lab_result", "test_name") == before
 
 
+# --- collisions ruled TWO distinct facts (issue #122) -------------------------
+
+def test_a_distinct_verdict_resolves_a_collision_without_merging(conn):
+    """AC2. A `distinct` ruling settles the identity question the opposite way from
+    `merged-into`/`superseded` - two facts, not one - and that is enough to unblock the
+    table. The write is the same either way, because the `--keep both` occurrence shape
+    *is* "two live rows on one identity"."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "distinct")
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == [] and report.blocked == []
+    assert [(r.row_id, r.clash_row_id, r.status, r.settlement, r.new_occurrence)
+            for r in report.resolved] == [
+        (albumin_id, peaf_id, "distinct", "distinct", 1)]
+    rows = _lab_rows(conn)
+    shared = rows[peaf_id]["dedup_base"]
+    assert rows[albumin_id]["dedup_base"] == shared              # one family, two rows
+    assert (rows[peaf_id]["dedup_occurrence"],
+            rows[albumin_id]["dedup_occurrence"]) == (0, 1)
+    assert rows[peaf_id]["dedup_key"] == shared
+    assert rows[albumin_id]["dedup_key"] == dedup.occurrence_key(shared, 1)
+
+
+@pytest.mark.parametrize("status,settlement", [
+    ("distinct", "distinct"),
+    ("merged-into", "merged"),
+    ("superseded", "merged"),
+])
+def test_a_resolution_reports_which_way_the_verdict_settled_it(conn, status,
+                                                               settlement):
+    """AC4 at the engine level. `status` is the raw vocabulary and may grow; `settlement`
+    is the two-valued contract the CLI and any consumer branch on."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    kwargs = ({"merged_into_base": _lab_rows(conn)[albumin_id]["dedup_base"]}
+              if status == "merged-into" else {})
+    resolver = _rule(conn, peaf_id, status, **kwargs)
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert [(r.status, r.settlement) for r in report.resolved] == [(status, settlement)]
+    marker = ("rules them two distinct facts" if settlement == "distinct"
+              else "settles the pair")
+    assert marker in report.resolved[0].message
+
+
+def test_a_distinct_resolution_leaves_no_key_drift(conn):
+    """The #116 reason for rekeying a settled clash rather than leaving it behind, which
+    a `distinct` ruling inherits unchanged: a stranded row stays permanently drifted and
+    `_assert_no_key_drift` would refuse every later ingest of that identity."""
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "distinct")
+    d_new = _rekey_dict(**_FUSING_ALBUMIN_SYNONYM)
+    dedup.rekey(conn, d_new, apply=True, resolver=resolver)
+
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    payloads = [{name: row[name] for name in dedup.FIELD_SPECS["lab_result"]}
+                for row in _lab_rows(conn).values()]
+    dedup._assert_no_key_drift(conn, "lab_result", payloads, pid, d_new)  # no raise
+
+
+def test_rekey_is_idempotent_after_a_distinct_resolution(conn):
+    peaf_id, _albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, peaf_id, "distinct")
+    d_new = _rekey_dict(**_FUSING_ALBUMIN_SYNONYM)
+    assert len(dedup.rekey(conn, d_new, apply=True, resolver=resolver).resolved) == 1
+
+    again = dedup.rekey(conn, d_new, apply=True,
+                        resolver=curation.collision_resolver(conn))
+    assert (again.changes, again.collisions, again.resolved) == ([], [], [])
+
+
+def _generic_condition_pair(conn):
+    """Two real, different conditions extracted under generic placeholder labels.
+
+    The `meridun/pemr-data#12` item 6 shape: an extractor that numbers repeated fields
+    emits `diagnosis` / `diagnosis 2`, so the labels carry no clinical identity at all and
+    the payloads differ only in the note. Returns ``(first id, second id)``."""
+    dedup.commit_extraction(conn, _make_document(conn), {"condition": [
+        {"name": "diagnosis", "status": "active", "note": "hypertension, per cardiology"},
+        {"name": "diagnosis 2", "status": "active", "note": "asthma, per pulmonology"},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    return tuple(int(r["condition_id"]) for r in conn.execute(
+        "SELECT condition_id FROM condition ORDER BY condition_id"))
+
+
+def test_generic_condition_labels_declared_distinct_are_rekeyed_apart(conn):
+    """AC6 - the real-world trigger, end to end at the engine.
+
+    A dictionary edit folds `diagnosis 2` onto `diagnosis`, and because the labels are
+    placeholders rather than synonyms of anything there is no dictionary fix available:
+    both rows are real and different. Without a verdict the whole `condition` table is
+    withheld; with a `distinct` verdict `--apply` writes it and both rows survive as
+    occurrences 0 and 1 of one family."""
+    first_id, second_id = _generic_condition_pair(conn)
+    d_new = _rekey_dict(**{"diagnosis 2": "diagnosis"})
+    before = _keys(conn, "condition", "name")
+
+    blocked = dedup.rekey(conn, d_new, apply=True,
+                          resolver=curation.collision_resolver(conn))
+    assert [c.kind for c in blocked.collisions] == ["fused"]
+    assert blocked.blocked == ["condition"]
+    assert _keys(conn, "condition", "name") == before        # #92 quarantine held
+
+    curation.annotate_record(conn, "condition", str(first_id), status="distinct",
+                             note="two different diagnoses under numbered labels",
+                             attributed_to="Dr Who", apply=True)
+
+    report = dedup.rekey(conn, d_new, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert report.collisions == [] and report.blocked == []
+    assert [(r.record_type, r.row_id, r.clash_row_id, r.settlement)
+            for r in report.resolved] == [
+        ("condition", second_id, first_id, "distinct")]
+    rows = {int(r["condition_id"]): r
+            for r in conn.execute("SELECT * FROM condition")}
+    shared = rows[first_id]["dedup_base"]
+    assert rows[second_id]["dedup_base"] == shared
+    assert sorted(int(r["dedup_occurrence"]) for r in rows.values()) == [0, 1]
+    # Both facts are still there, unmutated: only the key machinery moved.
+    assert {r["note"] for r in rows.values()} == {
+        "hypertension, per cardiology", "asthma, per pulmonology"}
+
+
 # --- ingest-before-rekey drift guard ------------------------------------------
 
 def test_commit_refuses_an_ingest_against_a_drifted_key(conn):

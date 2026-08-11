@@ -527,6 +527,118 @@ def test_rekey_reports_a_verdict_resolved_collision_in_text_and_json(
     assert captured.out.isascii()               # issue #23
 
 
+def test_rekey_reports_a_distinct_resolved_collision_in_text_and_json(
+    ready, capsys, tmp_path
+):
+    """Issue #122 at the CLI: a pair the operator ruled *two distinct facts* unblocks its
+    table exactly as a merge-shaped ruling does, and both output modes say which of the
+    two happened - `settlement` in `--json`, the wording plus the summary counts in
+    text."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id),
+                "--status", "distinct", "--note", "two assays, one generic label",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["collisions"] == [] and payload["skipped"] == []
+    assert [(r["row_id"], r["clash_row_id"], r["status"], r["settlement"])
+            for r in payload["resolved"]] == [
+        (albumin_id, alb_id, "distinct", "distinct")]
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "lab_result: 2/2 key(s) change" in captured.out
+    assert "(skipped: collision)" not in captured.out
+    assert "rules them two distinct facts" in captured.out
+    assert "both rows keep rendering as live, independent facts" in captured.out
+    assert "1 collision(s) resolved by verdict (0 as one fact, 1 as distinct facts)" \
+        in captured.out
+    assert captured.out.isascii()               # issue #23
+
+
+def _seed_generic_condition_pair(ready, capsys, tmp_path, old):
+    """The `meridun/pemr-data#12` item 6 shape at the CLI: two real, different conditions
+    that the extractor labelled with numbered placeholders, one document each. A
+    `"diagnosis 2" = "diagnosis"` dictionary entry folds them onto one key - the fuse a
+    dictionary edit cannot undo, because the labels are synonyms of nothing."""
+    for i, (name, note) in enumerate(
+        (("diagnosis", "hypertension, per cardiology"),
+         ("diagnosis 2", "asthma, per pulmonology")), start=1
+    ):
+        scan = tmp_path / f"generic{i}.txt"
+        scan.write_bytes(f"scan {i}".encode())
+        assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                    "--sources", str(tmp_path / "sources")) == 0
+        doc = _document_id(tmp_path)[-1]["document_id"]
+        payload = _write_json(tmp_path, f"generic{i}.json", {"condition": [
+            {"name": name, "status": "active", "onset_on": f"2024-0{i}-05", "note": note},
+        ]})
+        assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                    "--json", str(payload), "--dictionary", str(old)) == 0
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("status, both_live", [("distinct", True),
+                                               ("superseded", False)])
+def test_a_distinct_resolved_pair_still_renders_as_two_live_problems(
+    ready, capsys, tmp_path, status, both_live
+):
+    """AC2 + AC3 as one chain at the CLI, on the real-world trigger (AC6): declare the
+    pair distinct, `rekey --apply` writes the table, and the rendered summary still shows
+    *both* conditions with no `## Superseded / corrected` appendix at all.
+
+    The `superseded` leg is the control that keeps the assertion honest. Both statuses
+    resolve the collision and both produce the identical two-occurrence family, so the
+    only thing separating them is `distinct`'s absence from
+    `curation.APPENDIX_STATUSES` - and on that leg the ruled row *does* leave Active
+    Problems for the appendix. Without the contrast, "no appendix" could equally mean the
+    appendix never fires for conditions."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml", '"diagnosis 2" = "diagnosis"\n')
+    _seed_generic_condition_pair(ready, capsys, tmp_path, old)
+    first_id, second_id = _row_ids(tmp_path, "condition")
+
+    # Unruled, the whole table is withheld (AC5 / the #92 quarantine).
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    assert "condition was not written" in capsys.readouterr().err
+
+    assert _run(tmp_path, "record", "annotate", "condition", str(first_id), "--row",
+                "--status", status, "--note", "two diagnoses, numbered labels",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "condition: 1/2 key(s) change" in captured.out
+    assert "(skipped: collision)" not in captured.out
+    assert captured.out.isascii()               # issue #23
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        rows = {int(r["condition_id"]): r
+                for r in conn.execute("SELECT * FROM condition")}
+        # Identical write either way: one family, occurrences 0 and 1.
+        assert rows[first_id]["dedup_base"] == rows[second_id]["dedup_base"]
+        assert (rows[first_id]["dedup_occurrence"],
+                rows[second_id]["dedup_occurrence"]) == (0, 1)
+        summary = render.render_summary(conn, "jane-doe")
+    finally:
+        conn.close()
+
+    problems = summary.split("## Active Problems")[1].split("##")[0]
+    assert "asthma, per pulmonology" in problems           # never the ruled row
+    assert ("hypertension, per cardiology" in problems) is both_live
+    assert ("## Superseded / corrected" not in summary) is both_live
+
+
 def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
     """The same seed with no verdict recorded: `resolved` is empty, the table is still
     skipped by name and the exit code is still 1 (the #92 contract, unwidened)."""

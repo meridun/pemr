@@ -105,6 +105,7 @@ STATUSES: tuple[str, ...] = (
     "erroneous-in-source",
     "disputed",
     "merged-into",
+    "distinct",
 )
 
 #: The statuses that move a family **out** of its normal rendered section and into the
@@ -118,14 +119,40 @@ APPENDIX_STATUSES: tuple[str, ...] = (
 )
 
 #: The statuses that say "a human settled *which fact this is*" — and therefore the only
-#: ones that may resolve a `pemr rekey` collision (issue #116). ``confirmed`` records
-#: agreement with the row as filed, ``disputed`` records that the question is still open,
-#: and ``erroneous-in-source`` rules on the *content* of one row without saying anything
-#: about its identity relative to another — none of the three settles "these two rows are
-#: one fact", which is the question a collision asks.
+#: ones that may resolve a `pemr rekey` collision (issues #116, #122). They answer that
+#: question two opposite ways: ``merged-into``/``superseded`` say **one fact** (the pair
+#: is a single fact filed twice), ``distinct`` says **two facts** (issue #122 — the labels
+#: are generic extraction placeholders that recompute onto one key, and there is no
+#: dictionary entry to narrow because they are synonyms of nothing). Both settle the
+#: identity question, so both let `rekey` proceed; which of the two was recorded is
+#: reported as the resolution's ``settlement`` (:meth:`CollisionResolver.settlement`).
+#:
+#: ``confirmed`` records agreement with the row as filed, ``disputed`` records that the
+#: question is still open, and ``erroneous-in-source`` rules on the *content* of one row
+#: without saying anything about its identity relative to another — none of the three
+#: settles the pair either way, so none of them resolves a collision.
+#:
+#: Every resolving verdict is **unary**: it names one row or one family and no
+#: counterpart, so it settles *any* collision that target takes part in, including a
+#: future one that would otherwise have blocked. That generality is deliberate and
+#: unchanged since #116 — every resolution is reported with both row ids, the status and
+#: the scope, so the reach of a ruling is never silent.
 RESOLVING_STATUSES: tuple[str, ...] = (
     "merged-into",
     "superseded",
+    "distinct",
+)
+
+#: The resolving statuses that say **two facts**, not one (issue #122) — the sub-vocabulary
+#: :meth:`CollisionResolver.settlement` reports as ``"distinct"``.
+#:
+#: Deliberately **disjoint from** :data:`APPENDIX_STATUSES`, and that disjointness *is* the
+#: guarantee both rows keep rendering as live, independent facts: a distinct-resolved pair
+#: lands in one family at two occurrences — the ``--keep both`` shape — and nothing about
+#: rendering changes. If a status ever appeared in both tuples, a live row would silently
+#: leave its clinical section, the failure issue #114 was raised for.
+DISTINCT_STATUSES: tuple[str, ...] = (
+    "distinct",
 )
 
 #: The key a rendered row carries its verdict under, when it has one.
@@ -811,6 +838,20 @@ class CollisionResolver:
             if verdict is not None and verdict["status"] in RESOLVING_STATUSES:
                 return verdict
         return None
+
+    def settlement(self, verdict: dict) -> str:
+        """Which question the resolving ``verdict`` answered: ``"merged"`` | ``"distinct"``.
+
+        ``"merged"`` — the pair is **one fact** (``merged-into``/``superseded``).
+        ``"distinct"`` — it is **two facts** that share a recomputed key
+        (:data:`DISTINCT_STATUSES`, issue #122).
+
+        A method rather than a constant `dedup` could read: the status vocabulary lives
+        here and must not leak across the seam, since ``dedup`` cannot import ``curation``.
+        The two return values are the stable contract `rekey` and the CLI report on, while
+        the vocabulary behind them stays free to grow.
+        """
+        return "distinct" if verdict["status"] in DISTINCT_STATUSES else "merged"
 
     def narrow(
         self,

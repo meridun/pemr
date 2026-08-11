@@ -1468,6 +1468,11 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                     "verdict_action": r.verdict_action,
                     "narrowed_row_ids": r.narrowed_row_ids,
                     "message": r.message,
+                    # Appended (issue #122): which question the verdict answered -
+                    # "merged" (the pair is one fact) or "distinct" (two facts that share
+                    # a recomputed key). `status` carries the raw vocabulary; this is the
+                    # two-valued contract a consumer can branch on.
+                    "settlement": r.settlement,
                 }
                 for r in report.resolved
             ],
@@ -1498,7 +1503,15 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                 f"`pemr record annotate --row {resolution.record_type} <id>`"
             )
     if report.resolved:
-        print(f"{len(report.resolved)} collision(s) resolved by verdict")
+        # Both counts, always: "resolved by verdict" alone hides the difference between
+        # "a human folded these into one fact" and "a human ruled them two facts that
+        # both keep rendering" (issue #122).
+        merged = sum(1 for r in report.resolved if r.settlement != "distinct")
+        distinct = len(report.resolved) - merged
+        print(
+            f"{len(report.resolved)} collision(s) resolved by verdict "
+            f"({merged} as one fact, {distinct} as distinct facts)"
+        )
 
     for collision in report.collisions:
         print(f"error: {collision.message}", file=sys.stderr)
