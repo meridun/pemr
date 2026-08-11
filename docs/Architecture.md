@@ -429,14 +429,27 @@ clinical section — they render as two live siblings, exactly like a `--keep bo
 That absence is the whole guarantee, and `tests/test_curation.py` asserts the two tuples
 stay disjoint.
 
+Because the two kinds answer the *same* question opposite ways, a pair carrying a resolving
+verdict on **each** row can be **contradictory** — one row ruled `distinct`, the other
+`merged-into`/`superseded` (issue #124). Two opposite rulings settle nothing, so such a pair
+is **not** resolved: it stays a blocking collision, quarantines its own table like any other,
+and its `--json` entry carries a `contradiction` list naming both rulings (row id, status,
+scope, `verdict_base`, `settlement`); the text message says which row was ruled which way.
+No occurrence is assigned and **no narrowing is written** — pinning one arbitrarily chosen
+side would convert a family verdict to row scope to authorize a write that never happened.
+The fix is the operator's: re-rule or clear one of the two verdicts and re-run. Rulings that
+merely *agree* — or a pair carrying only one — resolve exactly as they always have.
+
 `confirmed`, `disputed` and `erroneous-in-source` resolve nothing — they rule on a row's
 content, not on its identity against another row — and a table holding any *unresolved*
 collision still withholds every change in it, resolved pairs included (its resolutions say
-exactly that, rather than describing a write that did not happen). All three cases are
+exactly that, rather than describing a write that did not happen). All four cases are
 distinguishable in output: a resolved pair is a `note:` line naming which way it was
 settled plus an entry in `--json`'s `resolved` list carrying `settlement`
-(`"merged"` | `"distinct"`), a blocked one stays `error:` plus `skipped`. A run whose
-every collision was verdict-resolved therefore exits **0**.
+(`"merged"` | `"distinct"`), a blocked one stays `error:` plus `skipped`, and a
+contradictory one is an `error:` naming both rulings plus a non-empty `contradiction` on
+its `collisions` entry. A run whose every collision was verdict-resolved therefore exits
+**0**.
 
 A resolving verdict is **unary** — it names one row or one family, never a counterpart —
 so like `superseded` since #116 it settles any collision its target takes part in,
@@ -453,8 +466,9 @@ to row scope** instead, pinned to exactly the rows whose stored `dedup_base` was
 in the same transaction as the keys: the ruling keeps precisely the extension it had when
 it was made, the merged-in row keeps rendering where it was, and the verdict that *resolved*
 the collision is never orphaned. That guarantee is scoped to the resolving verdict only: a
-clash covered by verdicts on **both** colliding families still resolves through exactly one
-of them (`covering()` returns a single verdict — row scope over family scope), and the
+clash covered by *agreeing* verdicts on **both** colliding families still resolves through
+exactly one of them (`covering_verdicts()` reports both — row scope over family scope per
+row — and resolution takes the first), and the
 *other* family's verdict is not carried anywhere. Its rows move out from under it the same
 way an unrelated dictionary-driven rekey has always been able to orphan a family verdict
 (documented since migration 008) — `rekey`'s own output says nothing about it, and `pemr

@@ -1445,6 +1445,20 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                     "clash_label": c.clash_label,
                     "kind": c.kind,
                     "message": c.message,
+                    # Appended (issue #124): the two rulings that disagree, when *that*
+                    # is why the pair blocks. Empty on every ordinary collision, so a
+                    # consumer can branch on it without a second lookup - and a
+                    # contradiction is never reported as a clean one-sided resolution.
+                    "contradiction": [
+                        {
+                            "row_id": v.row_id,
+                            "status": v.status,
+                            "scope": v.scope,
+                            "verdict_base": v.verdict_base,
+                            "settlement": v.settlement,
+                        }
+                        for v in c.contradiction
+                    ],
                 }
                 for c in report.collisions
             ],

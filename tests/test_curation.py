@@ -668,6 +668,44 @@ def test_settlement_reports_which_question_the_verdict_answered():
     assert resolver.settlement({"status": "superseded"}) == "merged"
 
 
+def _lab_row(conn, test_name):
+    return conn.execute("SELECT * FROM lab_result WHERE test_name = ?",
+                        (test_name,)).fetchone()
+
+
+def test_covering_verdicts_reports_both_rows_rulings(seeded):
+    """Issue #124. The seam hands back *every* ruling on the pair, in `(row, clash)`
+    order, instead of the first one it happens to find: which of two opposite rulings a
+    scan order lands on first is no basis for telling the operator what a human decided.
+    Non-resolving verdicts contribute nothing, exactly as before."""
+    conn = seeded["conn"]
+    resolver = curation.collision_resolver(conn)
+    glucose, hba1c = _lab_row(conn, "Glucose"), _lab_row(conn, "HbA1c")
+    assert resolver.covering_verdicts("lab_result", glucose, hba1c) == []
+
+    curation.annotate_record(conn, "lab_result", str(glucose["lab_result_id"]),
+                             status="distinct", note="two analytes", row=True,
+                             apply=True)
+    resolver = curation.collision_resolver(conn)
+    assert [v["status"] for v in
+            resolver.covering_verdicts("lab_result", glucose, hba1c)] == ["distinct"]
+
+    curation.annotate_record(conn, "lab_result", str(hba1c["lab_result_id"]),
+                             status="confirmed", note="rules on content, not identity",
+                             row=True, apply=True)
+    resolver = curation.collision_resolver(conn)
+    assert [v["status"] for v in
+            resolver.covering_verdicts("lab_result", glucose, hba1c)] == ["distinct"]
+
+    curation.annotate_record(conn, "lab_result", str(hba1c["lab_result_id"]),
+                             status="superseded", note="one fact after all", row=True,
+                             apply=True)
+    resolver = curation.collision_resolver(conn)
+    assert [v["status"] for v in
+            resolver.covering_verdicts("lab_result", glucose, hba1c)] \
+        == ["distinct", "superseded"]                  # (row, clash) order
+
+
 def test_a_distinct_verdict_rejects_a_merge_target(seeded):
     """`distinct` is unary: it names the row or family it rules on and no counterpart, so
     `--merged-into` is meaningless with it and must fail before anything is written."""
