@@ -527,6 +527,42 @@ def test_rekey_reports_a_verdict_resolved_collision_in_text_and_json(
     assert captured.out.isascii()               # issue #23
 
 
+def test_rekey_reports_a_distinct_resolved_collision_in_text_and_json(
+    ready, capsys, tmp_path
+):
+    """Issue #122 at the CLI: a pair the operator ruled *two distinct facts* unblocks its
+    table exactly as a merge-shaped ruling does, and both output modes say which of the
+    two happened - `settlement` in `--json`, the wording plus the summary counts in
+    text."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id),
+                "--status", "distinct", "--note", "two assays, one generic label",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["collisions"] == [] and payload["skipped"] == []
+    assert [(r["row_id"], r["clash_row_id"], r["status"], r["settlement"])
+            for r in payload["resolved"]] == [
+        (albumin_id, alb_id, "distinct", "distinct")]
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "lab_result: 2/2 key(s) change" in captured.out
+    assert "(skipped: collision)" not in captured.out
+    assert "rules them two distinct facts" in captured.out
+    assert "both rows keep rendering as live, independent facts" in captured.out
+    assert "1 collision(s) resolved by verdict (0 as one fact, 1 as distinct facts)" \
+        in captured.out
+    assert captured.out.isascii()               # issue #23
+
+
 def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
     """The same seed with no verdict recorded: `resolved` is empty, the table is still
     skipped by name and the exit code is still 1 (the #92 contract, unwidened)."""

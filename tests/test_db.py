@@ -46,6 +46,7 @@ ALL_MIGRATIONS = [
     "008_curation.sql",
     "009_record_attestation.sql",
     "010_curation_row_scope.sql",
+    "011_curation_distinct_status.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -135,7 +136,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
     assert db.migrate(conn) == [
         "006_condition_allergy.sql", "007_document_tombstone.sql",
         "008_curation.sql", "009_record_attestation.sql",
-        "010_curation_row_scope.sql",
+        "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -268,7 +269,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
 
     assert db.migrate(conn) == [
         "008_curation.sql", "009_record_attestation.sql",
-        "010_curation_row_scope.sql",
+        "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -320,6 +321,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
 
     assert db.migrate(conn) == [
         "009_record_attestation.sql", "010_curation_row_scope.sql",
+        "011_curation_distinct_status.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -368,7 +370,9 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
         "SELECT * FROM curation ORDER BY dedup_base"
     ).fetchall()]
 
-    assert db.migrate(conn) == ["010_curation_row_scope.sql"]
+    assert db.migrate(conn) == [
+        "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
+    ]
 
     after = [dict(r) for r in conn.execute(
         "SELECT * FROM curation ORDER BY dedup_base"
@@ -409,6 +413,79 @@ def test_migration_010_lets_scopes_coexist_but_pins_one_verdict_per_row(conn):
             "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
             "created_at) VALUES ('lab_result', 'base-a', -1, 'disputed', 'why', "
             "'2026-01-01T00:00:00')"
+        )
+
+
+def _migrate_through_010(conn, tmp_path):
+    """Apply every migration up to 010, leaving 011 pending (a 010-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre011"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "011":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
+    conn, tmp_path
+):
+    """Issue #122's rebuild, checked the way 010's is: a widened CHECK cannot be ALTERed
+    in, so the table is rebuilt, and the round trip must carry every 010-era verdict of
+    *both* scopes through byte-for-byte. The partial index is the failure mode of a
+    rebuild - it is dropped with the old table - so its survival is asserted explicitly."""
+    from pemr import curation
+
+    _migrate_through_010(conn, tmp_path)
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+        "attributed_to, created_at) VALUES ('lab_result', 'base-a', 0, 'disputed', "
+        "'two sources', 'Dr Who', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+        "merged_into_base, created_at) VALUES ('condition', 'base-b', 7, "
+        "'merged-into', 'same episode', 'base-c', '2026-02-02T00:00:00+00:00')"
+    )
+    conn.commit()
+    before = [dict(r) for r in conn.execute(
+        "SELECT * FROM curation ORDER BY dedup_base"
+    ).fetchall()]
+
+    assert db.migrate(conn) == ["011_curation_distinct_status.sql"]
+
+    after = [dict(r) for r in conn.execute(
+        "SELECT * FROM curation ORDER BY dedup_base"
+    ).fetchall()]
+    assert after == before
+    assert [r["record_id"] for r in after] == [0, 7]      # both scopes survived
+    verdicts = curation.load_verdicts(conn)
+    assert len(verdicts.family) == 1 and len(verdicts.rows) == 1
+
+    # The uniqueness rule the rebuild would silently lose.
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_curation_row'"
+    ).fetchone() is not None
+    with pytest.raises(sqlite3.IntegrityError):          # same row, a different base
+        conn.execute(
+            "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+            "created_at) VALUES ('condition', 'base-z', 7, 'disputed', 'why', "
+            "'2026-03-03T00:00:00+00:00')"
+        )
+
+    # The point of the migration: the new status is accepted, and only it widened.
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+        "created_at) VALUES ('condition', 'base-d', 0, 'distinct', 'two diagnoses', "
+        "'2026-03-03T00:00:00+00:00')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+            "created_at) VALUES ('condition', 'base-e', 0, 'made-up', 'nope', "
+            "'2026-03-03T00:00:00+00:00')"
         )
 
 
