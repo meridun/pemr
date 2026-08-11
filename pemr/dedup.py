@@ -1392,10 +1392,13 @@ class CollisionResolver(Protocol):
     silently reintroduce the cycle this seam exists to prevent.
     """
 
-    def covering(
+    def covering_verdicts(
         self, record_type: str, row: sqlite3.Row, clash: sqlite3.Row
-    ) -> dict | None:
-        """The verdict settling this pair's identity, or None if none does."""
+    ) -> list[dict]:
+        """Every verdict ruling on this pair's identity, in ``(row, clash)`` order —
+        empty when none does. A pair may carry **two** rulings, one per row, and since
+        #122 they can disagree: one saying "two facts", the other "one fact". Deciding
+        what that means is the caller's (issue #124)."""
 
     def settlement(self, verdict: dict) -> str:
         """Which way ``verdict`` settled the pair (issue #122): ``"merged"`` — the two
@@ -1483,6 +1486,21 @@ class RekeyResolution:
 
 
 @dataclass
+class RekeyVerdictClash:
+    """One row's ruling on a pair whose two rulings contradict each other (issue #124).
+
+    Flattened rather than the raw verdict dict, following :class:`RekeyResolution`'s rule
+    that a report is a plain, serializable account: the curation row itself never crosses
+    the seam.
+    """
+    row_id: int             # the colliding row this ruling applies to
+    status: str             # the verdict's status (one of curation.RESOLVING_STATUSES)
+    scope: str              # "family" | "row"
+    verdict_base: str       # dedup_base the verdict is stored under
+    settlement: str         # "merged" (one fact) | "distinct" (two facts)
+
+
+@dataclass
 class RekeyCollision:
     """Two rows in one table that recompute onto a single ``dedup_key``.
 
@@ -1497,6 +1515,10 @@ class RekeyCollision:
     clash_label: str
     kind: str               # "fused" (dictionary merges two facts) | "doubled" (data)
     message: str            # full diagnosis, ready to print
+    # The two rulings that contradict each other, when *that* is why this pair blocks
+    # (issue #124) — entry row first, then clash row. Empty on every ordinary collision.
+    # Appended, never inserted: the existing construction sites are positional.
+    contradiction: list[RekeyVerdictClash] = field(default_factory=list)
 
 
 @dataclass
@@ -1595,6 +1617,14 @@ def rekey(
     a verdict carried over wholesale would extend a ruling over a row nobody judged and
     (for the appendix statuses) pull that live row out of its rendered section. With
     ``resolver=None`` (the default) every collision blocks, exactly as before.
+
+    A pair may carry a resolving verdict on **each** row, and since the vocabulary holds
+    opposite answers those two rulings can **contradict** each other — one says two facts,
+    the other says one (issue #124). Two opposite rulings settle nothing, so the pair stays
+    a blocking collision (its table quarantined as usual) and the rulings are reported on
+    :attr:`RekeyCollision.contradiction`; no occurrence is assigned and no verdict is
+    narrowed. Rulings that merely *agree* (or a pair carrying only one) resolve exactly as
+    they always have.
     """
     db.require_migrated(conn)
     report = RekeyReport(applied=False)
@@ -1659,9 +1689,34 @@ def rekey(
                                   _rekey_label(record_type, clash.row))
             kind = ("doubled" if _rows_equal(record_type, clash.row, entry.payload)
                     else "fused")
-            verdict = (None if resolver is None
-                       else resolver.covering(record_type, entry.row, clash.row))
-            if verdict is not None:
+            verdicts = ([] if resolver is None
+                        else resolver.covering_verdicts(record_type, entry.row,
+                                                        clash.row))
+            # Empty without a resolver, so `resolver.settlement` is never reached there.
+            settlements = {resolver.settlement(v) for v in verdicts}
+            if len(settlements) > 1:
+                # Two rulings that answer the identity question opposite ways settle
+                # nothing (issue #124). Checked *before* `_resolve_clash`, which mutates
+                # `entry`/`seen` — a resolution can never be built and then rejected. No
+                # narrowing is queued either: pinning one arbitrarily chosen side would
+                # convert a family verdict to row scope to authorize a write that never
+                # happened.
+                rulings = [
+                    RekeyVerdictClash(
+                        row_id=row_id, status=verdict["status"],
+                        scope="row" if verdict["record_id"] else "family",
+                        verdict_base=verdict["dedup_base"],
+                        settlement=resolver.settlement(verdict),
+                    )
+                    for row_id, verdict in zip((entry.row_id, clash.row_id), verdicts)
+                ]
+                report.collisions.append(_contradictory_collision(
+                    record_type, pk, entry, clash, kind, label, clash_label, rulings,
+                ))
+                continue
+
+            if verdicts:
+                verdict = verdicts[0]
                 covered = ([int(verdict["record_id"])] if verdict["record_id"]
                            else stored_family.get(verdict["dedup_base"], []))
                 resolution = _resolve_clash(
@@ -1775,6 +1830,49 @@ def rekey(
                 resolution.verdict_action, resolution.narrowed_row_ids = done[ident]
     report.applied = apply
     return report
+
+
+def _contradictory_collision(
+    record_type: str,
+    pk: str,
+    entry: _RekeyEntry,
+    clash: _RekeyEntry,
+    kind: str,
+    label: str,
+    clash_label: str,
+    rulings: list[RekeyVerdictClash],
+) -> RekeyCollision:
+    """A collision whose two rows carry rulings that disagree on settlement (issue #124).
+
+    Blocking, not resolved: the premise of the resolution path is "a human already
+    answered the identity question", and a pair ruled *two facts* by one verdict and *one
+    fact* by the other has not been answered. Reporting either side's settlement as the
+    outcome would be scan order deciding what the operator is told a human decided.
+
+    Builds nothing but the account — no occurrence is taken and no narrowing is queued —
+    so the pair lands in :attr:`RekeyReport.collisions` and the existing per-table
+    quarantine (issue #92) and exit code follow with no new rule.
+    """
+    first, second = rulings
+
+    def _ruled(settlement: str) -> str:
+        return "two facts" if settlement == "distinct" else "one fact"
+
+    message = (
+        f"{record_type}: {pk} {entry.row_id} ({label!r}) and {pk} {clash.row_id} "
+        f"({clash_label!r}) recompute to the same dedup_key ({kind}), but the two rows "
+        f"carry contradictory verdicts - a {first.scope}-scoped '{first.status}' on {pk} "
+        f"{entry.row_id} rules them {_ruled(first.settlement)} while a "
+        f"{second.scope}-scoped '{second.status}' on {pk} {clash.row_id} rules them "
+        f"{_ruled(second.settlement)}. A pair ruled two opposite ways is not settled: "
+        f"re-rule or clear one of them (`pemr record annotate [--row] {record_type} "
+        "<id> --status ...` / `--clear`) and re-run; "
+        f"{record_type} was not written"
+    )
+    return RekeyCollision(
+        record_type, entry.row_id, label, clash.row_id, clash_label, kind, message,
+        contradiction=rulings,
+    )
 
 
 def _resolve_clash(

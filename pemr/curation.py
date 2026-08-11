@@ -817,27 +817,41 @@ class CollisionResolver:
     def __init__(self, verdicts: VerdictMap) -> None:
         self._verdicts = verdicts
 
-    def covering(
+    def covering_verdicts(
         self, record_type: str, row: sqlite3.Row, clash: sqlite3.Row
-    ) -> dict | None:
-        """The verdict that settles a collision between two rows, or None.
+    ) -> list[dict]:
+        """**Every** verdict that rules on a collision between two rows, in ``(row,
+        clash)`` order — 0, 1 or 2 of them.
 
         Either row, either scope: the operator annotated whichever of the pair they were
         looking at, and a family verdict on one is as much a ruling on the pair as a row
         verdict on the other. Resolution runs through :meth:`VerdictMap.for_row`, so the
         row-over-family precedence rule stays defined in exactly one place.
 
+        Reporting *both* rulings is the point (issue #124). Since #122 the resolving
+        vocabulary holds opposite answers — ``distinct`` says two facts, the others say
+        one — so a pair carrying a resolving verdict on each row can be contradictory,
+        and returning only the first would report one side's settlement as if it were
+        unanimous, decided by nothing but scan order. Choosing among the rulings, or
+        refusing to, is no longer this method's job: the caller decides on the set of
+        :meth:`settlement` values.
+
+        When a single family verdict covers both rows, ``for_row`` returns the same dict
+        twice and it is returned twice — deliberate, and harmless precisely because the
+        caller decides on settlements rather than on verdict identity.
+
         The **stored** ``dedup_base`` is the lookup key, not the recomputed one: the
         human ruled on the family as it exists today, before this rekey moves it.
         """
         pk = f"{record_type}_id"
+        verdicts: list[dict] = []
         for candidate in (row, clash):
             verdict = self._verdicts.for_row(
                 record_type, candidate["dedup_base"], candidate[pk]
             )
             if verdict is not None and verdict["status"] in RESOLVING_STATUSES:
-                return verdict
-        return None
+                verdicts.append(verdict)
+        return verdicts
 
     def settlement(self, verdict: dict) -> str:
         """Which question the resolving ``verdict`` answered: ``"merged"`` | ``"distinct"``.
