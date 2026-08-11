@@ -643,11 +643,70 @@ def _fusing_ids(conn):
             _row_id(conn, "lab_result", "test_name", "Glucose"))
 
 
-def test_resolving_statuses_are_only_merged_into_and_superseded():
+def test_resolving_statuses_settle_identity_either_way():
     """The constant guard. `confirmed`/`disputed`/`erroneous-in-source` rule on a row's
-    content; only these two say two rows are one fact, which is what a collision asks."""
-    assert curation.RESOLVING_STATUSES == ("merged-into", "superseded")
+    content; the three below settle *identity* - two of them saying "one fact", `distinct`
+    saying "two facts" (issue #122) - which is what a collision asks.
+
+    The disjointness assertion is load-bearing, not decoration: a `distinct` verdict that
+    leaked into `APPENDIX_STATUSES` would pull a live row out of its clinical section, the
+    failure #114 was raised for, and it is the *absence* from that tuple that makes both
+    rows of a distinct-resolved pair keep rendering."""
+    assert curation.RESOLVING_STATUSES == ("merged-into", "superseded", "distinct")
+    assert curation.DISTINCT_STATUSES == ("distinct",)
     assert set(curation.RESOLVING_STATUSES) <= set(curation.STATUSES)
+    assert set(curation.DISTINCT_STATUSES) <= set(curation.RESOLVING_STATUSES)
+    assert set(curation.DISTINCT_STATUSES) & set(curation.APPENDIX_STATUSES) == set()
+
+
+def test_settlement_reports_which_question_the_verdict_answered():
+    """The seam `dedup` reads instead of importing the status vocabulary: two values, and
+    every resolving status maps onto one of them."""
+    resolver = curation.CollisionResolver(curation.VerdictMap())
+    assert resolver.settlement({"status": "distinct"}) == "distinct"
+    assert resolver.settlement({"status": "merged-into"}) == "merged"
+    assert resolver.settlement({"status": "superseded"}) == "merged"
+
+
+def test_a_distinct_verdict_rejects_a_merge_target(seeded):
+    """`distinct` is unary: it names the row or family it rules on and no counterpart, so
+    `--merged-into` is meaningless with it and must fail before anything is written."""
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    target = _base(conn, "lab_result", "test_name", "HbA1c")
+
+    with pytest.raises(ValueError, match="only meaningful with status 'merged-into'"):
+        curation.annotate_record(conn, "lab_result", base, status="distinct",
+                                 note="two different assays", merged_into_base=target,
+                                 apply=True)
+
+    assert _curation_count(conn) == 0
+
+
+def test_a_distinct_family_verdict_is_narrowed_to_the_rows_it_covered(seeded):
+    """The #116 narrowing, unchanged for the new status: a resolving family verdict is
+    pinned to exactly the rows it covered, and a NULL `merged_into_base` survives the pin
+    (the coupling CHECK would reject anything else)."""
+    conn = seeded["conn"]
+    _hba1c_id, glucose_id = _fusing_ids(conn)
+    glucose_base = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", glucose_base, status="distinct",
+                             note="different analytes, generic labels",
+                             attributed_to="Dr Who",
+                             now="2026-01-01T00:00:00+00:00", apply=True)
+
+    report = dedup.rekey(conn, {"glucose": "hba1c"}, apply=True,
+                         resolver=curation.collision_resolver(conn))
+
+    assert [r.verdict_action for r in report.resolved] == ["narrowed"]
+    assert [r.narrowed_row_ids for r in report.resolved] == [[glucose_id]]
+    assert [r.settlement for r in report.resolved] == ["distinct"]
+    assert _curation_count(conn) == 1               # narrowed, not copied
+    pinned = curation.get_verdict(conn, "lab_result", "", record_id=glucose_id)
+    assert (pinned["status"], pinned["scope"], pinned["merged_into_base"],
+            pinned["created_at"]) == ("distinct", "row", None,
+                                      "2026-01-01T00:00:00+00:00")
+    assert curation.get_verdict(conn, "lab_result", glucose_base) is None
 
 
 def test_a_resolving_family_verdict_is_narrowed_to_the_rows_it_covered(seeded):

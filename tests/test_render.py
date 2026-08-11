@@ -760,6 +760,30 @@ def test_a_row_verdict_overrides_its_family_verdict_at_render_time(seeded):
     assert appendix.count("lab_result: Glucose, fasting") == 1
 
 
+def test_a_distinct_verdict_keeps_both_siblings_live(seeded):
+    """AC3 (issue #122). `distinct` is a *resolving* status but deliberately not an
+    appendix one, so it changes rendering not at all: the two-live-row family a
+    distinct-resolved rekey leaves behind keeps both rows in their normal section, and no
+    `## Superseded / corrected` appendix appears at all.
+
+    The contrast with `superseded` on the same family is the point - that one takes both
+    rows out (see the keep-both test above); this one is the ruling that says both facts
+    are real."""
+    base, _occ0, _occ1 = _keep_both_sibling(seeded)
+    before = _renders(seeded)
+
+    curation.annotate_record(seeded, "lab_result", base, status="distinct",
+                             note="two different draws under one generic label",
+                             apply=True)
+
+    after = _renders(seeded)
+    assert after == before                  # like `confirmed`: recorded, not rendered
+    for name, md in after.items():
+        assert "Superseded / corrected" not in md, name
+    summary = after["summary"]
+    assert "200.0" in summary and "205.0" in summary
+
+
 def test_a_row_scoped_verdict_filters_only_its_own_journal_event(seeded):
     """The journal resolves per row too, via the `record_id` `with_identity` now
     stamps: without it a row verdict could only ever be applied family-wide."""

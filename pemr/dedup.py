@@ -1397,6 +1397,13 @@ class CollisionResolver(Protocol):
     ) -> dict | None:
         """The verdict settling this pair's identity, or None if none does."""
 
+    def settlement(self, verdict: dict) -> str:
+        """Which way ``verdict`` settled the pair (issue #122): ``"merged"`` — the two
+        rows are one fact — or ``"distinct"`` — they are two different facts that
+        recompute onto one key. Both let the rekey proceed and both file the clash row as
+        a new occurrence; the difference is what the operator is told, and (outside this
+        module) that a distinct-resolved pair keeps rendering as two live siblings."""
+
     def narrow(
         self,
         conn: sqlite3.Connection,
@@ -1429,12 +1436,16 @@ class RekeyResolution:
     """A collision a recorded human verdict settled, instead of blocking on (issue #116).
 
     The pair still recomputes onto one identity; what the verdict supplies is the answer
-    `rekey` cannot derive — that a human already ruled these two rows are one fact. The
-    clash row is then filed as the next free **occurrence** of the surviving family, the
-    shape a ``--keep both`` conflict resolution produces, rather than left on its stored
-    key: a row left behind would stay permanently drifted, and
+    `rekey` cannot derive — that a human already ruled on these two rows. The ruling comes
+    in two kinds, reported as :attr:`settlement` (issue #122): ``"merged"`` says the pair
+    is **one fact**, ``"distinct"`` says it is **two facts** whose extracted labels are
+    generic enough to recompute onto one key. Both are settled rather than blocking, and
+    both take the same write: the clash row is filed as the next free **occurrence** of
+    the shared family, the shape a ``--keep both`` conflict resolution produces, rather
+    than left on its stored key — a row left behind would stay permanently drifted, and
     :func:`_assert_no_key_drift` would refuse the next ingest deriving that identity
-    while this very command reported clean.
+    while this very command reported clean. A distinct-resolved pair therefore renders as
+    two live siblings, which is exactly what "two facts" has to mean.
 
     Resolution merges a judged family into a larger one, so the authorizing verdict is
     **narrowed** to the rows it already covered rather than moved onto the surviving
@@ -1455,6 +1466,12 @@ class RekeyResolution:
     new_base: str           # the surviving family both rows land in
     new_occurrence: int     # occurrence the clash row takes under new_base
     message: str            # full account, ready to print
+    # Which question the verdict answered (issue #122): "merged" — the pair is one fact —
+    # or "distinct" — two facts sharing a recomputed key. Kept apart from `status` on
+    # purpose: `status` is the raw curation vocabulary and may grow, `settlement` is the
+    # stable two-valued contract the CLI reports. Defaults to the #116 answer, so a
+    # resolution built without one reads as it always did.
+    settlement: str = "merged"
     # Rows the verdict covered before this rekey — its extension at ruling time. For a
     # row-scoped verdict, the one row it names.
     covered_row_ids: list[int] = field(default_factory=list)
@@ -1558,11 +1575,17 @@ def rekey(
     :attr:`RekeyReport.blocked`. Callers surface a non-empty ``collisions`` as a failure;
     partial progress with an explicit account of what was skipped beats all-or-nothing.
 
-    ``resolver`` is the optional curation-overlay seam (issue #116). Many collisions are
-    exactly the pair a human already ruled on — since migrations 008/010 a
-    ``merged-into`` or ``superseded`` verdict says "these are one fact", which is the
-    very question the guard is stuck on. With a resolver injected, a clash whose pair
-    carries such a verdict (either row, either scope) is **not** blocking: the clash row
+    ``resolver`` is the optional curation-overlay seam (issues #116, #122). Many
+    collisions are exactly the pair a human already ruled on — since migrations 008/010 a
+    ``merged-into`` or ``superseded`` verdict says "these are one fact", and since
+    migration 011 a ``distinct`` verdict says "these are two different facts whose
+    extracted labels merely recompute onto one key" — either way the very question the
+    guard is stuck on. Both are reported as :attr:`RekeyResolution.settlement`
+    (``"merged"`` / ``"distinct"``) and both take the same write, because "two live rows
+    on one identity" already has exactly one representation: occurrence numbering, the
+    ``--keep both`` shape that renders as two independent siblings. With a resolver
+    injected, a clash whose pair carries such a verdict (either row, either scope) is
+    **not** blocking: the clash row
     is filed as the next free occurrence of the surviving family — the shape a
     ``--keep both`` conflict resolution produces — and reported in
     :attr:`RekeyReport.resolved` instead of :attr:`RekeyReport.collisions`, so the table
@@ -1644,6 +1667,7 @@ def rekey(
                 resolution = _resolve_clash(
                     report, record_type, pk, entry, clash, kind, verdict,
                     by_base[entry.base], seen, label, clash_label, covered,
+                    resolver.settlement(verdict),
                 )
                 pending_narrowings.append((record_type, verdict, resolution))
                 continue
@@ -1766,6 +1790,7 @@ def _resolve_clash(
     label: str,
     clash_label: str,
     covered_row_ids: list[int],
+    settlement: str,
 ) -> RekeyResolution:
     """File a verdict-settled clash as the next free occurrence of its family.
 
@@ -1774,6 +1799,11 @@ def _resolve_clash(
     keeps its occurrence and the later row takes the next free one, which is the state a
     ``--keep both`` conflict resolution leaves behind and exactly what row-scoped
     curation (issue #114) exists to annotate.
+
+    ``settlement`` is which way the verdict settled the pair (issue #122) — ``"merged"``
+    or ``"distinct"``. It selects the wording only: the write is identical either way,
+    because the ``--keep both`` shape is *already* "two live siblings on one identity",
+    which is what a distinct ruling asks for.
 
     Mutates ``entry`` and ``seen`` so a *third* row landing on this family sees the
     occupancy this one just created, and appends to ``report``.
@@ -1790,13 +1820,22 @@ def _resolve_clash(
     scope = "row" if verdict["record_id"] else "family"
     # Present tense, not past: whether this actually lands depends on `apply` and on the
     # rest of the table coming out clean, and the caller appends that verdict.
-    message = (
+    preamble = (
         f"{record_type}: {pk} {entry.row_id} ({label!r}) and {pk} {clash.row_id} "
         f"({clash_label!r}) recompute to the same dedup_key ({kind}), but a "
-        f"{scope}-scoped '{verdict['status']}' verdict already settles the pair - "
-        f"{pk} {entry.row_id} takes occurrence {occurrence} of "
-        f"{entry.base[:12]}..., the surviving family"
+        f"{scope}-scoped '{verdict['status']}' verdict already "
     )
+    if settlement == "distinct":
+        message = (
+            f"{preamble}rules them two distinct facts - {pk} {entry.row_id} takes "
+            f"occurrence {occurrence} of {entry.base[:12]}..., the shared family, and "
+            "both rows keep rendering as live, independent facts"
+        )
+    else:
+        message = (
+            f"{preamble}settles the pair - {pk} {entry.row_id} takes occurrence "
+            f"{occurrence} of {entry.base[:12]}..., the surviving family"
+        )
     report.changes.append(RekeyChange(
         record_type, entry.row_id, label, entry.row["dedup_key"], entry.key,
         entry.base, new_occurrence=occurrence,
@@ -1806,7 +1845,7 @@ def _resolve_clash(
         clash_row_id=clash.row_id, clash_label=clash_label, kind=kind,
         status=verdict["status"], scope=scope, record_id=verdict["record_id"],
         verdict_base=verdict["dedup_base"], new_base=entry.base,
-        new_occurrence=occurrence, message=message,
+        new_occurrence=occurrence, message=message, settlement=settlement,
         covered_row_ids=sorted(covered_row_ids),
     )
     report.resolved.append(resolution)
