@@ -1398,7 +1398,13 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
     try:
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         try:
-            report = dedup.rekey(conn, dictionary, apply=args.apply)
+            # The curation overlay is injected, never imported by `dedup` (issue #116):
+            # a collision the human already ruled on with a merged-into/superseded
+            # verdict is settled, not blocking.
+            report = dedup.rekey(
+                conn, dictionary, apply=args.apply,
+                resolver=curation.collision_resolver(conn),
+            )
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -1408,6 +1414,8 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
     # A collision blocks its own table only (issue #92), so it is a partial failure:
     # the clean tables are reported (and, under --apply, written) and the exit code
     # still says something was left undone. Same rc in --json mode as in text mode.
+    # `collisions` is now the *blocking* ones only, so a run whose every collision was
+    # verdict-resolved exits 0 - there is nothing left for the operator to fix.
     writable = report.writable()
     rc = 1 if report.collisions else 0
 
@@ -1440,6 +1448,29 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                 }
                 for c in report.collisions
             ],
+            # Appended, never inserted (the additive-only contract rule): the collisions
+            # a recorded verdict settled, which `collisions` and `skipped` deliberately
+            # no longer carry.
+            "resolved": [
+                {
+                    "record_type": r.record_type,
+                    "row_id": r.row_id,
+                    "label": r.label,
+                    "clash_row_id": r.clash_row_id,
+                    "clash_label": r.clash_label,
+                    "kind": r.kind,
+                    "status": r.status,
+                    "scope": r.scope,
+                    "record_id": r.record_id,
+                    "new_base": r.new_base,
+                    "new_occurrence": r.new_occurrence,
+                    "covered_row_ids": r.covered_row_ids,
+                    "verdict_action": r.verdict_action,
+                    "narrowed_row_ids": r.narrowed_row_ids,
+                    "message": r.message,
+                }
+                for r in report.resolved
+            ],
         })
         return rc
 
@@ -1449,6 +1480,25 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
         print(f"{record_type}: {changed}/{count} key(s) change{blocked}")
     for c in report.changes:
         print(f"  {c.record_type} #{c.row_id}  {c.label}")
+
+    # A note, not an error: the operator has nothing to fix here, but they do need to
+    # see why a table that holds a collision was written anyway - and, when a ruling's
+    # scope was narrowed to keep it off a row it never judged, they need to be told
+    # loudly enough to re-affirm or re-rule it.
+    for resolution in report.resolved:
+        print(f"note: {resolution.message}")
+        if resolution.verdict_action == "narrowed":
+            rows = ", ".join(str(r) for r in resolution.narrowed_row_ids)
+            print(
+                f"note: the family verdict on {resolution.verdict_base[:12]}... was "
+                f"narrowed to row scope on {resolution.record_type} "
+                f"{'rows' if len(resolution.narrowed_row_ids) > 1 else 'row'} {rows} - "
+                "the rows it already covered - so it does not extend over the rest of "
+                f"{resolution.new_base[:12]}...; re-affirm or re-rule it with "
+                f"`pemr record annotate --row {resolution.record_type} <id>`"
+            )
+    if report.resolved:
+        print(f"{len(report.resolved)} collision(s) resolved by verdict")
 
     for collision in report.collisions:
         print(f"error: {collision.message}", file=sys.stderr)
@@ -1460,7 +1510,7 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    if not report.changes and not report.collisions:
+    if not report.changes and not report.collisions and not report.resolved:
         print("all dedup keys already match the current dictionary")
     elif report.applied:
         print(f"rekeyed {len(writable)} row(s)")

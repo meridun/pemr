@@ -399,8 +399,59 @@ stored keys, and names them (`skipped: collision` per table, plus a `skipped` li
 `--json`). `--json`'s `changed` list is every key the scan computed as moving, not only
 the ones written — a row in a skipped table still shows up there, so a consumer must
 cross-reference `skipped` to tell written from withheld. Exit code is 1 whenever any
-collision was found, in both output modes: partial progress is fine, silent partial
-progress is not.
+**blocking** collision was found, in both output modes: partial progress is fine, silent
+partial progress is not.
+
+**A collision a human already ruled on is settled, not blocking** (issue #116). Many
+collisions are exactly the pair the curation overlay exists to answer: a `merged-into` or
+`superseded` verdict says "these two are one fact", which is the question the guard is
+stuck on. So `rekey` consults the overlay — through an injected resolver, because
+`curation` imports `dedup` and not the reverse — and a clash covered by such a verdict on
+**either** row at **either** scope stops being blocking. The clash row is filed as the
+next free *occurrence* of the surviving family (the `--keep both` shape; leaving it on its
+stored key would strand it permanently drifted while `rekey` itself reported clean). Only
+`merged-into`/`superseded` resolve — `confirmed`, `disputed` and `erroneous-in-source`
+rule on a row's content, not on its identity against another row — and a table holding any
+*unresolved* collision still withholds every change in it, resolved pairs included (its
+resolutions say exactly that, rather than describing a write that did not happen). Both
+output modes distinguish the two: a resolved pair is a `note:` line and an entry in
+`--json`'s `resolved` list, a blocked one stays `error:` plus `skipped`. A run whose every
+collision was verdict-resolved therefore exits **0**.
+
+**A verdict's scope never widens across that merge.** Resolution joins a judged family to
+an unjudged one, so the surviving family is *larger* than the one the human ruled on.
+Carrying the family verdict over wholesale would silently extend the ruling to a row nobody
+judged — and for the appendix statuses that resolve collisions, that pulls a live row out
+of its clinical section (a `merged-into` on one spelling of an allergy taking the other,
+canonical spelling out of `## Allergies`). So the authorizing family verdict is **narrowed
+to row scope** instead, pinned to exactly the rows whose stored `dedup_base` was its own,
+in the same transaction as the keys: the ruling keeps precisely the extension it had when
+it was made, the merged-in row keeps rendering where it was, and the verdict that *resolved*
+the collision is never orphaned. That guarantee is scoped to the resolving verdict only: a
+clash covered by verdicts on **both** colliding families still resolves through exactly one
+of them (`covering()` returns a single verdict — row scope over family scope), and the
+*other* family's verdict is not carried anywhere. Its rows move out from under it the same
+way an unrelated dictionary-driven rekey has always been able to orphan a family verdict
+(documented since migration 008) — `rekey`'s own output says nothing about it, and `pemr
+verify` is the only signal (`curation verdict ... has no live family (removed?)`). The
+direction is over-reporting, not data loss: no fact disappears, but a row a human had ruled
+out of its clinical section can be promoted back into it until the operator re-rules or
+clears the stale verdict. Criticality-blind by construction — no live row silently leaves
+its rendered section, whatever it records. The conversion is announced, never silent:
+`resolved` names the pinned rows in both output modes, and `pemr verify` notices a row
+verdict whose family breadcrumb a rekey left stale, pointing at `pemr record annotate --row`
+to re-affirm or re-rule. A recorded human ruling is only ever re-pointed or scope-narrowed
+within its original extension here — never overwritten, deleted, or auto-cleared; a row that
+already carries its own row-scoped verdict is skipped for the same reason.
+
+That re-affirm has to be *runnable*, which is why `--merged-into` may name the annotated
+row's own family at **row** scope. A `merged-into` narrowing is the common shape, and the
+same rekey that narrows the ruling also moves its row into the merge target — so by the
+time the operator answers the notice there is no third family left to name. At row scope
+the pointer still means something (this occurrence is absorbed into the family it sits in;
+it moves to the appendix while its siblings keep rendering live), so it is accepted. At
+**family** scope a self-merge would leave the fact rendering nowhere at all, and stays
+refused.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -441,7 +492,11 @@ documents is three stored rows that all recompute onto the single date-free key 
 type — the legacy shape behind #86's apparently duplicated condition bullets, correct storage
 under the old identity and a three-way fusion under the new one. A collision quarantines its own
 table only (above), so the clean tables are still written and the fusion is settled in the
-dictionary or the data before a re-run.
+dictionary or the data before a re-run — or, where a `merged-into`/`superseded` verdict has
+already been recorded on the pair, it is settled by that verdict and the table writes
+(above, issue #116). That is the common case for this migration's collisions: the rows are
+the *same* standing fact restated by several documents, which is precisely what those two
+statuses record.
 
 `rekey` is likewise a **required upgrade step for the `lab_result` date-only key** (issue
 #117). Every stored lab whose `collected_at` carries a time recomputes to a new key the

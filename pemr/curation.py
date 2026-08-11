@@ -30,7 +30,15 @@ single **row**:
 occurrence shifts `record rm` (#107) leaves behind. It does *not* survive every
 `pemr rekey`: a dictionary edit that changes this family's own canonical name moves its
 ``dedup_base``, orphaning the verdict (`pemr verify` warns; `record annotate --clear`
-then re-annotate).
+then re-annotate). The one exception is the verdict that *resolved* a rekey collision
+(issue #116, :class:`CollisionResolver`): rather than being left orphaned, it is
+**narrowed to row scope** — pinned to exactly the rows it covered when it was made — in
+the same transaction as the keys it authorized. It is narrowed rather than re-pointed
+because the surviving family is *larger* than the one the human ruled on: re-pointing
+would silently extend the ruling over a row nobody judged, and a ``superseded`` verdict
+reaching a previously-live row drops that row out of its clinical section. A ruling's
+judgment is never destroyed or reinterpreted; re-pointing and scope-narrowing that
+preserve its original extension are what this module permits.
 
 *Row scope* — ``--row``, keyed by ``(record_type, record_id)`` **alone**. It exists for
 the family a ``--keep both`` conflict resolution left holding two *live* rows: a
@@ -42,7 +50,11 @@ untouched"), so a row-scoped verdict genuinely **survives** the dictionary-drive
 that orphans a family-scoped one; it is orphaned only by the removal of its row. The
 ``dedup_base`` stored beside it is a *breadcrumb* — which family it ruled in, at
 annotate time — that may go stale after such a rekey and is never consulted for
-resolution: every reader re-reads the live base off the row.
+resolution: every reader re-reads the live base off the row. A stale breadcrumb is not
+an error, but it *is* reported: `pemr verify` notices that a rekey moved the row out of
+the family the ruling was made in, so the human can re-affirm (re-annotating collapses
+the breadcrumb) or re-rule. That notice is what makes a collision-resolving narrowing
+loud rather than silent.
 
 **Removing the row retires the verdict.** A ``dedup_base`` is content-derived, so a
 family verdict re-attaching to a re-ingested identical fact is correct. A row id is not:
@@ -103,6 +115,17 @@ APPENDIX_STATUSES: tuple[str, ...] = (
     "superseded",
     "erroneous-in-source",
     "merged-into",
+)
+
+#: The statuses that say "a human settled *which fact this is*" — and therefore the only
+#: ones that may resolve a `pemr rekey` collision (issue #116). ``confirmed`` records
+#: agreement with the row as filed, ``disputed`` records that the question is still open,
+#: and ``erroneous-in-source`` rules on the *content* of one row without saying anything
+#: about its identity relative to another — none of the three settles "these two rows are
+#: one fact", which is the question a collision asks.
+RESOLVING_STATUSES: tuple[str, ...] = (
+    "merged-into",
+    "superseded",
 )
 
 #: The key a rendered row carries its verdict under, when it has one.
@@ -513,9 +536,16 @@ def annotate_record(
     table is the why and who said so, and a verdict with no reason is a verdict nobody
     can audit later.
 
-    ``merged_into_base`` is set iff ``status='merged-into'``, must name a live family
-    of the same ``record_type``, and must not be the annotated family itself (a family
-    merged into itself would render nowhere at all).
+    ``merged_into_base`` is set iff ``status='merged-into'``, and must name a live family
+    of the same ``record_type``. At **family** scope it must not be the annotated family
+    itself: a family merged into itself would render nowhere at all. At **row** scope it
+    may be — "this occurrence is absorbed into the family it sits in" is a coherent
+    ruling (the row moves to the appendix, its siblings keep rendering live), and it is
+    exactly the state :meth:`CollisionResolver.narrow` produces when it pins a
+    collision-resolving ``merged-into`` family verdict to its rows (#116): the same rekey
+    that narrows the verdict also moves those rows into the merge target. Refusing it
+    here would make `pemr verify`'s "re-affirm it" notice impossible to follow for the
+    one status that most often carries it.
 
     Raises ``ValueError`` for an unknown ``record_type``/``status``/empty note or a bad
     merge target, :class:`FamilyNotFoundError` when a family target does not resolve, and
@@ -547,7 +577,7 @@ def annotate_record(
                 "--merged-into <BASE-OR-ID>; nothing was written"
             )
         merge_target = resolve_base(conn, record_type, merge_target)
-        if merge_target == base:
+        if merge_target == base and not record_id:
             raise ValueError(
                 f"cannot merge {record_type} {base[:12]}... into itself - the merged "
                 "family renders only under its target, so this would hide it "
@@ -741,6 +771,137 @@ def clear_curation(
                 )
     report.applied = apply
     return report
+
+
+# --------------------------------------------------------------------------- #
+# The `pemr rekey` collision seam (issue #116)
+# --------------------------------------------------------------------------- #
+
+class CollisionResolver:
+    """The overlay half of :class:`dedup.CollisionResolver` — the seam `rekey` asks
+    "did a human already settle this pair?" through.
+
+    Injected rather than imported: this module imports :mod:`dedup`, so ``dedup`` cannot
+    import it back. ``dedup`` declares the shape as a ``Protocol`` and the CLI builds the
+    implementation, which keeps every `curation`-table SQL statement here (the
+    :func:`retire_row_verdicts` precedent) and keeps the import graph acyclic.
+    """
+
+    def __init__(self, verdicts: VerdictMap) -> None:
+        self._verdicts = verdicts
+
+    def covering(
+        self, record_type: str, row: sqlite3.Row, clash: sqlite3.Row
+    ) -> dict | None:
+        """The verdict that settles a collision between two rows, or None.
+
+        Either row, either scope: the operator annotated whichever of the pair they were
+        looking at, and a family verdict on one is as much a ruling on the pair as a row
+        verdict on the other. Resolution runs through :meth:`VerdictMap.for_row`, so the
+        row-over-family precedence rule stays defined in exactly one place.
+
+        The **stored** ``dedup_base`` is the lookup key, not the recomputed one: the
+        human ruled on the family as it exists today, before this rekey moves it.
+        """
+        pk = f"{record_type}_id"
+        for candidate in (row, clash):
+            verdict = self._verdicts.for_row(
+                record_type, candidate["dedup_base"], candidate[pk]
+            )
+            if verdict is not None and verdict["status"] in RESOLVING_STATUSES:
+                return verdict
+        return None
+
+    def narrow(
+        self,
+        conn: sqlite3.Connection,
+        record_type: str,
+        verdict: dict,
+        covered_row_ids: Iterable[int],
+        base_map: dict[str, str],
+    ) -> tuple[str, list[int]]:
+        """Pin a collision-resolving family verdict to the rows it actually ruled on.
+
+        Returns ``(action, row_ids)`` where ``action`` is ``"unchanged"`` or
+        ``"narrowed"``. **Caller-managed transaction** (the
+        :func:`retire_row_verdicts` precedent): `rekey` writes the keys and this
+        conversion in one ``with conn:``, because a committed rekey whose authorizing
+        verdict was left orphaned is the exact failure the seam exists to avoid.
+
+        A *row-scoped* verdict needs nothing (``"unchanged"``): it already names exactly
+        one row, `rekey` never renumbers a row id, and its stored base is a breadcrumb
+        (migration 010).
+
+        A *family-scoped* one may **not** simply follow its family onto the surviving
+        base. Resolution merges a judged family with an unjudged one, so the surviving
+        family is larger than the one the human ruled on: a verdict that moved wholesale
+        would silently extend over a row nobody judged, and — for the
+        :data:`APPENDIX_STATUSES` that resolve collisions — would drop that previously
+        live row out of its clinical section. Criticality-blind by design: no live row
+        ever silently leaves its rendered section, whatever it records. So the verdict is
+        narrowed instead, to row-scoped verdicts on ``covered_row_ids`` — the rows whose
+        *stored* ``dedup_base`` was the verdict's, i.e. its extension at ruling time.
+
+        ``status``, ``note``, ``attributed_to`` and ``created_at`` are carried verbatim
+        onto each pinned row (the first by ``UPDATE``, so the original ledger row itself
+        survives), and ``merged_into_base`` follows ``base_map`` when the merge target
+        moved in this same run. The breadcrumb ``dedup_base`` deliberately stays the
+        family the ruling was made in — which is what `pemr verify` notices, so the
+        narrowing is announced rather than silent.
+
+        A row that already carries its **own** row-scoped verdict is skipped: that
+        verdict already wins over the family one for that row (:meth:`VerdictMap.for_row`),
+        so the family verdict never applied there and narrowing must not overwrite a
+        second human ruling. If that skip leaves nothing to pin — defensive; the verdict
+        was reached *through* a row that had none — nothing is written at all
+        (``"unchanged"``): a verdict is a human's, and nothing here deletes one outright.
+        """
+        if verdict["record_id"]:
+            return ("unchanged", [])
+        _require_type(record_type)
+        base = verdict["dedup_base"]
+        target = verdict["merged_into_base"]
+        new_target = base_map.get(target, target) if target else target
+        taken = {
+            int(r["record_id"])
+            for r in conn.execute(
+                "SELECT record_id FROM curation "
+                "WHERE record_type = ? AND record_id <> 0",
+                (record_type,),
+            ).fetchall()
+        }
+        pinned = sorted(
+            {int(rid) for rid in covered_row_ids if int(rid)} - taken
+        )
+        if not pinned:
+            return ("unchanged", [])
+        conn.execute(
+            "UPDATE curation SET record_id = ?, merged_into_base = ? "
+            "WHERE record_type = ? AND dedup_base = ? AND record_id = 0",
+            (pinned[0], new_target, record_type, base),
+        )
+        for row_id in pinned[1:]:
+            # The same ruling, restated on a sibling it already covered - not a new
+            # verdict, hence the verbatim note/attribution/timestamp.
+            conn.execute(
+                "INSERT INTO curation (record_type, dedup_base, record_id, status, "
+                "note, merged_into_base, attributed_to, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (record_type, base, row_id, verdict["status"], verdict["note"],
+                 new_target, verdict["attributed_to"], verdict["created_at"]),
+            )
+        return ("narrowed", pinned)
+
+
+def collision_resolver(conn: sqlite3.Connection) -> CollisionResolver:
+    """Build the resolver `pemr rekey` adjudicates its collisions through.
+
+    One :func:`load_verdicts` query up front (the render/verify hot-path idiom) — a rekey
+    scans every row of every table, and a per-collision SELECT would be the wrong shape.
+    A pre-008 snapshot yields an empty map, hence a resolver that resolves nothing, which
+    is exactly today's behaviour.
+    """
+    return CollisionResolver(load_verdicts(conn))
 
 
 def describe(verdict: dict) -> str:

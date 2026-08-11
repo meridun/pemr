@@ -159,7 +159,16 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     A **row-scoped** verdict (#114) is checked against its row, not its family: it
     resolves by row id, so a rekey no longer orphans it - only the row's removal does.
     Its stored `dedup_base` is a breadcrumb that may legitimately be stale, so the family
-    check is deliberately skipped for it.
+    check is deliberately skipped for it - but a stale breadcrumb is *reported*, because
+    it means a rekey moved the row out of the family the human ruled in and the ruling
+    may want re-affirming. That notice is also how a collision-resolving **narrowing**
+    (#116) announces itself: a family verdict that settles a `rekey` collision is pinned
+    to exactly the rows it already covered - so the merged-in row it never judged keeps
+    rendering in its own clinical section - and this is where the human is told to
+    re-affirm or re-rule. Re-annotating collapses the breadcrumb and the notice with it -
+    including for `merged-into`, whose re-affirm names the row's own (post-rekey) family,
+    which :func:`curation.annotate_record` accepts at row scope precisely so this notice
+    can be answered without downgrading or lifting the ruling.
     """
     if not curation.has_table(conn):
         return
@@ -178,12 +187,24 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
         if record_id:
             pk = f"{record_type}_id"
             live = conn.execute(
-                f"SELECT 1 FROM {record_type} WHERE {pk} = ?", (record_id,)
+                f"SELECT dedup_base FROM {record_type} WHERE {pk} = ?", (record_id,)
             ).fetchone()
             if live is None:
                 report.warnings.append(
                     f"curation verdict {record_type} row #{record_id} names no live "
                     "row (removed?) - lift it with `pemr record annotate --clear --row`"
+                )
+            elif live["dedup_base"] != base:
+                # The verdict still resolves (by row id), so this is a notice, not an
+                # orphan: a rekey moved the row into a different family than the one it
+                # was ruled in - including the narrowing that resolves a collision
+                # (#116), where the row joined a family it was never judged against.
+                report.warnings.append(
+                    f"curation verdict {record_type} row #{record_id} was recorded in "
+                    f"family {short}... but the row now sits in "
+                    f"{str(live['dedup_base'])[:12]}... - a rekey moved it; re-affirm "
+                    f"with `pemr record annotate --row {record_type} {record_id}` or "
+                    "lift it with `--clear --row`"
                 )
         elif not dedup.load_family(conn, record_type, base):
             report.warnings.append(
