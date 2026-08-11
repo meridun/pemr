@@ -359,7 +359,12 @@ def enum_token(value: object) -> str:
 
 
 def _date_only(value: object) -> str:
-    """Date portion of an ISO datetime/date string ('2026-01-02T09:00' -> '2026-01-02')."""
+    """Date portion of an ISO datetime/date string ('2026-01-02T09:00' -> '2026-01-02').
+
+    The identity granularity for every dated type except ``observation``: medication
+    start / procedure date / appointment date, and — since issue #117 —
+    ``lab_result.collected_at``, whose documents state the same draw at mixed precision.
+    """
     if value is None:
         return ""
     text = str(value).strip()
@@ -370,13 +375,14 @@ def _norm_ts(value: object) -> str:
     """Normalize an ISO date/datetime for use as a dedup-key identity part, keeping
     *full precision* (unlike :func:`_date_only`, which truncates to the date).
 
-    A timestamped draw (``2026-01-02T09:00``) and a bare-date draw (``2026-01-02``)
-    stay distinct, and two draws on the same day at different times keep distinct keys
-    — so serial same-day repeats (GTT, peri-op, inpatient q6h) survive as separate
-    rows. A re-read/correction of the *same* draw carries the same timestamp, collides,
-    and surfaces as a CONFLICT via :data:`_COMPARE_FIELDS`. Only the ``T``/space
-    separator and surrounding/collapsed whitespace are normalized, so trivial
-    formatting differences don't fork the key."""
+    Its one remaining consumer is ``observation.observed_at``: a timestamped
+    observation (``2026-01-02T09:00``) and a bare-date one (``2026-01-02``) stay
+    distinct, and two observations on the same day at different times keep distinct
+    keys, so serial same-day repeats survive as separate rows. A re-read/correction of
+    the *same* observation carries the same timestamp, collides, and surfaces as a
+    CONFLICT via :data:`_COMPARE_FIELDS`. Only the ``T``/space separator and
+    surrounding/collapsed whitespace are normalized, so trivial formatting differences
+    don't fork the key."""
     if value is None:
         return ""
     return _WS.sub(" ", str(value).strip().replace("T", " "))
@@ -409,7 +415,7 @@ def _key_parts(
         return key_token(row.get(field_name), dictionary)
 
     if record_type == "lab_result":
-        return [person_id, kt("test_name"), _norm_ts(row.get("collected_at"))]
+        return [person_id, kt("test_name"), _date_only(row.get("collected_at"))]
     if record_type == "medication":
         return [person_id, n("name"), _collapse(str(row.get("dose") or "")),
                 _date_only(row.get("started_on"))]
@@ -614,10 +620,11 @@ class CommitSummary:
 # Identity fields (those feeding the dedup_key) are equal by construction — a
 # difference there yields a *different* key and hence a new row, never a collision —
 # so they are deliberately excluded here. The measured value is deliberately NOT an
-# identity field: the lab/observation keys carry temporal identity (collected_at /
-# observed_at at full precision) but not the value, so a corrected or re-read value on
-# an otherwise-matching key collides and surfaces here as a CONFLICT instead of a
-# silent duplicate — hence value_num/value_text appear below.
+# identity field: the lab and observation keys carry temporal identity — the collection
+# *date* for lab_result (issue #117), the full observed_at timestamp for observation —
+# but not the value, so a corrected or re-read value on an otherwise-matching key
+# collides and surfaces here as a CONFLICT instead of a silent duplicate — hence
+# value_num/value_text appear below.
 _COMPARE_FIELDS: dict[str, list[str]] = {
     "lab_result": ["value_num", "value_text", "unit", "ref_low", "ref_high", "flag", "loinc"],
     "medication": ["route", "frequency", "ended_on", "prescriber", "status"],
@@ -835,15 +842,23 @@ def commit_extraction(
             if prior is None:
                 seen[base] = (index, row)
             elif not _rows_equal(record_type, prior[1], row):
+                # Adding times only helps where the key still keeps the time
+                # component, which after issue #117 is `observation` alone —
+                # lab_result keys on the collection *date*, so for it that advice
+                # cannot separate the rows.
+                time_hint = (
+                    "If the source gives distinct times, add them (AGENTS.md "
+                    "date-precision rule). "
+                    if record_type == "observation"
+                    else ""
+                )
                 raise ValidationError(
                     f"{record_type}: rows {prior[0]} and {index} of this submission "
                     f"derive the same dedup_key "
                     f"({identity_label(record_type, row, person_id, dictionary)}) "
-                    "but carry different values. If the source gives distinct "
-                    "collection times, add them (AGENTS.md date-precision rule). If "
-                    "these are two genuine same-day results the source cannot "
-                    "timestamp, commit them in separate submissions and resolve the "
-                    "conflict with `--keep both`"
+                    f"but carry different values. {time_hint}If these are two genuine "
+                    "same-day results, commit them in separate submissions and "
+                    "resolve the conflict with `--keep both`"
                 )
         # Still pass 1 (nothing written yet): a stored row whose frozen key no longer
         # matches its recompute would be missed by pass 2's dedup, forking the fact.
