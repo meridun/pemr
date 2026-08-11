@@ -304,7 +304,7 @@ Each typed/observation row computes a deterministic `dedup_key` from normalized 
 so the *same clinical fact* extracted from two different documents collapses to one row.
 
 ```
-lab_result.dedup_key   = hash(person_id | key_token(test_name) | collected_at)
+lab_result.dedup_key   = hash(person_id | key_token(test_name) | date_only(collected_at))
 medication.dedup_key    = hash(person_id | norm(name) | dose | started_on)
 procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
@@ -498,15 +498,55 @@ already been recorded on the pair, it is settled by that verdict and the table w
 the *same* standing fact restated by several documents, which is precisely what those two
 statuses record.
 
+`rekey` is likewise a **required upgrade step for the `lab_result` date-only key** (issue
+#117). Every stored lab whose `collected_at` carries a time recomputes to a new key the
+moment that change lands, so run the `pemr rekey` dry-run and then `pemr rekey --apply`
+before the next `commit-extraction` that restates one of those draws. As with 006 nothing is
+silent — the drift guard raises `DictionaryDriftError` naming `pemr rekey --apply` and writes
+nothing — and this note is the signpost, not the enforcement. Read the dry-run's collisions
+with the key change in mind, because `rekey`'s vocabulary describes the shape, not the cause:
+
+- a `lab_result` **`"doubled"`** collision (same payload, two keys) is exactly the
+  mixed-precision duplicate pair this change fixes — one draw stored twice. Resolve it with
+  `pemr record rm` on the redundant row, per `rekey`'s own guidance.
+- a `lab_result` **`"fused"`** collision (different payloads onto one key) most likely means
+  two *genuine* same-day draws already stored as separate rows, **not** a dictionary fault —
+  the message's dictionary diagnosis is wrong here. Re-admit the second through
+  `review-conflicts --resolve --keep both` rather than editing the dictionary.
+
+Either way the collision quarantines only `lab_result`; the other tables are rekeyed.
+
 The **measured value is deliberately *not* in the key** — temporal identity carries the
-draw instead. `collected_at`/`observed_at` are used at full precision (timestamp when the
-document gives one, date when it only gives a date), not truncated to the date. Two draws
-of the same analyte on the same day at different times (serial glucose, peri-op, inpatient
-q6h) get distinct timestamps → distinct keys → two rows preserved; a correction or OCR
-re-read of the *same* draw carries the same timestamp → collides → surfaces as a conflict
-(below). When only a date is available, same-day differing values collide → conflict; that
-safety bias is intentional (a spurious conflict on a genuine repeat is human-recoverable, a
-silent duplicate of a correction poisons `trends`/brief/`query` irrecoverably).
+draw instead. The two temporal types differ in *how much* of that timestamp is identity.
+
+`observation.observed_at` is used at **full precision** (timestamp when the document gives
+one, date when it only gives a date), not truncated to the date. Two readings of the same
+measurement on the same day at different times get distinct timestamps → distinct keys →
+two rows preserved; a correction or OCR re-read of the *same* reading carries the same
+timestamp → collides → surfaces as a conflict (below). When only a date is available,
+same-day differing values collide → conflict; that safety bias is intentional (a spurious
+conflict on a genuine repeat is human-recoverable, a silent duplicate of a correction
+poisons `trends`/brief/`query` irrecoverably).
+
+`lab_result.collected_at` is **truncated to the date** for key purposes (issue #117); the
+column itself still stores the most precise prefix the source gave, and the read layer
+(`trends`, `query labs`, render) uses that full value. Full precision in the key forked one
+draw into two rows whenever two documents stated it at different precision — `2026-04-01`
+in a summary, `2026-04-01T09:15` in the lab report — which is the common real-world case
+and the one layer-2 dedup exists to collapse. The cost is that a genuine second draw on the
+same day (a GTT timepoint) now collides on the date-only key and **stages a conflict**
+rather than landing as a second clean row; it is re-admitted with `review-conflicts
+--resolve --keep both`. That trade is this issue's recorded `decision:` — same-day distinct
+draws are rare, mixed-precision restatements of one draw are not, and the conflict path
+makes the rare case recoverable while the common case is now correct by construction.
+`collected_at` is deliberately **not** in `_COMPARE_FIELDS["lab_result"]`: comparing it
+would turn every mixed-precision pair into a conflict, recreating the same bug as noise.
+The first document to state a draw therefore fixes its stored precision — a later
+restatement with a time reports `duplicate` and does not upgrade the column. The same
+exclusion means a same-day repeat draw with an *identical* value (e.g. a QC re-run
+confirming the prior result) compares equal on every `_COMPARE_FIELDS` entry and so
+collapses to one row reported as `duplicate` too — only a *differing* value on a same-day
+repeat takes the conflict path above.
 
 **Conflict handling.** On dedup-key collision with *differing* non-key fields (e.g. a
 corrected value), don't silently drop — write to a `conflict` staging table and surface
@@ -580,9 +620,12 @@ that table until the collision is fixed.
 derive the same key and disagree fail validation (pass 1) and roll the batch back, naming
 the identity and the recovery path. A conflict whose "existing" side was inserted
 milliseconds earlier in the same batch has no independent provenance to adjudicate
-against; the overwhelmingly likely cause is a collection time the source did give and the
-extraction dropped. Two *identical* rows in one payload stay benign (first inserts, second
-reports `duplicate`) — that is an agent listing one fact twice. Genuine untimestampable
+against; for `observation` the overwhelmingly likely cause is a time the source did give and
+the extraction dropped, and the rejection message says so. For `lab_result` it is not —
+the key holds only the collection date (above), so adding times cannot separate the rows and
+the message omits that advice: two same-day draws go through two submissions plus
+`--keep both`. Two *identical* rows in one payload stay benign (first inserts, second
+reports `duplicate`) — that is an agent listing one fact twice. Genuine same-day
 repeats go through two submissions plus `--keep both`, which keeps the human sign-off in
 the loop rather than letting an agent self-admit near-duplicates.
 

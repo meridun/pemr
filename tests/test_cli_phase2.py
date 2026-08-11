@@ -1,11 +1,12 @@
 """End-to-end CLI wiring for phase 2: ingest -> commit-extraction -> review-conflicts."""
 
+import hashlib
 import json
 import zipfile
 
 import pytest
 
-from pemr import cli, curation, db, render, verify
+from pemr import cli, curation, db, dedup, render, verify
 
 
 def _run(tmp_path, *argv):
@@ -1107,3 +1108,158 @@ def test_curated_synonyms_dedup_across_documents_through_the_cli(ready, capsys):
     # nothing to move and no collision to report.
     assert _run(tmp_path, "rekey") == 0
     assert "all dedup keys already match the current dictionary" in capsys.readouterr().out
+
+
+# --- issue #117: lab_result keys on the collection date, walked through the real CLI ---
+
+def _ingest_lab_document(tmp_path, name, text, payload):
+    """Ingest a scan and commit one `lab_result` payload against it, CLI-only."""
+    scan = tmp_path / name
+    scan.write_bytes(text)
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    doc = _document_id(tmp_path)[-1]["document_id"]
+    json_path = _write_json(tmp_path, f"{name}.json", {"lab_result": [payload]})
+    return _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(json_path))
+
+
+def test_mixed_precision_same_draw_dedups_at_the_cli(ready, capsys):
+    """The reported bug (pemr-data#9) end to end: a summary states the draw as a bare
+    date, the lab report timestamps it. One fact, so one row -- and the read layer still
+    sees the precision the first document gave."""
+    tmp_path = ready
+    payload = {"test_name": "HbA1c", "value_num": 5.7, "unit": "%",
+               "ref_low": 4.0, "ref_high": 5.6}
+    assert _ingest_lab_document(tmp_path, "summary.txt", b"hba1c 5.7 (no time given)",
+                                {**payload, "collected_at": "2026-04-01"}) == 0
+    assert "1 new, 0 duplicate" in capsys.readouterr().out
+    assert _ingest_lab_document(tmp_path, "labreport.txt", b"hba1c 5.7 collected 09:15",
+                                {**payload, "collected_at": "2026-04-01T09:15"}) == 0
+    assert "0 new, 1 duplicate" in capsys.readouterr().out
+
+    assert _run(tmp_path, "query", "labs", "--person", "jane-doe", "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["test_name"], r["collected_at"]) for r in rows] == [("HbA1c", "2026-04-01")]
+
+
+def test_same_day_distinct_draw_is_staged_and_keep_both_admits_it(ready, capsys):
+    """The accepted cost of the date-only key, walked through the operator's recovery:
+    a genuine second same-day draw (a GTT timepoint) collides and STAGES -- it is never
+    silently doubled and never silently dropped -- and `--keep both` admits it."""
+    tmp_path = ready
+    common = {"test_name": "glucose", "unit": "mg/dL"}
+    assert _ingest_lab_document(tmp_path, "gtt-0h.txt", b"glucose 92 fasting",
+                                {**common, "collected_at": "2026-04-01T08:00",
+                                 "value_num": 92}) == 0
+    assert _ingest_lab_document(tmp_path, "gtt-2h.txt", b"glucose 130 two hour",
+                                {**common, "collected_at": "2026-04-01T14:00",
+                                 "value_num": 130}) == 0
+    assert "0 new, 0 duplicate, 0 enriched, 1 conflict" in capsys.readouterr().out
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both",
+                "--note", "GTT timepoints") == 0
+    out = capsys.readouterr().out
+    assert "occurrence 1" in out and out.isascii()
+
+    assert _run(tmp_path, "query", "labs", "--person", "jane-doe", "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["value_num"], r["collected_at"]) for r in rows] == [
+        (92.0, "2026-04-01T08:00"), (130.0, "2026-04-01T14:00")]
+
+
+def test_observation_keeps_its_full_precision_key_at_the_cli(ready, capsys):
+    """The scope boundary: `observation` was deliberately left on `_norm_ts`, so the
+    same mixed-precision pair still forks there -- two rows, no conflict."""
+    tmp_path = ready
+    for name, observed_at in (("obs1.txt", "2026-04-02"), ("obs2.txt", "2026-04-02T07:30")):
+        scan = tmp_path / name
+        scan.write_bytes(b"weight 180 lb")
+        assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                    "--sources", str(tmp_path / "sources")) == 0
+        doc = _document_id(tmp_path)[-1]["document_id"]
+        payload = _write_json(tmp_path, f"{name}.json", {"observation": [
+            {"obs_type": "vital", "key": "weight", "observed_at": observed_at,
+             "value_num": 180, "unit": "lb"}]})
+        assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                    "--json", str(payload)) == 0
+        assert "1 new" in capsys.readouterr().out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        counts = conn.execute("SELECT COUNT(*), COUNT(DISTINCT dedup_key) "
+                              "FROM observation").fetchone()
+    finally:
+        conn.close()
+    assert tuple(counts) == (2, 2)
+
+
+def _seed_pre_117_mixed_precision_pair(tmp_path):
+    """The state an existing database is in when this change lands: one draw stored
+    twice because the two documents dated it differently, both rows on the *legacy*
+    full-precision keys. Inserted directly -- `commit-extraction` would now dedup them."""
+    scan = tmp_path / "legacy.txt"
+    scan.write_bytes(b"hba1c 5.7 stated twice")
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    row = {"test_name": "HbA1c", "value_num": 5.7, "unit": "%"}
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        person_id = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+        doc = conn.execute("SELECT document_id FROM document").fetchone()["document_id"]
+        for collected_at in ("2026-04-01", "2026-04-01T09:15"):
+            legacy = hashlib.sha256("|".join([          # pre-#117: _norm_ts(collected_at)
+                str(person_id), dedup.key_token(row["test_name"]),
+                collected_at.replace("T", " "),
+            ]).encode("utf-8")).hexdigest()
+            dedup._insert_record(conn, "lab_result",
+                                 {**row, "collected_at": collected_at},
+                                 person_id, doc, legacy)
+        conn.commit()
+    finally:
+        conn.close()
+    return _write_json(tmp_path, "legacy.json",
+                       {"lab_result": [{**row, "collected_at": "2026-04-01"}]})
+
+
+def test_rekey_is_the_migration_for_a_pre_change_database(ready, capsys):
+    """The upgrade path an existing database takes, at the CLI: the drift guard refuses
+    to file the fact a third time, `rekey` names the pair as `doubled` (data, not
+    dictionary) and writes nothing, `record rm` clears it, and the same document then
+    dedups cleanly."""
+    tmp_path = ready
+    payload = _seed_pre_117_mixed_precision_pair(tmp_path)
+    doc = _document_id(tmp_path)[-1]["document_id"]
+    capsys.readouterr()
+
+    # 1. Nothing silent: the next commit touching that identity is refused outright.
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload)) == 1
+    err = capsys.readouterr().err
+    assert "pemr rekey --apply" in err and err.isascii()
+
+    # 2. The dry run diagnoses it as doubled DATA and quarantines only lab_result.
+    assert _run(tmp_path, "rekey", "--json") == 1
+    report = json.loads(capsys.readouterr().out)
+    assert [c["kind"] for c in report["collisions"]] == ["doubled"]
+    assert report["skipped"] == ["lab_result"]
+    assert "pemr record rm" in report["collisions"][0]["message"]
+
+    # 3. `--apply` still writes nothing for the blocked table.
+    assert _run(tmp_path, "rekey", "--apply") == 1
+    capsys.readouterr()
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        assert conn.execute("SELECT COUNT(DISTINCT dedup_key) AS n "
+                            "FROM lab_result").fetchone()["n"] == 2
+    finally:
+        conn.close()
+
+    # 4. The documented resolution, then a clean rekey and a clean re-commit.
+    assert _run(tmp_path, "record", "rm", "lab_result", "2", "--apply") == 0
+    assert "removed lab_result #2" in capsys.readouterr().out
+    assert _run(tmp_path, "rekey") == 0
+    assert "all dedup keys already match" in capsys.readouterr().out
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload)) == 0
+    assert "0 new, 1 duplicate" in capsys.readouterr().out
