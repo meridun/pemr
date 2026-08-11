@@ -270,8 +270,11 @@ Agents never resolve staged conflicts silently.
   document simply didn't repeat. On the dated types an unstated field IS a clearing and is written
   as one.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
-  that is an extraction error, not a conflict. Re-read the source for collection times; if there
-  genuinely are none, submit them separately and ask the human about `keep both`.
+  that is an extraction error, not a conflict. For `observation`, re-read the source for times; if
+  there genuinely are none, submit them separately and ask the human about `keep both`. For
+  `lab_result` the key holds only the collection **date** (issue #117), so a time cannot separate
+  two same-day draws — submit them separately and ask the human about `keep both`. The rejection
+  message names the applicable path.
 
 ### 6. Medication-interaction section
 

@@ -604,9 +604,11 @@ def test_far_apart_correction_conflicts_not_duplicates(conn):
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
 
 
-def test_serial_same_day_draws_are_distinct_rows(conn):
-    # Two genuine draws on the same day at different times (GTT / peri-op / inpatient
-    # q6h) carry distinct timestamps -> distinct keys -> two rows, no data loss.
+def test_serial_same_day_draws_in_one_submission_are_rejected(conn):
+    # Issue #117 flipped the lab key to the collection DATE, so two same-day timepoints
+    # (GTT / peri-op / inpatient q6h) of ONE submission now derive one key with differing
+    # values -> pass-1 rejection, not two rows. The message must not send the agent back
+    # to the source for times that would be truncated away.
     d = dedup.load_dictionary(DICT_PATH)
     doc = _make_document(conn)
     rows = [
@@ -615,9 +617,71 @@ def test_serial_same_day_draws_are_distinct_rows(conn):
         {"test_name": "Glucose", "collected_at": "2026-04-01T14:00", "value_num": 130,
          "unit": "mg/dL"},
     ]
-    summary = dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
-    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0, "promoted": 0}
-    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+    with pytest.raises(dedup.ValidationError) as exc:
+        dedup.commit_extraction(conn, doc, {"lab_result": rows}, d)
+    message = str(exc.value)
+    assert "rows 0 and 1" in message
+    assert "person 1 | glucose | 2026-04-01" in message   # the identity, date-only
+    assert "--keep both" in message                       # the recovery that works
+    assert "date-precision rule" not in message           # the advice that no longer can
+    assert message.isascii()                              # cp1252 console (issue #23)
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 0
+
+
+def test_mixed_precision_same_draw_dedups_to_one_row(conn):
+    # Issue #117 headline (pemr-data#9): a summary states the draw as a bare date and the
+    # lab report timestamps it. Same person/analyte/value/unit/refs -> one clinical fact,
+    # which the full-precision key used to fork into two rows.
+    d = dedup.load_dictionary(DICT_PATH)
+    payload = {"value_num": 95, "unit": "mg/dL", "ref_low": 70, "ref_high": 99}
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-04-01", **payload}]}, d)
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-04-01T09:15", **payload}]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 1, "enriched": 0, "conflict": 0, "promoted": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+    # First writer fixes the stored precision: collected_at is payload, not compared.
+    assert conn.execute(
+        "SELECT collected_at FROM lab_result").fetchone()["collected_at"] == "2026-04-01"
+
+
+def test_same_day_distinct_draw_stages_a_conflict(conn):
+    # The cost of the date-only key, and its recovery: a genuine second same-day draw
+    # (a GTT timepoint) collides instead of landing as a second clean row -- but it is
+    # STAGED, never dropped, and `--keep both` admits it as occurrence 1.
+    d = dedup.load_dictionary(DICT_PATH)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-04-01T08:00", "value_num": 92,
+         "unit": "mg/dL"}]}, d)
+    summary = dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-04-01T14:00", "value_num": 130,
+         "unit": "mg/dL"}]}, d)
+    assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1, "promoted": 0}
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"], keep="both")
+    rows = conn.execute(
+        "SELECT * FROM lab_result ORDER BY dedup_occurrence").fetchall()
+    assert [r["dedup_occurrence"] for r in rows] == [0, 1]
+    assert [r["value_num"] for r in rows] == [92, 130]
+
+
+def test_lab_key_is_date_only_and_observation_is_not(conn):
+    """The scope boundary issue #117 draws: `lab_result` truncates `collected_at` to the
+    date, `observation` keeps `observed_at` at full precision."""
+    d = dedup.load_dictionary(DICT_PATH)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    bare = {"test_name": "Glucose", "collected_at": "2026-04-01", "value_num": 95}
+    timed = {"test_name": "Glucose", "collected_at": "2026-04-01T09:15", "value_num": 95}
+    assert dedup.dedup_key("lab_result", bare, pid, d) \
+        == dedup.dedup_key("lab_result", timed, pid, d)
+
+    o_bare = {"obs_type": "vital", "key": "systolic", "observed_at": "2026-04-01",
+              "value_num": 120}
+    o_timed = {"obs_type": "vital", "key": "systolic", "observed_at": "2026-04-01T09:15",
+               "value_num": 120}
+    assert dedup.dedup_key("observation", o_bare, pid, d) \
+        != dedup.dedup_key("observation", o_timed, pid, d)
 
 
 def test_observation_correction_conflicts_not_duplicates(conn):
@@ -686,13 +750,16 @@ def test_intra_payload_collision_checked_per_record_type(conn):
     """Distinct types never collide with each other, and a same-key observation pair is
     caught the same way a lab pair is."""
     doc = _make_document(conn)
-    with pytest.raises(dedup.ValidationError, match="observation: rows 0 and 1"):
+    with pytest.raises(dedup.ValidationError, match="observation: rows 0 and 1") as exc:
         dedup.commit_extraction(conn, doc, {"observation": [
             {"obs_type": "vital", "key": "systolic", "observed_at": "2024-04-01",
              "value_num": 120},
             {"obs_type": "vital", "key": "systolic", "observed_at": "2024-04-01",
              "value_num": 138},
         ]})
+    # `observation` keeps the time in its key, so "add the times" is still real advice
+    # here -- the clause issue #117 dropped for `lab_result`.
+    assert "date-precision rule" in str(exc.value)
 
 
 # --- occurrence numbering -----------------------------------------------------
@@ -1050,7 +1117,7 @@ def test_rekey_over_unqualified_names_reports_no_changes(conn):
         legacy = "|".join([
             str(pid),
             dedup.norm(row["test_name"], d),                    # pre-fix: norm(), not key_token()
-            row["collected_at"].replace("T", " "),
+            row["collected_at"].replace("T", " ").split(" ")[0],   # issue #117: date only
         ])
         assert dedup.dedup_key("lab_result", row, pid, d) \
             == hashlib.sha256(legacy.encode("utf-8")).hexdigest(), row["test_name"]
@@ -1181,6 +1248,43 @@ def test_rekey_names_a_doubled_fact_instead_of_blaming_the_dictionary(conn):
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM lab_result WHERE dedup_key = 'stale-base-0000'"
     ).fetchone()["n"] == 1
+
+
+def test_rekey_reports_a_mixed_precision_pair_as_doubled(conn):
+    """The issue-#117 upgrade path: a database written *before* the date-only lab key
+    holds the reported bug's pair -- one draw under two keys because the documents stated
+    it at different precision. `rekey` is the migration, and it names the pair correctly:
+    the dictionary is fine, the data is doubled, so `pemr record rm` is the fix."""
+    import hashlib
+
+    d = dedup.load_dictionary(DICT_PATH)
+    pid = conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    doc = _make_document(conn)
+    payload = {"test_name": "Glucose", "value_num": 95, "unit": "mg/dL"}
+    # Seed the pre-change state directly: commit_extraction would now dedup these.
+    for collected_at in ("2026-04-01", "2026-04-01T09:15"):
+        legacy = hashlib.sha256("|".join([                     # pre-#117: _norm_ts()
+            str(pid),
+            dedup.key_token(payload["test_name"], d),
+            collected_at.replace("T", " "),
+        ]).encode("utf-8")).hexdigest()
+        dedup._insert_record(conn, "lab_result",
+                             {**payload, "collected_at": collected_at}, pid, doc, legacy)
+    conn.commit()
+
+    report = dedup.rekey(conn, d)
+    assert [c.kind for c in report.collisions] == ["doubled"]
+    assert "pemr record rm" in report.collisions[0].message
+    assert report.blocked == ["lab_result"]
+    # Dry run wrote nothing: both rows still sit on their legacy keys.
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+
+    report = dedup.rekey(conn, d, apply=True)
+    assert [c.kind for c in report.collisions] == ["doubled"]
+    assert report.blocked == ["lab_result"]
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 2
+    assert len({r["dedup_key"] for r in conn.execute(
+        "SELECT dedup_key FROM lab_result")}) == 2      # left on stored keys, unfused
 
 
 def test_rekey_still_blames_the_dictionary_when_it_fuses_distinct_facts(conn):
