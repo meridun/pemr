@@ -1633,6 +1633,37 @@ def test_one_resolving_verdict_beside_an_unverdicted_row_still_resolves(conn):
         == [(albumin_id, "distinct")]
 
 
+def test_a_contradictory_pair_blocks_a_third_row_the_same_anchor_resolves(conn):
+    """Contradiction is judged per `(entry, clash)` pair against the first-seen anchor, so
+    a third row on the one key is adjudicated on its own: the contradictory pair blocks
+    while the third row's clash against that same anchor is settled by the family verdict.
+    The table is quarantined either way (issue #92), so the resolution says it was withheld
+    and not one row moves."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    dedup.commit_extraction(conn, _make_document(conn), {"lab_result": [
+        {"test_name": "SPEP Albumin", "collected_at": "2026-01-02", "value_num": 3.9},
+    ]}, dedup.load_dictionary(DICT_PATH))
+    third_id = max(_lab_rows(conn))
+    before = _keys(conn, "lab_result", "test_name")
+    _rule(conn, peaf_id, "distinct")                       # family, on the anchor
+    resolver = _rule(conn, albumin_id, "superseded", row=True)   # contradicts it
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM,
+                                           **{"spep albumin": "albumin"}),
+                         apply=True, resolver=resolver)
+
+    assert [(c.row_id, c.clash_row_id) for c in report.collisions] \
+        == [(albumin_id, peaf_id)]
+    assert [(v.row_id, v.settlement) for v in report.collisions[0].contradiction] \
+        == [(albumin_id, "merged"), (peaf_id, "distinct")]
+    # The third row carries no ruling of its own, so its pair holds exactly one verdict
+    # and resolves as it always did - the contradiction next door does not spread.
+    assert [(r.row_id, r.clash_row_id, r.settlement) for r in report.resolved] \
+        == [(third_id, peaf_id, "distinct")]
+    assert report.blocked == ["lab_result"] and report.writable() == []
+    assert _keys(conn, "lab_result", "test_name") == before
+
+
 def _generic_condition_pair(conn):
     """Two real, different conditions extracted under generic placeholder labels.
 
