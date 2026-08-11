@@ -34,7 +34,9 @@ family or to a **single row** (:meth:`curation.VerdictMap.for_row` resolves per 
 scope winning over family scope): ``superseded`` / ``erroneous-in-source`` /
 ``merged-into`` leave their section for a ``## Superseded / corrected``
 appendix, ``disputed`` renders in place with a ``[DISPUTED: ...]`` marker (and
-reach the brief's ``## Questions for the Clinician``), and ``confirmed`` renders exactly
+reach the brief's ``## Questions for the Clinician``), and ``confirmed`` — like
+``distinct``, the collision ruling that says both rows are real facts (issue #122) —
+renders exactly
 as before. Both new sections are **omitted entirely** when empty, so a record with no
 verdicts renders byte-identically to what it did before the overlay existed. This is
 still a pure function of DB state -- the filter is a read, and output changes after a
