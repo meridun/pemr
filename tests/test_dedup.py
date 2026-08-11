@@ -1544,6 +1544,95 @@ def test_rekey_is_idempotent_after_a_distinct_resolution(conn):
     assert (again.changes, again.collisions, again.resolved) == ([], [], [])
 
 
+# --- pairs ruled two opposite ways (issue #124) -------------------------------
+
+@pytest.mark.parametrize("one_fact_status", ["merged-into", "superseded"])
+@pytest.mark.parametrize("distinct_on", ["incumbent", "clash"])
+def test_contradictory_verdicts_block_the_collision(conn, one_fact_status, distinct_on):
+    """AC1-AC3. One row ruled *two facts* and the other ruled *one fact* is not a settled
+    pair, whichever row carries which - and the parametrization over `distinct_on` *is*
+    the bug: first-wins made the reported settlement a function of scan order, so a run
+    would tell the operator the opposite of what a human decided depending on which row
+    happened to be scanned first. The pair blocks like any unresolved collision, and no
+    narrowing is written on the strength of an arbitrarily chosen side."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    distinct_id, other_id = ((peaf_id, albumin_id) if distinct_on == "incumbent"
+                             else (albumin_id, peaf_id))
+    before = _keys(conn, "lab_result", "test_name")
+    _rule(conn, distinct_id, "distinct")
+    kwargs = ({"merged_into_base": _lab_rows(conn)[distinct_id]["dedup_base"]}
+              if one_fact_status == "merged-into" else {})
+    resolver = _rule(conn, other_id, one_fact_status, **kwargs)
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.resolved == []
+    assert [(c.row_id, c.clash_row_id, c.kind) for c in report.collisions] \
+        == [(albumin_id, peaf_id, "fused")]
+    assert report.blocked == ["lab_result"] and report.writable() == []
+    # Both rulings are reported, in (entry row, clash row) order, with the settlements
+    # that disagree - never one side presented as the answer.
+    expected = {distinct_id: ("distinct", "distinct"),
+                other_id: (one_fact_status, "merged")}
+    assert [(v.row_id, v.status, v.settlement, v.scope)
+            for v in report.collisions[0].contradiction] == [
+        (albumin_id, *expected[albumin_id], "family"),
+        (peaf_id, *expected[peaf_id], "family")]
+    assert "contradictory verdicts" in report.collisions[0].message
+    assert report.collisions[0].message.isascii()            # issue #23
+    # Nothing was written: not the keys (the #92 quarantine)...
+    assert _keys(conn, "lab_result", "test_name") == before
+    # ...and not the verdicts either - both are still the family-scoped rulings the
+    # operator recorded, so re-ruling one of them is all that is needed.
+    assert sorted(r["record_id"] for r in
+                  conn.execute("SELECT record_id FROM curation")) == [0, 0]
+
+
+@pytest.mark.parametrize("first_status,second_status,settlement", [
+    ("distinct", "distinct", "distinct"),
+    ("merged-into", "superseded", "merged"),
+])
+def test_agreeing_resolving_verdicts_on_both_rows_still_resolve(
+    conn, first_status, second_status, settlement
+):
+    """AC4 regression. Two rulings that answer the identity question the *same* way are
+    not a contradiction - they are the pre-#124 "one resolving verdict wins" case with a
+    redundant second ruling, and it must resolve exactly as it always did."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    kwargs = ({"merged_into_base": _lab_rows(conn)[albumin_id]["dedup_base"]}
+              if first_status == "merged-into" else {})
+    _rule(conn, peaf_id, first_status, **kwargs)
+    kwargs = ({"merged_into_base": _lab_rows(conn)[peaf_id]["dedup_base"]}
+              if second_status == "merged-into" else {})
+    resolver = _rule(conn, albumin_id, second_status, **kwargs)
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == [] and report.blocked == []
+    assert [(r.row_id, r.clash_row_id, r.settlement, r.new_occurrence)
+            for r in report.resolved] == [(albumin_id, peaf_id, settlement, 1)]
+    rows = _lab_rows(conn)
+    assert rows[albumin_id]["dedup_base"] == rows[peaf_id]["dedup_base"]
+    assert (rows[peaf_id]["dedup_occurrence"],
+            rows[albumin_id]["dedup_occurrence"]) == (0, 1)
+
+
+def test_one_resolving_verdict_beside_an_unverdicted_row_still_resolves(conn):
+    """The other half of AC4: a pair carrying exactly one ruling has nothing to disagree
+    with, so the #124 check must not touch it."""
+    peaf_id, albumin_id = _fusing_pair(conn)
+    resolver = _rule(conn, albumin_id, "distinct")
+
+    report = dedup.rekey(conn, _rekey_dict(**_FUSING_ALBUMIN_SYNONYM), apply=True,
+                         resolver=resolver)
+
+    assert report.collisions == []
+    assert [(r.row_id, r.settlement) for r in report.resolved] \
+        == [(albumin_id, "distinct")]
+
+
 def _generic_condition_pair(conn):
     """Two real, different conditions extracted under generic placeholder labels.
 

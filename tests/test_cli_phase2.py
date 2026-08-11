@@ -563,6 +563,50 @@ def test_rekey_reports_a_distinct_resolved_collision_in_text_and_json(
     assert captured.out.isascii()               # issue #23
 
 
+def test_rekey_reports_contradictory_verdicts_in_text_and_json(
+    ready, capsys, tmp_path
+):
+    """Issue #124 end to end. One row ruled *two facts* and the other ruled *one fact*
+    settles nothing, so the pair blocks like any unresolved collision: rc 1 in both modes,
+    the table withheld by name, the contradiction spelled out on stderr and carried on the
+    `--json` collision entry - never reported as a clean one-sided resolution."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id),
+                "--status", "distinct", "--note", "two assays, one generic label",
+                "--apply") == 0
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(albumin_id), "--row",
+                "--status", "superseded", "--note", "no, one assay filed twice",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved"] == [] and payload["skipped"] == ["lab_result"]
+    collision = payload["collisions"][0]
+    assert collision["kind"] == "fused"
+    assert [(c["row_id"], c["status"], c["scope"], c["settlement"])
+            for c in collision["contradiction"]] == [
+        (albumin_id, "superseded", "row", "merged"),
+        (alb_id, "distinct", "family", "distinct")]
+
+    # Same rc in text mode, and the unaffected table is still written (the #92 quarantine
+    # is per table, and a contradiction is an ordinary blocking collision).
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 1
+    captured = capsys.readouterr()
+    assert "contradictory verdicts" in captured.err
+    assert "A pair ruled two opposite ways is not settled" in captured.err
+    assert "lab_result was not written" in captured.err
+    assert "left 1 table(s) on their stored keys: lab_result" in captured.err
+    assert "lab_result: 1/2 key(s) change (skipped: collision)" in captured.out
+    assert "resolved by verdict" not in captured.out
+    assert "rekeyed 1 row(s)" in captured.out
+    assert captured.out.isascii() and captured.err.isascii()   # issue #23
+
+
 def _seed_generic_condition_pair(ready, capsys, tmp_path, old):
     """The `meridun/pemr-data#12` item 6 shape at the CLI: two real, different conditions
     that the extractor labelled with numbered placeholders, one document each. A
