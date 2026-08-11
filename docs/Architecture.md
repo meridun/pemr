@@ -487,7 +487,11 @@ makes the rare case recoverable while the common case is now correct by construc
 `collected_at` is deliberately **not** in `_COMPARE_FIELDS["lab_result"]`: comparing it
 would turn every mixed-precision pair into a conflict, recreating the same bug as noise.
 The first document to state a draw therefore fixes its stored precision — a later
-restatement with a time reports `duplicate` and does not upgrade the column.
+restatement with a time reports `duplicate` and does not upgrade the column. The same
+exclusion means a same-day repeat draw with an *identical* value (e.g. a QC re-run
+confirming the prior result) compares equal on every `_COMPARE_FIELDS` entry and so
+collapses to one row reported as `duplicate` too — only a *differing* value on a same-day
+repeat takes the conflict path above.
 
 **Conflict handling.** On dedup-key collision with *differing* non-key fields (e.g. a
 corrected value), don't silently drop — write to a `conflict` staging table and surface
