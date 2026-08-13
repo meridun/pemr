@@ -2021,3 +2021,200 @@ def test_cli_reaffirm_refuses_map_file_together_with_clear(cli_ready):
     with pytest.raises(SystemExit) as exc:
         _run(cli_ready, "record", "reaffirm", "--clear", "--map-file", "x.json")
     assert exc.value.code == 2
+
+
+# --- the batch drill: the repro's 57 orphans in miniature (issue #126) --------
+#
+# Every test above rules on *one* family. The repro was a 57-verdict batch, and the write
+# loop is deliberately non-transactional and per-row, so a multi-row run is not the
+# single-verdict run repeated - it is the case this issue exists for. These two walk it
+# end to end through the CLI: four families moved by one dictionary edit, across two record
+# types, two of them merging into a sibling that moves in the same run (both orphan kinds
+# on one verdict), a row-scoped verdict alongside that must stay out of the batch, and a
+# healthy verdict that must not be touched.
+
+
+def _orphaning_rekey_batch(tmp_path, capsys):
+    """Rule on all four seeded families, then move all four with one dictionary edit.
+
+    Returns ``({name: (old base, new base)}, map file path)``. Also leaves a row-scoped
+    verdict on the Glucose row (a stale breadcrumb after the rekey, never an orphan) and a
+    ``confirmed`` family verdict on HbA1c that the batch must carry across verbatim.
+    """
+    bases = {n: _cli_base(tmp_path, rt, col, n) for rt, col, n in (
+        ("lab_result", "test_name", "HbA1c"),
+        ("lab_result", "test_name", "Glucose"),
+        ("condition", "name", "Type 2 Diabetes"),
+        ("condition", "name", "Prediabetes"),
+    )}
+    for table, name, args in (
+        ("lab_result", "HbA1c",
+         ("--status", "confirmed", "--note", "assay validated")),
+        ("lab_result", "Glucose",
+         ("--status", "merged-into", "--merged-into", bases["HbA1c"],
+          "--note", "same draw as the a1c")),
+        ("condition", "Type 2 Diabetes",
+         ("--status", "disputed", "--note", "onset year contested")),
+        ("condition", "Prediabetes",
+         ("--status", "merged-into", "--merged-into", bases["Type 2 Diabetes"],
+          "--note", "progressed, one condition")),
+    ):
+        assert _run(tmp_path, "record", "annotate", table, bases[name], *args,
+                    "--attributed-to", "Dr Who", "--apply") == 0
+    # A row verdict in the same database: the rekey leaves it a stale breadcrumb, which
+    # resolves by row id and so must never appear in the orphan batch. It sits on the HbA1c
+    # row, whose family verdict is `confirmed` — so shadowing it changes no rendering, and
+    # the appendix assertions below stay about the batch rather than about row precedence.
+    assert _run(tmp_path, "record", "annotate", "lab_result",
+                str(_cli_row_id(tmp_path, "lab_result", "test_name", "HbA1c")),
+                "--row", "--status", "disputed", "--note", "this draw only",
+                "--apply") == 0
+    dictionary = _cli_dict(tmp_path, "batch.toml",
+                           '"hba1c" = "hemoglobin a1c"\n'
+                           '"glucose" = "blood-sugar"\n'
+                           '"type 2 diabetes" = "diabetes mellitus type 2"\n'
+                           '"prediabetes" = "impaired glucose tolerance"\n')
+    capsys.readouterr()
+    assert _run(tmp_path, "rekey", "--dictionary", dictionary, "--apply", "--json") == 0
+    report = tmp_path / "batch-rekey.json"
+    report.write_text(capsys.readouterr().out, encoding="utf-8")
+    moved = {}
+    for rt, col, name in (("lab_result", "test_name", "HbA1c"),
+                          ("lab_result", "test_name", "Glucose"),
+                          ("condition", "name", "Type 2 Diabetes"),
+                          ("condition", "name", "Prediabetes")):
+        new = _cli_base(tmp_path, rt, col, name)
+        assert new != bases[name]
+        moved[name] = (bases[name], new)
+    return moved, str(report)
+
+
+def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
+    cli_ready, capsys
+):
+    """The drill at batch scale: `rekey --apply --json` names all four orphans at apply
+    time, one `reaffirm --apply` re-points all four with the human's own words, `verify`
+    stops reporting them, and the appendix follows the rulings onto the new identities."""
+    moved, report = _orphaning_rekey_batch(cli_ready, capsys)
+    payload = json.loads(open(report, encoding="utf-8").read())
+
+    # Apply time, not the next `verify`: this run's own fallout, and only the four family
+    # verdicts - the row-scoped breadcrumb is not orphaned (AC 5, 7).
+    assert {(e["dedup_base"], tuple(e["kinds"])) for e in payload["orphans"]} == {
+        (moved["HbA1c"][0], (curation.ORPHAN_NO_FAMILY,)),
+        (moved["Type 2 Diabetes"][0], (curation.ORPHAN_NO_FAMILY,)),
+        (moved["Glucose"][0],
+         (curation.ORPHAN_NO_FAMILY, curation.ORPHAN_DANGLING_MERGE)),
+        (moved["Prediabetes"][0],
+         (curation.ORPHAN_NO_FAMILY, curation.ORPHAN_DANGLING_MERGE)),
+    }
+    assert all(e["scope"] == "family" for e in payload["orphans"])
+
+    # The dry run is a dry run at batch scale too, in both dispositions.
+    before = _cli_curation_rows(cli_ready)
+    for extra in (("--map-file", report), ("--clear",)):
+        capsys.readouterr()
+        assert _run(cli_ready, "record", "reaffirm", *extra) == 0
+        assert "dry run: nothing was written" in capsys.readouterr().out
+        assert _cli_curation_rows(cli_ready) == before
+
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    assert "re-annotated 4 verdict(s)" in capsys.readouterr().out
+
+    # Every ruling landed on its successor, verbatim - and each merge verdict now points at
+    # its target's *new* base, which is the half a per-verdict remedy gets wrong.
+    stored = {(r["record_type"], r["dedup_base"], r["record_id"]): r
+              for r in _cli_curation_rows(cli_ready)}
+    assert len(stored) == 5   # four re-pointed families + the untouched row verdict
+    assert [(r["status"], r["note"], r["attributed_to"], r["merged_into_base"]) for r in (
+        stored[("lab_result", moved["HbA1c"][1], 0)],
+        stored[("lab_result", moved["Glucose"][1], 0)],
+        stored[("condition", moved["Type 2 Diabetes"][1], 0)],
+        stored[("condition", moved["Prediabetes"][1], 0)],
+    )] == [
+        ("confirmed", "assay validated", "Dr Who", None),
+        ("merged-into", "same draw as the a1c", "Dr Who", moved["HbA1c"][1]),
+        ("disputed", "onset year contested", "Dr Who", None),
+        ("merged-into", "progressed, one condition", "Dr Who",
+         moved["Type 2 Diabetes"][1]),
+    ]
+    # The row verdict was left exactly where it was: not this batch's business.
+    assert ("lab_result", moved["HbA1c"][0],
+            _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")) in stored
+
+    capsys.readouterr()
+    assert _run(cli_ready, "verify") == 0
+    out = capsys.readouterr().out
+    assert "has no live family" not in out and "merges into" not in out
+    assert "warnings       1" in out            # only the row-scope breadcrumb, by design
+    assert "but the row now sits in" in out
+
+    capsys.readouterr()
+    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
+    summary = capsys.readouterr().out
+    assert "## Superseded / corrected" in summary
+    for note in ("same draw as the a1c", "progressed, one condition"):
+        assert note in summary
+
+
+def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(
+    cli_ready, capsys
+):
+    """The loop is per-row and non-transactional on purpose, so a batch that cannot fully
+    succeed must still land every row that can and account for the rest: rc 1, each refusal
+    with its reason, the untouched rows still orphaned, and a second pass that finishes the
+    job without re-writing what already landed."""
+    moved, report = _orphaning_rekey_batch(cli_ready, capsys)
+    # (a) a second reviewer already ruled on the family HbA1c's verdict would land in.
+    assert _run(cli_ready, "record", "annotate", "lab_result", moved["HbA1c"][1],
+                "--status", "confirmed", "--note", "a second ruling",
+                "--attributed-to", "Dr Other", "--apply") == 0
+    # (b) one orphan the map does not name, and (c) an entry with no live orphan behind it.
+    full = json.loads(open(report, encoding="utf-8").read())
+    partial = cli_ready / "partial.json"
+    stale = dict(full["orphans"][0], dedup_base="0" * 64, record_id=0,
+                 successor_base="1" * 64)
+    partial.write_text(json.dumps({"orphans": [
+        *[e for e in full["orphans"]
+          if e["dedup_base"] != moved["Type 2 Diabetes"][0]],
+        stale,
+    ]}), encoding="utf-8")
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(partial),
+                "--apply") == 1
+    captured = capsys.readouterr()
+    assert "already carries its own verdict" in captured.out
+    assert "not named by the map file" in captured.out
+    assert "already-handled" in captured.out and "no longer orphaned" in captured.out
+    assert "re-annotated 2 verdict(s)" in captured.out
+    assert "were not handled" in captured.err
+
+    # The two clean rows landed; the refused ones sit exactly as they were.
+    stored = {(r["record_type"], r["dedup_base"], r["record_id"]): r
+              for r in _cli_curation_rows(cli_ready)}
+    assert ("lab_result", moved["Glucose"][1], 0) in stored
+    assert ("condition", moved["Prediabetes"][1], 0) in stored
+    assert ("lab_result", moved["HbA1c"][0], 0) in stored          # refused: conflict
+    assert ("condition", moved["Type 2 Diabetes"][0], 0) in stored  # refused: unmapped
+    assert stored[("lab_result", moved["HbA1c"][1], 0)]["note"] == "a second ruling"
+    assert len(stored) == len(before)   # two re-pointed in place, nothing lost or doubled
+
+    # Second pass with the full map finishes the unmapped one and re-refuses the conflict,
+    # without touching what already landed.
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 1
+    out = capsys.readouterr().out
+    assert "re-annotated 1 verdict(s)" in out
+    assert "already carries its own verdict" in out
+    after = {(r["record_type"], r["dedup_base"], r["record_id"]) for r in
+             _cli_curation_rows(cli_ready)}
+    assert ("condition", moved["Type 2 Diabetes"][1], 0) in after
+    assert ("lab_result", moved["HbA1c"][0], 0) in after   # still the operator's call
+
+    # Only the deliberately-refused verdict and the row breadcrumb are still reported.
+    capsys.readouterr()
+    assert _run(cli_ready, "verify") == 0
+    assert "warnings       2" in capsys.readouterr().out
