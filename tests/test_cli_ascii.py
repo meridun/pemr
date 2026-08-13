@@ -213,6 +213,44 @@ def test_record_annotate_output_is_console_safe(ready, capsys):
     _assert_console_safe(captured.err)
 
 
+def test_record_reaffirm_output_is_console_safe(ready, capsys):
+    """Issue #126's new surfaces: `record reaffirm`'s listing (with its `->` successor
+    column) and the `rekey --apply` orphan block, both on a cp437 console."""
+    with pytest.raises(SystemExit):
+        _run(ready, "record", "reaffirm", "--help")
+    _assert_console_safe(capsys.readouterr().out)
+
+    scan = ready / "scan.txt"
+    scan.write_bytes(b"visit note: glucose 95")
+    assert _run(ready, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(ready / "sources"), "--ocr-text-file", str(scan)) == 0
+    payload = ready / "extract.json"
+    payload.write_text(json.dumps({"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 95,
+         "unit": "mg/dL"},
+    ]}), encoding="utf-8")
+    assert _run(ready, "commit-extraction", "--document", "1", "--json",
+                str(payload)) == 0
+    assert _run(ready, "record", "annotate", "lab_result", "1", "--status",
+                "superseded", "--note", "old label", "--apply") == 0
+
+    dictionary = ready / "new.toml"
+    dictionary.write_text('[synonyms]\n"glucose" = "blood-sugar"\n', encoding="utf-8")
+    capsys.readouterr()
+    assert _run(ready, "rekey", "--dictionary", str(dictionary), "--apply") == 0
+    captured = capsys.readouterr()
+    assert "orphaned by this rekey" in captured.err
+    _assert_console_safe(captured.out)
+    _assert_console_safe(captured.err)
+
+    # And again through the map-file path, whose listing carries the `->` column.
+    assert _run(ready, "rekey", "--dictionary", str(dictionary), "--apply",
+                "--json") == 0
+    capsys.readouterr()
+    assert _run(ready, "record", "reaffirm") == 0
+    _assert_console_safe(capsys.readouterr().out)
+
+
 def test_record_assert_output_is_console_safe(ready, capsys):
     """Issue #110's new CLI + render surface: the report block, the `--list` table, the
     collision refusal, and the `(attested by ...)` marker in every render."""

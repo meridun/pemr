@@ -1203,6 +1203,157 @@ def test_verify_warns_about_a_hand_edited_unknown_record_type(seeded):
     assert any("unknown record type" in w for w in report.warnings)
 
 
+# --- orphaned verdicts: one detector, three readers (issue #126) --------------
+#
+# `verify`'s two orphan warnings, `record reaffirm`'s listing and `rekey --apply`'s orphan
+# block all read `curation.orphan_kinds`. The tests that matter most here are the two
+# *exclusions*: a bulk remedy that re-annotated a verdict which still resolves would
+# silently re-point a live ruling, which is the failure the #109/#114 design forbids.
+
+
+def test_list_orphans_reports_a_family_a_rekey_moved(seeded):
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", base, status="superseded",
+                            note="old label", attributed_to="Dr Who", apply=True)
+    assert curation.list_orphans(conn) == []
+
+    dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+
+    orphans = curation.list_orphans(conn)
+    assert [(o.record_type, o.dedup_base, o.kinds) for o in orphans] == [
+        ("lab_result", base, [curation.ORPHAN_NO_FAMILY])]
+    # The ruling is carried verbatim: a bulk re-affirm re-annotates from exactly this.
+    assert (orphans[0].status, orphans[0].note, orphans[0].attributed_to) == (
+        "superseded", "old label", "Dr Who")
+    assert (orphans[0].label, orphans[0].family_size) == ("", 0)
+
+
+def test_list_orphans_reports_a_dangling_merge_target(seeded):
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    target = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", base, status="merged-into",
+                            note="same draw", merged_into_base=target, apply=True)
+    records.remove_record(
+        conn, "lab_result", _row_id(conn, "lab_result", "test_name", "HbA1c"),
+        apply=True,
+    )
+
+    orphans = curation.list_orphans(conn)
+    assert [o.kinds for o in orphans] == [[curation.ORPHAN_DANGLING_MERGE]]
+    # The verdict's own family is still live, so what remains is still described.
+    assert (orphans[0].label, orphans[0].family_size) == ("Glucose", 1)
+
+
+def test_list_orphans_reports_one_entry_carrying_both_kinds(seeded):
+    """A verdict in both classes must be re-annotated **once**, not twice — which is why
+    the detector returns a list of kinds per verdict rather than one entry per warning."""
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    target = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", base, status="merged-into",
+                            note="same draw", merged_into_base=target, apply=True)
+    for name in ("Glucose", "HbA1c"):
+        records.remove_record(
+            conn, "lab_result", _row_id(conn, "lab_result", "test_name", name),
+            apply=True,
+        )
+
+    orphans = curation.list_orphans(conn)
+    assert len(orphans) == 1
+    assert orphans[0].kinds == [
+        curation.ORPHAN_NO_FAMILY, curation.ORPHAN_DANGLING_MERGE]
+    # `verify` still says both things about it; the orphan list names it once.
+    warnings = verify.verify_report(conn).warnings
+    assert any("has no live family" in w for w in warnings)
+    assert any("merges into" in w for w in warnings)
+
+
+def test_list_orphans_excludes_the_row_scoped_stale_breadcrumb(seeded):
+    """The scope boundary. A rekey moved the row out of the family it was ruled in, but
+    the verdict still resolves *by row id* — so it is a notice for the human, never an
+    orphan for a bulk re-point to touch."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="this occurrence only", row=True, apply=True)
+
+    dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+
+    assert curation.list_orphans(conn) == []
+    assert [w for w in verify.verify_report(conn).warnings if "a rekey moved it" in w]
+
+
+def test_list_orphans_excludes_a_removed_row(seeded):
+    """The other exclusion: a row-scoped verdict whose row is gone *is* inert, but its
+    remedy is `--clear --row` (and the removal write paths already retire it), not a
+    re-point — so it stays out of the set the bulk verb acts on."""
+    conn = seeded["conn"]
+    base = _second_occurrence(seeded)
+    _occ0, occ1 = _occurrence_ids(conn, base)
+    curation.annotate_record(conn, "lab_result", str(occ1), status="superseded",
+                            note="loser", row=True, apply=True)
+    # Straight to the table, behind the write paths' backs - the only way to this state.
+    conn.execute("DELETE FROM lab_result WHERE lab_result_id = ?", (occ1,))
+    conn.commit()
+
+    assert curation.list_orphans(conn) == []
+    assert any("names no live row" in w for w in verify.verify_report(conn).warnings)
+    # `list_curation`'s broader `family_size == 0` signal *does* flag it: the two are
+    # deliberately different sets, and this is the row they disagree about.
+    entry = next(r for r in curation.list_curation(conn) if r["record_id"] == occ1)
+    assert entry["family_size"] == 0
+
+
+def test_orphan_kinds_never_queries_a_hand_edited_record_type(seeded):
+    """The read-path re-validation: a stored `record_type` reaches `load_family`, which
+    interpolates it into a table name, so an unknown one must report nothing at all."""
+    conn = seeded["conn"]
+    assert curation.orphan_kinds(conn, {
+        "record_type": "family_history", "dedup_base": "b", "record_id": 0,
+        "merged_into_base": None,
+    }) == []
+    conn.execute(
+        "INSERT INTO curation (record_type, dedup_base, status, note, created_at) "
+        "VALUES ('family_history', 'b', 'disputed', 'hand-edited', "
+        "'2026-01-01T00:00:00')"
+    )
+    conn.commit()
+    assert curation.list_orphans(conn) == []
+    # `verify` keeps its own, separate warning for this case.
+    assert any("unknown record type" in w for w in verify.verify_report(conn).warnings)
+
+
+def test_list_orphans_filters_by_record_type(seeded):
+    conn = seeded["conn"]
+    lab = _base(conn, "lab_result", "test_name", "Glucose")
+    cond = _base(conn, "condition", "name", "Prediabetes")
+    for record_type, base in (("lab_result", lab), ("condition", cond)):
+        curation.annotate_record(conn, record_type, base, status="superseded",
+                                note="gone", apply=True)
+        records.remove_record(
+            conn, record_type,
+            _row_id(conn, record_type,
+                    "test_name" if record_type == "lab_result" else "name",
+                    "Glucose" if record_type == "lab_result" else "Prediabetes"),
+            apply=True,
+        )
+
+    assert len(curation.list_orphans(conn)) == 2
+    assert [o.record_type for o in curation.list_orphans(conn, "condition")] == [
+        "condition"]
+
+
+def test_list_orphans_is_empty_without_the_curation_table(seeded):
+    """The pre-008 snapshot guard, so no caller needs a second `has_table` check."""
+    conn = seeded["conn"]
+    conn.execute("DROP TABLE curation")
+    conn.commit()
+    assert curation.list_orphans(conn) == []
+
+
 # --- CLI surface -------------------------------------------------------------
 
 
@@ -1243,6 +1394,25 @@ def _cli_curation_count(tmp_path):
     conn = _cli_conn(tmp_path)
     try:
         return _curation_count(conn)
+    finally:
+        conn.close()
+
+
+def _cli_base(tmp_path, record_type, column, value):
+    conn = _cli_conn(tmp_path)
+    try:
+        return _base(conn, record_type, column, value)
+    finally:
+        conn.close()
+
+
+def _cli_curation_rows(tmp_path):
+    """Every stored verdict, in a stable order — the "nothing was written" assertion."""
+    conn = _cli_conn(tmp_path)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM curation ORDER BY record_type, dedup_base, record_id"
+        )]
     finally:
         conn.close()
 
@@ -1569,3 +1739,285 @@ def test_cli_annotate_render_remove_verify_drill(cli_ready, capsys):
     out = capsys.readouterr().out
     assert "warnings       1" in out
     assert "has no live family" in out
+
+
+# --- `record reaffirm`: the bulk remedy (issue #126) --------------------------
+
+
+def _cli_dict(tmp_path, name, body):
+    p = tmp_path / name
+    p.write_text("[synonyms]\n" + body, encoding="utf-8")
+    return str(p)
+
+
+def _orphaning_rekey(tmp_path, capsys):
+    """Rule on the Glucose family, then move it with a dictionary edit — the repro shape.
+
+    Returns ``(old base, new base, path of this run's `rekey --apply --json` report)``.
+    The report is the map file: a ``dedup_base`` is overwritten in place, so the old->new
+    mapping exists nowhere but the payload of the run that made it.
+    """
+    base = _cli_base(tmp_path, "lab_result", "test_name", "Glucose")
+    assert _run(tmp_path, "record", "annotate", "lab_result", base, "--status",
+                "superseded", "--note", "one assay, two labels",
+                "--attributed-to", "Dr Who", "--apply") == 0
+    dictionary = _cli_dict(tmp_path, "new.toml", '"glucose" = "blood-sugar"\n')
+    capsys.readouterr()
+    assert _run(tmp_path, "rekey", "--dictionary", dictionary, "--apply", "--json") == 0
+    report = tmp_path / "rekey.json"
+    report.write_text(capsys.readouterr().out, encoding="utf-8")
+    return base, _cli_base(tmp_path, "lab_result", "test_name", "Glucose"), str(report)
+
+
+def test_cli_reaffirm_is_friendly_when_nothing_is_orphaned(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm") == 0
+    assert "no orphaned curation verdicts" in capsys.readouterr().out
+
+
+def test_cli_reaffirm_bare_listing_writes_nothing(cli_ready, capsys):
+    """No disposition supplied = a pure listing, rc 0: the default invocation reports the
+    orphan set and nothing else (AC 2)."""
+    base, _new, _report = _orphaning_rekey(cli_ready, capsys)
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm") == 0
+    out = capsys.readouterr().out
+    assert base[:12] in out and "no-live-family" in out
+    assert "one assay, two labels" in out
+    assert "listing only" in out and "--map-file" in out
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_reaffirm_dry_run_with_a_map_file_writes_nothing(cli_ready, capsys):
+    base, new_base, report = _orphaning_rekey(cli_ready, capsys)
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report) == 0
+    out = capsys.readouterr().out
+    # The successor's label *and size* are shown: that is how a reviewer catches a ruling
+    # about to widen over rows nobody judged.
+    assert f"-> {new_base[:12]} (Glucose, 1 row(s))" in out
+    assert "dry run: nothing was written - re-run with --apply" in out
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_reaffirm_json_shape_is_stable(cli_ready, capsys):
+    base, _new, _report = _orphaning_rekey(cli_ready, capsys)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [e["dedup_base"] for e in payload] == [base]
+    entry = payload[0]
+    assert entry["kinds"] == [curation.ORPHAN_NO_FAMILY]
+    assert entry["scope"] == "family" and entry["record_id"] == 0
+    assert entry["status"] == "superseded" and entry["attributed_to"] == "Dr Who"
+    # No map file: nothing to point at yet, and nothing written.
+    assert entry["action"] == "list"
+    assert entry["to_base"] is None and entry["to_merge_base"] is None
+    assert entry["applied"] is False
+    assert set(entry) == {
+        "record_type", "dedup_base", "record_id", "scope", "status", "note",
+        "attributed_to", "merged_into_base", "created_at", "kinds", "label",
+        "family_size", "action", "to_base", "to_merge_base", "target_label",
+        "target_family_size", "reason", "applied",
+    }
+
+
+def test_cli_reaffirm_drill_moves_the_verdict_and_quiets_verify(cli_ready, capsys):
+    """The whole point (AC 4, 6, 7): rekey --apply --json -> reaffirm --map-file --apply,
+    and the verdict is live again on the successor family with the human's own words."""
+    base, new_base, report = _orphaning_rekey(cli_ready, capsys)
+    assert new_base != base
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    assert "re-annotated 1 verdict(s)" in capsys.readouterr().out
+
+    assert [(r["dedup_base"], r["record_id"], r["status"], r["note"],
+             r["attributed_to"]) for r in _cli_curation_rows(cli_ready)] == [
+        (new_base, 0, "superseded", "one assay, two labels", "Dr Who")]
+
+    capsys.readouterr()
+    assert _run(cli_ready, "verify") == 0
+    out = capsys.readouterr().out
+    assert "has no live family" not in out
+    assert not any(line.startswith("warnings") for line in out.splitlines())
+
+    # And the ruling is doing its job again on the new identity.
+    capsys.readouterr()
+    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
+    summary = capsys.readouterr().out
+    assert "## Superseded / corrected" in summary
+    assert "one assay, two labels" in summary
+
+
+def test_cli_reaffirm_rerunning_the_same_map_file_is_a_clean_no_op(cli_ready, capsys):
+    """Idempotence: a map entry with no live orphan behind it is `already-handled`, not an
+    error — so the composed pipeline is safe to retry."""
+    _base_, _new, report = _orphaning_rekey(cli_ready, capsys)
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    after_first = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    out = capsys.readouterr().out
+    assert "already-handled" in out and "no longer orphaned" in out
+    assert _cli_curation_rows(cli_ready) == after_first
+
+
+def test_cli_reaffirm_accepts_a_bare_orphans_array(cli_ready, capsys):
+    """The map file is `rekey --json`'s payload *or* a bare array of its `orphans`
+    entries, so a caller that already split the report needs no reassembly."""
+    _base_, new_base, report = _orphaning_rekey(cli_ready, capsys)
+    bare = cli_ready / "bare.json"
+    with open(report, encoding="utf-8") as fh:
+        bare.write_text(json.dumps(json.load(fh)["orphans"]), encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(bare),
+                "--apply") == 0
+    assert [r["dedup_base"] for r in _cli_curation_rows(cli_ready)] == [new_base]
+
+
+def test_cli_reaffirm_clear_lifts_exactly_the_orphan_set(cli_ready, capsys):
+    """AC 5: no blanket re-affirm — a healthy verdict elsewhere is not touched."""
+    _base_, _new, _report = _orphaning_rekey(cli_ready, capsys)
+    healthy = _cli_row_id(cli_ready, "condition", "name", "Prediabetes")
+    assert _run(cli_ready, "record", "annotate", "condition", str(healthy),
+                "--status", "confirmed", "--note", "checked", "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--clear", "--apply") == 0
+    assert [(r["record_type"], r["status"]) for r in _cli_curation_rows(cli_ready)] == [
+        ("condition", "confirmed")]
+
+
+def test_cli_reaffirm_refuses_to_overwrite_a_verdict_on_the_successor(cli_ready, capsys):
+    """A second human already ruled on the family this one would land in. Refuse the row,
+    exit 1, and leave both verdicts exactly as they were."""
+    _base_, new_base, report = _orphaning_rekey(cli_ready, capsys)
+    assert _run(cli_ready, "record", "annotate", "lab_result", new_base,
+                "--status", "confirmed", "--note", "a second ruling", "--apply") == 0
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 1
+    captured = capsys.readouterr()
+    assert "already carries its own verdict" in captured.out
+    assert "were not handled" in captured.err
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_reaffirm_skips_an_orphan_the_map_does_not_name(cli_ready, capsys):
+    """An orphan from some other run is reported and refused, never guessed at — rc 1 says
+    the operator asked for a batch and did not get all of it."""
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
+                "--status", "superseded", "--note", "gone soon", "--apply") == 0
+    assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--apply") == 0
+    empty = cli_ready / "empty.json"
+    empty.write_text(json.dumps({"orphans": []}), encoding="utf-8")
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(empty),
+                "--apply") == 1
+    assert "not named by the map file" in capsys.readouterr().out
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_reaffirm_skips_a_merge_target_with_no_successor(cli_ready, capsys):
+    """`annotate_record` rejects a dangling `--merged-into`, so this row has to be refused
+    in the *plan* rather than blowing up mid-batch."""
+    glucose = _cli_base(cli_ready, "lab_result", "test_name", "Glucose")
+    hba1c = _cli_base(cli_ready, "lab_result", "test_name", "HbA1c")
+    assert _run(cli_ready, "record", "annotate", "lab_result", glucose,
+                "--status", "merged-into", "--merged-into", hba1c,
+                "--note", "same draw", "--apply") == 0
+    assert _run(cli_ready, "record", "rm", "lab_result",
+                str(_cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")),
+                "--apply") == 0
+    dictionary = _cli_dict(cli_ready, "new.toml", '"glucose" = "blood-sugar"\n')
+    capsys.readouterr()
+    assert _run(cli_ready, "rekey", "--dictionary", dictionary, "--apply",
+                "--json") == 0
+    report = cli_ready / "rekey.json"
+    report.write_text(capsys.readouterr().out, encoding="utf-8")
+    before = _cli_curation_rows(cli_ready)
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(report),
+                "--apply") == 1
+    assert "no successor for the merge target" in capsys.readouterr().out
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_reaffirm_skips_a_row_verdict_whose_row_is_gone(cli_ready, capsys):
+    """A restored or hand-edited database can hold a row verdict whose merge target moved
+    *and* whose own row is gone. Refused in the plan, with the `--clear` pointer, rather
+    than raising out of `resolve_row` halfway through the batch."""
+    glucose_id = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
+    hba1c = _cli_base(cli_ready, "lab_result", "test_name", "HbA1c")
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(glucose_id), "--row",
+                "--status", "merged-into", "--merged-into", hba1c,
+                "--note", "same draw", "--apply") == 0
+    # Straight to the table: the write paths would retire the verdict with the rows.
+    conn = _cli_conn(cli_ready)
+    try:
+        conn.execute("DELETE FROM lab_result")
+        conn.commit()
+    finally:
+        conn.close()
+
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "--json") == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [e["kinds"] for e in listed] == [[curation.ORPHAN_DANGLING_MERGE]]
+    # The listing doubles as the map file - a bare array of the same entries.
+    bare = cli_ready / "bare.json"
+    bare.write_text(json.dumps(listed), encoding="utf-8")
+    before = _cli_curation_rows(cli_ready)
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(bare),
+                "--apply") == 1
+    assert "the annotated row is gone" in capsys.readouterr().out
+    assert _cli_curation_rows(cli_ready) == before
+    # ... and --clear is the remedy it names, which does work.
+    assert _run(cli_ready, "record", "reaffirm", "--clear", "--apply") == 0
+    assert _cli_curation_rows(cli_ready) == []
+
+
+def test_cli_reaffirm_filters_by_table(cli_ready, capsys):
+    _base_, _new, _report = _orphaning_rekey(cli_ready, capsys)
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "condition") == 0
+    assert "no orphaned curation verdicts" in capsys.readouterr().out
+    assert _run(cli_ready, "record", "reaffirm", "lab_result") == 0
+    assert "no-live-family" in capsys.readouterr().out
+
+
+def test_cli_reaffirm_map_file_misuse_is_friendly(cli_ready, capsys):
+    assert _run(cli_ready, "record", "reaffirm", "--map-file",
+                str(cli_ready / "nope.json")) == 1
+    assert "cannot read" in capsys.readouterr().err
+
+    bad = cli_ready / "bad.json"
+    bad.write_text("[1, 2", encoding="utf-8")
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(bad)) == 1
+    assert "error:" in capsys.readouterr().err
+
+    wrong = cli_ready / "wrong.json"
+    wrong.write_text('"not a report"', encoding="utf-8")
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(wrong)) == 1
+    assert "not a rekey report" in capsys.readouterr().err
+
+
+def test_cli_reaffirm_refuses_map_file_together_with_clear(cli_ready):
+    """A verdict is re-pointed or lifted, never both: `--clear` ignores the map entirely,
+    so accepting the pair would silently discard one of them."""
+    with pytest.raises(SystemExit) as exc:
+        _run(cli_ready, "record", "reaffirm", "--clear", "--map-file", "x.json")
+    assert exc.value.code == 2
