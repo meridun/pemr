@@ -121,8 +121,8 @@ CREATE TABLE document_tombstone (
 -- live rows, where a family verdict would hide the occurrence it says should win. Row
 -- wins over family for its own row. Like 007 the table carries no FK to what it
 -- annotates, and `pemr verify` warns (never fails) on a verdict whose family - or row -
--- is gone. Written only by `record annotate`; read at render time by every generated
--- document.
+-- is gone. Written only by `record annotate` and `record reaffirm` (the bulk remedy for
+-- that orphaning, issue #126); read at render time by every generated document.
 CREATE TABLE curation (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
   dedup_base       TEXT NOT NULL,   -- family identity; a breadcrumb when record_id <> 0
@@ -471,8 +471,8 @@ exactly one of them (`covering_verdicts()` reports both — row scope over famil
 row — and resolution takes the first), and the
 *other* family's verdict is not carried anywhere. Its rows move out from under it the same
 way an unrelated dictionary-driven rekey has always been able to orphan a family verdict
-(documented since migration 008) — `rekey`'s own output says nothing about it, and `pemr
-verify` is the only signal (`curation verdict ... has no live family (removed?)`). The
+(documented since migration 008). Since issue #126 `rekey --apply` **reports that fallout
+itself** (below) rather than leaving `pemr verify` as the only signal. The
 direction is over-reporting, not data loss: no fact disappears, but a row a human had ruled
 out of its clinical section can be promoted back into it until the operator re-rules or
 clears the stale verdict. Criticality-blind by construction — no live row silently leaves
@@ -491,6 +491,48 @@ the pointer still means something (this occurrence is absorbed into the family i
 it moves to the appendix while its siblings keep rendering live), so it is accepted. At
 **family** scope a self-merge would leave the fact rendering nowhere at all, and stays
 refused.
+
+**The orphans a rekey does cause are reported where they happen, and fixable in bulk**
+(issue #126). Two additions, both leaving the warn-and-reannotate design above exactly as
+it is — `rekey` still never re-points a verdict by itself:
+
+- `rekey --apply` computes, after its write, the verdicts *this run* orphaned — scoped to
+  the families it actually moved, so a pre-existing orphan is not blamed on it — and prints
+  them plus the follow-up command (`orphans` in `--json`, always present and `[]` on a dry
+  run, which wrote nothing to have fallout from). It is a `warning:`, not an `error:`: the
+  exit code stays `1 if collisions else 0`.
+- `pemr record reaffirm` is the batch remedy beside the per-row `record annotate --clear`.
+  The 57-row orphan batch one dictionary edit produced is what forced it. Dry run by
+  default, `--json` for an agent, one explicit `--apply`, no prompting.
+
+Both read **one** orphan detector, `curation.orphan_kinds` — which `pemr verify`'s two
+orphan warnings now read too. That sharing is the point: a bulk remedy that disagreed with
+the warning it answers would re-annotate the wrong rows. It owns exactly two classes:
+`no-live-family` (a family-scoped verdict whose `dedup_base` names no live family) and
+`dangling-merge-target` (either scope, `merged_into_base` names no live family). The
+row-scoped **stale breadcrumb** is deliberately not one of them — that verdict still
+resolves by row id, so nothing may re-point it — nor is the removed-row case, whose remedy
+is `--clear --row` and which the removal write paths already retire.
+
+The two halves compose **by file**, and have to: a `dedup_base` is a content hash
+overwritten in place, so once the run is over nothing in the database records that `F_old`
+became `F_new`. Only `rekey` knows, and the mapping is not persisted (no new table, no
+migration) — it travels on `RekeyReport.base_maps` and out through the report:
+
+```
+pemr rekey --apply --json > rekey.json      # applies, and reports its own orphans
+pemr record reaffirm --map-file rekey.json  # dry run: what would be re-pointed, where
+pemr record reaffirm --map-file rekey.json --apply
+```
+
+Every re-point is an explicit map entry plus `--apply`; the dry run shows the successor
+family's **label and size**, so a ruling about to widen over rows nobody judged is visible
+before approval; a successor that already carries its own verdict is **skipped**, never
+overwritten; and an entry matching no live orphan is reported `already handled` rather than
+failing, so re-running the same file is a clean no-op. Writes reuse `annotate_record` /
+`clear_curation` per row — annotate **before** clear, so a failure between the two leaves
+the ruling duplicated (recoverable) rather than destroyed. `record reaffirm` is CLI-only,
+absent from `WRITE_TOOLS` for the same reason `record annotate` is.
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -813,6 +855,14 @@ pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attribut
                                                          # pure overlay - no record row is mutated; dry run by default
 pemr record annotate --list [<table>] [--json]           # current verdicts, newest first (scope + orphans flagged)
 pemr record annotate <table> <base-or-id> [--row] --clear [--apply]   # lift one verdict, in the named scope
+pemr record reaffirm [<table>] [--json]                  # the verdicts a rekey ORPHANED: no live family, or a
+                                                         # dangling merged_into target (NOT the row-scope stale
+                                                         # breadcrumb - that one still resolves)
+pemr record reaffirm [<table>] (--map-file <file> | --clear) [--apply] [--json]
+                                                         # bulk remedy (§3): --map-file takes `rekey --apply --json`'s
+                                                         # payload and re-points each verdict onto its successor
+                                                         # family; --clear lifts them instead. Dry run by default;
+                                                         # a successor already carrying its own verdict is skipped
 pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
                    --field NAME=VALUE [--field ...] [--apply]
                                                          # commit a fact attested by a PERSON, with no
@@ -838,6 +888,9 @@ pemr restore latest [--force]                            # install a snapshot ba
 pemr verify                                              # integrity + row counts + source-blob resolution
 pemr migrate [--create]                                  # apply pending migrations (--create bootstraps a new DB)
 pemr rekey [--apply]                                     # re-derive dedup keys after a dictionary edit
+                                                         # --apply also reports the curation verdicts THIS run
+                                                         # orphaned; `--json` carries them as `orphans`, which is
+                                                         # the map file `record reaffirm` reads (§3)
 ```
 
 Every line above is implemented and parses today **except** the one flagged `NOT IMPLEMENTED`.
@@ -866,13 +919,15 @@ annotations expose the read/write split to the client.
 `commit_extraction`/`person_add`/`person_edit`/`ingest`/`document_set_text`; always `ingest` (with `ocr_text` populated) before
 extracting; dictionary additions go through human review, never agent-direct edits.
 
-`document rm`, `record rm` (issue #107), `record annotate` (issue #109) and `record assert`
+`document rm`, `record rm` (issue #107), `record annotate` (issue #109), `record reaffirm`
+(issue #126) and `record assert`
 (issue #110) are deliberately **absent** from `WRITE_TOOLS` — this is a rule, not an
 oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and therefore no
 agent, can remove a record or a document. `record annotate` joins them for the adjacent
 reason: a `curation` verdict is a *human's clinical judgment*, recorded with attribution, and
 an agent that could write one could make a record disappear from every generated document
-without deleting a row. `record assert` is the sharpest case of all — it is a *write*, not a
+without deleting a row — and `record reaffirm` writes those same verdicts *in bulk*, which
+only sharpens the argument. `record assert` is the sharpest case of all — it is a *write*, not a
 deletion, and the only path in the system that can put a fact into the record with no
 external source. Any future destructive — or render-altering, or unsourced — verb should
 default to the same exclusion unless a human explicitly decides otherwise.

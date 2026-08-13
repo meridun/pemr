@@ -1075,6 +1075,38 @@ def test_rekey_covers_every_record_type(conn):
     assert report.changes == []  # same dictionary (none) -> keys already current
 
 
+def test_rekey_report_carries_the_stored_to_recomputed_base_map(conn):
+    """Issue #126. A ``dedup_base`` is a content hash overwritten in place, so once the run
+    is over nothing in the database records that ``F_old`` became ``F_new``. Only `rekey`
+    knows, which is why the mapping leaves on the report: it is what scopes the CLI's
+    apply-time orphan report and what `record reaffirm --map-file` follows.
+
+    Stays a plain dict of strings on purpose — `dedup` must never import `curation`."""
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {
+        "lab_result": [{"test_name": "ZZT", "collected_at": "2026-01-02",
+                        "value_num": 108}],
+        "condition": [{"name": "Type 2 Diabetes", "status": "active"}],
+    }, dedup.load_dictionary(DICT_PATH))
+    stored = {
+        table: conn.execute(f"SELECT dedup_base FROM {table}").fetchone()["dedup_base"]
+        for table in ("lab_result", "condition")
+    }
+
+    report = dedup.rekey(conn, _rekey_dict(zzt="zonulin_test"))
+
+    # Every scanned type gets a map, and a table with no rows gets an empty one.
+    assert set(report.base_maps) == set(dedup.KNOWN_TYPES)
+    assert report.base_maps["medication"] == {}
+    # The moved family maps old -> new; the untouched one maps to itself.
+    moved = report.base_maps["lab_result"][stored["lab_result"]]
+    assert moved != stored["lab_result"]
+    assert report.base_maps["condition"] == {
+        stored["condition"]: stored["condition"]}
+    # A dry run still reports the mapping: it is what the run *would* do.
+    assert report.applied is False
+
+
 def test_rekey_is_a_no_op_over_a_keep_both_family(conn):
     """The whole reason occurrence lives in a column: `rekey` re-derives keys from
     payload, so siblings must recompute to their own keys rather than collide."""

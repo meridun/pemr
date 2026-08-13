@@ -1530,6 +1530,18 @@ class RekeyReport:
     # `blocked`/`writable()`: a resolved pair does not quarantine its table.
     resolved: list[RekeyResolution] = field(default_factory=list)
     applied: bool = False
+    # Stored ``dedup_base`` -> recomputed base, per record type (issue #126). Appended,
+    # never inserted: the construction sites are keyword-only but `RekeyReport` is part of
+    # the `--json` contract's provenance and that contract may only widen.
+    #
+    # A ``dedup_base`` is a content hash overwritten in place by `apply=True`, so once the
+    # run is over *nothing in the database records that F_old became F_new*. Only this run
+    # knows, which is why the mapping has to leave on the report: it is what lets the CLI
+    # scope "which curation verdicts did this rekey orphan" and what `pemr record reaffirm
+    # --map-file` follows to the successor family. Deliberately a plain dict of strings -
+    # `dedup` must never import `curation`, so the orphan report itself is assembled in
+    # `cli.py`, which imports both.
+    base_maps: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def blocked(self) -> list[str]:
@@ -1629,8 +1641,10 @@ def rekey(
     db.require_migrated(conn)
     report = RekeyReport(applied=False)
     # Stored dedup_base -> recomputed base, per table: how a family verdict's merge
-    # target is followed when the target family moved in this same run.
-    base_maps: dict[str, dict[str, str]] = {}
+    # target is followed when the target family moved in this same run - and, since #126,
+    # how the CLI scopes the orphan report to the families *this* run moved. The report's
+    # own dict, not a copy: one map, two readers, no chance of them drifting.
+    base_maps: dict[str, dict[str, str]] = report.base_maps
     # (record_type, verdict, resolution) — the narrowings the write block owes. Kept
     # beside the report rather than inside it so RekeyResolution stays a plain,
     # serializable account of what happened (the raw verdict dict is not part of it).
