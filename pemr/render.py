@@ -248,23 +248,23 @@ def _apply_curation(
     Called immediately after each section's ``SELECT`` and **before** any latest-wins,
     grouping or top-N logic, so a superseded reading can neither win "latest" nor
     consume a slot in a truncated list.
+
+    The stamping itself is :func:`curation.annotate_rows` (issue #131) — shared with
+    `pemr query`, so the two verbs cannot drift apart about which rows carry which
+    verdict. What stays here is the *policy*: collect into the appendix, then drop. An
+    appendix-bound row is now stamped a moment before it is dropped, which is invisible
+    (the row is discarded) but is why this is a filter over stamped rows rather than a
+    stamp-only-survivors loop.
     """
     if cur is None or not cur.verdicts:
         return rows
-    out: list[dict] = []
-    for row in rows:
-        verdict = cur.verdicts.for_row(
-            record_type, row["dedup_base"], row.get(f"{record_type}_id")
+    return [
+        row
+        for row in curation.annotate_rows(
+            rows, record_type, cur.verdicts, on_verdict=cur.record
         )
-        if verdict is None:
-            out.append(row)
-            continue
-        cur.record(verdict)
-        if verdict["status"] in curation.APPENDIX_STATUSES:
-            continue
-        row[curation.CURATION_FIELD] = verdict
-        out.append(row)
-    return out
+        if not curation.is_appendix(row)
+    ]
 
 
 def _apply_curation_events(
@@ -277,26 +277,19 @@ def _apply_curation_events(
     :func:`query.query_timeline` was asked for them (``with_identity``). An event
     without identity is passed through -- that is the no-verdicts fast path, where the
     journal never asks for the extra keys in the first place.
+
+    Stamping is :func:`curation.annotate_events`, shared with `pemr query timeline`
+    (issue #131); the appendix policy stays here, as in :func:`_apply_curation`.
     """
     if cur is None or not cur.verdicts:
         return events
-    out: list[dict] = []
-    for event in events:
-        base = event.get("dedup_base")
-        if base is None:
-            out.append(event)
-            continue
-        record_type = event["record_type"]
-        verdict = cur.verdicts.for_row(record_type, base, event.get("record_id"))
-        if verdict is None:
-            out.append(event)
-            continue
-        cur.record(verdict)
-        if verdict["status"] in curation.APPENDIX_STATUSES:
-            continue
-        event[curation.CURATION_FIELD] = verdict
-        out.append(event)
-    return out
+    return [
+        event
+        for event in curation.annotate_events(
+            events, cur.verdicts, on_verdict=cur.record
+        )
+        if not curation.is_appendix(event)
+    ]
 
 
 def _dispute_suffix(row: dict) -> str:

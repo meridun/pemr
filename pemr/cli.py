@@ -2343,6 +2343,19 @@ def _resolved_as(result: dedup.ResolveResult) -> str:
 # Internal columns never emitted in --json (unstable / not part of the contract).
 _HIDDEN_FIELDS = dedup.INTERNAL_COLUMNS
 
+# The keys `query.query_timeline(with_identity=True)` adds so the curation overlay can
+# resolve an event (issue #131). They are resolution scaffolding, not output: stripped
+# again before **both** the human and the --json path, because `dedup_base` is one of
+# :data:`dedup.INTERNAL_COLUMNS` and letting it reach --json would break the same read
+# contract :func:`_clean` enforces for rows.
+_QUERY_IDENTITY_KEYS = ("record_type", "dedup_base", "record_id")
+
+# One help string for the three `query` subcommands' --raw flag (issue #131).
+_RAW_HELP = (
+    "ignore the curation overlay: include superseded/corrected rows in the listing "
+    "(--json is unaffected; it always carries the verdict)"
+)
+
 
 def _clean(row: dict) -> dict:
     """Strip a record row down to its ``--json`` contract (:func:`dedup.public_row`).
@@ -2379,19 +2392,65 @@ def _with_conn_person(args: argparse.Namespace, work):
         conn.close()
 
 
+def _verdict_suffix(carrier: dict, *, raw: bool = False) -> str:
+    """The marker one listed row/event carries because of its curation verdict.
+
+    ``""`` for an unannotated carrier, and for ``confirmed``/``distinct`` — both record
+    that the row renders exactly as filed. ``disputed`` reuses
+    :func:`render._dispute_suffix` verbatim (the precedent `_cmd_query_labs` already sets
+    with :func:`render._ref_range`), so the one ``[DISPUTED: ...]`` format is written
+    once. An :data:`curation.APPENDIX_STATUSES` verdict is marked **only under
+    ``--raw``** — in the default view that row is not printed at all, and a raw listing
+    has to say which rows the overlay would have hidden.
+    """
+    verdict = curation.verdict_of(carrier)
+    if verdict is None:
+        return ""
+    if verdict["status"] == "disputed":
+        return render._dispute_suffix(carrier)
+    if raw and verdict["status"] in curation.APPENDIX_STATUSES:
+        return f"  [{curation.describe(verdict)}]"
+    return ""
+
+
+def _visible(carriers: list[dict], *, raw: bool) -> list[dict]:
+    """The carriers a human-readable listing prints: everything under ``--raw``, else
+    everything the curation overlay has not sent to the appendix."""
+    if raw:
+        return carriers
+    return [c for c in carriers if not curation.is_appendix(c)]
+
+
+def _hidden_note(hidden: int, noun: str) -> str:
+    """The trailing line disclosing what the overlay suppressed.
+
+    Printed whenever anything was hidden — **including** when everything was, alongside
+    the "no ..." line. Silently shortening a clinical list is the one failure this
+    feature must not introduce, so it follows the disclose-don't-drop rule
+    `trends.other_assays` and render's appendix section already do.
+    """
+    return f"({hidden} superseded/corrected {noun} hidden; --raw to include)"
+
+
 def _cmd_query_labs(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
         rows = query.query_labs(
             conn, args.person, test=args.test, since=args.since, dictionary=dictionary
         )
+        # The curation overlay (issue #131): `render summary` has consulted it since
+        # #109, and a `query` that did not made the two verbs disagree about what is
+        # live. Always stamped, never suppressed in --json — a programmatic caller
+        # filters for itself.
+        rows = curation.annotate_rows(rows, "lab_result", curation.load_verdicts(conn))
         if args.json:
             _print_json([_clean(r) for r in rows])
             return 0
-        if not rows:
+        shown = _visible(rows, raw=args.raw)
+        hidden = len(rows) - len(shown)
+        if not shown:
             print("no lab results")
-            return 0
-        for r in rows:
+        for r in shown:
             value = r["value_num"] if r["value_num"] is not None else r["value_text"]
             unit = f" {r['unit']}" if r["unit"] else ""
             flag = f"  [{r['flag']}]" if r["flag"] else ""
@@ -2399,7 +2458,9 @@ def _cmd_query_labs(args: argparse.Namespace) -> int:
             # as "(ref <= 20)" / "(ref >= 8)" instead of a bogus "(ref -20.0)".
             ref = render._ref_range(r)
             print(f"{_fmt(r['collected_at']):19}  {r['test_name']:20}  "
-                  f"{_fmt(value)}{unit}{flag}{ref}")
+                  f"{_fmt(value)}{unit}{flag}{ref}{_verdict_suffix(r, raw=args.raw)}")
+        if hidden:
+            print(_hidden_note(hidden, "lab results"))
         return 0
 
     return _with_conn_person(args, work)
@@ -2408,13 +2469,15 @@ def _cmd_query_labs(args: argparse.Namespace) -> int:
 def _cmd_query_meds(args: argparse.Namespace) -> int:
     def work(conn):
         rows = query.query_meds(conn, args.person, active=args.active)
+        rows = curation.annotate_rows(rows, "medication", curation.load_verdicts(conn))
         if args.json:
             _print_json([_clean(r) for r in rows])
             return 0
-        if not rows:
+        shown = _visible(rows, raw=args.raw)
+        hidden = len(rows) - len(shown)
+        if not shown:
             print("no active medications" if args.active else "no medications")
-            return 0
-        for r in rows:
+        for r in shown:
             dose = f"  {r['dose']}" if r["dose"] else ""
             freq = f"  {r['frequency']}" if r["frequency"] else ""
             if r["ended_on"]:
@@ -2425,7 +2488,10 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
                 end = " -> (ended)"
             span = _fmt(r["started_on"]) + end
             status = f"  [{r['status']}]" if r["status"] else ""
-            print(f"{r['name']:24}{dose}{freq}  {span}{status}")
+            print(f"{r['name']:24}{dose}{freq}  {span}{status}"
+                  f"{_verdict_suffix(r, raw=args.raw)}")
+        if hidden:
+            print(_hidden_note(hidden, "medications"))
         return 0
 
     return _with_conn_person(args, work)
@@ -2433,16 +2499,30 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
 
 def _cmd_query_timeline(args: argparse.Namespace) -> int:
     def work(conn):
-        events = query.query_timeline(conn, args.person, since=args.since)
+        # `render_journal`'s idiom: ask for row identity only when there is a verdict to
+        # resolve, so an unannotated database builds the exact event shape it always has.
+        verdicts = curation.load_verdicts(conn)
+        events = query.query_timeline(
+            conn, args.person, since=args.since, with_identity=bool(verdicts)
+        )
+        curation.annotate_events(events, verdicts)
+        events = [
+            {k: v for k, v in e.items() if k not in _QUERY_IDENTITY_KEYS}
+            for e in events
+        ]
         if args.json:
             _print_json(events)
             return 0
-        if not events:
+        shown = _visible(events, raw=args.raw)
+        hidden = len(events) - len(shown)
+        if not shown:
             print("no events")
-            return 0
-        for e in events:
+        for e in shown:
             prov = f"  (doc #{e['document_id']})" if e["document_id"] is not None else ""
-            print(f"{e['date']:10}  {e['type']:12}  {e['summary']}{prov}")
+            print(f"{e['date']:10}  {e['type']:12}  {e['summary']}{prov}"
+                  f"{_verdict_suffix(e, raw=args.raw)}")
+        if hidden:
+            print(_hidden_note(hidden, "events"))
         return 0
 
     return _with_conn_person(args, work)
@@ -3250,12 +3330,14 @@ def build_parser() -> argparse.ArgumentParser:
     q_labs.add_argument("--since", help="ISO date; keep rows on/after this date")
     q_labs.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     q_labs.add_argument("--json", action="store_true", help="machine-readable output")
+    q_labs.add_argument("--raw", action="store_true", help=_RAW_HELP)
     q_labs.set_defaults(func=_cmd_query_labs)
 
     q_meds = query_sub.add_parser("meds", help="medications for a person")
     q_meds.add_argument("--person", required=True, help="owner slug")
     q_meds.add_argument("--active", action="store_true", help="current meds only")
     q_meds.add_argument("--json", action="store_true", help="machine-readable output")
+    q_meds.add_argument("--raw", action="store_true", help=_RAW_HELP)
     q_meds.set_defaults(func=_cmd_query_meds)
 
     q_timeline = query_sub.add_parser(
@@ -3264,6 +3346,7 @@ def build_parser() -> argparse.ArgumentParser:
     q_timeline.add_argument("--person", required=True, help="owner slug")
     q_timeline.add_argument("--since", help="ISO date; keep events on/after this date")
     q_timeline.add_argument("--json", action="store_true", help="machine-readable output")
+    q_timeline.add_argument("--raw", action="store_true", help=_RAW_HELP)
     q_timeline.set_defaults(func=_cmd_query_timeline)
 
     p_find = sub.add_parser("find", help="full-text search over OCR text + record fields")

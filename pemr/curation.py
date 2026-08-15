@@ -14,6 +14,9 @@ write it.
     list_curation        -- every verdict, newest first
     clear_curation       -- lift one verdict, dry-run by default
     load_verdicts        -- the whole table as a lookup, for the render/verify hot path
+    annotate_rows        -- stamp a section's rows with their verdicts (read-time overlay)
+    annotate_events      -- ... the same for timeline events
+    is_appendix          -- does a stamped carrier leave the live view?
     row_verdicts_for     -- the row-scoped verdicts naming a set of rows
     retire_row_verdicts  -- ... and drop them, for the row-removal write paths
     orphan_kinds         -- why (if at all) one verdict points at nothing live
@@ -94,7 +97,7 @@ of.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -388,6 +391,107 @@ def load_verdicts(conn: sqlite3.Connection) -> VerdictMap:
         else:
             out.family[(view["record_type"], view["dedup_base"])] = view
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Read-time overlay — the stamping half, shared by every front door (issue #131)
+# --------------------------------------------------------------------------- #
+#
+# The *stamping* rule (which verdict applies to which carrier) lives here, beside
+# :meth:`VerdictMap.for_row` and :data:`APPENDIX_STATUSES`; the *policy* rule (what to do
+# with a carrier bound for the appendix) stays with each front door, because they
+# legitimately differ: `render` collects the carrier into its "Superseded / corrected"
+# section, `pemr query` hides it behind a count, and the MCP payload hides nothing at all.
+#
+# Before #131 the stamping half lived only inside `render`, and `pemr query` had no
+# overlay at all — the two verbs disagreed about which medications a person is on.
+
+
+def annotate_rows(
+    rows: list[dict],
+    record_type: str,
+    verdicts: VerdictMap,
+    *,
+    on_verdict: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """Stamp each row of one section with the verdict that applies to it.
+
+    Rows are mutated **in place** and the same list is returned, so a caller may either
+    take the return value or ignore it. A row whose verdict resolves carries it under
+    :data:`CURATION_FIELD`; a row with no verdict is left exactly as it was — no key is
+    added — which is what keeps unannotated output byte-identical (Architecture.md's
+    additive-only rule). An empty ``verdicts`` short-circuits the whole pass.
+
+    Resolution is **per row**, not per family (issue #114), and runs solely through
+    :meth:`VerdictMap.for_row` so the row-over-family precedence rule is never restated.
+    That needs the row's own identity, so ``rows`` must come from a ``SELECT *``: a
+    projected row missing ``dedup_base``/``<record_type>_id`` silently degrades to family
+    scope, or to no verdict at all.
+
+    ``on_verdict`` fires once per stamped row (`render` passes ``_CurationPass.record``,
+    which files the verdict into the appendix / open-questions sections). It is called
+    for **every** resolved verdict, including one bound for the appendix — the caller
+    decides what leaves the live view, via :func:`is_appendix`.
+    """
+    if not verdicts:
+        return rows
+    pk = f"{record_type}_id"
+    for row in rows:
+        verdict = verdicts.for_row(record_type, row.get("dedup_base"), row.get(pk))
+        if verdict is None:
+            continue
+        if on_verdict is not None:
+            on_verdict(verdict)
+        row[CURATION_FIELD] = verdict
+    return rows
+
+
+def annotate_events(
+    events: list[dict],
+    verdicts: VerdictMap,
+    *,
+    on_verdict: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """:func:`annotate_rows` for timeline events.
+
+    Same rule, different carrier: an event is a rendered sentence rather than a row, and
+    it carries ``record_type``/``dedup_base``/``record_id`` only when
+    :func:`query.query_timeline` was asked for them (``with_identity=True``). An event
+    without identity passes through untouched — that is also the no-verdicts fast path,
+    where no caller asks for the extra keys in the first place.
+    """
+    if not verdicts:
+        return events
+    for event in events:
+        base = event.get("dedup_base")
+        if base is None:
+            continue
+        verdict = verdicts.for_row(
+            event["record_type"], base, event.get("record_id")
+        )
+        if verdict is None:
+            continue
+        if on_verdict is not None:
+            on_verdict(verdict)
+        event[CURATION_FIELD] = verdict
+    return events
+
+
+def verdict_of(carrier: dict) -> dict | None:
+    """The verdict :func:`annotate_rows`/:func:`annotate_events` stamped, or None."""
+    return carrier.get(CURATION_FIELD) if isinstance(carrier, dict) else None
+
+
+def is_appendix(carrier: dict) -> bool:
+    """Whether a stamped carrier leaves the live view — the one predicate every front
+    door asks.
+
+    True for exactly the :data:`APPENDIX_STATUSES`. ``disputed`` is deliberately false:
+    it renders in place, marked, because a disputed fact that vanished from a clinical
+    list would be worse than an unmarked one.
+    """
+    verdict = verdict_of(carrier)
+    return verdict is not None and verdict.get("status") in APPENDIX_STATUSES
 
 
 def row_verdicts_for(

@@ -17,7 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from pemr import __version__, db, dedup, ingest, mcp_server, persons, tombstones
+from pemr import (
+    __version__, curation, db, dedup, ingest, mcp_server, persons, tombstones,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 DICT_PATH = REPO / "data" / "dictionary.example.toml"
@@ -99,6 +101,35 @@ def test_query_kinds(seeded):
 def test_query_unknown_kind_raises(seeded):
     with pytest.raises(mcp_server.ToolError, match="unknown query kind"):
         mcp_server.query(seeded, kind="bogus", person="jane-doe")
+
+
+def test_query_carries_the_verdict_and_suppresses_nothing(seeded):
+    """Issue #131: the structured payload mirrors the CLI's `--json`, not its human
+    view — it discloses the verdict and lets the caller decide."""
+    base = seeded.execute(
+        "SELECT dedup_base FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "medication", base, status="superseded",
+                             note="stopped", apply=True)
+
+    meds = mcp_server.query(seeded, kind="meds", person="jane-doe")
+    assert [m["name"] for m in meds] == ["Metformin"]        # nothing hidden
+    assert meds[0]["_curation"]["status"] == "superseded"
+
+    labs = mcp_server.query(seeded, kind="labs", person="jane-doe")
+    assert all("_curation" not in r for r in labs)           # additive: no verdict, no key
+
+    events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
+    assert any(e.get("_curation", {}).get("status") == "superseded" for e in events)
+    # `with_identity=True` scaffolding must not reach the payload.
+    for key in ("record_type", "dedup_base", "record_id"):
+        assert all(key not in e for e in events)
+
+
+def test_query_with_no_verdicts_carries_no_curation_key(seeded):
+    for kind in ("labs", "meds", "timeline"):
+        rows = mcp_server.query(seeded, kind=kind, person="jane-doe")
+        assert rows and all("_curation" not in r for r in rows)
 
 
 def test_find_and_trends(seeded):

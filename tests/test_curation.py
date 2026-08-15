@@ -632,6 +632,131 @@ def test_re_annotating_a_row_after_a_rekey_collapses_the_stale_breadcrumb(seeded
     assert live["dedup_base"] == new_base and live["note"] == "after"
 
 
+# --- the read-time overlay helpers (issue #131) -------------------------------
+#
+# The stamping half of the overlay, lifted out of `render` so `pemr query` applies the
+# same rule. Renderer *policy* (appendix collection) stays in test_render.py; the CLI's
+# policy (suppression + --raw) is in test_cli_phase3.py.
+
+
+def _rows(conn, record_type):
+    return [dict(r) for r in conn.execute(f"SELECT * FROM {record_type}").fetchall()]
+
+
+def test_annotate_rows_stamps_a_family_verdict_on_every_row_of_the_family(seeded):
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", base, status="superseded",
+                             note="corrected by a later draw", apply=True)
+
+    rows = curation.annotate_rows(
+        _rows(conn, "lab_result"), "lab_result", curation.load_verdicts(conn)
+    )
+    stamped = {r["test_name"]: r.get(curation.CURATION_FIELD) for r in rows}
+    assert stamped["HbA1c"]["status"] == "superseded"
+    assert stamped["Glucose"] is None          # a different family: no key at all
+    assert curation.CURATION_FIELD not in [r for r in rows if r["test_name"] == "Glucose"][0]
+
+
+def test_annotate_rows_lets_a_row_verdict_beat_the_family_one_on_its_own_row(seeded):
+    """The #114 precedence rule, resolved solely through ``VerdictMap.for_row``."""
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "HbA1c")
+    # A second occurrence of the same family, so the two scopes can disagree.
+    conn.execute(
+        "INSERT INTO lab_result (person_id, document_id, test_name, collected_at, "
+        "value_num, unit, dedup_key, dedup_base, dedup_occurrence) "
+        "SELECT person_id, document_id, test_name, collected_at, 5.9, unit, "
+        "dedup_key || '#1', dedup_base, 1 FROM lab_result WHERE test_name = 'HbA1c'",
+    )
+    conn.commit()
+    sibling = int(conn.execute(
+        "SELECT lab_result_id FROM lab_result WHERE dedup_occurrence = 1"
+    ).fetchone()["lab_result_id"])
+    curation.annotate_record(conn, "lab_result", base, status="superseded",
+                             note="family ruling", apply=True)
+    curation.annotate_record(conn, "lab_result", str(sibling), status="disputed",
+                             note="row ruling", row=True, apply=True)
+
+    by_id = {
+        r["lab_result_id"]: curation.verdict_of(r)
+        for r in curation.annotate_rows(
+            _rows(conn, "lab_result"), "lab_result", curation.load_verdicts(conn)
+        )
+    }
+    assert by_id[sibling]["status"] == "disputed"          # row scope wins here
+    occ0 = _row_id(conn, "lab_result", "dedup_occurrence", 0)
+    assert by_id[occ0]["status"] == "superseded"           # ... and only here
+
+
+def test_annotate_rows_fires_on_verdict_once_per_stamped_row(seeded):
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", base, status="confirmed",
+                             note="ruled", apply=True)
+    seen = []
+    curation.annotate_rows(
+        _rows(conn, "lab_result"), "lab_result", curation.load_verdicts(conn),
+        on_verdict=seen.append,
+    )
+    assert [v["status"] for v in seen] == ["confirmed"]
+
+
+def test_annotate_rows_with_no_verdicts_adds_no_key(seeded):
+    """The additive-only guarantee: an unannotated database is untouched, key-for-key."""
+    conn = seeded["conn"]
+    rows = _rows(conn, "lab_result")
+    before = [dict(r) for r in rows]
+    assert curation.annotate_rows(rows, "lab_result", curation.load_verdicts(conn)) is rows
+    assert rows == before
+    assert all(curation.CURATION_FIELD not in r for r in rows)
+
+
+def test_annotate_events_passes_an_identity_less_event_through(seeded):
+    conn = seeded["conn"]
+    curation.annotate_record(
+        conn, "lab_result", _base(conn, "lab_result", "test_name", "HbA1c"),
+        status="superseded", note="corrected", apply=True,
+    )
+    events = [{"date": "2026-01-02", "type": "lab", "summary": "HbA1c 5.7 %"}]
+    assert curation.annotate_events(events, curation.load_verdicts(conn)) == [
+        {"date": "2026-01-02", "type": "lab", "summary": "HbA1c 5.7 %"}
+    ]
+
+
+def test_annotate_events_stamps_an_event_carrying_identity(seeded):
+    conn = seeded["conn"]
+    base = _base(conn, "lab_result", "test_name", "HbA1c")
+    row_id = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", base, status="superseded",
+                             note="corrected", apply=True)
+    events = [{"date": "2026-01-02", "type": "lab", "summary": "HbA1c",
+               "record_type": "lab_result", "dedup_base": base, "record_id": row_id}]
+    curation.annotate_events(events, curation.load_verdicts(conn))
+    assert events[0][curation.CURATION_FIELD]["status"] == "superseded"
+
+
+@pytest.mark.parametrize("status, appendix", [
+    ("superseded", True),
+    ("erroneous-in-source", True),
+    ("merged-into", True),
+    ("confirmed", False),
+    ("disputed", False),
+    ("distinct", False),
+])
+def test_is_appendix_is_exactly_the_appendix_statuses(status, appendix):
+    """A live row must never silently leave its clinical section — the classification
+    behind that is one predicate, and this pins the whole vocabulary against it."""
+    carrier = {curation.CURATION_FIELD: {"status": status}}
+    assert curation.is_appendix(carrier) is appendix
+    assert curation.verdict_of(carrier)["status"] == status
+
+
+def test_is_appendix_and_verdict_of_on_an_unstamped_carrier():
+    assert curation.is_appendix({"name": "Metformin"}) is False
+    assert curation.verdict_of({"name": "Metformin"}) is None
+
+
 # --- the rekey collision seam (issue #116) -----------------------------------
 
 def _fusing_ids(conn):
