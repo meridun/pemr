@@ -9,6 +9,8 @@
     "sync:claude-config:check": "node scripts/sync-claude-config.mjs --check",
     "check:meta-drift": "node scripts/check-meta-drift.mjs",
     "check:pii": "node scripts/pii-scan.mjs",
+    "setup:hooks": "node scripts/setup-hooks.mjs",
+    "check:hooks": "node scripts/setup-hooks.mjs --check",
     "sdlc": "node scripts/sdlc.mjs",
     "test": "node --test"
   }

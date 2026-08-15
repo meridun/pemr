@@ -1,0 +1,27 @@
+#!/bin/sh
+# Block a commit message that names a real identity.
+#
+# This repo is public and the message is as public as the diff. The incident
+# that motivated the guard leaked partly through commit messages written to
+# *describe* the leak — so the rule is: describe the shape, never the value.
+#
+# Installed via `npm run setup:hooks` (sets core.hooksPath to .githooks).
+# Bypass, if you are certain: `git commit --no-verify`.
+
+[ -z "$SKIP_PII_HOOK" ] || exit 0
+
+command -v node >/dev/null 2>&1 || {
+  echo "pii-guard: node not found; cannot check the commit message." >&2
+  exit 1
+}
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+scanner="$repo_root/scripts/pii-scan.mjs"
+[ -f "$scanner" ] || exit 0
+
+if ! node "$scanner" --stdin "this commit message" < "$1"; then
+  echo "" >&2
+  echo "pii-guard: commit blocked — the message above names a real identity." >&2
+  echo "Rewrite it to describe the shape rather than the value." >&2
+  exit 1
+fi

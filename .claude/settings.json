@@ -9,6 +9,15 @@
             "command": "python3 .claude/hooks/graphify-nudge.py 2>/dev/null || python .claude/hooks/graphify-nudge.py 2>/dev/null || true"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/pii-guard.py || python .claude/hooks/pii-guard.py"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
