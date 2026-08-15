@@ -400,6 +400,18 @@ one raises and names the stored row. Same reason `commit_extraction`'s pass 1 re
 colliding rows of one submission: the human is at the keyboard, and a conflict staged
 against oneself has no independent provenance to adjudicate.
 
+Since issue #133, that refusal first consults the `curation` overlay (§2): a colliding row
+already carrying a **releasing** verdict — `superseded` / `erroneous-in-source` /
+`merged-into` (row scope beats family scope, same precedence rule as §6) — no longer blocks.
+Only a `disputed` or unverdicted row still raises, and the error's remedy text only
+recommends `record annotate` when annotating that row could actually change the outcome —
+a row already released is never named. Once every colliding row is released the attestation
+proceeds as an ordinary new occurrence of the identity (the next free `dedup_occurrence`),
+not a replacement of what is stored. One consequence worth knowing: a **family**-scoped
+release covers that new occurrence too, so the freshly attested row itself renders in the
+`## Superseded / corrected` appendix (§6) until the verdict is re-scoped to the rows it
+meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
+
 `norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
 synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
 `HbA1c`, `Hemoglobin A1c` → one canonical `hba1c`. The dictionary is the one place fuzzy
@@ -950,6 +962,9 @@ pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
                    --field NAME=VALUE [--field ...] [--apply]
                                                          # commit a fact attested by a PERSON, with no
                                                          # source document (§2 attestation); dry run by default
+                                                         # a colliding family fully released by curation
+                                                         # verdicts no longer blocks (§3, issue #133);
+                                                         # disputed/unverdicted rows still refuse it
 pemr record assert --list [<table>] [--all] [--json]     # attested rows still needing a source document
 pemr document tombstone list [--json]                    # recorded intentional removals, newest first
 pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]

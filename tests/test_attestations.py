@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from pemr import attestations, cli, db, dedup, persons, query
+from pemr import attestations, cli, curation, db, dedup, persons, query, records
 
 MED = {"name": "Metformin", "dose": "500 mg", "started_on": "2025-06-01"}
 
@@ -203,6 +203,211 @@ def test_the_collision_message_names_an_attestation_as_such(conn, jane):
 
 
 # --------------------------------------------------------------------------- #
+# The collision check consults the curation overlay (issue #133)
+#
+# Before this, `record assert` resolved a collision from `dedup.load_family`'s raw SQL,
+# which never sees the `curation` table: a row the human had already ruled `superseded`
+# still blocked, and the error's own suggested remedy (`record annotate`) provably could
+# not work. Released rows now stop blocking; `disputed` and unverdicted ones do not.
+# --------------------------------------------------------------------------- #
+
+def _rule(conn, target, status="superseded", *, row=False, **kwargs):
+    """Record one verdict the way an operator would — `record annotate`'s API."""
+    return curation.annotate_record(
+        conn, "medication", str(target), status=status,
+        note="ruled on during the test", row=row, apply=True, **kwargs,
+    )
+
+
+def _base(conn, jane):
+    return dedup.dedup_key("medication", MED, jane.person_id)
+
+
+def _stored_row_id(conn, occurrence=0):
+    return int(conn.execute(
+        "SELECT medication_id FROM medication WHERE dedup_occurrence = ?",
+        (occurrence,),
+    ).fetchone()["medication_id"])
+
+
+def test_a_released_row_no_longer_blocks_a_differing_attestation(conn, jane):
+    """The defect, inverted: annotating the colliding row now does what the error said."""
+    _assert_med(conn, apply=True)
+    _rule(conn, _stored_row_id(conn), row=True)
+    report = _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    assert report.outcome == "new"
+    assert report.applied is True
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 2
+
+
+@pytest.mark.parametrize("status", curation.APPENDIX_STATUSES)
+def test_every_appendix_status_releases_the_identity(conn, jane, status):
+    """The vocabulary is `APPENDIX_STATUSES`, not three literals — a status added there
+    must release here too, or the two halves of "leaves the live view" have drifted."""
+    _assert_med(conn, apply=True)
+    extra = (
+        {"merged_into_base": _base(conn, jane)} if status == "merged-into" else {}
+    )
+    _rule(conn, _stored_row_id(conn), status=status, row=True, **extra)
+    assert _assert_med(
+        conn, payload=MED | {"frequency": "daily"}, apply=True
+    ).outcome == "new"
+
+
+def test_a_family_scoped_release_also_unblocks(conn, jane):
+    _assert_med(conn, apply=True)
+    _rule(conn, _base(conn, jane))
+    assert _assert_med(
+        conn, payload=MED | {"frequency": "daily"}, apply=True
+    ).outcome == "new"
+
+
+@pytest.mark.parametrize("scope_row", [True, False])
+def test_a_disputed_row_still_blocks(conn, jane, scope_row):
+    """`disputed` is deliberately not in APPENDIX_STATUSES: the row still holds the
+    identity, it is merely flagged."""
+    _assert_med(conn, apply=True)
+    target = _stored_row_id(conn) if scope_row else _base(conn, jane)
+    _rule(conn, target, status="disputed", row=scope_row)
+    with pytest.raises(attestations.AttestationCollisionError):
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+
+
+def test_an_unverdicted_row_still_blocks(conn, jane):
+    _assert_med(conn, apply=True)
+    with pytest.raises(attestations.AttestationCollisionError):
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+
+
+def test_one_unverdicted_sibling_still_blocks_a_released_family(conn, jane):
+    """A released row must not mask an unresolved one — and must not be the row the
+    error tells you to annotate."""
+    _assert_med(conn, apply=True)
+    first = _stored_row_id(conn)
+    _rule(conn, first, row=True)
+    _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    second = _stored_row_id(conn, occurrence=1)
+
+    with pytest.raises(attestations.AttestationCollisionError) as exc:
+        _assert_med(conn, payload=MED | {"frequency": "TID"}, apply=True)
+    message = str(exc.value)
+    assert f"medication {second}" in message
+    assert f"medication {first}" not in message
+    assert "1 other row(s) in this family already carry a releasing verdict" in message
+
+
+def test_row_scope_beats_family_scope_in_the_collision_check(conn, jane):
+    """Both directions, through `VerdictMap.for_row` — no second precedence rule."""
+    _assert_med(conn, apply=True)
+    row_id, base = _stored_row_id(conn), _base(conn, jane)
+
+    _rule(conn, base, status="superseded")
+    _rule(conn, row_id, status="disputed", row=True)
+    with pytest.raises(attestations.AttestationCollisionError):
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+
+    _rule(conn, base, status="disputed")
+    _rule(conn, row_id, status="superseded", row=True)
+    assert _assert_med(
+        conn, payload=MED | {"frequency": "daily"}, apply=True
+    ).outcome == "new"
+
+
+def test_the_collision_message_stays_honest(conn, jane):
+    """The bug this issue is about: never recommend a remedy that cannot work."""
+    _assert_med(conn, apply=True)
+    row_id = _stored_row_id(conn)
+
+    # Unverdicted: today's advice, which does work.
+    with pytest.raises(attestations.AttestationCollisionError) as bare:
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    assert f"pemr record rm medication {row_id}" in str(bare.value)
+    assert f"pemr record annotate medication {row_id} --row" in str(bare.value)
+
+    # Verdicted but not releasing: say which verdict it carries, and which ones release.
+    _rule(conn, row_id, status="disputed", row=True)
+    with pytest.raises(attestations.AttestationCollisionError) as ruled:
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    message = str(ruled.value)
+    assert "already carries the verdict 'disputed'" in message
+    for status in curation.APPENDIX_STATUSES:
+        assert f"`{status}`" in message
+
+
+def test_a_released_row_matching_the_payload_still_reports_duplicate(conn, jane):
+    """Twin semantics are untouched: matching stays `dedup._rows_equal`'s call."""
+    _assert_med(conn, apply=True)
+    _rule(conn, _stored_row_id(conn), row=True)
+    report = _assert_med(conn, apply=True)
+    assert report.outcome == "duplicate"
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 1
+
+
+def test_the_unblocked_write_takes_the_next_free_occurrence(conn, jane):
+    """`dedup_key` is UNIQUE: an unblocked write at occurrence 0 would raise
+    IntegrityError against its released sibling instead of landing."""
+    _assert_med(conn, apply=True)
+    _rule(conn, _stored_row_id(conn), row=True)
+    _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    _rule(conn, _stored_row_id(conn, occurrence=1), row=True)
+    base = _base(conn, jane)
+
+    dry = _assert_med(conn, payload=MED | {"frequency": "TID"})
+    assert dry.dedup_occurrence == 2
+    assert dry.dedup_key == dedup.occurrence_key(base, 2)
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 2
+
+    written = _assert_med(conn, payload=MED | {"frequency": "TID"}, apply=True)
+    assert written.dedup_occurrence == 2
+    assert written.dedup_key == dedup.occurrence_key(base, 2)
+    row = conn.execute(
+        "SELECT * FROM medication WHERE medication_id = ?", (written.row_id,)
+    ).fetchone()
+    assert row["dedup_key"] == dedup.occurrence_key(base, 2)
+    assert row["dedup_base"] == base
+    assert len(dedup.load_family(conn, "medication", base)) == 3
+
+
+def test_an_unblocked_write_steps_over_a_hole_left_by_record_rm(conn, jane):
+    """The occupied-occurrence seam: `record rm` on a middle sibling leaves a hole, and
+    the next unblocked write must take `max + 1` over what is still stored — not the
+    hole, whose key belongs to no live row, and not a number a live sibling already
+    holds (that would be `UNIQUE(dedup_key)` instead of a landing). Same rule, same
+    idiom, as `dedup._resolve_keep_both`."""
+    base = _base(conn, jane)
+    for occurrence, frequency in enumerate((None, "daily", "TID")):
+        payload = MED if frequency is None else MED | {"frequency": frequency}
+        _assert_med(conn, payload=payload, apply=True)
+        _rule(conn, _stored_row_id(conn, occurrence=occurrence), row=True)
+
+    records.remove_record(
+        conn, "medication", _stored_row_id(conn, occurrence=1), apply=True
+    )
+    written = _assert_med(conn, payload=MED | {"frequency": "QID"}, apply=True)
+    assert written.dedup_occurrence == 3
+    assert written.dedup_key == dedup.occurrence_key(base, 3)
+    stored = {
+        int(row["dedup_occurrence"])
+        for row in dedup.load_family(conn, "medication", base)
+    }
+    assert stored == {0, 2, 3}
+
+
+def test_an_unverdicted_database_is_byte_identical(conn, jane):
+    """The additive-only AC: with no verdicts at all, nothing about this path moved."""
+    report = _assert_med(conn, apply=True)
+    assert report.dedup_occurrence == 0
+    assert report.dedup_key == report.dedup_base
+    row = conn.execute("SELECT * FROM medication").fetchone()
+    assert row["dedup_key"] == row["dedup_base"]
+    assert int(row["dedup_occurrence"]) == 0
+    with pytest.raises(attestations.AttestationCollisionError) as exc:
+        _assert_med(conn, payload=MED | {"frequency": "daily"}, apply=True)
+    assert "`pemr record rm medication 1`" in str(exc.value)
+    assert "already carries the verdict" not in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
 # list_attested — the "needs source" queue
 # --------------------------------------------------------------------------- #
 
@@ -352,6 +557,87 @@ def test_cli_assert_collision_fails_friendly(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, *_ASSERT_ARGV, "--field", "frequency=BID", "--apply") == 1
     assert "already holds this identity" in capsys.readouterr().err
+
+
+def _seed_cli_family(path, count):
+    """`count` document-sourced rows on one identity — the #130 repro's shape."""
+    conn = db.connect(path / "cli.db")
+    person_id = int(
+        conn.execute("SELECT person_id FROM person").fetchone()["person_id"]
+    )
+    doc = _document(conn, person_id, "cc33dd44")
+    base = dedup.dedup_key("medication", MED, person_id)
+    ids = [
+        dedup._insert_record(
+            conn, "medication", MED | {"frequency": f"{occ + 1}x daily"},
+            person_id, doc, base, occ,
+        )
+        for occ in range(count)
+    ]
+    conn.commit()
+    conn.close()
+    return ids
+
+
+def test_cli_annotating_every_colliding_row_unblocks_the_assert(cli_ready, capsys):
+    """The #130 repro end to end: four stored rows hold one identity, the assert is
+    refused, the error's own remedy is run on all four, and the identical assert lands.
+    Before the fix the second assert refused byte-identically to the first."""
+    ids = _seed_cli_family(cli_ready, 4)
+    argv = (*_ASSERT_ARGV, "--field", "status=discontinued")
+    assert _run(cli_ready, *argv, "--apply") == 1
+    assert "already holds this identity" in capsys.readouterr().err
+
+    for row_id in ids:
+        assert _run(
+            cli_ready, "record", "annotate", "medication", str(row_id), "--row",
+            "--status", "superseded", "--note", "replaced by the current order",
+            "--apply",
+        ) == 0
+    capsys.readouterr()
+
+    assert _run(cli_ready, *argv, "--apply") == 0
+    assert "wrote medication #5" in capsys.readouterr().out
+
+
+def test_cli_assert_discloses_a_family_scoped_release(cli_ready, capsys):
+    """The one surprising outcome of the fix: a *family* verdict covers the row just
+    written, so it must be disclosed rather than reported as a plain success."""
+    ids = _seed_cli_family(cli_ready, 1)
+    assert _run(
+        cli_ready, "record", "annotate", "medication", str(ids[0]),
+        "--status", "superseded", "--note", "family ruling", "--apply",
+    ) == 0
+    capsys.readouterr()
+    argv = (*_ASSERT_ARGV, "--field", "status=discontinued")
+    assert _run(cli_ready, *argv, "--apply") == 0
+    out = capsys.readouterr().out
+    assert "family-scoped 'superseded' verdict" in out
+    assert "wrote medication #2" in out
+
+    # A row-scoped release gets the plain occurrence note instead, not this one: re-scope
+    # the family ruling onto the two rows it meant, then lift it.
+    for row_id in (str(ids[0]), "2"):
+        assert _run(
+            cli_ready, "record", "annotate", "medication", row_id, "--row",
+            "--status", "superseded", "--note", "row ruling", "--apply",
+        ) == 0
+    assert _run(
+        cli_ready, "record", "annotate", "medication", str(ids[0]), "--clear", "--apply"
+    ) == 0
+    capsys.readouterr()
+    assert _run(cli_ready, *argv, "--field", "route=oral", "--apply") == 0
+    out = capsys.readouterr().out
+    assert "family-scoped" not in out
+    assert "takes occurrence 2 of the identity" in out
+
+    # The --json contract is unchanged on this path (the #110 key set).
+    assert _run(cli_ready, *argv, "--field", "route=oral", "--json") == 0
+    assert set(json.loads(capsys.readouterr().out)) == {
+        "record_type", "person", "person_id", "attributed_to", "attested_on",
+        "attested_at", "label", "fields", "dedup_key", "dedup_base",
+        "dedup_occurrence", "outcome", "row_id", "existing_provenance", "applied",
+    }
 
 
 def test_cli_walk_from_attestation_to_a_source_document(cli_ready, capsys):
