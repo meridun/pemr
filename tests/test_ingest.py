@@ -952,6 +952,48 @@ def test_malformed_ccda_xml_does_not_raise(conn, tmp_path, sources, capsys, monk
     assert "--ocr-text-file" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("wrapper", ["content", "list", "paragraph"])
+def test_deeply_nested_ccda_narrative_does_not_raise(
+    conn, tmp_path, sources, wrapper
+):
+    """Nesting depth is document-controlled and unbounded, and ~1500 levels fits in
+    30 KB — far under the extraction cap. A recursive walk raised `RecursionError`
+    (a `RuntimeError`, so outside `_EXTRACT_ERRORS`) straight out of
+    `extract_text_routed`, breaking its "never raises" contract and losing the
+    document entirely."""
+    narrative = "Ferritin 201 ng/mL"
+    for _ in range(1500):
+        narrative = f"<{wrapper}>{narrative}</{wrapper}>"
+    src = _make_ccda(
+        tmp_path,
+        sections=(f"<section><title>Results</title><text>{narrative}</text></section>",),
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                       # the document still lands
+    assert "Ferritin 201 ng/mL" in result.document.ocr_text   # ...and is readable
+
+
+def test_recursion_error_degrades_like_any_other_extraction_failure(
+    conn, tmp_path, sources, capsys, monkeypatch
+):
+    """Our own walk is iterative, but the stdlib's are not (`Element.itertext()` is a
+    recursive generator), so the best-effort handler has to cover `RecursionError`
+    too — it is a `RuntimeError` and would otherwise escape the contract."""
+    def boom(_):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    def never(path):  # pragma: no cover - the degrade is native, not a fallback to OCR
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "_extract_ccda", boom)
+    monkeypatch.setattr(ingest, "run_ocr", never)
+    src = _make_ccda(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                # the document still lands
+    assert result.document.ocr_text is None
+    assert "text extraction failed" in capsys.readouterr().err
+
+
 def test_ccda_doctype_is_not_parsed_natively(conn, tmp_path, sources, monkeypatch):
     """stdlib `ET` expands internal entities, so a `<!DOCTYPE` is refused before the
     parse rather than after — a billion-laughs file is small enough to clear the cap."""

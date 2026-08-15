@@ -798,7 +798,11 @@ time so the owner check has an identity to match. Detection is the parsed **root
 (`{urn:hl7-org:v3}ClinicalDocument`), never the suffix — `.xml` is a container, so any
 other XML keeps the OCR route. A `<!DOCTYPE` is refused before parsing (stdlib
 `ElementTree` expands internal entities, and the size cap does not bound expansion), and
-a malformed file is simply "not detectably a CCDA" and falls through. Only the narrative
+a malformed file is simply "not detectably a CCDA" and falls through. The narrative walk
+is **iterative, not recursive**: nesting depth is document-controlled and ~1500 levels fit
+in 30 KB, so a recursive walk hit `RecursionError` — a `RuntimeError`, outside the
+best-effort handler — and cost the whole document. `RecursionError` is caught there now
+as well, since the stdlib's own `itertext()` walk is a recursive generator. Only the narrative
 is read: CCDA's coded entries are out of scope, since in real exports they are only
 selectively trustworthy (medication codes arrive `nullFlavor="UNK"` with the drug name
 only in the narrative, and historical entries carry a synthetic placeholder prescriber).

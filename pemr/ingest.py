@@ -53,7 +53,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study, tombstones as _tombstones
@@ -391,8 +391,14 @@ _CCDA_SNIFF_BYTES = 8192
 # Errors an OOXML/plaintext read can legitimately produce on a malformed or truncated
 # file. Extraction is best-effort: any of these degrades to "no ocr_text", never a lost
 # document — the same contract `run_ocr` already has for a missing tesseract.
+# `RecursionError` is in the list because element nesting depth is document-controlled
+# and the stdlib's own walkers recurse: `Element.itertext()` is a recursive generator,
+# so a pathologically nested narrative can exhaust the stack even though our own walk
+# is iterative. It is a `RuntimeError`, so it would otherwise escape the "never raises"
+# contract and cost the document (issue #138 audit).
 _EXTRACT_ERRORS = (
-    OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile, ET.ParseError,
+    OSError, ValueError, KeyError, IndexError, RecursionError,
+    zipfile.BadZipFile, ET.ParseError,
 )
 
 _SHEET_NUM = re.compile(r"(\d+)")
@@ -541,22 +547,41 @@ def _ccda_table_rows(table: ET.Element) -> list[str]:
 
 
 def _ccda_narrative(node: ET.Element) -> list[str]:
-    """One section's `<text>` narrative block, rendered as lines."""
+    """One section's `<text>` narrative block, rendered as lines.
+
+    Walked with an explicit stack rather than recursion: nesting depth is whatever the
+    document says it is (~1000 levels of `<content>` fits in 20 KB, far under the
+    extraction cap), and a `RecursionError` here is a `RuntimeError` — it would escape
+    :func:`extract_text_routed`'s "never raises" contract and cost the document.
+    """
     lines: list[str] = []
     if (node.text or "").strip():
         lines.append(" ".join(node.text.split()))
-    for child in node:
+    # Each frame is (remaining children, that element's tail) — the tail is emitted
+    # when the frame pops, i.e. *after* its subtree, exactly as the recursion did.
+    stack: list[tuple[Iterator[ET.Element], str | None]] = [(iter(node), None)]
+    while stack:
+        children, tail = stack[-1]
+        child = next(children, None)
+        if child is None:
+            stack.pop()
+            if (tail or "").strip():
+                lines.append(" ".join(tail.split()))
+            continue
         name = _localname(child.tag)
         if name == "table":
             lines.extend(_ccda_table_rows(child))
         elif name in ("paragraph", "item", "caption"):
-            # Nested inline markup is already flattened by `_ccda_flat`; recursing
+            # Nested inline markup is already flattened by `_ccda_flat`; descending
             # would emit its text a second time.
             flat = _ccda_flat(child)
             if flat:
                 lines.append(flat)
         elif name != "renderMultiMedia":   # an image reference has no text to give
-            lines.extend(_ccda_narrative(child))
+            if (child.text or "").strip():
+                lines.append(" ".join(child.text.split()))
+            stack.append((iter(child), child.tail))
+            continue                       # its tail is emitted when that frame pops
         if (child.tail or "").strip():
             lines.append(" ".join(child.tail.split()))
     return lines
@@ -646,8 +671,9 @@ def _extract_ccda(path: Path) -> str | None:
         for section in body.iter(f"{_CDA_NS}section"):
             block: list[str] = []
             title = section.find(f"{_CDA_NS}title")
-            if title is not None and _ccda_flat(title):
-                block.append(_ccda_flat(title))
+            heading = _ccda_flat(title) if title is not None else ""
+            if heading:
+                block.append(heading)
             narrative = section.find(f"{_CDA_NS}text")
             if narrative is not None:
                 block.extend(_ccda_narrative(narrative))
