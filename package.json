@@ -2,12 +2,13 @@
   "name": "pemr",
   "version": "0.0.1",
   "private": true,
-  "description": "Personal EMR — SDLC tooling wrapper around the Python engine (SQLite is truth)",
+  "description": "Personal EMR \u2014 SDLC tooling wrapper around the Python engine (SQLite is truth)",
   "type": "module",
   "scripts": {
     "sync:claude-config": "node scripts/sync-claude-config.mjs",
     "sync:claude-config:check": "node scripts/sync-claude-config.mjs --check",
     "check:meta-drift": "node scripts/check-meta-drift.mjs",
+    "check:pii": "node scripts/pii-scan.mjs",
     "sdlc": "node scripts/sdlc.mjs",
     "test": "node --test"
   }

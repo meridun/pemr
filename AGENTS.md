@@ -330,6 +330,14 @@ This repository is **public**. It is framework + documentation only.
 
 - **No PHI anywhere in the repo** — no real names, DOBs, values, encounter dates, or personal-name
   filenames in issues, commits, logs, PRs, or test fixtures. Fixtures are synthetic only.
+- **A real identifier reaches GitHub more than once.** The SDLC lanes quote diffs, repro steps and
+  issue text back into issue comments, so one real name in a fixture or a repro write-up gets
+  republished across every downstream thread. Substitute the persona *before* it is written down,
+  not after — a later scrub cannot reach `refs/pull/*`, which GitHub keeps permanently.
+- **The roster is the allowlist.** `SYNTHETIC_ROSTER` in `scripts/pii-scan.mjs` is the complete set
+  of identities permitted in this repo. Need another persona? Add it there — that edit is the
+  review point. `npm run check:pii` enforces this in CI, and the same check gates every outbound
+  `gh` write in `scripts/sdlc.mjs`, so a lane physically cannot post an identity it invented.
 - MCP responses stay on the local machine. Agents MUST NOT relay record contents into any remote
   channel (issue comments, PRs, external APIs) beyond what the human explicitly asks for.
 - The live database and blobs stay out of git: `pemr.db` (and `*-wal`/`*-shm`), `sources/`,

@@ -25,4 +25,7 @@ jobs:
           node-version: "22"
       - run: npm run sync:claude-config:check
       - run: npm run check:meta-drift
+      # This repo is public: fail the build before a real identity lands in it.
+      # See AGENTS.md §"Privacy posture".
+      - run: npm run check:pii
       - run: npm test
