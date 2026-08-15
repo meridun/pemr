@@ -7,6 +7,11 @@
 # This is the check that actually stands between a real identity and GitHub,
 # where a later scrub cannot reach refs/pull/*.
 #
+# The message scan skips commits already reachable from origin/dev or
+# origin/main — CI gates those trees, and re-scanning them means every branch
+# that merges the integration branch inherits their verdict. Nothing wider is
+# exempt: a commit that escaped onto some other origin ref never earns a pass.
+#
 # Bypass, if you are certain: `git push --no-verify`.
 
 [ -z "$SKIP_PII_HOOK" ] || exit 0
@@ -29,11 +34,16 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
         || git merge-base "$local_sha" origin/main 2>/dev/null)
     range=${base:+$base..$local_sha}
     range=${range:-$local_sha}
+    commits=$(git rev-list "$range" 2>/dev/null)
   else
     range="$remote_sha..$local_sha"
+    # Same range, minus what origin/dev and origin/main already carry. Falls
+    # back to the whole range if those refs are absent — a missing ref must
+    # scan more, never less.
+    commits=$(git rev-list "$local_sha" --not "$remote_sha" origin/dev origin/main 2>/dev/null) \
+      || commits=$(git rev-list "$range" 2>/dev/null)
   fi
 
-  commits=$(git rev-list "$range" 2>/dev/null) || continue
   [ -z "$commits" ] && continue
 
   for sha in $commits; do
