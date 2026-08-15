@@ -14,7 +14,7 @@ import shlex
 import sqlite3
 import sys
 import tomllib
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import (
@@ -1069,6 +1069,428 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# bulk re-affirm of orphaned verdicts (`record reaffirm`) - issue #126
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class _ReaffirmAction:
+    """What `record reaffirm` plans to do about one orphaned verdict.
+
+    Also the ``--json`` payload shape (``as_dict`` widens
+    :meth:`curation.OrphanVerdict.as_dict`), so these key names are a contract.
+
+    ``action`` is one of:
+
+    * ``"list"`` — no disposition was supplied; this is the pure listing mode.
+    * ``"reaffirm"`` — re-record the same ruling against ``to_base`` (a family
+      ``dedup_base``, or the row id at row scope).
+    * ``"clear"`` — lift the verdict (``--clear``).
+    * ``"skip"`` — refused, with ``reason``: nothing in the map names it, no successor
+      family for a kind that needs one, or the successor already carries its own ruling.
+    * ``"already-handled"`` — a map entry that matches no live orphan, so an earlier run
+      already dealt with it. Not an error; re-running the same file is a clean no-op.
+    """
+
+    orphan: "curation.OrphanVerdict"
+    action: str
+    to_base: str | None = None
+    to_merge_base: str | None = None
+    target_label: str = ""
+    target_family_size: int = 0
+    reason: str = ""
+    applied: bool = False
+
+    def as_dict(self) -> dict:
+        return {
+            **self.orphan.as_dict(),
+            "action": self.action,
+            "to_base": self.to_base,
+            "to_merge_base": self.to_merge_base,
+            "target_label": self.target_label,
+            "target_family_size": self.target_family_size,
+            "reason": self.reason,
+            "applied": self.applied,
+        }
+
+
+#: The `record reaffirm` actions that refuse an orphan, and therefore set rc=1: the
+#: operator asked for a batch and did not get all of it. ``already-handled`` is
+#: deliberately absent - re-running the same map file is idempotent, not a failure.
+_REAFFIRM_REFUSALS = ("skip",)
+
+
+def _load_reaffirm_map(path: str) -> list[dict]:
+    """Read a ``--map-file`` into the list of orphan entries it carries.
+
+    Accepts either the object `pemr rekey --apply --json` emits (its ``orphans`` array is
+    taken) or a bare array of the same entries, so the composed pipeline is one
+    redirection: ``pemr rekey --apply --json > f`` then
+    ``pemr record reaffirm --map-file f``. Unknown keys are ignored — the rekey payload
+    carries much more than this command needs, and a consumer must not have to trim it.
+    """
+    with open(path, "rb") as fh:
+        payload = json.load(fh)
+    if isinstance(payload, dict):
+        payload = payload.get("orphans", [])
+    if not isinstance(payload, list):
+        raise ValueError(
+            f"{path} is not a rekey report: expected an object with an 'orphans' array, "
+            "or a bare array of orphan entries"
+        )
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def _reaffirm_map_key(record_type: object, record_id: object, base: object) -> tuple:
+    """The identity a map entry and a live orphan are matched on.
+
+    Row id when there is one, ``dedup_base`` otherwise — the same split every other
+    curation path uses, because a row-scoped verdict resolves by id alone and its stored
+    base may be a stale breadcrumb.
+    """
+    rid = int(record_id or 0)
+    return (str(record_type), rid) if rid else (str(record_type), str(base))
+
+
+def _orphan_from_entry(entry: dict) -> "curation.OrphanVerdict":
+    """A map-file entry read back as an :class:`curation.OrphanVerdict`.
+
+    Only for reporting an ``already-handled`` entry: the live table is always the authority
+    on what is orphaned, so a stored entry is never trusted as one.
+    """
+    return curation.OrphanVerdict(
+        record_type=str(entry.get("record_type") or ""),
+        dedup_base=str(entry.get("dedup_base") or ""),
+        record_id=int(entry.get("record_id") or 0),
+        scope=str(entry.get("scope") or ""),
+        status=str(entry.get("status") or ""),
+        note=str(entry.get("note") or ""),
+        attributed_to=entry.get("attributed_to"),
+        merged_into_base=entry.get("merged_into_base"),
+        created_at=str(entry.get("created_at") or ""),
+        kinds=[str(k) for k in (entry.get("kinds") or [])],
+    )
+
+
+def _reaffirm_target(
+    conn, orphan: "curation.OrphanVerdict", to_base: str
+) -> tuple[str, int]:
+    """``(label, family_size)`` for where a re-affirm would land — what a reviewer reads.
+
+    Load-bearing, not decoration (issue #126): the successor family is often *larger* than
+    the one the human ruled on, and seeing its size is how a reviewer catches a ruling that
+    would widen over rows nobody judged before approving the batch.
+    """
+    if orphan.record_id:
+        label, _live_base, size = curation.row_label(
+            conn, orphan.record_type, orphan.record_id
+        )
+        return label, size
+    return curation.family_label(conn, orphan.record_type, to_base)
+
+
+def _plan_reaffirm(
+    conn,
+    orphans: list["curation.OrphanVerdict"],
+    mapping: list[dict] | None,
+    clear: bool,
+) -> list[_ReaffirmAction]:
+    """Decide what to do about every live orphan — the whole batch, before any write.
+
+    ``mapping=None`` and ``clear=False`` is the pure listing mode: no disposition was
+    supplied, so nothing is planned and nothing is refused.
+
+    Nothing is ever *silently* re-pointed here (the #109/#114/#116 design this issue
+    preserves): a re-point needs an explicit map entry naming the successor family, the
+    successor's label and size are reported for review, and a successor that already
+    carries its own family-scoped verdict is **skipped** — a second human's ruling is never
+    overwritten.
+    """
+    listing = mapping is None and not clear
+    by_key: dict[tuple, dict] = {}
+    for entry in mapping or []:
+        by_key[_reaffirm_map_key(
+            entry.get("record_type"), entry.get("record_id"), entry.get("dedup_base")
+        )] = entry
+
+    plan: list[_ReaffirmAction] = []
+    matched: set[tuple] = set()
+    claimed: set[tuple[str, str]] = set()
+    for orphan in orphans:
+        key = _reaffirm_map_key(orphan.record_type, orphan.record_id, orphan.dedup_base)
+        if listing:
+            plan.append(_ReaffirmAction(orphan=orphan, action="list"))
+            continue
+        if clear:
+            plan.append(_ReaffirmAction(orphan=orphan, action="clear"))
+            continue
+        entry = by_key.get(key)
+        if entry is None:
+            plan.append(_ReaffirmAction(
+                orphan=orphan, action="skip",
+                reason="not named by the map file - re-run `pemr rekey --apply --json` "
+                       "for the run that orphaned it, or lift it with --clear",
+            ))
+            continue
+        matched.add(key)
+        action = _plan_one_reaffirm(conn, orphan, entry)
+        if action.action == "reaffirm" and not orphan.record_id:
+            # One family verdict per family, and `annotate_record` is an upsert: two
+            # orphans re-pointed onto the same successor would leave the second silently
+            # overwriting the first. The whole batch is planned before any write, so the
+            # per-row `get_verdict` check above cannot see an earlier row's claim - this
+            # does.
+            claim = (orphan.record_type, str(action.to_base))
+            if claim in claimed:
+                action = _ReaffirmAction(
+                    orphan=orphan, action="skip",
+                    reason="another verdict in this batch is already being re-pointed "
+                           "onto that family - reconcile the two by hand",
+                )
+            else:
+                claimed.add(claim)
+        plan.append(action)
+
+    # A map entry with no live orphan behind it: an earlier run already handled it (or a
+    # human did, by hand). Reported, never an error - re-running the same file must be a
+    # clean no-op, which is what makes the composed pipeline safe to retry.
+    for key, entry in by_key.items():
+        if key in matched:
+            continue
+        plan.append(_ReaffirmAction(
+            orphan=_orphan_from_entry(entry), action="already-handled",
+            reason="no longer orphaned",
+        ))
+    return plan
+
+
+def _plan_one_reaffirm(
+    conn, orphan: "curation.OrphanVerdict", entry: dict
+) -> _ReaffirmAction:
+    """Plan the re-affirm of one mapped orphan, or refuse it with a reason."""
+    successor = entry.get("successor_base") or None
+    successor_merge = entry.get("successor_merge_base") or None
+
+    def skip(reason: str) -> _ReaffirmAction:
+        return _ReaffirmAction(orphan=orphan, action="skip", reason=reason)
+
+    # Where the ruling itself goes. Only the family-scoped `no-live-family` class moves;
+    # a row-scoped verdict is re-affirmed against its own row (rekey never renumbers ids),
+    # and a family whose only fault is a dangling merge target is still live.
+    if curation.ORPHAN_NO_FAMILY in orphan.kinds:
+        if not successor:
+            return skip(
+                "the map names no successor family for this base - it was removed rather "
+                "than moved; lift the verdict with --clear"
+            )
+        to_base = str(successor)
+        if not dedup.load_family(conn, orphan.record_type, to_base):
+            return skip(
+                f"successor family {to_base[:12]}... is not live either - the map is "
+                "stale; re-run `pemr rekey --apply --json`"
+            )
+        if curation.get_verdict(conn, orphan.record_type, to_base) is not None:
+            return skip(
+                f"successor family {to_base[:12]}... already carries its own verdict - "
+                "refusing to overwrite a second ruling; reconcile the two by hand"
+            )
+    elif orphan.record_id:
+        # A row-scoped verdict is re-affirmed against its own row - `rekey` never renumbers
+        # a row id. Only reachable here for the dangling-merge class, and only while the row
+        # is still live: a removed row's remedy is `--clear --row`, and re-pointing it would
+        # just fail inside `resolve_row`.
+        to_base = str(orphan.record_id)
+        if not curation.row_label(conn, orphan.record_type, orphan.record_id)[2]:
+            return skip(
+                "the annotated row is gone - lift the verdict with --clear instead"
+            )
+    else:
+        to_base = orphan.dedup_base
+
+    # And where its merge pointer goes. `merged_into_base` is only legal on a
+    # `merged-into` verdict (:func:`curation.annotate_record` enforces that on the way in),
+    # so a dangling target on any other status can only be a hand-edited row - refused
+    # rather than reshaped.
+    to_merge_base: str | None = None
+    if orphan.merged_into_base:
+        if orphan.status != "merged-into":
+            return skip(
+                f"status '{orphan.status}' carries a merge target (hand-edited?) - "
+                "`--merged-into` is only meaningful with 'merged-into'; lift it with "
+                "--clear"
+            )
+        if curation.ORPHAN_DANGLING_MERGE in orphan.kinds:
+            if not successor_merge:
+                return skip(
+                    "the map names no successor for the merge target - it was removed "
+                    "rather than moved; re-rule the verdict with `pemr record annotate`"
+                )
+            to_merge_base = str(successor_merge)
+        else:
+            to_merge_base = orphan.merged_into_base
+        if not dedup.load_family(conn, orphan.record_type, to_merge_base):
+            return skip(
+                f"merge target {str(to_merge_base)[:12]}... is not live - the map is "
+                "stale; re-run `pemr rekey --apply --json`"
+            )
+        if to_merge_base == to_base and not orphan.record_id:
+            # This rekey fused the ruled family into its own merge target. A family merged
+            # into itself renders nowhere at all (`annotate_record` refuses it at family
+            # scope), so this needs a human, not a re-point.
+            return skip(
+                "this rekey merged the family into its own merge target - a family "
+                "merged into itself would render nowhere; re-rule it with "
+                "`pemr record annotate`"
+            )
+
+    label, size = _reaffirm_target(conn, orphan, to_base)
+    return _ReaffirmAction(
+        orphan=orphan, action="reaffirm", to_base=to_base,
+        to_merge_base=to_merge_base, target_label=label, target_family_size=size,
+    )
+
+
+def _apply_reaffirm(conn, plan: list[_ReaffirmAction]) -> str:
+    """Write the planned batch, per row, through the existing curation write paths.
+
+    Returns ``""`` on a clean batch, or the failure that stopped it. The plan is fully
+    validated before this is called, so a failure here is unexpected — and the batch stops
+    at it rather than pressing on, with :attr:`_ReaffirmAction.applied` naming exactly what
+    landed.
+
+    **Annotate before clear, never the reverse.** :func:`curation.annotate_record` and
+    :func:`curation.clear_curation` each own their own transaction (the requirements ask
+    for per-row reuse of those paths, not a new batch state machine), so a failure between
+    the two is possible: this order leaves the ruling *duplicated* on the old and new base,
+    which the next run reconciles, instead of destroying a human's verdict.
+    """
+    for action in plan:
+        orphan = action.orphan
+        row = orphan.scope == curation.SCOPE_ROW
+        token = str(orphan.record_id) if row else orphan.dedup_base
+        try:
+            if action.action == "clear":
+                curation.clear_curation(
+                    conn, orphan.record_type, token, row=row, apply=True
+                )
+            elif action.action == "reaffirm":
+                curation.annotate_record(
+                    conn, orphan.record_type, str(action.to_base),
+                    status=orphan.status, note=orphan.note,
+                    attributed_to=orphan.attributed_to,
+                    merged_into_base=action.to_merge_base,
+                    row=row, apply=True,
+                )
+                if not row and action.to_base != orphan.dedup_base:
+                    curation.clear_curation(
+                        conn, orphan.record_type, orphan.dedup_base, apply=True
+                    )
+            else:
+                continue
+        except (ValueError, curation.CurationNotFoundError) as exc:
+            action.reason = f"write failed: {exc}"
+            return str(exc)
+        action.applied = True
+    return ""
+
+
+def _reaffirm_line(action: _ReaffirmAction) -> str:
+    """One listing line: which verdict, why it is orphaned, and what happens to it."""
+    orphan = action.orphan
+    ident = (
+        f"row #{orphan.record_id}" if orphan.record_id
+        else str(orphan.dedup_base)[:12]
+    )
+    if action.action == "reaffirm":
+        target = f" -> {str(action.to_base)[:12]}"
+        if action.target_label:
+            target += f" ({action.target_label}, {action.target_family_size} row(s))"
+    elif action.reason:
+        target = f" ({action.reason})"
+    else:
+        target = ""
+    return (
+        f"{orphan.record_type:12}  {ident:12}  {orphan.scope:6}  "
+        f"{action.action:15}  {','.join(orphan.kinds):22}  "
+        f"[{curation.describe(orphan.as_dict())}]{target}"
+    )
+
+
+def _cmd_record_reaffirm(args: argparse.Namespace) -> int:
+    """`record reaffirm` — list the orphaned verdicts, then re-point or lift them in bulk.
+
+    The bulk remedy for the state `pemr rekey` deliberately leaves behind (issue #126):
+    `rekey` never re-points a verdict by itself, and the per-row `record annotate` remedy
+    does not scale to the 57-row orphan batch one dictionary edit produced. This is a
+    deterministic control, not an interactive tool: dry run by default (the
+    `annotate`/`clear` convention), `--json` so an agent can read and summarize it, and
+    exactly one explicit `--apply` as the human-approval gate. Nothing prompts.
+
+    A separate subcommand rather than a fourth `record annotate` mode: that handler already
+    hand-rolls cross-flag validation for three modes on one subparser, and a bulk verb with
+    its own disposition flags belongs on its own usage line.
+    """
+    mapping: list[dict] | None = None
+    if args.map_file:
+        try:
+            mapping = _load_reaffirm_map(args.map_file)
+        except OSError as exc:
+            print(f"error: cannot read {args.map_file}: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:      # includes json.JSONDecodeError
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    def work(conn):
+        plan = _plan_reaffirm(
+            conn, curation.list_orphans(conn, args.table), mapping, args.clear
+        )
+        failure = ""
+        if args.apply and any(a.action in ("reaffirm", "clear") for a in plan):
+            failure = _apply_reaffirm(conn, plan)
+        refused = [a for a in plan if a.action in _REAFFIRM_REFUSALS]
+        rc = 1 if (refused or failure) else 0
+
+        if args.json:
+            _print_json([a.as_dict() for a in plan])
+            return rc
+
+        if not plan:
+            print("no orphaned curation verdicts")
+            return rc
+        print(
+            f"{'type':12}  {'target':12}  {'scope':6}  {'action':15}  "
+            f"{'orphaned by':22}  [verdict]"
+        )
+        for action in plan:
+            print(_reaffirm_line(action))
+
+        written = sum(1 for a in plan if a.applied)
+        if failure:
+            print(
+                f"error: the batch stopped after {written} write(s): {failure}",
+                file=sys.stderr,
+            )
+        elif args.apply:
+            print(f"re-annotated {written} verdict(s)")
+        elif mapping is None and not args.clear:
+            print(
+                "listing only: pass --map-file <file> (from `pemr rekey --apply --json`) "
+                "to re-point these,\n  or --clear to lift them - then --apply"
+            )
+        else:
+            print("dry run: nothing was written - re-run with --apply")
+        if refused:
+            print(
+                f"warning: {len(refused)} verdict(s) were not handled - see the reasons "
+                "above",
+                file=sys.stderr,
+            )
+        return rc
+
+    return _with_document_conn(args, work)
+
+
+# --------------------------------------------------------------------------- #
 # human-attested records (`record assert`) - issue #110
 # --------------------------------------------------------------------------- #
 
@@ -1393,6 +1815,92 @@ def _cmd_commit_extraction(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rekey_orphans(
+    conn, report: "dedup.RekeyReport"
+) -> list[tuple["curation.OrphanVerdict", str | None, str | None]]:
+    """The curation verdicts *this* rekey run orphaned, each with its successor family.
+
+    Issue #126. `rekey` deliberately never re-points a verdict by itself (the #109/#114/#116
+    design), so a run that moves a family's `dedup_base` leaves that family's verdict inert.
+    Until now the operator only learned which ones on the *next* `pemr verify`; this is the
+    same detection (:func:`curation.list_orphans`) read at apply time and **scoped to what
+    this run moved**, so the report is this run's fallout rather than every orphan in the
+    database.
+
+    Assembled here rather than in `dedup` on purpose: `dedup` must never import `curation`
+    (the :class:`dedup.CollisionResolver` injected-seam rule), and this module imports both.
+
+    Returns ``(orphan, successor_base, successor_merge_base)`` per entry — the successors
+    being where the moved family and the moved merge target went, or ``None`` when this run
+    did not move that one. A table in :attr:`dedup.RekeyReport.blocked` is excluded by
+    construction: its changes were withheld, so it orphaned nothing.
+    """
+    blocked = set(report.blocked)
+    moved: dict[tuple[str, str], str] = {
+        (record_type, old): new
+        for record_type, base_map in report.base_maps.items()
+        if record_type not in blocked
+        for old, new in base_map.items()
+        if old != new
+    }
+    if not moved:
+        return []
+    out: list[tuple["curation.OrphanVerdict", str | None, str | None]] = []
+    for orphan in curation.list_orphans(conn):
+        successor = moved.get((orphan.record_type, orphan.dedup_base))
+        successor_merge = (
+            moved.get((orphan.record_type, orphan.merged_into_base))
+            if orphan.merged_into_base else None
+        )
+        if successor is None and successor_merge is None:
+            # A pre-existing orphan from an earlier run or an unrelated `record rm`:
+            # real, but not this run's doing, and `pemr verify` already names it.
+            continue
+        out.append((orphan, successor, successor_merge))
+    return out
+
+
+def _print_rekey_orphans(
+    orphans: list[tuple["curation.OrphanVerdict", str | None, str | None]]
+) -> None:
+    """The apply-time orphan block: what this rekey knocked loose, and how to fix it.
+
+    A `warning:`, not an `error:` — orphaning a verdict is the documented consequence of
+    the warn-and-reannotate design, not a failure, so `rekey`'s exit code is unchanged
+    (issue #126).
+    """
+    if not orphans:
+        return
+    print(
+        f"warning: {len(orphans)} curation verdict(s) were orphaned by this rekey",
+        file=sys.stderr,
+    )
+    for orphan, successor, successor_merge in orphans:
+        ident = (
+            f"row #{orphan.record_id}" if orphan.record_id
+            else f"{str(orphan.dedup_base)[:12]}..."
+        )
+        # The two successors are reported apart: one is where the family the verdict rules
+        # on went, the other where its merge target went, and a verdict can be flagged for
+        # either or both.
+        arrow = f" -> {str(successor)[:12]}..." if successor else ""
+        if successor_merge:
+            arrow += f" (merges into {str(successor_merge)[:12]}...)"
+        print(
+            f"  {orphan.record_type} {ident}  {','.join(orphan.kinds)}{arrow}  "
+            f"[{curation.describe(orphan.as_dict())}]",
+            file=sys.stderr,
+        )
+    print(
+        "  re-point them in one reviewed batch with\n"
+        "  `pemr record reaffirm --map-file <file>` (dry run), then --apply - where <file>\n"
+        "  is this run's own report: `pemr rekey --apply --json > <file>`. A dedup_base is\n"
+        "  overwritten in place, so the old->new mapping exists nowhere else.\n"
+        "  `pemr record reaffirm` alone lists them; `--clear` lifts them instead.",
+        file=sys.stderr,
+    )
+
+
 def _cmd_rekey(args: argparse.Namespace) -> int:
     conn = _connect_db(args)
     try:
@@ -1408,6 +1916,11 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        # Read *after* the write, from live state: the orphan set is what the next `pemr
+        # verify` would say about this run, and a dry run wrote nothing to have fallout
+        # from (predicting it would mean simulating the post-write database - out of
+        # scope, issue #126).
+        orphans = _rekey_orphans(conn, report) if args.apply else []
     finally:
         conn.close()
 
@@ -1490,6 +2003,19 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                 }
                 for r in report.resolved
             ],
+            # Appended (issue #126): the curation verdicts *this* run orphaned, so an
+            # agent sees the fallout here instead of on the next `pemr verify` - and can
+            # feed this very payload straight back as
+            # `pemr record reaffirm --map-file <file>`. Always present, `[]` on a dry run
+            # (which writes nothing, so it orphans nothing).
+            "orphans": [
+                {
+                    **orphan.as_dict(),
+                    "successor_base": successor,
+                    "successor_merge_base": successor_merge,
+                }
+                for orphan, successor, successor_merge in orphans
+            ],
         })
         return rc
 
@@ -1526,6 +2052,8 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
             f"{len(report.resolved)} collision(s) resolved by verdict "
             f"({merged} as one fact, {distinct} as distinct facts)"
         )
+
+    _print_rekey_orphans(orphans)
 
     for collision in report.collisions:
         print(f"error: {collision.message}", file=sys.stderr)
@@ -2338,6 +2866,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_annotate.add_argument("--json", action="store_true", help="machine-readable output")
     r_annotate.set_defaults(func=_cmd_record_annotate, annotate_parser=r_annotate)
+
+    # --- bulk remedy for orphaned verdicts (issue #126) ---
+    r_reaffirm = record_sub.add_parser(
+        "reaffirm",
+        help="re-point or lift the curation verdicts a rekey orphaned, in one reviewed "
+             "batch (dry run by default)",
+    )
+    r_reaffirm.add_argument(
+        "table", nargs="?", choices=list(dedup.KNOWN_TYPES),
+        help="limit to one record type (default: every type)",
+    )
+    # A verdict is either re-pointed or lifted, never both: `--clear` ignores the map
+    # entirely, so accepting the pair would silently discard one of them. With neither,
+    # the command is a pure listing.
+    r_reaffirm_how = r_reaffirm.add_mutually_exclusive_group()
+    r_reaffirm_how.add_argument(
+        "--map-file", dest="map_file", metavar="FILE",
+        help="old->new base mapping from `pemr rekey --apply --json` (that payload, or a "
+             "bare array of its 'orphans' entries); required to re-point anything, since "
+             "the mapping cannot be re-derived once the rekey is over",
+    )
+    r_reaffirm_how.add_argument(
+        "--clear", action="store_true",
+        help="lift the listed verdicts instead of re-pointing them",
+    )
+    r_reaffirm.add_argument(
+        "--apply", action="store_true",
+        help="write the batch (default: report only)",
+    )
+    r_reaffirm.add_argument("--json", action="store_true", help="machine-readable output")
+    r_reaffirm.set_defaults(func=_cmd_record_reaffirm, reaffirm_parser=r_reaffirm)
 
     # --- human-attested records (issue #110) ---
     r_assert = record_sub.add_parser(

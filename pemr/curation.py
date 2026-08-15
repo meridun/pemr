@@ -16,6 +16,8 @@ write it.
     load_verdicts        -- the whole table as a lookup, for the render/verify hot path
     row_verdicts_for     -- the row-scoped verdicts naming a set of rows
     retire_row_verdicts  -- ... and drop them, for the row-removal write paths
+    orphan_kinds         -- why (if at all) one verdict points at nothing live
+    list_orphans         -- ... over the whole table, for `verify` and `record reaffirm`
 
 **Pure overlay.** No record row is ever written. `render` stays a pure function of DB
 state: it just reads two tables per section instead of one, and re-rendering after a
@@ -167,6 +169,29 @@ FAMILY_SCOPE = 0
 #: :data:`STATUSES` it has exactly one source of truth.
 SCOPE_FAMILY = "family"
 SCOPE_ROW = "row"
+
+#: The orphan vocabulary (issue #126) — the *one* source of truth for "this verdict
+#: points at nothing live", spoken by :func:`orphan_kinds`, :func:`list_orphans`,
+#: `pemr verify`'s warnings, `pemr rekey --apply`'s orphan block and
+#: `pemr record reaffirm`'s ``--json``.
+#:
+#: ``ORPHAN_NO_FAMILY`` — a **family-scoped** verdict whose ``dedup_base`` names no live
+#: family. Its ruling is inert: nothing renders the fact it judged.
+#:
+#: ``ORPHAN_DANGLING_MERGE`` — a verdict in **either** scope whose ``merged_into_base``
+#: names no live family. The merge target is always a family (``--merged-into`` takes a
+#: ``dedup_base``), so this one is scope-independent.
+#:
+#: Deliberately **not** an orphan kind, and this exclusion is load-bearing: the
+#: *row-scoped stale breadcrumb* — a row verdict whose stored ``dedup_base`` a rekey left
+#: behind. That verdict still resolves, by ``record_id``; the stale base is never consulted
+#: (see the module docstring). `verify` keeps reporting it as its own notice, and nothing
+#: here may re-annotate it.
+ORPHAN_NO_FAMILY = "no-live-family"
+ORPHAN_DANGLING_MERGE = "dangling-merge-target"
+
+#: Every orphan kind, in the order :func:`orphan_kinds` reports them.
+ORPHAN_KINDS: tuple[str, ...] = (ORPHAN_NO_FAMILY, ORPHAN_DANGLING_MERGE)
 
 
 class CurationNotFoundError(ValueError):
@@ -713,6 +738,125 @@ def list_curation(
         view["label"] = label
         view["family_size"] = size
         out.append(view)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# orphaned verdicts — one detector, three readers (issue #126)
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class OrphanVerdict:
+    """One stored verdict that points at nothing live, plus why.
+
+    Also the ``--json`` payload shape for `pemr record reaffirm` and the per-entry shape of
+    `pemr rekey --apply`'s ``orphans`` key, so — like :class:`CurationReport` — these key
+    names are a contract that may only widen.
+
+    ``label``/``family_size`` describe *what is left*, which for an orphan is usually
+    nothing: a ``no-live-family`` entry reports ``("", 0)``, while a
+    ``dangling-merge-target`` one still names the live family the verdict itself rules on.
+    """
+
+    record_type: str
+    dedup_base: str
+    record_id: int
+    scope: str
+    status: str
+    note: str
+    attributed_to: str | None
+    merged_into_base: str | None
+    created_at: str
+    kinds: list[str] = field(default_factory=list)
+    label: str = ""
+    family_size: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "record_type": self.record_type,
+            "dedup_base": self.dedup_base,
+            "record_id": self.record_id,
+            "scope": self.scope,
+            "status": self.status,
+            "note": self.note,
+            "attributed_to": self.attributed_to,
+            "merged_into_base": self.merged_into_base,
+            "created_at": self.created_at,
+            "kinds": list(self.kinds),
+            "label": self.label,
+            "family_size": self.family_size,
+        }
+
+
+def orphan_kinds(conn: sqlite3.Connection, verdict: dict) -> list[str]:
+    """Why ``verdict`` points at nothing live — ``[]`` when it is healthy.
+
+    The single detector behind `pemr verify`'s two orphan warnings, `pemr record
+    reaffirm`'s listing and `pemr rekey --apply`'s orphan block (issue #126): all three
+    used to derive this state their own way, and a bulk remedy that disagreed with the
+    warning it answers would re-annotate the wrong rows.
+
+    ``verdict`` is a ``_row_view``-shaped dict, so both :meth:`VerdictMap.all` entries and
+    :func:`list_curation` entries are valid input. A verdict whose ``record_type`` is not
+    a known table reports ``[]``: the value can come off a hand-edited row and
+    :func:`dedup.load_family` interpolates it into a table name, so it must never reach
+    SQL — `verify` keeps its own separate warning for that case.
+
+    Kinds are returned in :data:`ORPHAN_KINDS` order, and a verdict can carry both.
+    """
+    record_type = verdict["record_type"]
+    if record_type not in dedup.FIELD_SPECS:
+        return []
+    kinds: list[str] = []
+    # Family scope only: a row-scoped verdict resolves by `record_id`, and its stored base
+    # is a breadcrumb a rekey may have left stale (the module docstring's scope rule).
+    if not verdict["record_id"] and not dedup.load_family(
+        conn, record_type, verdict["dedup_base"]
+    ):
+        kinds.append(ORPHAN_NO_FAMILY)
+    target = verdict.get("merged_into_base")
+    if target and not dedup.load_family(conn, record_type, target):
+        kinds.append(ORPHAN_DANGLING_MERGE)
+    return kinds
+
+
+def list_orphans(
+    conn: sqlite3.Connection, record_type: str | None = None
+) -> list[OrphanVerdict]:
+    """Every orphaned verdict (optionally one record type), newest first.
+
+    **One entry per verdict**, carrying every kind that flagged it: a verdict in both
+    classes must be re-annotated once, not twice.
+
+    Returns ``[]`` when `curation` is absent (pre-008 snapshot) — the
+    :func:`list_curation` guard, so callers need no second check. Deliberately narrower
+    than :func:`list_curation`'s ``family_size == 0`` signal, which also flags the
+    row-scoped orphan whose remedy is ``--clear --row``, not a re-point.
+    """
+    db.require_migrated(conn)
+    if record_type is not None:
+        _require_type(record_type)
+    if not has_table(conn):
+        return []
+    out: list[OrphanVerdict] = []
+    for verdict in list_curation(conn, record_type):
+        kinds = orphan_kinds(conn, verdict)
+        if not kinds:
+            continue
+        out.append(OrphanVerdict(
+            record_type=verdict["record_type"],
+            dedup_base=verdict["dedup_base"],
+            record_id=verdict["record_id"],
+            scope=verdict["scope"],
+            status=verdict["status"],
+            note=verdict["note"],
+            attributed_to=verdict["attributed_to"],
+            merged_into_base=verdict["merged_into_base"],
+            created_at=verdict["created_at"],
+            kinds=kinds,
+            label=verdict["label"],
+            family_size=verdict["family_size"],
+        ))
     return out
 
 

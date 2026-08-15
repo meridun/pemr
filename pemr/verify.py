@@ -169,6 +169,14 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     including for `merged-into`, whose re-affirm names the row's own (post-rekey) family,
     which :func:`curation.annotate_record` accepts at row scope precisely so this notice
     can be answered without downgrading or lifting the ruling.
+
+    The two *orphan* classes - a family verdict with no live family, and either scope's
+    dangling `merged_into_base` - are detected by :func:`curation.orphan_kinds`, the one
+    detector `pemr record reaffirm` reads too (issue #126): a bulk remedy that disagreed
+    with the warning it answers would re-annotate the wrong rows. `record reaffirm` is that
+    remedy at batch scale, beside the per-row `record annotate --clear`. The row-scoped
+    stale-breadcrumb notice below is deliberately *not* one of those classes: that verdict
+    still resolves by row id, so nothing re-points it.
     """
     if not curation.has_table(conn):
         return
@@ -184,6 +192,10 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
                 f"type (known: {', '.join(dedup.KNOWN_TYPES)})"
             )
             continue
+        # The shared detector (issue #126): the two *orphan* classes below are derived
+        # once, here, so this warning and `pemr record reaffirm`'s bulk remedy can never
+        # disagree about which verdicts are inert.
+        kinds = curation.orphan_kinds(conn, verdict)
         if record_id:
             pk = f"{record_type}_id"
             live = conn.execute(
@@ -206,13 +218,13 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
                     f"with `pemr record annotate --row {record_type} {record_id}` or "
                     "lift it with `--clear --row`"
                 )
-        elif not dedup.load_family(conn, record_type, base):
+        elif curation.ORPHAN_NO_FAMILY in kinds:
             report.warnings.append(
                 f"curation verdict {record_type}/{short}... has no live family "
                 "(removed?) - lift it with `pemr record annotate --clear`"
             )
         target = verdict.get("merged_into_base")
-        if target and not dedup.load_family(conn, record_type, target):
+        if curation.ORPHAN_DANGLING_MERGE in kinds:
             # The merge target is always a family, in either scope (`--merged-into`
             # names a `dedup_base`), so this check is scope-independent.
             ident = (

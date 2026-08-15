@@ -698,6 +698,122 @@ def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
     assert [c["kind"] for c in payload["collisions"]] == ["fused"]
 
 
+# --- apply-time orphan reporting (issue #126) ---------------------------------
+#
+# `rekey` still never re-points a verdict by itself (the #109/#114/#116 design). What
+# changes here is *when the operator hears about it*: at the apply that caused it, rather
+# than on the next `pemr verify`.
+
+def _first_base(tmp_path, record_type):
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return conn.execute(
+            f"SELECT dedup_base FROM {record_type} ORDER BY {record_type}_id"
+        ).fetchone()["dedup_base"]
+    finally:
+        conn.close()
+
+
+def _seed_ruled_lab(ready, capsys, tmp_path):
+    """One ZZT lab row under a verdict, plus the dictionary that will move its family."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "new.toml", '"zzt" = "zonulin_test"\n')
+    _seed_lab(ready, tmp_path, old)
+    base = _first_base(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", base, "--status",
+                "superseded", "--note", "old label", "--apply") == 0
+    capsys.readouterr()
+    return base, new
+
+
+def test_rekey_apply_names_the_orphans_it_produced(ready, capsys, tmp_path):
+    """AC 7: the fallout is on the apply's own output, with the follow-up command."""
+    base, new = _seed_ruled_lab(ready, capsys, tmp_path)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply") == 0
+    captured = capsys.readouterr()
+    assert "1 curation verdict(s) were orphaned by this rekey" in captured.err
+    assert base[:12] in captured.err and "no-live-family" in captured.err
+    assert "pemr record reaffirm --map-file" in captured.err
+    # Orphaning a verdict is the documented consequence, not a failure: rc is unchanged
+    # and the run still reports itself as applied.
+    assert "rekeyed 1 row(s)" in captured.out
+    assert captured.err.isascii()               # issue #23
+
+
+def test_rekey_apply_json_carries_the_orphan_list(ready, capsys, tmp_path):
+    base, new = _seed_ruled_lab(ready, capsys, tmp_path)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [o["dedup_base"] for o in payload["orphans"]] == [base]
+    orphan = payload["orphans"][0]
+    assert orphan["kinds"] == ["no-live-family"]
+    assert orphan["successor_base"] == _first_base(tmp_path, "lab_result")
+    assert orphan["successor_base"] != base
+    assert orphan["successor_merge_base"] is None
+    # Exit-code parity with the text mode, and the rest of the payload is untouched.
+    assert payload["applied"] is True and payload["collisions"] == []
+
+
+def test_rekey_dry_run_reports_no_orphans(ready, capsys, tmp_path):
+    """AC 8: dry-run behaviour is unchanged — it wrote nothing, so it orphaned nothing.
+    `orphans` is still present (always, so a consumer need not branch), just empty."""
+    _base, new = _seed_ruled_lab(ready, capsys, tmp_path)
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--json") == 0
+    assert json.loads(capsys.readouterr().out)["orphans"] == []
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new)) == 0
+    captured = capsys.readouterr()
+    assert "orphaned by this rekey" not in captured.err
+    assert "dry run: 1 row(s) would change" in captured.out
+
+
+def test_rekey_does_not_report_an_orphan_it_did_not_cause(ready, capsys, tmp_path):
+    """The report is *this run's* fallout, scoped to the families it moved. A verdict
+    orphaned earlier by `record rm` is still an orphan — `pemr verify` still says so — but
+    listing it here would blame this rekey for someone else's."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    moves_condition = _dict_file(tmp_path, "cond.toml", '"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, _albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id), "--status",
+                "superseded", "--note", "gone soon", "--apply") == 0
+    assert _run(tmp_path, "record", "rm", "lab_result", str(alb_id), "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(moves_condition), "--apply",
+                "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["record_type"] for c in payload["changed"]] == ["condition"]
+    assert payload["orphans"] == []
+
+    assert _run(tmp_path, "verify") == 0
+    assert "has no live family" in capsys.readouterr().out
+
+
+def test_rekey_reports_no_orphans_for_a_verdict_resolved_collision(
+    ready, capsys, tmp_path
+):
+    """The repro's 11/11 collision-fused rows, guarded (AC 8). That path *narrows* its
+    authorizing verdict to row scope in the same transaction as the keys, so the ruling is
+    never orphaned and the orphan report must stay empty."""
+    old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
+    new = _dict_file(tmp_path, "fuse.toml",
+                     '"alb" = "albumin"\n"t2dm" = "type 2 diabetes"\n')
+    _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old)
+    alb_id, _albumin_id = _row_ids(tmp_path, "lab_result")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(alb_id), "--status",
+                "superseded", "--note", "one assay, two labels", "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--dictionary", str(new), "--apply", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["verdict_action"] for r in payload["resolved"]] == ["narrowed"]
+    assert payload["orphans"] == []
+
+
 # --- intake formats at the CLI (issue #66) ------------------------------------
 
 def test_ingest_refuses_a_google_drive_pointer_stub(ready, capsys):
