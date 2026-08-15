@@ -29,3 +29,20 @@ jobs:
       # See AGENTS.md §"Privacy posture".
       - run: npm run check:pii
       - run: npm test
+
+  # The tree is only one surface. A PR's title and body are just as public, are
+  # not covered by check:pii, and are where the identities this guard exists for
+  # were republished twice — while describing the fix.
+  pii-pr-text:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Scan PR title and body
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | node scripts/pii-scan.mjs --stdin "this pull request's title/body"
