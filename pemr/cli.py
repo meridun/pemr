@@ -2902,7 +2902,7 @@ def build_parser() -> argparse.ArgumentParser:
     r_assert = record_sub.add_parser(
         "assert",
         help="record a fact attested by a person, with no source document yet "
-             "(dry run by default); CLI-only, never an agent write",
+             "(dry run by default); CLI-only, never an MCP tool",
     )
     # Optional so `--list` can take an optional table and no payload; the handler
     # enforces "table and --field unless --list" with the usage line.
