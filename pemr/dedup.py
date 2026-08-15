@@ -449,6 +449,45 @@ def _condition_subject(row: dict, dictionary: dict[str, str] | None = None) -> s
     return "family:" + norm(row.get("relation"), dictionary)
 
 
+# Per record type: the :data:`FIELD_SPECS` names :func:`_key_parts` reads — the fields
+# whose value participates in the identity. Written down once, here, beside the function
+# it must stay true to, so `record edit` (issue #129) can derive its editable set as
+# "everything else" instead of carrying a denylist that rots the next time a key changes.
+#
+# `person_id` is deliberately absent: it is not in FIELD_SPECS at all (it is inherited
+# from the document), so nothing reading this table could offer it for editing anyway.
+# `condition` lists `status` **and** `relation` because :func:`_condition_subject` reads
+# them together — moving status to/from `family-history` moves the key, and `relation` is
+# what it moves it to.
+KEY_FIELDS: dict[str, frozenset[str]] = {
+    "lab_result": frozenset({"test_name", "collected_at"}),
+    "medication": frozenset({"name", "dose", "started_on"}),
+    "procedure": frozenset({"name", "performed_on"}),
+    "appointment": frozenset({"provider", "scheduled_for"}),
+    "observation": frozenset({"obs_type", "observed_at", "key"}),
+    "allergy": frozenset({"substance"}),
+    "condition": frozenset({"name", "status", "relation"}),
+}
+
+
+def editable_fields(record_type: str) -> tuple[str, ...]:
+    """The non-key payload columns of ``record_type``, in :data:`FIELD_SPECS` order.
+
+    The safety property `record edit` (issue #129) rests on: identity is excluded by
+    **derivation**, not by a hand-maintained denylist. Provenance is excluded for free —
+    ``document_id``, ``person_id``, the ``dedup_*`` columns and
+    :data:`ATTESTATION_COLUMNS` are not in :data:`FIELD_SPECS` at all, so no caller
+    reading this list can name one.
+    """
+    if record_type not in FIELD_SPECS:
+        raise ValueError(
+            f"unknown record type '{record_type}' - known types: "
+            f"{', '.join(KNOWN_TYPES)}"
+        )
+    key = KEY_FIELDS[record_type]
+    return tuple(name for name in FIELD_SPECS[record_type] if name not in key)
+
+
 def identity_label(
     record_type: str, row: dict, person_id: int, dictionary: dict[str, str] | None = None
 ) -> str:

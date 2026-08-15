@@ -139,7 +139,46 @@ CREATE TABLE curation (
 -- SQLite treats NULLs as distinct in a unique index.
 CREATE UNIQUE INDEX idx_curation_row ON curation(record_type, record_id)
   WHERE record_id <> 0;
+
+-- Append-only ledger of in-place field corrections (issue #129). Written only by
+-- `record edit`, which corrects a row's NON-KEY fields - a mislabelled unit, say - and
+-- leaves document_id, person_id, dedup_key and the source blob untouched. The editable
+-- set is DERIVED (dedup.FIELD_SPECS minus dedup.KEY_FIELDS, §3), so identity and
+-- provenance are unreachable from an edit by construction rather than by a denylist.
+-- One row per changed field, all sharing one edited_at, so a single command's correction
+-- reads as one act while each field stays individually legible.
+--
+-- Nothing RESOLVES THROUGH this table - render, verify, rekey and rekey's collision
+-- resolver never read it - which is what makes append-only affordable. Entries therefore
+-- outlive their row, the opposite of 010's answer to the same row-id-reuse hazard:
+-- retiring one would destroy the audit trail the table exists to create, while a stale
+-- entry mis-renders nothing. `record rm` discloses (never deletes) the entries naming the
+-- row it removes, and the dedup_base breadcrumb tells a reader whether a later occupant
+-- of that id is even the same family.
+CREATE TABLE record_edit (
+  record_edit_id INTEGER PRIMARY KEY,
+  record_type    TEXT NOT NULL,    -- one of dedup.KNOWN_TYPES; validated in Python
+  record_id      INTEGER NOT NULL, -- <record_type>_id at edit time; no FK (the 007/010 precedent)
+  dedup_base     TEXT NOT NULL,    -- breadcrumb, never a lookup key
+  field          TEXT NOT NULL,    -- a non-key FIELD_SPECS column
+  old_value      TEXT,             -- rendered TEXT; NULL = the column was NULL
+  new_value      TEXT,
+  note           TEXT NOT NULL,    -- required: why the correction was made
+  attributed_to  TEXT,
+  edited_at      TEXT NOT NULL     -- ISO8601 UTC; shared across one command
+);
+CREATE INDEX record_edit_row ON record_edit (record_type, record_id);
 ```
+
+A correction is **not** a re-attribution. Before `record edit`, a wrong display field
+could only be repaired by re-submitting the row through `commit-extraction` (or deleting
+and re-committing it), both of which re-file the fact under whichever document is passed
+at correction time — so a 2022 measurement would end up sourced to a 2026 chart export.
+An edit keeps the row's provenance exactly as it was; what changes is that the row now
+*differs* from what that source literally said, and the ledger is the record of that
+divergence. The visible consequence: since `unit` is one of the compared payload fields
+(§4), re-ingesting the original document after a unit correction stages a **conflict**
+rather than deduping. That is the honest outcome, not a bug.
 
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
 005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
@@ -844,6 +883,12 @@ pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--no
                                                          # --tombstone: also refuse to re-ingest this content (§3)
 pemr record rm <table> <id> [--apply]                    # delete ONE record row; its document and every
                                                          # other record it produced survive; dry run by default
+pemr record edit <table> <id> --set NAME=VALUE [--set ...] --note <text>
+                 [--attributed-to ...] [--apply]         # correct a row's NON-KEY fields in place (§2 record_edit);
+                                                         # document_id/dedup_key/source blob untouched; NAME= clears;
+                                                         # identity fields refused (that is a dictionary edit + rekey);
+                                                         # every change ledgered; dry run by default
+pemr record edit --list [<table>] [--json]               # recorded corrections, newest first (field: old -> new)
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
                      [--merged-into <base-or-id>] [--row] [--apply]
                                                          # record a human verdict over a record FAMILY (§2 curation):
@@ -920,8 +965,8 @@ annotations expose the read/write split to the client.
 extracting; dictionary additions go through human review, never agent-direct edits.
 
 `document rm`, `record rm` (issue #107), `record annotate` (issue #109), `record reaffirm`
-(issue #126) and `record assert`
-(issue #110) are deliberately **absent** from `WRITE_TOOLS` — this is a rule, not an
+(issue #126), `record assert`
+(issue #110) and `record edit` (issue #129) are deliberately **absent** from `WRITE_TOOLS` — this is a rule, not an
 oversight. Deletion of PHI stays a human-at-a-terminal action; no MCP tool, and therefore no
 agent, can remove a record or a document. `record annotate` joins them for the adjacent
 reason: a `curation` verdict is a *human's clinical judgment*, recorded with attribution, and
@@ -929,7 +974,8 @@ an agent that could write one could make a record disappear from every generated
 without deleting a row — and `record reaffirm` writes those same verdicts *in bulk*, which
 only sharpens the argument. `record assert` is the sharpest case of all — it is a *write*, not a
 deletion, and the only path in the system that can put a fact into the record with no
-external source. Any future destructive — or render-altering, or unsourced — verb should
+external source. `record edit` is that same boundary from the other side: it changes a stored
+clinical value with no new source behind the change. Any future destructive — or render-altering, or unsourced — verb should
 default to the same exclusion unless a human explicitly decides otherwise.
 
 ---
