@@ -172,13 +172,16 @@ export const PARK_LABELS = ['sdlc:needs-human', 'sdlc:hold'];
 /** The wip-lock reap threshold: two full hourly cycles. */
 export const WIP_STALE_MS = 2 * 60 * 60 * 1000;
 
-/** Priority ordering for CLAIM: lower rank sorts first. Unlabeled sorts last. */
+/**
+ * Priority ordering for CLAIM: lower rank sorts first. Unlabeled is the normal
+ * default and sorts between critical and future — only the two exceptional
+ * tiers carry a label.
+ */
 export const PRIORITY_RANK = {
   'priority:critical': 0,
-  'priority:medium': 1,
   'priority:future': 2,
 };
-const NO_PRIORITY_RANK = 3;
+const NO_PRIORITY_RANK = 1;
 
 /** Every `stage:*` suffix on a label set (defensive: may be 0 or >1). */
 export function stagesOf(labelNames) {
@@ -347,7 +350,7 @@ export function lastUnlabeledAt(timelineEvents, label) {
  * `[{ number, labels:[{name}]|[name], createdAt }]`. Pure.
  *
  * Eligible = has that stage, not wip and not parked/hold; ordered exactly as a
- * worker's CLAIM would pick — priority (critical › medium › future › none),
+ * worker's CLAIM would pick — priority (critical › unlabeled › future),
  * then FIFO by createdAt. `integrity` lists every issue whose stage-label
  * state is corrupt (see the zero-vs-flagged rule below). Each lane also
  * carries an `ineligible` breakdown ({hold, needs-human, wip} counts) so the
