@@ -327,6 +327,25 @@ def test_summary_orders_result_within_window_suppresses(seeded):
     assert "LDL" not in _orders_section(seeded)
 
 
+def test_summary_orders_match_window_edges_are_exact(seeded):
+    """...and the window is a hard `[-1, +30]` days around the order date, pinned on
+    both edges so any later widening is a deliberate edit rather than a drift (widening
+    is the over-suppression risk this design is built against). A result on day +30
+    closes its order, day +31 does not; a draw dated one day *ahead* of the order text
+    still closes it, two days ahead does not -- that one answered an earlier order."""
+    _seed_orders(seeded, [
+        {"key": "TSH", "observed_at": "2022-12-02"},               # result +30d: closed
+        {"key": "HbA1c", "observed_at": "2023-12-01"},             # result +31d: open
+        {"key": "LDL", "observed_at": "2025-01-02"},               # result -1d: closed
+        {"key": "Glucose, fasting", "observed_at": "2026-01-03"},  # result -2d: open
+    ])
+    section = _orders_section(seeded)
+    assert "TSH" not in section
+    assert "LDL" not in section
+    assert "- HbA1c  (ordered 2023-12-01)" in section
+    assert "- Glucose, fasting  (ordered 2026-01-03)" in section
+
+
 def test_summary_orders_open_order_is_never_aged_out(seeded):
     """Age is never a suppression signal (the issue's whole point): a 2019 order no
     result answers keeps rendering, and a result four years adrift does not close it."""
