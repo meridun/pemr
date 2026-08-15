@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from pemr import attestations, cli, curation, db, dedup, persons, query
+from pemr import attestations, cli, curation, db, dedup, persons, query, records
 
 MED = {"name": "Metformin", "dose": "500 mg", "started_on": "2025-06-01"}
 
@@ -366,6 +366,31 @@ def test_the_unblocked_write_takes_the_next_free_occurrence(conn, jane):
     assert row["dedup_key"] == dedup.occurrence_key(base, 2)
     assert row["dedup_base"] == base
     assert len(dedup.load_family(conn, "medication", base)) == 3
+
+
+def test_an_unblocked_write_steps_over_a_hole_left_by_record_rm(conn, jane):
+    """The occupied-occurrence seam: `record rm` on a middle sibling leaves a hole, and
+    the next unblocked write must take `max + 1` over what is still stored — not the
+    hole, whose key belongs to no live row, and not a number a live sibling already
+    holds (that would be `UNIQUE(dedup_key)` instead of a landing). Same rule, same
+    idiom, as `dedup._resolve_keep_both`."""
+    base = _base(conn, jane)
+    for occurrence, frequency in enumerate((None, "daily", "TID")):
+        payload = MED if frequency is None else MED | {"frequency": frequency}
+        _assert_med(conn, payload=payload, apply=True)
+        _rule(conn, _stored_row_id(conn, occurrence=occurrence), row=True)
+
+    records.remove_record(
+        conn, "medication", _stored_row_id(conn, occurrence=1), apply=True
+    )
+    written = _assert_med(conn, payload=MED | {"frequency": "QID"}, apply=True)
+    assert written.dedup_occurrence == 3
+    assert written.dedup_key == dedup.occurrence_key(base, 3)
+    stored = {
+        int(row["dedup_occurrence"])
+        for row in dedup.load_family(conn, "medication", base)
+    }
+    assert stored == {0, 2, 3}
 
 
 def test_an_unverdicted_database_is_byte_identical(conn, jane):
