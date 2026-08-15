@@ -147,6 +147,16 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 
+# Per-`obs_type` required fields, enforced by validate_row after the per-field loop.
+# `observation`'s FIELD_SPECS entry marks `observed_at` optional because vitals and orders
+# legitimately arrive undated, but a `functional` row's whole value is being dated (issue
+# #132: "the running-balance column stops in July") — an undated one is exactly the
+# unqueryable prose that record type exists to eliminate. Scoped to `functional` alone:
+# widening it to the other families would reject already-valid extractions.
+OBS_TYPE_REQUIRED: dict[str, frozenset[str]] = {
+    "functional": frozenset({"observed_at"}),
+}
+
 _WS = re.compile(r"\s+")
 # Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
 # bare analyte stem) and yields its contents (`findall`, giving the candidate qualifier).
@@ -572,6 +582,18 @@ def validate_row(record_type: str, row: object) -> None:
                 f"{record_type}.{name}: expected one of "
                 f"{', '.join(sorted(allowed))}, got {value!r}"
             )
+    if record_type == "observation":
+        # Runs after the per-field loop so a type/ISO-date error on a field that *is*
+        # present still reports first. `obs_type` is required=True, hence present here.
+        # Matched verbatim (not via enum_token): `obs_type` is stored as written and every
+        # reader selects on it with `=`, so a rule keyed to a normalized spelling would
+        # bind a value that then renders nowhere.
+        for field in sorted(OBS_TYPE_REQUIRED.get(row["obs_type"], frozenset())):
+            if row.get(field) is None:
+                raise ValidationError(
+                    f"observation: missing required field '{field}' "
+                    f"for obs_type={row['obs_type']!r}"
+                )
 
 
 def _type_names(types: object) -> str:

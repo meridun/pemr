@@ -107,7 +107,7 @@ report's verbatim label.
   edit for you to make in the payload.
 - MUST NOT invent abbreviations or "helpful" renames.
 
-### 2. Observation rows — vitals, orders, screenings, immunizations
+### 2. Observation rows — vitals, orders, screenings, immunizations, functional
 
 `render_summary` populates its **Orders & Referrals** and **Latest Vitals** sections purely from
 `observation` rows, keyed by `obs_type`. An extraction that omits them leaves those sections
@@ -133,10 +133,10 @@ also maps common synonyms (`bp` → `blood_pressure`), but agents SHOULD emit th
 directly. Set `observed_at` (ISO date) whenever the source gives one — it drives timeline order and
 the "latest" selection.
 
-Two more observation families capture care-gap inputs. They have **no dedicated summary section** —
-their structured consumer is the future `pemr due` (care-gap) command, so they surface only via the
-generic `observation` loop in the appointment brief and timeline. Commit them anyway; the last-done
-date is what phase 7 needs and re-extraction to recover it later is expensive:
+Three more observation families have **no dedicated summary section** — they surface only via the
+generic `observation` loop in the appointment brief and timeline. Commit them anyway: for the first
+two the structured consumer is the future `pemr due` (care-gap) command and the last-done date is
+what phase 7 needs; re-extraction to recover any of them later is expensive:
 
 - **Screening** → `obs_type='screening'`, `key=<snake_case screening name>` (e.g. `mammogram`,
   `colonoscopy`, `diabetes_screening`), `observed_at=<last-done ISO date>` (the load-bearing
@@ -145,6 +145,28 @@ date is what phase 7 needs and re-extraction to recover it later is expensive:
 - **Immunization** → `obs_type='immunization'`, `key=<snake_case vaccine name>` (e.g. `influenza`,
   `tdap`, `mmr`, `pneumococcal`), `observed_at=<date administered>`, optional `value_text=<detail:
   dose #, lot, site>`. One row per administration; multiple rows over time = vaccination history.
+
+- **Functional** → `obs_type='functional'`, `key=<snake_case IADL / self-management token>` (e.g.
+  `financial_self_management`, `meal_regularity`, `medication_self_administration`, `iadl_bathing`),
+  `observed_at=<ISO date the fact was observed>`, optional `value_num` (an ordinal/scale rating) or
+  `value_text` (the observed fact in words). This is the home for a caregiver-observed fact about
+  daily function — the class of evidence that is not a vital sign, not an order and not a diagnosis
+  (issue #132).
+  - `observed_at` is **required** here, unlike every other observation family: a functional
+    observation's entire value is being dated (a decline is a date, not a state), and an undated one
+    is the unqueryable prose this family exists to replace. A commit without it is **rejected**.
+  - Attribution: set `document_id` implicitly by committing against the source document when one
+    states the fact (e.g. a transcribed ledger or letter). A fact known only from family knowledge
+    with no document goes through `pemr record assert` (CLI-only, never an MCP tool — see the tool
+    surface above; issue #110) — **never** invent a document to hang it on.
+  - **MUST NOT imply a diagnosis.** A `functional` row records an observed fact ("stopped balancing
+    the register in July"), never a coded finding. Never promote one to a `condition` row and never
+    emit a paired `condition` because the pattern suggests one — no diagnostic code without
+    clinician documentation. The inverse rule lives in §3: conditions are typed rows, not
+    observations.
+  - `key` is lightly controlled: emit sensible `snake_case` tokens, no approval gate (same
+    discipline as screening/vaccine tokens). One row per observation date — a series of rows on the
+    same `key` over time *is* the trend.
 
 Vaccine overlap (influenza appears in both worlds): an **administered** vaccine → an `immunization`
 row; a health-screening-table *"due / last-done"* line → a `screening` row **only when the table is

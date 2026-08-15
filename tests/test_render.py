@@ -513,6 +513,29 @@ def test_brief_scopes_to_appointment_and_person(seeded):
     assert "999" not in md           # john's lab must never leak in
 
 
+def test_functional_observation_surfaces_without_a_new_section(seeded):
+    """Issue #132: a functional observation reaches the brief through the generic
+    observation loop, and must stay out of the vitals/orders sections — those are scoped
+    by obs_type equality and widening them is not how this family surfaces."""
+    doc = _doc(seeded, "jane-doe", ocr="ledger transcription")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "functional", "key": "financial_self_management",
+         "observed_at": "2025-07-20",
+         "value_text": "running balance column stops mid-page"},
+    ]})
+    md = render.render_brief(seeded, _upcoming_appt_id(seeded))
+    ctx = md.split("## Procedures & Observations")[1].split("\n## ")[0]
+    assert "functional financial_self_management" in ctx
+    assert "running balance column stops mid-page" in ctx
+    assert "2025-07-20" in ctx
+
+    summary = render.render_summary(seeded, "jane-doe")
+    assert "financial_self_management" not in \
+        summary.split("## Latest Vitals")[1].split("\n## ")[0]
+    assert "financial_self_management" not in \
+        summary.split("## Orders & Referrals")[1].split("\n## ")[0]
+
+
 def test_brief_flags_abnormal_labs_with_marker_and_ref(seeded):
     """Recent Labs in the brief must not hide an abnormal value: each abnormal lab gets
     a marker + its reference interval, mirroring render summary; normal labs stay bare."""
