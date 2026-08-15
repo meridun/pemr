@@ -29,6 +29,12 @@ Issue #70 closes that dispatcher's last hole, **PDFs**. They fall through to
 no PDF reader), so every PDF ingest used to store an empty `ocr_text`. See
 :func:`_ocr_pdf`.
 
+Issue #143 adds the *backwards* half of those extractor fixes: :func:`reocr_documents`
+re-runs today's dispatch against a blob already in `sources/`, so a document ingested
+before an extractor improved can gain the text it never got. It calls the same
+:func:`extract_text_routed` `ingest` calls (so the two paths cannot drift) and writes
+through the same :func:`pemr.documents.set_document_text` guard.
+
 Issue #69 adds a second entry point, :func:`ingest_study_dir`: a DICOM study
 *directory* becomes one document whose blob is a canonical zip of its slices (see
 :mod:`pemr.study`). It reuses every rail above — same person lookup, same layer-1
@@ -58,7 +64,7 @@ from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study, tombstones as _tombstones
-from .documents import normalize_document_text
+from .documents import normalize_document_text, set_document_text
 from .models import Document, Person
 
 
@@ -314,6 +320,39 @@ def _ocr_pdf(src: Path) -> str | None:
     finally:
         doc.close()
     return normalize_document_text(_PAGE_SEPARATOR.join(pages)) or None
+
+
+def pdf_page_count(src: Path) -> int | None:
+    """How many pages a PDF has, or ``None`` when that cannot be known.
+
+    ``None`` covers every "don't know" — the ``pemr[ocr]`` extra is absent, the file is
+    not a PDF, or it is unreadable/password-protected — so a caller can only ever say
+    "this document is over the cap" on positive evidence. Never raises, same contract
+    as :func:`_ocr_pdf`.
+
+    Deliberately a second, tiny open rather than a refactor of :func:`_ocr_pdf` (which
+    needs the page handles it already holds): both read the one ``OCR_MAX_PAGES``
+    constant, so there is nothing here to drift. Exists for `document reocr` (issue
+    #143), where the operator is not looking at the source document and so cannot see
+    the truncation note `_ocr_pdf` prints.
+    """
+    if src.suffix.lower() != ".pdf":
+        return None
+    backend = _load_pdf_backend()
+    if backend is None:
+        return None
+    try:
+        doc = backend.open(str(src))
+    except _PDF_ERRORS:
+        return None
+    try:
+        if getattr(doc, "needs_pass", False):
+            return None
+        return int(doc.page_count)
+    except _PDF_ERRORS:
+        return None
+    finally:
+        doc.close()
 
 
 def run_ocr(path: str | Path) -> str | None:
@@ -1140,6 +1179,21 @@ def _person_for_slug(conn: sqlite3.Connection, slug: str) -> Person:
     return Person.from_row(row)
 
 
+def _person_for_id(conn: sqlite3.Connection, person_id: int | None) -> Person | None:
+    """The claimed owner of an already-filed document, or ``None`` when unowned.
+
+    Sibling of :func:`_person_for_slug` for the re-run path (issue #143), where the
+    owner comes from the stored row rather than a `--person` flag. Unowned is not an
+    error here — there is simply nobody to check the recovered text against.
+    """
+    if person_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM person WHERE person_id = ?", (person_id,)
+    ).fetchone()
+    return Person.from_row(row) if row is not None else None
+
+
 def _roster(conn: sqlite3.Connection) -> list[Person]:
     """Everyone on the roster, **including deactivated people** — a deactivated person
     is still a real person whose documents must not land on someone else."""
@@ -1503,3 +1557,174 @@ def ingest_study_dir(
     return IngestResult(
         status="new", document=document, owner_check=owner_check, tombstone=tombstone
     )
+
+
+# --------------------------------------------------------------------------- #
+# Re-extraction against an already-stored blob (issue #143)
+# --------------------------------------------------------------------------- #
+#
+# `ingest` writes `ocr_text` once, from whatever the extractor could read that day.
+# Every later extractor fix (#70's PDF route, #138's CCDA route) therefore only helps
+# documents ingested *after* it landed; the ones already on file keep the empty column
+# they got. `document set-text` cannot close that gap — it takes text derived
+# out-of-band, which is a transcription path, not a re-run.
+#
+# `reocr_documents` is the missing verb's engine: a selector and a policy layer over
+# two functions that already exist. It calls `extract_text_routed` (the one `ingest`
+# calls, not a copy) and writes through `set_document_text` (the one `set-text` calls),
+# so the re-run cannot drift from the ingest path and cannot bypass the overwrite guard.
+
+
+@dataclass(frozen=True)
+class ReocrResult:
+    """What a re-extraction did — or refused to do — for one document.
+
+    Same shape and spirit as :class:`IngestResult`: one frozen row per document, so a
+    262-document sweep is a list a caller can print, count and serialise without a
+    second pass over the database.
+
+    ``status``:
+
+    * ``written`` — the recovered text is stored.
+    * ``would-write`` — ``dry_run``; ``chars`` is what *would* have been stored.
+    * ``has-text`` — the column already holds visible text and ``force`` was off.
+      Refused **before** extraction, so the skip is cheap.
+    * ``no-text`` — extraction ran and recovered nothing. A warning, not an error.
+    * ``owner-mismatch`` — the recovered text affirmatively names a *different* roster
+      person (issue #61's check, re-run against text that did not exist at ingest).
+    * ``missing-blob`` — ``source_path`` does not resolve under ``sources_dir``.
+    * ``study-blob`` — a packed DICOM study, whose ``ocr_text`` is a derived header
+      summary rather than extracted text (see :func:`ingest_study_dir`).
+    """
+
+    document_id: int
+    status: str
+    chars: int = 0
+    previous_chars: int = 0
+    route: str | None = None
+    pages: int | None = None
+    truncated: bool = False
+    owner_check: OwnerCheck | None = None
+    blob_path: str | None = None
+
+    @property
+    def wrote(self) -> bool:
+        return self.status == "written"
+
+    @property
+    def refused(self) -> bool:
+        """Whether the caller asked for work that was declined (drives the exit code).
+
+        ``no-text`` is deliberately excluded: a document that genuinely has no readable
+        text is an expected outcome of a sweep, and a sweep that exits non-zero on
+        expected outcomes trains `|| true` — the same reasoning as
+        :attr:`IngestResult.is_tombstoned`.
+        """
+        return self.status in ("has-text", "owner-mismatch", "missing-blob",
+                               "study-blob")
+
+
+def reocr_documents(
+    conn: sqlite3.Connection,
+    document_ids: Sequence[int],
+    sources_dir: str | Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+) -> list[ReocrResult]:
+    """Re-derive ``ocr_text`` for each document from its stored blob (`document reocr`).
+
+    Every id is resolved **before** any extraction runs: an unknown id is a typo, and a
+    sweep must not half-run on one. After that, each document is independent — there is
+    deliberately **no transaction across the sweep** (each write is
+    :func:`pemr.documents.set_document_text`'s own), so an interrupted 262-document run
+    leaves the finished documents committed and is safely re-runnable.
+
+    ``force`` means both "replace existing ``ocr_text``" and "store despite an owner
+    mismatch", matching what ``--force`` already means on `ingest`. ``dry_run`` reports
+    what would be stored and writes nothing.
+
+    Raises :class:`IngestError` for an unknown document id.
+    """
+    db.require_migrated(conn)
+    root = Path(sources_dir)
+
+    rows: list[Document] = []
+    for document_id in document_ids:
+        row = get_document_by_id(conn, document_id)
+        if row is None:
+            raise IngestError(
+                f"no document with id {document_id} - see `pemr document list`"
+            )
+        rows.append(row)
+
+    roster = _roster(conn)
+    results: list[ReocrResult] = []
+    for row in rows:
+        previous = normalize_document_text(row.ocr_text)
+        common = {"document_id": row.document_id, "previous_chars": len(previous)}
+
+        if row.source_path.endswith(STUDY_EXT):
+            # A study's `ocr_text` is a DICOM-header summary built from the unpacked
+            # slices, not text extracted from the blob. Re-deriving it is a different
+            # pipeline (see `ingest_study_dir`), so this verb reports and skips.
+            results.append(ReocrResult(status="study-blob", **common))
+            continue
+
+        # Before extraction, not after: the skip has to be cheap, or a sweep across a
+        # mostly-populated corpus pays for OCR it then discards. Same normalised
+        # predicate `set_document_text` uses, so an invisible-characters-only row
+        # (issue #87) correctly counts as empty and gets repaired.
+        if previous and not force:
+            results.append(ReocrResult(status="has-text", **common))
+            continue
+
+        blob = root / row.source_path
+        # Recorded even when it does not resolve — a `missing-blob` result is only
+        # actionable if it names the path that was looked for.
+        common["blob_path"] = str(blob)
+        if not blob.is_file():
+            results.append(ReocrResult(status="missing-blob", **common))
+            continue
+
+        text, route = extract_text_routed(blob)
+        # What `set_document_text` would actually store, so `--dry-run`'s character
+        # count is the number the write reports and not one character more.
+        text = normalize_document_text(text)
+        pages = pdf_page_count(blob)
+        common.update(
+            route=route, pages=pages,
+            truncated=pages is not None and pages > OCR_MAX_PAGES,
+        )
+        if not text:
+            results.append(ReocrResult(status="no-text", **common))
+            continue
+
+        person = _person_for_id(conn, row.person_id)
+        owner_check = None
+        if person is not None:
+            owner_check = check_owner(
+                text, person, roster, trust_anchors=(route != "native")
+            )
+        common["owner_check"] = owner_check
+        # Only `mismatch` refuses here, unlike ingest where `suspect` blocks too: this
+        # document is *already filed* under that owner, so withholding the text does
+        # not un-file it — it only hides the evidence and keeps the document invisible
+        # to `find`, which is the bug this verb exists to close. `mismatch` is
+        # affirmative evidence of a cross-owner leak, so it still earns the refusal.
+        if owner_check is not None and owner_check.verdict == "mismatch" and not force:
+            results.append(ReocrResult(status="owner-mismatch", **common))
+            continue
+
+        if dry_run:
+            results.append(
+                ReocrResult(status="would-write", chars=len(text), **common)
+            )
+            continue
+
+        # `force=True` unconditionally: this call is only reached once the `has-text`
+        # guard above has already applied the caller's own force policy, and re-testing
+        # it here would refuse the invisible-only rows that guard deliberately admits.
+        set_document_text(conn, row.document_id, text, force=True)
+        results.append(ReocrResult(status="written", chars=len(text), **common))
+    return results

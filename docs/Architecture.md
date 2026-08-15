@@ -997,6 +997,8 @@ pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--n
                                                          # pre-emptive exclusion; ingests and copies nothing
 pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
+pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force]
+                                                         # re-derive ocr_text from the stored blob using the ingest dispatch
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
 pemr query meds --person jane --active [--raw]
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
