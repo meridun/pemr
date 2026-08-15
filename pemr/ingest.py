@@ -20,6 +20,9 @@ Issue #66 adds two intake-format guards, both stdlib-only (the engine has no run
 dependencies): a pre-write refusal of Google Drive **pointer stubs** (see
 :func:`is_pointer_stub`) and a text-extraction dispatcher (:func:`extract_text`) so
 `.txt`/`.docx`/`.xlsx` and friends become findable instead of landing as opaque blobs.
+Issue #138 adds one more native route to that dispatcher, **CCDA** (C-CDA / HL7 CDA R2)
+XML — what every US portal's "download my record" produces — whose narrative was
+previously handed to tesseract, which cannot decode XML.
 
 Issue #70 closes that dispatcher's last hole, **PDFs**. They fall through to
 :func:`run_ocr`, and tesseract cannot decode a PDF at all (its Leptonica backend has
@@ -367,8 +370,9 @@ def run_ocr(path: str | Path) -> str | None:
 # this file type allows", not "shell out to tesseract". `run_ocr` keeps its name and
 # its tesseract semantics and becomes the image/PDF branch of the dispatcher below.
 #
-# Hard constraint: **zero new dependencies.** Everything here is stdlib, which is what
-# draws the scope line — `.rtf`, `.msg`, `.doc` and PDF *text-layer* extraction all
+# Hard constraint: **zero new dependencies.** Everything here is stdlib (CCDA included —
+# `xml.etree.ElementTree` is enough for it), which is what draws the scope line —
+# `.rtf`, `.msg`, `.doc` and PDF *text-layer* extraction all
 # need a third-party parser and stay out, covered by the agent transcription path
 # (`--ocr-text-file`) that `AGENTS.md` §3 already makes the default.
 # --------------------------------------------------------------------------- #
@@ -377,6 +381,12 @@ _PLAINTEXT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".json", ".log"}
 
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+# CCDA / C-CDA (HL7 CDA R2) — issue #138. `.xml` is a *container* suffix, so unlike
+# `.docx`/`.xlsx` the detection is on the parsed root element, never the extension.
+_CDA_NS = "{urn:hl7-org:v3}"
+_CDA_ROOT = f"{_CDA_NS}ClinicalDocument"
+_CCDA_SNIFF_BYTES = 8192
 
 # Errors an OOXML/plaintext read can legitimately produce on a malformed or truncated
 # file. Extraction is best-effort: any of these degrades to "no ocr_text", never a lost
@@ -483,11 +493,182 @@ def _extract_xlsx(path: Path) -> str:
     return "\n".join(lines)
 
 
+_CDA_TS_DIGITS = re.compile(r"\d+")
+
+
+def _localname(tag: str) -> str:
+    """Element name without its `{namespace}` prefix."""
+    return tag.rpartition("}")[2]
+
+
+def _ccda_flat(el: ET.Element) -> str:
+    """One element → one whitespace-collapsed line.
+
+    The single flattening primitive: it is what turns `<content>`, `<linkHtml>`,
+    `<sub>`/`<sup>` and any unknown inline markup inside a narrative block into text.
+    """
+    return " ".join("".join(el.itertext()).split())
+
+
+def _ccda_name(el: ET.Element) -> str:
+    """A CDA `<name>` as one line, one space per element boundary.
+
+    Not `_ccda_flat`: that concatenates (right for narrative, where markup splits
+    *inside* a word), and `<given>Jane</given><family>Doe</family>` carries no
+    whitespace of its own, so concatenating yields `JaneDoe` — a single token the
+    owner check can never match against "Jane Doe".
+    """
+    return " ".join(
+        " ".join(chunk.split()) for chunk in el.itertext() if chunk.strip()
+    )
+
+
+def _ccda_table_rows(table: ET.Element) -> list[str]:
+    """Narrative `<table>` as one tab-delimited line per `<tr>` (`thead` and `tbody`
+    alike, document order). Tab is what `_extract_xlsx` already uses for tabular text,
+    and it is what keeps a header cell on the same line as its value."""
+    rows: list[str] = []
+    for tr in table.iter():
+        if _localname(tr.tag) != "tr":
+            continue
+        cells = [
+            _ccda_flat(cell) for cell in tr
+            if _localname(cell.tag) in ("th", "td")
+        ]
+        if any(cells):
+            rows.append("\t".join(cells))
+    return rows
+
+
+def _ccda_narrative(node: ET.Element) -> list[str]:
+    """One section's `<text>` narrative block, rendered as lines."""
+    lines: list[str] = []
+    if (node.text or "").strip():
+        lines.append(" ".join(node.text.split()))
+    for child in node:
+        name = _localname(child.tag)
+        if name == "table":
+            lines.extend(_ccda_table_rows(child))
+        elif name in ("paragraph", "item", "caption"):
+            # Nested inline markup is already flattened by `_ccda_flat`; recursing
+            # would emit its text a second time.
+            flat = _ccda_flat(child)
+            if flat:
+                lines.append(flat)
+        elif name != "renderMultiMedia":   # an image reference has no text to give
+            lines.extend(_ccda_narrative(child))
+        if (child.tail or "").strip():
+            lines.append(" ".join(child.tail.split()))
+    return lines
+
+
+def _ccda_date(value: str | None) -> str | None:
+    """A CDA `TS/@value` (`"19620314000000-0600"`) as an ISO-ish date string.
+
+    The 8-digit → `YYYY-MM-DD` reformat is load-bearing: :func:`dob_candidates`
+    recognises `1962-03-14` and friends but not the raw `19620314` form, so without
+    it the DOB half of the owner check could never fire on a CCDA.
+    """
+    digits = _CDA_TS_DIGITS.match((value or "").strip())
+    if digits is None:
+        return None
+    raw = digits.group()
+    if len(raw) >= 8:
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    if len(raw) >= 6:
+        return f"{raw[:4]}-{raw[4:6]}"
+    if len(raw) >= 4:
+        return raw[:4]
+    return None
+
+
+def _ccda_header(root: ET.Element) -> list[str]:
+    """`recordTarget` identity lines, prepended so the #61 owner check has an anchor.
+
+    A CCDA's own header is the most reliable identity in the document, and without it
+    the check degrades to "filed on your say-so" — the symptom issue #138 reports.
+    """
+    lines: list[str] = []
+    patient = root.find(
+        f"{_CDA_NS}recordTarget/{_CDA_NS}patientRole/{_CDA_NS}patient"
+    )
+    if patient is None:
+        return lines
+    for name in patient.findall(f"{_CDA_NS}name"):
+        flat = _ccda_name(name)   # `given`/`given`/`family` → "Jane A Doe"
+        if flat:
+            lines.append(f"Patient: {flat}")
+    birth = patient.find(f"{_CDA_NS}birthTime")
+    if birth is not None:
+        dob = _ccda_date(birth.get("value"))
+        if dob:
+            lines.append(f"DOB: {dob}")
+    return lines
+
+
+def _extract_ccda(path: Path) -> str | None:
+    """CCDA narrative text, or ``None`` when the file is **not** a CCDA.
+
+    ``None`` is the caller's signal to fall through to :func:`run_ocr` unchanged:
+    `.xml` is a container suffix, so an ordinary XML file must keep today's route.
+    """
+    size = path.stat().st_size
+    if size > _MAX_EXTRACT_BYTES:
+        # Deliberately a raise, not a fall-through: the honest "past the extraction
+        # cap" note beats handing a 40 MB XML to tesseract to fail on.
+        raise ValueError(
+            f"{size} bytes, past the {_MAX_EXTRACT_BYTES}-byte extraction cap"
+        )
+    with path.open("rb") as fh:
+        head = fh.read(_CCDA_SNIFF_BYTES)
+    # A conformant CCDA has no internal subset, and stdlib `ET` *does* expand internal
+    # entities — so a `<!DOCTYPE` is refused here rather than parsed (billion-laughs on
+    # a file whose bytes are well under the cap). Falling through costs nothing: today
+    # such a file goes to tesseract anyway.
+    if b"<!doctype" in head.lower():
+        return None
+    # Cheap negative first, so an ordinary `.xml` is never fully parsed.
+    if b"urn:hl7-org:v3" not in head or b"ClinicalDocument" not in head:
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        # Malformed XML is not *detectably* a CCDA, so it takes today's path.
+        return None
+    if root.tag != _CDA_ROOT:
+        return None
+
+    lines = _ccda_header(root)
+    body = root.find(f"{_CDA_NS}component/{_CDA_NS}structuredBody")
+    if body is not None:
+        # `.iter` so a nested section is rendered too; the narrative is read from each
+        # section's *direct* `<text>` child, or a nested one would be emitted twice.
+        for section in body.iter(f"{_CDA_NS}section"):
+            block: list[str] = []
+            title = section.find(f"{_CDA_NS}title")
+            if title is not None and _ccda_flat(title):
+                block.append(_ccda_flat(title))
+            narrative = section.find(f"{_CDA_NS}text")
+            if narrative is not None:
+                block.extend(_ccda_narrative(narrative))
+            if block:
+                if lines:
+                    lines.append("")
+                lines.extend(block)
+    # No `structuredBody` (a `nonXMLBody` CDA) still returns the header alone: strictly
+    # better than today, since it restores owner verification.
+    return "\n".join(lines)
+
+
 def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     """:func:`extract_text` plus the **route** that produced the text.
 
     Dispatches on suffix: plaintext-ish formats are read directly and `.docx`/`.xlsx`
-    are unzipped and their OOXML parsed with the stdlib (route ``"native"``).
+    are unzipped and their OOXML parsed with the stdlib (route ``"native"``). A CCDA
+    `.xml` (issue #138) is rendered natively too — sections' narrative plus a
+    `recordTarget` identity header — but on the parsed **root element**, not the
+    suffix: a non-CCDA or malformed `.xml` falls through to the OCR route exactly as
+    it did before that branch existed.
     **Everything else falls through to :func:`run_ocr`** (route ``"ocr"``) — the same
     thing `ocr=True` did before this dispatcher existed. Deliberately not a suffix
     allowlist: image extensions vary far too widely (`.jfif`, `.jpe`, extension-less
@@ -521,6 +702,11 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             text = _extract_docx(src)
         elif suffix == ".xlsx":
             text = _extract_xlsx(src)
+        # `.xml` deliberately stays out of `_PLAINTEXT_SUFFIXES`: only a file whose
+        # root element is `{urn:hl7-org:v3}ClinicalDocument` is read natively, and
+        # every other `.xml` falls through to the `run_ocr` branch below unchanged.
+        elif suffix == ".xml" and (ccda := _extract_ccda(src)) is not None:
+            text = ccda
         else:
             ocr_text = run_ocr(src)
             if ocr_text is None:

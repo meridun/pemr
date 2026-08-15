@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from pemr import db, ingest, persons
+from pemr import db, ingest, persons, query
 from pemr.models import Person
 
 
@@ -739,6 +739,45 @@ def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "
     return p
 
 
+_CCDA_SECTIONS = (
+    "<section><title>Allergies</title><text>"
+    "<paragraph>No known drug allergies</paragraph>"
+    "</text></section>",
+    "<section><title>Results</title><text><table>"
+    "<thead><tr><th>Test</th><th>Value</th></tr></thead>"
+    "<tbody><tr><td>Ferritin</td><td>201 ng/mL</td></tr></tbody>"
+    "</table></text></section>",
+)
+
+
+def _make_ccda(
+    tmp_path,
+    name="DOC0001.XML",
+    patient=("Jane", "Doe"),
+    birth="19620314",
+    sections=_CCDA_SECTIONS,
+):
+    given, family = patient
+    birth_el = f'<birthTime value="{birth}"/>' if birth else ""
+    body = (
+        f"<component><structuredBody>"
+        + "".join(f"<component>{s}</component>" for s in sections)
+        + "</structuredBody></component>"
+    ) if sections else ""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+        "<recordTarget><patientRole><patient>"
+        f"<name><given>{given}</given><family>{family}</family></name>"
+        f"{birth_el}"
+        "</patient></patientRole></recordTarget>"
+        f"{body}</ClinicalDocument>"
+    )
+    p = tmp_path / name
+    p.write_text(doc, encoding="utf-8")
+    return p
+
+
 def test_pointer_stub_is_refused_pre_write(conn, tmp_path, sources):
     stub = _make_stub(tmp_path)
     with pytest.raises(ingest.IngestError) as excinfo:
@@ -797,6 +836,146 @@ def test_extract_text_reads_xlsx(conn, tmp_path, sources):
     src = _make_xlsx(tmp_path)
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
     assert result.document.ocr_text == "test\tvalue\nsodium\t140"
+
+
+# --- CCDA (issue #138) ---------------------------------------------------------
+# `.xml` used to reach tesseract, which cannot decode it, so every portal export
+# ("download my record" produces CCDA) landed with no `ocr_text` *and* an unverified
+# owner. Detection is on the parsed root element, never the suffix.
+
+
+def test_extract_text_reads_ccda_xml(conn, tmp_path, sources):
+    src = _make_ccda(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    text = result.document.ocr_text
+    assert result.ocr_text_populated
+    assert text.startswith("Patient: Jane Doe\nDOB: 1962-03-14")
+    assert "Allergies\nNo known drug allergies" in text
+    # header and value survive on one tab-delimited line each
+    assert "Test\tValue" in text
+    assert "Ferritin\t201 ng/mL" in text
+
+
+def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
+    def boom(path):  # pragma: no cover - the assertion is that this never runs
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", boom)
+    src = _make_ccda(tmp_path)
+    assert ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).ocr_text_populated
+
+
+@pytest.mark.parametrize(
+    "name, payload",
+    [
+        # an IHE_XDM manifest sitting beside the documents
+        ("METADATA.XML",
+         '<?xml version="1.0"?><Manifest><Doc>DOC0001.XML</Doc></Manifest>'),
+        ("plain.xml", "<root><a>1</a></root>"),
+        # right namespace, wrong root: the parsed root tag is the authority
+        ("other.xml", '<Bundle xmlns="urn:hl7-org:v3"><ClinicalDocument/></Bundle>'),
+    ],
+)
+def test_non_ccda_xml_still_reaches_tesseract(
+    conn, tmp_path, sources, monkeypatch, name, payload
+):
+    seen: list[str] = []
+
+    def fake_run_ocr(path):
+        seen.append(str(path))
+        return "Ferritin 201 nanograms"
+
+    monkeypatch.setattr(ingest, "run_ocr", fake_run_ocr)
+    src = _make_file(tmp_path, name, payload.encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "Ferritin 201 nanograms"
+
+
+def test_malformed_ccda_xml_does_not_raise(conn, tmp_path, sources, capsys, monkeypatch):
+    monkeypatch.setattr(ingest, "run_ocr", lambda _: None)   # tesseract declines
+    src = _make_file(
+        tmp_path, "broken.xml",
+        b'<?xml version="1.0"?><ClinicalDocument xmlns="urn:hl7-org:v3">'
+        b"<recordTarget><patientRole",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"           # the document still lands
+    assert result.document.ocr_text is None
+    assert "--ocr-text-file" in capsys.readouterr().err
+
+
+def test_ccda_doctype_is_not_parsed_natively(conn, tmp_path, sources, monkeypatch):
+    """stdlib `ET` expands internal entities, so a `<!DOCTYPE` is refused before the
+    parse rather than after — a billion-laughs file is small enough to clear the cap."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="doctype-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>", '?><!DOCTYPE ClinicalDocument [<!ENTITY a "aaaa">]>', 1
+        ),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
+    """The point of the issue: `recordTarget` is an identity the check can use, so a
+    CCDA no longer degrades to "filed on your say-so"."""
+    _seed_roster(conn)
+    # no `birthTime`, so the name is the only signal — `<given>`/`<family>` have no
+    # whitespace of their own and must not flatten into one unmatchable token
+    src = _make_ccda(tmp_path, birth="")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "match"
+    assert result.owner_check.blocks is False
+    # ...and the protective half still fires on this route.
+    other = _make_ccda(tmp_path, name="DOC0002.XML", patient=("Robert Alan", "Roe"),
+                       birth="")
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, other, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "bob-roe"
+
+
+def test_ccda_birth_time_is_rendered_matchably(conn, tmp_path, sources):
+    """`19620314` is not a form `dob_candidates` knows; the ISO reformat is what makes
+    the DOB half of the check work at all."""
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, patient=("Unreadable", "Smudge"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "match"
+
+
+def test_ccda_stranger_is_unverified_not_suspect(conn, tmp_path, sources):
+    """Route-scoped anchors, same as `.docx`/`.xlsx`: a CCDA naming a non-roster
+    stranger is `unverified`. No regression — it used to yield no text at all."""
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, patient=("Karen", "Fields"), birth="19710909")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "unverified"
+    assert result.status == "new"
+
+
+def test_find_sees_ccda_narrative(conn, tmp_path, sources):
+    """The headline symptom: `find` was blind to every CCDA."""
+    ingest.ingest_document(conn, _make_ccda(tmp_path), "jane-doe", sources, ocr=True)
+    hits = query.find(conn, "jane-doe", "ferritin")
+    assert [hit["person"] for hit in hits] == ["jane-doe"]
+
+
+def test_ccda_without_structured_body_still_yields_identity(conn, tmp_path, sources):
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, sections=())
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Patient: Jane Doe\nDOB: 1962-03-14"
+    assert result.owner_check.verdict == "match"
 
 
 def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys, monkeypatch):
@@ -1075,7 +1254,7 @@ def test_ocr_route_still_produces_suspect(conn, tmp_path, sources, monkeypatch):
 # `word/document.xml`). Over the cap degrades like any other extraction failure.
 
 
-@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt"])
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt", "ccda"])
 def test_oversized_extraction_degrades_instead_of_reading_it(
     conn, tmp_path, sources, capsys, monkeypatch, kind
 ):
@@ -1084,6 +1263,10 @@ def test_oversized_extraction_degrades_instead_of_reading_it(
         src = _make_docx(tmp_path, paragraphs=("a" * 500,))
     elif kind == "xlsx":
         src = _make_xlsx(tmp_path)
+    elif kind == "ccda":
+        # over the cap degrades *native* with the cap note, rather than falling
+        # through to a tesseract failure that says nothing useful
+        src = _make_ccda(tmp_path)
     else:
         src = _make_file(tmp_path, "big.txt", b"x" * 500)
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)

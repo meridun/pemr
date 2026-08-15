@@ -183,7 +183,8 @@ def ingest_document(
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
     contract without a follow-up read. ``ocr=true`` is the fallback: it extracts by
-    whatever route the file type allows (plaintext/`.docx`/`.xlsx` natively, everything
+    whatever route the file type allows (plaintext/`.docx`/`.xlsx` and CCDA `.xml`
+    natively, everything
     else via tesseract), and stores nothing when nothing could be read — `.pdf`, `.rtf`,
     `.msg` and `.doc` have no route at all (tesseract does not accept PDF input), so
     transcribe those yourself.
@@ -203,7 +204,8 @@ def ingest_document(
     go-ahead before retrying with ``force=true``. ``suspect`` (a patient-identity
     header naming nobody on the roster) is scoped by route: it applies to the text you
     supply and to a tesseract pass, never to anything ``ocr=true`` extracts natively
-    (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``), where
+    (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``, CCDA
+    ``.xml``), where
     those words are column labels — so pass your transcription as ``ocr_text`` rather
     than saving it to a ``.txt`` and re-reading that. ``mismatch`` holds on every route.
 
