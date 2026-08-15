@@ -275,7 +275,11 @@ export function assertClean(text, what = 'text') {
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'sources', 'exports', 'inbox', 'backups', 'data', 'vdm-diag', '.venv', 'pemr.egg-info']);
 const TEXT_EXT = new Set(['.py', '.mjs', '.js', '.ts', '.md', '.json', '.toml', '.yml', '.yaml', '.txt', '.csv', '.sql', '.cfg', '.ini']);
-// This file and its test necessarily contain the shapes they describe.
+// This file and its test necessarily contain the shapes they describe, so the
+// scanner cannot scan them — which makes them the one blind spot in the repo.
+// Every identity used as an example here MUST therefore be invented: a given
+// name from the list above plus a surname that belongs to nobody. Never
+// illustrate a rule with the real identity that motivated it.
 const SKIP_FILES = new Set(['scripts/pii-scan.mjs', 'test/pii-scan.test.mjs']);
 
 function trackedFiles() {
