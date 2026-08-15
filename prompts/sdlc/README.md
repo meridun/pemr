@@ -54,7 +54,8 @@ comfortably.
    run), self-query as above. The snapshot only seeds candidate selection, never ownership — the
    claim race always runs against live GitHub data, so a stale entry (closed, relabeled, or claimed
    since the snapshot) just loses the claim; move to the next candidate. Pick the next: higher
-   priority first (`priority:critical` › `priority:medium` › `priority:future`), then oldest by
+   priority first (`priority:critical` › *unlabeled* › `priority:future` — untagged is the normal
+   default, only the two exceptional tiers carry a label), then oldest by
    creation date (FIFO). If none (or the snapshot is exhausted) → reply `<LANE>: idle` and stop.
 
    **CLI-first** (the primary path when the reference CLI is present — `scripts/sdlc.mjs`, see
