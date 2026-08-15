@@ -332,6 +332,32 @@ This repository is **public**. It is framework + documentation only.
 
 - **No PHI anywhere in the repo** — no real names, DOBs, values, encounter dates, or personal-name
   filenames in issues, commits, logs, PRs, or test fixtures. Fixtures are synthetic only.
+- **A real identifier reaches GitHub more than once.** The SDLC lanes quote diffs, repro steps and
+  issue text back into issue comments, so one real name in a fixture or a repro write-up gets
+  republished across every downstream thread. Substitute the persona *before* it is written down,
+  not after — a later scrub cannot reach `refs/pull/*`, which GitHub keeps permanently.
+- **The roster is the allowlist.** `SYNTHETIC_ROSTER` in `scripts/pii-scan.mjs` is the complete set
+  of identities permitted in this repo. Need another persona? Add it there — that edit is the
+  review point.
+- **Describe the shape, never the value.** Writing *about* a leak is how one keeps spreading: a
+  fix's own commit message, PR body, and test fixtures are as public as the code. Say "a person
+  slug whose surname is not a placeholder", never the slug itself. The one place this is
+  unenforceable is `scripts/pii-scan.mjs` and its test, which the scanner must exempt — every
+  example identity there has to be invented.
+- **Every publishing surface is gated** (`npm run setup:hooks` installs the git ones; `npm install`
+  does it automatically):
+
+  | surface | gate |
+  |---|---|
+  | tracked files | `npm run check:pii`, in CI |
+  | commit message | `.githooks/commit-msg` |
+  | push (messages + introduced lines) | `.githooks/pre-push` |
+  | PR title and body | `pii-pr-text` CI job |
+  | agent shell commands | `.claude/hooks/pii-guard.py` |
+  | SDLC lane comments | `guardOutboundBody` in `scripts/sdlc.mjs` |
+
+  All of them shell out to `scripts/pii-scan.mjs`, so there is one set of patterns rather than six
+  that drift. Bypass is `--no-verify` and should be rare enough to notice.
 - MCP responses stay on the local machine. Agents MUST NOT relay record contents into any remote
   channel (issue comments, PRs, external APIs) beyond what the human explicitly asks for.
 - The live database and blobs stay out of git: `pemr.db` (and `*-wal`/`*-shm`), `sources/`,

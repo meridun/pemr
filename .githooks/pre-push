@@ -1,0 +1,61 @@
+#!/bin/sh
+# Last gate before anything leaves the machine: scan the commit messages and
+# the diff of everything about to be pushed.
+#
+# commit-msg catches a message as it is written, but not one written before the
+# hooks were installed, amended elsewhere, or merged in from another branch.
+# This is the check that actually stands between a real identity and GitHub,
+# where a later scrub cannot reach refs/pull/*.
+#
+# Bypass, if you are certain: `git push --no-verify`.
+
+[ -z "$SKIP_PII_HOOK" ] || exit 0
+
+command -v node >/dev/null 2>&1 || exit 0
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+scanner="$repo_root/scripts/pii-scan.mjs"
+[ -f "$scanner" ] || exit 0
+
+z40=0000000000000000000000000000000000000000
+status=0
+
+# stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$z40" ] && continue   # branch deletion
+
+  if [ "$remote_sha" = "$z40" ]; then
+    # New branch: only what it adds on top of the upstream default branch.
+    base=$(git merge-base "$local_sha" origin/dev 2>/dev/null \
+        || git merge-base "$local_sha" origin/main 2>/dev/null)
+    range=${base:+$base..$local_sha}
+    range=${range:-$local_sha}
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  commits=$(git rev-list "$range" 2>/dev/null) || continue
+  [ -z "$commits" ] && continue
+
+  for sha in $commits; do
+    if ! git log -1 --format=%B "$sha" | node "$scanner" --stdin "commit $(git rev-parse --short "$sha") message" >/dev/null 2>&1; then
+      echo "pii-guard: push blocked — commit $(git rev-parse --short "$sha") names a real identity in its message:" >&2
+      git log -1 --format=%B "$sha" | node "$scanner" --stdin "commit message" >&2 2>&1
+      status=1
+    fi
+  done
+
+  # --diff scans only introduced lines, so a scrub commit is not blocked by the
+  # old value sitting on its own removal lines, and the scanner's own exempt
+  # files stay exempt. A guard that cries wolf gets bypassed.
+  if ! git diff "$range" 2>/dev/null | node "$scanner" --diff >/dev/null 2>&1; then
+    echo "pii-guard: push blocked — the outgoing diff introduces a real identity:" >&2
+    git diff "$range" 2>/dev/null | node "$scanner" --diff >&2 2>&1
+    status=1
+  fi
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "" >&2
+  echo "Nothing was pushed. Fix the history, or re-run with --no-verify if this is genuinely synthetic." >&2
+fi
+exit $status
