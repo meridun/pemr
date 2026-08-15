@@ -1740,6 +1740,36 @@ def _print_attest_report(report: "attestations.AttestReport") -> None:
         )
 
 
+def _print_released_identity_note(
+    conn, record_type: str, report: "attestations.AttestReport"
+) -> None:
+    """Disclose that this `new` landed into an already-populated family (issue #133).
+
+    Reachable only when curation verdicts released a colliding identity, so the operator
+    is told which occurrence the fact took — and, in the one genuinely surprising case,
+    that a **family**-scoped verdict covers the row just written too: a family verdict
+    applies to every row of its family, including the new one, so without this line
+    `record assert` would report success and `query`/`render` would show nothing.
+
+    Human output only — the ``--json`` / :class:`AttestReport` key set is unchanged, and
+    presentation stays with the front door while stamping stays in `curation` (#131).
+    """
+    verdict = curation.get_verdict(conn, record_type, report.dedup_base)
+    if verdict is not None and verdict["status"] in curation.APPENDIX_STATUSES:
+        print(
+            f"  note: this identity carries a family-scoped '{verdict['status']}' "
+            "verdict, which covers this row too - it renders in the superseded/corrected "
+            "appendix until the verdict is re-scoped to the rows it meant "
+            f"(`pemr record annotate {record_type} <row-id> --row ...`) or lifted "
+            f"(`pemr record annotate {record_type} <row-id> --clear`)"
+        )
+    else:
+        print(
+            "  note: earlier rows of this fact are superseded/corrected, so this one "
+            f"takes occurrence {report.dedup_occurrence} of the identity"
+        )
+
+
 def _cmd_record_assert(args: argparse.Namespace) -> int:
     """`record assert` — list attested rows, or commit one attested fact.
 
@@ -1800,6 +1830,8 @@ def _cmd_record_assert(args: argparse.Namespace) -> int:
             _print_json(report.as_dict())
             return 0
         _print_attest_report(report)
+        if report.outcome == "new" and report.dedup_occurrence:
+            _print_released_identity_note(conn, args.table, report)
         if report.outcome == "duplicate":
             print("nothing to do: the fact is already on record")
         elif report.applied:

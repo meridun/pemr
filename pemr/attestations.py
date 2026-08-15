@@ -27,7 +27,10 @@ disagreement, only for recording an agreement.
 
 **Refuse, don't stage.** The mirror case — asserting a fact the record already holds —
 never stages a conflict. An equal payload reports ``duplicate`` and writes nothing; a
-differing one raises :class:`AttestationCollisionError` naming the stored row. Precedent:
+differing one raises :class:`AttestationCollisionError` naming the stored row — *unless*
+every colliding row already carries a verdict that released the identity
+(:data:`curation.APPENDIX_STATUSES`, issue #133), in which case the human has already ruled
+the identity free and the attestation is an ordinary new occurrence. Precedent:
 ``commit_extraction``'s pass 1 already refuses two colliding rows of one submission,
 because the human is at the keyboard and a conflict staged against oneself has no
 independent provenance to adjudicate. A conflict would also have to carry
@@ -45,7 +48,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from . import db, dedup, query
+from . import curation, db, dedup, query
 
 
 class AttestationCollisionError(ValueError):
@@ -134,6 +137,73 @@ def _provenance(row: sqlite3.Row | dict) -> str:
     if row_map.get("document_id") is not None:
         return f"document #{row_map['document_id']}"
     return "attestation"
+
+
+def _blocking_rows(
+    conn: sqlite3.Connection, record_type: str, family: list[sqlite3.Row]
+) -> tuple[list[dict], list[dict]]:
+    """Split a colliding family into ``(blocking, released)`` — issue #133.
+
+    A row *releases* the identity when a human already ruled on it with one of
+    :data:`curation.APPENDIX_STATUSES` (``superseded`` / ``erroneous-in-source`` /
+    ``merged-into``); ``disputed`` and unverdicted rows keep blocking, because a disputed
+    row still holds the identity, it is merely flagged.
+
+    Resolution runs through :func:`curation.annotate_rows`, never a hand-rolled lookup, so
+    the row-beats-family precedence rule stays the single site :meth:`VerdictMap.for_row`
+    already is (issue #114) and "leaves the live view" stays :func:`curation.is_appendix`'s
+    vocabulary. Both lists keep the family's occurrence order.
+
+    The ``dict`` copy is required: ``annotate_rows`` stamps in place and ``sqlite3.Row`` is
+    immutable. The stamped key is inert for every reader downstream of here —
+    :func:`dedup._rows_equal` iterates its own field list, and ``_rekey_label`` /
+    ``_provenance`` read named columns.
+    """
+    rows = curation.annotate_rows(
+        [dict(row) for row in family], record_type, curation.load_verdicts(conn)
+    )
+    blocking = [row for row in rows if not curation.is_appendix(row)]
+    released = [row for row in rows if curation.is_appendix(row)]
+    return blocking, released
+
+
+def _collision_remedy(record_type: str, stored: dict, released: int) -> str:
+    """The half of the collision message that must stay honest — issue #133.
+
+    The defect this fixes was dead advice: the error recommended `record annotate` for a
+    row whose verdict could not change the outcome. A row already carrying a releasing
+    verdict is never in ``blocking``, so it can never be named here; what remains is a row
+    with no verdict (annotating it *would* unblock) or one carrying a non-releasing verdict
+    (say which, and name the ones that do release — interpolated from
+    :data:`curation.APPENDIX_STATUSES`, never hand-typed).
+
+    ``released`` discloses siblings already ruled on, rather than dropping them: an
+    operator who annotated three rows of four must not be left guessing why the fourth
+    still refuses.
+    """
+    pk = f"{record_type}_id"
+    row_id = stored[pk]
+    verdict = curation.verdict_of(stored)
+    releasing = ", ".join(f"`{status}`" for status in curation.APPENDIX_STATUSES)
+    if verdict is None:
+        remedy = (
+            f"Correct the stored row (`pemr record rm {record_type} {row_id}`, or "
+            f"`pemr record annotate {record_type} {row_id} --row --status superseded` "
+            "to rule on it) and retry"
+        )
+    else:
+        remedy = (
+            f"That row already carries the verdict '{verdict.get('status')}', which does "
+            f"not release the identity - only {releasing} do. Re-rule on it "
+            f"(`pemr record annotate {record_type} {row_id} --row --status superseded`) "
+            f"or remove it (`pemr record rm {record_type} {row_id}`) and retry"
+        )
+    if released:
+        remedy += (
+            f"; {released} other row(s) in this family already carry a releasing verdict "
+            "and no longer block"
+        )
+    return remedy + "; nothing was written"
 
 
 def assert_record(
@@ -233,29 +303,43 @@ def assert_record(
         )
         pk = f"{record_type}_id"
         if twin is None:
-            stored = family[0]
-            raise AttestationCollisionError(
-                f"{record_type} {stored[pk]} "
-                f"({dedup._rekey_label(record_type, stored)!r}, "
-                f"{_provenance(stored)}) already holds this identity with a different "
-                "value. An attestation is refused rather than staged as a conflict - "
-                "there is no second source to adjudicate against, only you. Correct the "
-                f"stored row (`pemr record rm {record_type} {stored[pk]}`, or "
-                "`pemr record annotate` to rule on it) and retry; nothing was written"
-            )
-        report.outcome = "duplicate"
-        report.row_id = int(twin[pk])
-        report.label = dedup._rekey_label(record_type, twin)
-        report.dedup_key = twin["dedup_key"]
-        report.dedup_occurrence = int(twin["dedup_occurrence"] or 0)
-        report.existing_provenance = _provenance(twin)
-        report.applied = apply
-        return report
+            # The identity only still holds if some family row is unreleased (#133):
+            # a family the human already ruled superseded/corrected is theirs to
+            # re-file. Falls through to the ordinary write path when none blocks.
+            blocking, released = _blocking_rows(conn, record_type, family)
+            if blocking:
+                stored = blocking[0]
+                raise AttestationCollisionError(
+                    f"{record_type} {stored[pk]} "
+                    f"({dedup._rekey_label(record_type, stored)!r}, "
+                    f"{_provenance(stored)}) already holds this identity with a "
+                    "different value. An attestation is refused rather than staged as a "
+                    "conflict - there is no second source to adjudicate against, only "
+                    f"you. {_collision_remedy(record_type, stored, len(released))}"
+                )
+        else:
+            report.outcome = "duplicate"
+            report.row_id = int(twin[pk])
+            report.label = dedup._rekey_label(record_type, twin)
+            report.dedup_key = twin["dedup_key"]
+            report.dedup_occurrence = int(twin["dedup_occurrence"] or 0)
+            report.existing_provenance = _provenance(twin)
+            report.applied = apply
+            return report
 
+    # Reachable with a non-empty family only via the released-identity fall-through
+    # above, and `dedup_key` is UNIQUE per table (migration 001) — so the new row takes
+    # the next free occurrence, the monotonic rule `dedup._resolve_keep_both` uses.
+    # An empty family gives occurrence 0, whose key *is* the base, exactly as before.
+    occurrence = max(
+        (int(f["dedup_occurrence"] or 0) for f in family), default=-1
+    ) + 1
+    report.dedup_occurrence = occurrence
+    report.dedup_key = dedup.occurrence_key(base, occurrence)
     if apply:
         with conn:
             report.row_id = dedup._insert_record(
-                conn, record_type, payload, person_id, None, base,
+                conn, record_type, payload, person_id, None, base, occurrence,
                 attestation=(who, when, stamp),
             )
     report.applied = apply
