@@ -115,7 +115,7 @@ def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
     """Issue #93, walked through the real CLI: an order restated by three documents is
     one bullet carrying the latest detail plus the `+N earlier` disclosure; distinct and
     qualifier-bearing items stay their own bullets; a timestamped row shows a bare date;
-    an undated row shows none; newest first, undated last. (Keyless rows are covered in
+    an undated row shows none; oldest first, undated last. (Keyless rows are covered in
     `tests/test_render.py` -- two undated ones collide on the storage dedup key, so that
     case cannot be seeded through the commit path.)"""
     tmp_path, _ = ready
@@ -143,11 +143,11 @@ def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
     section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
     lines = [ln for ln in section.splitlines() if ln.startswith("- ")]
     assert lines == [
+        "- outpatient physical therapy  (ordered 2026-01-05)",
+        "- sleep study - home study  (ordered 2026-02-01)",
         "- cervical collar - Dr. Jones, ortho  (ordered 2026-06-14; +2 earlier, "
         "first 2026-01-05)",
         "- outpatient physical therapy (aquatic)  (ordered 2026-06-14)",
-        "- sleep study - home study  (ordered 2026-02-01)",
-        "- outpatient physical therapy  (ordered 2026-01-05)",
         "- wheelchair evaluation - seating clinic",
     ]
     # the collapse is render-only: every stored row survives, keys untouched
@@ -157,6 +157,31 @@ def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
     ).fetchone()["n"] == 7
     conn.close()
     assert out.isascii()          # cp1252/cp437 console contract
+
+
+def test_render_summary_hides_resulted_order_end_to_end(ready, capsys):
+    """Issue #128 through the real CLI (the render helpers are private, so the seam only
+    stays honest if the behaviour is pinned at the command boundary): the `ready` fixture
+    already holds an LDL result collected 2026-01-01, so an LDL order placed that day is
+    gone from the section while the referral beside it stays."""
+    tmp_path, _ = ready
+    _commit_orders(tmp_path, "sha-r1", [
+        {"key": "LDL", "value_text": "fasting", "observed_at": "2026-01-01"},
+        {"key": "cervical collar", "observed_at": "2026-01-01"},   # no result: still open
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
+    assert "LDL" not in section
+    assert "- cervical collar  (ordered 2026-01-01)" in section
+    # render-only: the suppressed order row is untouched in the DB
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order' AND key='LDL'"
+    ).fetchone()["n"] == 1
+    conn.close()
 
 
 def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
