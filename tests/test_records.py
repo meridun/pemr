@@ -1258,3 +1258,128 @@ def test_cli_record_edit_misuse_is_argparse_rc2(cli_ready, argv):
     with pytest.raises(SystemExit) as exc:
         _run(cli_ready, *argv)
     assert exc.value.code == 2
+
+
+# --- smoke: the correction loop, end to end through the CLI ------------------
+
+
+def _commit_plain(tmp_path, name, document, payload):
+    """`_commit` without a dictionary override - this story needs no synonym edit."""
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run(tmp_path, "commit-extraction", "--document", str(document),
+                "--json", str(path)) == 0
+
+
+def _weights(unit, month, first_value):
+    return [
+        {"obs_type": "vital", "observed_at": f"{month}-0{i}T09:00", "key": "weight",
+         "value_num": first_value + i, "unit": unit}
+        for i in (1, 2, 3)
+    ]
+
+
+def _observation_identity(tmp_path, where):
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return {
+            int(r["observation_id"]): (r["document_id"], r["dedup_key"])
+            for r in conn.execute(
+                f"SELECT * FROM observation WHERE {where} ORDER BY observation_id"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+
+def test_cli_smoke_walks_the_reporters_correction_loop(tmp_path, capsys):
+    """The issue's operator story, driven entirely through the CLI (issue #129).
+
+    The engine-level test builds the corpus with `dedup.commit_extraction`; this one earns
+    it the way an operator does - a 2026 chart export spelling the unit `lb` beside a 2022
+    outside note spelling it `lbs`, the exact provenance trap the issue reports - and then
+    walks the whole loop: dry run (AC 3) -> `--apply` per row (AC 1) -> `record edit
+    --list` (AC 2) -> `rekey`/`verify` still clean with every corrected row still on its
+    own document (AC 4) -> `record rm` disclosing the append-only ledger -> re-committing
+    the original extraction staging a conflict rather than silently deduping.
+    """
+    assert _run(tmp_path, "migrate", "--create") == 0
+    assert _run(tmp_path, "person", "add", "--slug", "jane-doe", "--name", "Jane") == 0
+    _ingest(tmp_path, "chart.txt", b"2026 chart export: weights recorded in lb")
+    _ingest(tmp_path, "outside.txt", b"2022 outside clinic note: weights in lbs")
+    _commit_plain(tmp_path, "chart.json", 1,
+                  {"observation": _weights("lb", "2026-01", 180.0)})
+    _commit_plain(tmp_path, "outside.json", 2,
+                  {"observation": _weights("lbs", "2022-06", 175.0)})
+
+    # The minority spelling: three rows, sourced to the 2022 note. Re-submitting them
+    # through `commit-extraction` is what would re-attribute them to the 2026 export.
+    before = _observation_identity(tmp_path, "unit = 'lbs'")
+    assert len(before) == 3
+    assert {doc for doc, _key in before.values()} == {2}
+    targets = sorted(before)
+
+    # 1. AC 3: dry run is the default, and it writes nothing.
+    capsys.readouterr()
+    assert _run(tmp_path, "record", "edit", "observation", str(targets[0]),
+                "--set", "unit=lb", "--note", "normalise unit label") == 0
+    dry = capsys.readouterr().out
+    assert "unit: lbs -> lb" in dry
+    assert "document: #2 (unchanged - a correction is not a re-attribution)" in dry
+    assert "dry run: nothing was written - re-run with --apply" in dry
+    assert _cli_field(tmp_path, "observation", targets[0], "unit") == "lbs"
+    assert _run(tmp_path, "record", "edit", "--list") == 0
+    assert "no record corrections recorded" in capsys.readouterr().out
+
+    # 2. AC 1: --apply corrects each minority row in place.
+    for row_id in targets:
+        assert _run(tmp_path, "record", "edit", "observation", str(row_id),
+                    "--set", "unit=lb", "--note", "normalise unit label to `lb`",
+                    "--attributed-to", "Jane", "--apply") == 0
+        assert f"corrected observation #{row_id}" in capsys.readouterr().out
+    assert _cli_count(tmp_path, "observation") == 6
+    assert _observation_identity(tmp_path, "unit = 'lb'").keys() == set(range(1, 7))
+
+    # 3. AC 4: provenance and identity are bit-identical on every corrected row - the
+    #    failure both pre-existing workarounds have.
+    after = _observation_identity(tmp_path, "unit = 'lb'")
+    assert {row_id: after[row_id] for row_id in targets} == before
+
+    # 4. AC 2: a discoverable audit trail, one entry per corrected row.
+    capsys.readouterr()
+    assert _run(tmp_path, "record", "edit", "--list", "observation", "--json") == 0
+    entries = json.loads(capsys.readouterr().out)
+    assert [e["record_id"] for e in entries] == sorted(targets, reverse=True)
+    assert {(e["field"], e["old"], e["new"], e["attributed_to"]) for e in entries} == {
+        ("unit", "lbs", "lb", "Jane")
+    }
+
+    # 5. The identity layer never noticed: no rekey work, and the database still verifies
+    #    (with the new ledger counted).
+    capsys.readouterr()
+    assert _run(tmp_path, "rekey") == 0
+    assert "all dedup keys already match" in capsys.readouterr().out
+    assert _run(tmp_path, "verify", "--sources", str(tmp_path / "sources")) == 0
+    verified = capsys.readouterr().out
+    assert "integrity      ok" in verified
+    assert "record_edit    3" in verified
+
+    # 6. `record rm` discloses the ledger entries naming a doomed row - and the ledger is
+    #    append-only, so they are disclosed as kept history, never retired.
+    capsys.readouterr()
+    assert _run(tmp_path, "record", "rm", "observation", str(targets[0])) == 0
+    disclosure = capsys.readouterr().out
+    assert "1 recorded correction(s) name this row" in disclosure
+    assert "append-only" in disclosure and "unit: lbs -> lb" in disclosure
+
+    # 7. The deliberate behaviour change: re-committing the *original* extraction now
+    #    stages a conflict where it previously deduped. The divergence is real - the
+    #    stored row no longer says what its document says - so it is loud, not silent.
+    capsys.readouterr()
+    payload = tmp_path / "outside.json"
+    assert _run(tmp_path, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+    recommit = capsys.readouterr().out
+    assert "0 new, 0 duplicate, 0 enriched, 3 conflict" in recommit
+    assert "review-conflicts" in recommit
+    assert _cli_count(tmp_path, "observation") == 6
