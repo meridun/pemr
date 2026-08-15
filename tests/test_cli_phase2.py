@@ -1535,3 +1535,69 @@ def test_rekey_is_the_migration_for_a_pre_change_database(ready, capsys):
     assert _run(tmp_path, "commit-extraction", "--document", str(doc),
                 "--json", str(payload)) == 0
     assert "0 new, 1 duplicate" in capsys.readouterr().out
+
+
+# --- functional observations end to end (issue #132) --------------------------
+
+def test_functional_observation_cli_roundtrip(ready, capsys):
+    """The #132 round trip through the real CLI: a caregiver-observed functional fact
+    stated by an ingested document commits, reaches `query timeline` and `render brief`
+    on the generic observation path, and stays out of `render summary`'s vitals/orders
+    sections and out of the problem list entirely."""
+    tmp_path = ready
+    register = tmp_path / "register.txt"
+    register.write_bytes(b"check register transcription, jane-doe: the running balance "
+                         b"column stops mid-page while checks keep being written")
+    assert _run(tmp_path, "ingest", str(register), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources")) == 0
+    capsys.readouterr()
+
+    payload = _write_json(tmp_path, "functional.json", {
+        "observation": [
+            {"obs_type": "functional", "key": "financial_self_management",
+             "observed_at": "2025-07-05",
+             "value_text": "stopped carrying the running balance forward"},
+            {"obs_type": "functional", "key": "meal_regularity",
+             "observed_at": "2025-07-19", "value_num": 2, "unit": "meals/day"},
+        ],
+        "appointment": [{"scheduled_for": "2099-02-01", "provider": "Dr. Smith",
+                         "specialty": "Geriatrics", "reason": "function review"}],
+    })
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(payload)) == 0
+    assert "3 new" in capsys.readouterr().out
+
+    # An undated functional row is refused at the CLI boundary, not quietly stored.
+    undated = _write_json(tmp_path, "undated.json", {"observation": [
+        {"obs_type": "functional", "key": "meal_regularity",
+         "value_text": "skipping meals"},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(undated)) == 1
+    assert "missing required field 'observed_at'" in capsys.readouterr().err
+
+    assert _run(tmp_path, "query", "timeline", "--person", "jane-doe") == 0
+    timeline = capsys.readouterr().out
+    assert "functional financial_self_management" in timeline
+    assert "stopped carrying the running balance forward" in timeline
+    assert "2025-07-05" in timeline
+    assert "functional meal_regularity" in timeline and "meals/day" in timeline
+
+    assert _run(tmp_path, "render", "brief", "--appointment", "1") == 0
+    brief = capsys.readouterr().out
+    observations = brief.split("## Procedures & Observations")[1].split("\n## ")[0]
+    assert "functional financial_self_management" in observations
+    assert "## Active Problems\n\n_none recorded_" in brief   # never a diagnosis
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    summary = capsys.readouterr().out
+    for section in ("## Latest Vitals", "## Orders & Referrals", "## Active Problems"):
+        assert "functional" not in summary.split(section)[1].split("\n## ")[0]
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM observation "
+                            "WHERE obs_type='functional'").fetchone()["n"] == 2
+        assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
+    finally:
+        conn.close()
