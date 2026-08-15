@@ -63,7 +63,8 @@ Read/write separation is also declared to the client via MCP `readOnlyHint` anno
 
 **Deletion — and clinical verdicts, and unsourced writes — are never an MCP tool.** `document rm`,
 `record rm` (the CLI's destructive verbs — the latter added by issue #107), `record annotate`
-(issue #109), `record reaffirm` (issue #126), and `record assert` (issue #110) are deliberately
+(issue #109), `record reaffirm` (issue #126), `record assert` (issue #110), and `record edit`
+(issue #129) are deliberately
 excluded from the tool surface
 above. This is what keeps "an agent cannot delete PHI" true: removing a document or a single
 record row is a human-at-a-terminal action only, never something an agent can reach through this
@@ -72,7 +73,10 @@ clinical judgment, and writing one can drop a record out of every generated docu
 deleting a row; `record reaffirm` writes those same verdicts in bulk, so it is excluded for the
 same reason (an agent may still *read* the orphan list from `--json` and summarize it). `record assert` is the sharpest case of all — it is a *write*, not a deletion, and
 the only path in the system that can put a fact into the record with no external source; only a
-human at the CLI may vouch for one.
+human at the CLI may vouch for one. `record edit` sits on the same trust boundary from the other
+side: it mutates a *stored clinical value* with no new source backing the change, so the row stops
+matching what its document says on one person's say-so — which is exactly the kind of write that
+must carry a named human, not an agent.
 
 ## MUST rules
 

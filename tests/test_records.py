@@ -1,15 +1,16 @@
-"""Row-level record repair: `pemr record rm` (issue #107).
+"""Row-level record repair: `pemr record rm` (issue #107), `record edit` (issue #129).
 
 Covers the module surface (pemr/records.py) and the CLI wiring, in the shape
-test_documents.py uses for the `document` group. The scenario the verb exists for
-— a doubled fact quarantining a table from `rekey` — gets its own end-to-end test.
+test_documents.py uses for the `document` group. Each verb gets the end-to-end test of
+the scenario it exists for: a doubled fact quarantining a table from `rekey` for
+`record rm`, and the reporter's unit-label normalisation for `record edit`.
 """
 
 import json
 
 import pytest
 
-from pemr import cli, db, dedup, documents, persons, records
+from pemr import cli, curation, db, dedup, documents, persons, records
 
 RECORDS = {
     "lab_result": [
@@ -421,6 +422,9 @@ def test_cli_record_rm_json_shape_is_stable(cli_ready, capsys):
         # Appended by #114: the row-scoped curation verdicts retired with the row.
         # Appended, never inserted - the --json key set is a contract.
         "curation_retired",
+        # Appended by #129: the edit-ledger entries naming the row. Disclosed, not
+        # retired - the contrast with `curation_retired` is the point.
+        "edits_recorded",
     }
     capsys.readouterr()
     assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--json") == 0
@@ -581,3 +585,676 @@ def test_cli_smoke_walks_the_whole_doubled_collision_loop(tmp_path, capsys):
 
     # 6. And the database is still internally consistent.
     assert _run(tmp_path, "verify", "--sources", str(tmp_path / "sources")) == 0
+
+
+# =============================================================================
+# in-place correction of non-key fields: `record edit` (issue #129)
+# =============================================================================
+#
+# The reporting case: stored values correct and on one scale, but the unit STRING
+# varies by whichever extraction submitted it (`lbs` beside `lb`, `F` beside `degF`).
+# Both pre-existing repairs — re-submitting through `commit-extraction`, or
+# delete-and-recommit — re-attribute the row to whichever document is passed, so a 2022
+# measurement ends up sourced to a 2026 chart export. `record edit` corrects the field
+# and leaves provenance alone.
+
+# One fully-populated payload per record type, plus a different-but-valid value for
+# every field. Used to prove the KEY_FIELDS/`_key_parts` agreement behaviourally, for
+# every type, rather than by eyeballing the two lists.
+FIELD_VALUES = {
+    "lab_result": {
+        "test_name": ("HbA1c", "Glucose"),
+        "loinc": ("4548-4", "2345-7"),
+        "value_num": (5.7, 6.1),
+        "value_text": ("normal", "high"),
+        "unit": ("%", "pct"),
+        "ref_low": (4.0, 3.5),
+        "ref_high": (6.0, 6.5),
+        "flag": ("H", "L"),
+        "collected_at": ("2026-01-02", "2026-02-03"),
+    },
+    "medication": {
+        "name": ("Metformin", "Insulin"),
+        "dose": ("500 mg", "1000 mg"),
+        "route": ("PO", "SC"),
+        "frequency": ("BID", "QD"),
+        "started_on": ("2025-06-01", "2025-07-01"),
+        "ended_on": ("2026-01-01", "2026-02-01"),
+        "prescriber": ("Dr Who", "Dr No"),
+        "status": ("active", "discontinued"),
+    },
+    "procedure": {
+        "name": ("Colonoscopy", "Endoscopy"),
+        "performed_on": ("2025-03-04", "2025-04-05"),
+        "provider": ("Dr Who", "Dr No"),
+        "outcome": ("normal", "abnormal"),
+    },
+    "appointment": {
+        "scheduled_for": ("2026-02-01", "2026-03-01"),
+        "provider": ("Dr Who", "Dr No"),
+        "specialty": ("cardiology", "neurology"),
+        "reason": ("follow-up", "consult"),
+        "summary": ("seen", "rescheduled"),
+    },
+    "observation": {
+        "obs_type": ("vital", "anthropometric"),
+        "observed_at": ("2026-01-02T09:00", "2026-01-03T09:00"),
+        "key": ("weight", "height"),
+        "value_num": (180.0, 175.0),
+        "value_text": ("one eighty", "one seventy five"),
+        "unit": ("lb", "lbs"),
+    },
+    "allergy": {
+        "substance": ("Penicillin", "Sulfa"),
+        "reaction": ("rash", "hives"),
+        "criticality": ("high", "low"),
+        "noted_on": ("2010-01-01", "2011-01-01"),
+    },
+    "condition": {
+        "name": ("Asthma", "Eczema"),
+        "status": ("active", "resolved"),
+        "onset_on": ("2024-01-01", "2025-01-01"),
+        "resolved_on": ("2026-01-01", "2026-02-01"),
+        "relation": ("mother", "father"),
+        "note": ("dx by PCP", "dx by specialist"),
+    },
+}
+
+# One key-participating change per type that really does move the dedup_key — the
+# positive direction, so the KEY_FIELDS test cannot pass by the key being inert.
+KEY_MOVES = {
+    "lab_result": {"test_name": "Glucose"},
+    "medication": {"dose": "1000 mg"},
+    "procedure": {"performed_on": "2025-04-05"},
+    "appointment": {"provider": "Dr No"},
+    "observation": {"key": "height"},
+    "allergy": {"substance": "Sulfa"},
+    # The one status change that moves the key: `_condition_subject` keys on the
+    # relative once the status is family-history, and on "self" for every other status.
+    "condition": {"status": "family-history"},
+}
+
+
+def _full_payload(record_type):
+    return {name: pair[0] for name, pair in FIELD_VALUES[record_type].items()}
+
+
+# --- KEY_FIELDS must stay true to dedup._key_parts ---------------------------
+
+
+@pytest.mark.parametrize("record_type", dedup.KNOWN_TYPES)
+def test_no_editable_field_can_move_the_dedup_key(record_type):
+    """The safety-critical direction, proved behaviourally for every type.
+
+    `record edit` derives its editable set as FIELD_SPECS - KEY_FIELDS, so if
+    KEY_FIELDS ever drifts from `dedup._key_parts` an "editable" field would silently
+    re-key a stored row. This is what stops that drift: mutate every non-key field, one
+    at a time, and require the key byte-identical each time.
+    """
+    base = _full_payload(record_type)
+    expected = dedup.dedup_key(record_type, base, 1)
+    editable = dedup.editable_fields(record_type)
+    assert editable, record_type
+    for name in editable:
+        other = FIELD_VALUES[record_type][name][1]
+        moved = {**base, name: other}
+        assert dedup.dedup_key(record_type, moved, 1) == expected, name
+        # And clearing it is equally key-neutral (`--set NAME=` writes None).
+        cleared = {**base, name: None}
+        assert dedup.dedup_key(record_type, cleared, 1) == expected, name
+
+
+@pytest.mark.parametrize("record_type", dedup.KNOWN_TYPES)
+def test_key_fields_really_do_move_the_key(record_type):
+    """The positive direction: a hand-listed key change per type moves the key, so the
+    test above is not passing because the key is inert."""
+    base = _full_payload(record_type)
+    moved = {**base, **KEY_MOVES[record_type]}
+    assert dedup.dedup_key(record_type, moved, 1) != dedup.dedup_key(
+        record_type, base, 1
+    )
+
+
+def test_editable_fields_excludes_identity_and_never_names_provenance():
+    for record_type in dedup.KNOWN_TYPES:
+        editable = set(dedup.editable_fields(record_type))
+        assert editable.isdisjoint(dedup.KEY_FIELDS[record_type])
+        assert editable == (
+            set(dedup.FIELD_SPECS[record_type]) - dedup.KEY_FIELDS[record_type]
+        )
+        # Provenance is out for free: it was never in FIELD_SPECS to begin with.
+        for column in ("document_id", "person_id", *dedup.INTERNAL_COLUMNS,
+                       *dedup.ATTESTATION_COLUMNS):
+            assert column not in editable
+
+
+def test_editable_fields_rejects_an_unknown_type():
+    with pytest.raises(ValueError, match="lab_result"):
+        dedup.editable_fields("family_history")
+
+
+# --- the module surface ------------------------------------------------------
+
+
+def _ledger(conn, record_type=None):
+    sql = "SELECT * FROM record_edit"
+    params = ()
+    if record_type is not None:
+        sql += " WHERE record_type = ?"
+        params = (record_type,)
+    return [dict(r) for r in conn.execute(sql + " ORDER BY record_edit_id", params)]
+
+
+def _row(conn, record_type, row_id):
+    return dict(conn.execute(
+        f"SELECT * FROM {record_type} WHERE {record_type}_id = ?", (row_id,)
+    ).fetchone())
+
+
+def test_dry_run_reports_the_change_and_writes_nothing(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    before_fts = _fts_ids(conn, "lab_result")
+
+    report = records.edit_record(
+        conn, "lab_result", target, {"unit": "percent"}, note="normalise the unit"
+    )
+
+    assert report.applied is False
+    assert report.changes == [{"field": "unit", "old": "%", "new": "percent"}]
+    assert report.unchanged == []
+    assert report.label == "HbA1c"
+    assert report.person_slug == "jane-doe"
+    assert report.document_id == seeded["doc"]
+    assert _row(conn, "lab_result", target) == before
+    assert _ledger(conn) == []
+    assert _fts_ids(conn, "lab_result") == before_fts
+
+
+def test_apply_moves_the_field_and_leaves_identity_and_provenance_alone(seeded):
+    """AC 1 and AC 4 together: the display field changes, and every column that says
+    where the fact came from or which fact it is stays bit-identical."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+
+    report = records.edit_record(
+        conn, "lab_result", target, {"unit": "percent", "flag": "H"},
+        note="normalise the unit", attributed_to="Jane", apply=True,
+    )
+
+    after = _row(conn, "lab_result", target)
+    assert after["unit"] == "percent" and after["flag"] == "H"
+    for column in ("document_id", "person_id", "test_name", "collected_at",
+                   "dedup_key", "dedup_base", "dedup_occurrence",
+                   *dedup.ATTESTATION_COLUMNS):
+        assert after[column] == before[column], column
+    assert report.applied is True
+
+    entries = _ledger(conn)
+    assert len(entries) == 2                       # one row per changed field
+    assert {e["field"] for e in entries} == {"unit", "flag"}
+    assert {e["edited_at"] for e in entries} == {report.edited_at}   # one act
+    unit_entry = next(e for e in entries if e["field"] == "unit")
+    assert (unit_entry["old_value"], unit_entry["new_value"]) == ("%", "percent")
+    assert unit_entry["record_type"] == "lab_result"
+    assert unit_entry["record_id"] == target
+    assert unit_entry["dedup_base"] == before["dedup_base"]
+    assert unit_entry["note"] == "normalise the unit"
+    assert unit_entry["attributed_to"] == "Jane"
+
+
+def test_editing_to_the_stored_value_is_a_no_op(seeded):
+    """A re-run must not accrete history: the ledger is append-only, so a second
+    identical `--apply` has to write nothing at all."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", apply=True)
+    assert len(_ledger(conn)) == 1
+
+    report = records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                                 note="normalise", apply=True)
+
+    assert report.changes == []
+    assert report.unchanged == ["unit"]
+    assert len(_ledger(conn)) == 1
+
+
+def test_a_numeric_no_op_compares_numerically(seeded):
+    """A numeric column round-trips out of SQLite as float, so `--set value_num=95`
+    against a stored 95.0 is a no-op, not a ledgered change."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "Glucose")
+    report = records.edit_record(conn, "lab_result", target, {"value_num": 95},
+                                 note="restate", apply=True)
+    assert report.changes == [] and report.unchanged == ["value_num"]
+    assert _ledger(conn) == []
+
+
+def test_clearing_a_field_nulls_it_and_ledgers_the_old_value(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+
+    report = records.edit_record(conn, "lab_result", target, {"unit": None},
+                                 note="the source states no unit", apply=True)
+
+    assert report.changes == [{"field": "unit", "old": "%", "new": None}]
+    assert _row(conn, "lab_result", target)["unit"] is None
+    entry = _ledger(conn)[0]
+    assert (entry["old_value"], entry["new_value"]) == ("%", None)
+
+
+def test_every_known_type_can_be_edited(conn):
+    """The verb covers the whole typed record surface, not just lab_result."""
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc_id = _insert_document(conn, jane.person_id, "cc33")
+    dedup.commit_extraction(
+        conn, doc_id,
+        {record_type: [_full_payload(record_type)]
+         for record_type in dedup.KNOWN_TYPES},
+    )
+    for record_type in dedup.KNOWN_TYPES:
+        row_id = int(conn.execute(
+            f"SELECT {record_type}_id FROM {record_type}"
+        ).fetchone()[f"{record_type}_id"])
+        name = dedup.editable_fields(record_type)[0]
+        before = _row(conn, record_type, row_id)
+        report = records.edit_record(
+            conn, record_type, row_id,
+            {name: FIELD_VALUES[record_type][name][1]},
+            note="correction", apply=True,
+        )
+        assert report.changes, record_type
+        after = _row(conn, record_type, row_id)
+        assert after["dedup_key"] == before["dedup_key"], record_type
+        assert after["document_id"] == before["document_id"], record_type
+
+
+# --- refusals: nothing is written on any raise -------------------------------
+
+
+def _assert_untouched(conn, record_type, row_id, before):
+    assert _row(conn, record_type, row_id) == before
+    assert _ledger(conn) == []
+
+
+def test_a_key_field_is_refused_and_points_at_the_right_operation(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    with pytest.raises(records.FieldNotEditableError) as exc:
+        records.edit_record(conn, "lab_result", target, {"test_name": "A1c"},
+                            note="rename", apply=True)
+    message = str(exc.value)
+    assert "identity" in message and "rekey" in message
+    assert "unit" in message                       # names the editable set
+    _assert_untouched(conn, "lab_result", target, before)
+
+
+def test_an_unknown_field_is_refused(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    with pytest.raises(records.FieldNotEditableError, match="editable fields"):
+        records.edit_record(conn, "lab_result", target, {"colour": "blue"},
+                            note="n", apply=True)
+    assert _ledger(conn) == []
+
+
+def test_an_unknown_row_id_is_refused(seeded):
+    with pytest.raises(records.RecordNotFoundError):
+        records.edit_record(seeded["conn"], "lab_result", 9999, {"unit": "lb"},
+                            note="n", apply=True)
+
+
+def test_an_unknown_type_is_refused_by_edit(seeded):
+    with pytest.raises(ValueError, match="lab_result"):
+        records.edit_record(seeded["conn"], "family_history", 1, {"unit": "lb"},
+                            note="n")
+
+
+def test_no_updates_is_refused(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    with pytest.raises(ValueError, match="at least one"):
+        records.edit_record(conn, "lab_result", target, {}, note="n", apply=True)
+
+
+def test_a_blank_note_is_refused(seeded):
+    """The `curation.annotate_record` rule: an unexplained mutation of a stored clinical
+    value is not an audit trail."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    with pytest.raises(ValueError, match="note is required"):
+        records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                            note="   ", apply=True)
+    _assert_untouched(conn, "lab_result", target, before)
+
+
+@pytest.mark.parametrize("record_type,updates", [
+    ("lab_result", {"value_num": "abc"}),          # wrong type
+    ("medication", {"ended_on": "06/15/2026"}),    # non-ISO date
+    ("condition", {"note": 5}),                    # wrong type
+])
+def test_a_value_that_fails_validation_is_refused(conn, record_type, updates):
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc_id = _insert_document(conn, jane.person_id, "dd44")
+    dedup.commit_extraction(conn, doc_id, {record_type: [_full_payload(record_type)]})
+    row_id = int(conn.execute(
+        f"SELECT {record_type}_id FROM {record_type}"
+    ).fetchone()[f"{record_type}_id"])
+    before = _row(conn, record_type, row_id)
+
+    with pytest.raises(dedup.ValidationError):
+        records.edit_record(conn, record_type, row_id, updates, note="n", apply=True)
+
+    _assert_untouched(conn, record_type, row_id, before)
+
+
+def test_an_enum_value_that_fails_validation_is_refused(conn):
+    """`allergy.criticality` is an ENUM_FIELDS column and editable — the enum rule has
+    to bind at edit time exactly as it does at commit."""
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc_id = _insert_document(conn, jane.person_id, "ee55")
+    dedup.commit_extraction(conn, doc_id, {"allergy": [_full_payload("allergy")]})
+    row_id = int(conn.execute("SELECT allergy_id FROM allergy").fetchone()[0])
+    before = _row(conn, "allergy", row_id)
+
+    with pytest.raises(dedup.ValidationError, match="criticality"):
+        records.edit_record(conn, "allergy", row_id, {"criticality": "extreme"},
+                            note="n", apply=True)
+
+    _assert_untouched(conn, "allergy", row_id, before)
+
+
+# --- the seams the plan calls risky ------------------------------------------
+
+
+def test_the_fts_row_follows_an_edit(conn):
+    """Migration 003's AFTER UPDATE trigger does this. `observation.value_text` is the
+    field that proves it: it is editable AND indexed (the trigger indexes `key` +
+    `value_text`; `unit` is deliberately not in the FTS text at all)."""
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc_id = _insert_document(conn, jane.person_id, "ff66")
+    dedup.commit_extraction(conn, doc_id, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-02T09:00", "key": "weight",
+         "value_text": "onehundredeighty"},
+    ]})
+    row_id = int(conn.execute("SELECT observation_id FROM observation").fetchone()[0])
+
+    def _matches(token):
+        return [int(r["source_id"]) for r in conn.execute(
+            "SELECT source_id FROM record_fts WHERE source_table = 'observation' "
+            "AND record_fts MATCH ?", (token,)
+        ).fetchall()]
+
+    assert _matches("onehundredeighty") == [row_id]
+
+    records.edit_record(conn, "observation", row_id,
+                        {"value_text": "onehundredseventyfive"},
+                        note="transcription error", apply=True)
+
+    assert _matches("onehundredseventyfive") == [row_id]
+    assert _matches("onehundredeighty") == []
+
+
+def test_curation_verdicts_in_both_scopes_survive_an_edit(seeded):
+    """No editable field feeds the key, so `dedup_base` never moves — which means an
+    edit orphans nothing, in either scope (contrast `rekey`, issue #126)."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    base = _row(conn, "lab_result", target)["dedup_base"]
+    curation.annotate_record(conn, "lab_result", base, status="confirmed",
+                             note="family verdict", apply=True)
+    curation.annotate_record(conn, "lab_result", str(target), status="disputed",
+                             note="row verdict", row=True, apply=True)
+
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", apply=True)
+
+    verdicts = curation.load_verdicts(conn)
+    assert verdicts.family[("lab_result", base)]["status"] == "confirmed"
+    assert verdicts.rows[("lab_result", target)]["status"] == "disputed"
+    # Neither is orphaned: both still resolve to a live target.
+    assert all(entry["family_size"] for entry in curation.list_curation(conn))
+
+
+def test_record_rm_discloses_the_ledger_and_keeps_it(seeded):
+    """The opposite ending to a row-scoped verdict (issue #114): the verdict is retired
+    with the row, the ledger entry is disclosed and kept — nothing resolves through it,
+    and retiring it would destroy the audit trail."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    base = _row(conn, "lab_result", target)["dedup_base"]
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", apply=True)
+    curation.annotate_record(conn, "lab_result", str(target), status="disputed",
+                             note="row verdict", row=True, apply=True)
+
+    dry = records.remove_record(conn, "lab_result", target)
+    assert [e["field"] for e in dry.edits_recorded] == ["unit"]
+    assert dry.edits_recorded[0]["dedup_base"] == base
+    assert len(dry.curation_retired) == 1
+
+    records.remove_record(conn, "lab_result", target, apply=True)
+
+    assert len(_ledger(conn)) == 1                      # kept
+    assert curation.row_verdicts_for(conn, "lab_result", [target]) == []   # retired
+    # And the entry is still listable, annotated as naming no live row.
+    listed = records.list_edits(conn)
+    assert len(listed) == 1 and listed[0]["label"] == ""
+
+
+def test_re_ingesting_the_original_document_stages_a_conflict_after_a_correction(
+    seeded,
+):
+    """Pinned deliberately: `unit` is one of `dedup._COMPARE_FIELDS`, so once a unit is
+    corrected the original document no longer matches the stored row and re-committing
+    it stages a CONFLICT rather than deduping. Loud and correct — the divergence is
+    real — and the sharpest argument for #136."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    original = RECORDS["lab_result"][0]
+
+    # Before the edit, re-committing the same payload is a plain duplicate.
+    doc2 = _insert_document(conn, seeded["jane"].person_id, "9999aaaa")
+    assert dedup.commit_extraction(
+        conn, doc2, {"lab_result": [original]}
+    ).counts["duplicate"] == 1
+
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", apply=True)
+
+    doc3 = _insert_document(conn, seeded["jane"].person_id, "9999bbbb")
+    summary = dedup.commit_extraction(conn, doc3, {"lab_result": [original]})
+    assert summary.counts["conflict"] == 1
+    assert summary.counts["duplicate"] == 0
+
+
+def test_list_edits_is_empty_on_a_database_predating_the_migration(seeded):
+    """The `curation.has_table` guard: a restored older snapshot reports no edits rather
+    than raising `no such table`."""
+    conn = seeded["conn"]
+    conn.execute("DROP TABLE record_edit")
+    conn.commit()
+    assert records.has_edit_table(conn) is False
+    assert records.list_edits(conn) == []
+    assert records.edits_for_rows(conn, "lab_result", [1]) == []
+    # And `record rm` still works against it.
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    assert records.remove_record(conn, "lab_result", target).edits_recorded == []
+
+
+# --- the reporter's scenario, end to end -------------------------------------
+
+
+def test_the_reporters_unit_normalisation_scenario(conn):
+    """Issue #129's own case: a majority unit beside a minority spelling of it. Correct
+    the minority rows, and `rekey` stays clean while every corrected row still points at
+    the document it came from (AC 4)."""
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    majority_doc = _insert_document(conn, jane.person_id, "a" * 16)
+    minority_doc = _insert_document(conn, jane.person_id, "b" * 16)
+
+    def _weights(count, unit, start_day):
+        return [
+            {"obs_type": "vital", "observed_at": f"2026-01-{start_day + i:02d}T09:00",
+             "key": "weight", "value_num": 180.0 + i, "unit": unit}
+            for i in range(count)
+        ]
+
+    dedup.commit_extraction(conn, majority_doc, {"observation": _weights(5, "lb", 1)})
+    dedup.commit_extraction(conn, minority_doc, {"observation": _weights(3, "lbs", 10)})
+
+    doomed = [
+        (int(r["observation_id"]), r["document_id"], r["dedup_key"])
+        for r in conn.execute(
+            "SELECT * FROM observation WHERE unit = 'lbs' ORDER BY observation_id"
+        ).fetchall()
+    ]
+    assert len(doomed) == 3
+
+    for row_id, _doc, _key in doomed:
+        records.edit_record(conn, "observation", row_id, {"unit": "lb"},
+                            note="normalise unit label to the majority spelling",
+                            attributed_to="Jane", apply=True)
+
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE unit = 'lb'"
+    ).fetchone()["n"] == 8
+    # AC 4: provenance and identity untouched on every corrected row.
+    for row_id, document_id, key in doomed:
+        after = _row(conn, "observation", row_id)
+        assert after["document_id"] == document_id
+        assert after["dedup_key"] == key
+    # AC 2: a discoverable audit trail, one entry per corrected row.
+    assert len(records.list_edits(conn, "observation")) == 3
+    # And the identity layer is untouched by the whole batch.
+    assert dedup.rekey(conn).collisions == []
+    assert dedup.rekey(conn).changes == []
+
+
+# --- CLI surface -------------------------------------------------------------
+
+
+def _cli_field(tmp_path, record_type, row_id, column):
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return _row(conn, record_type, row_id)[column]
+    finally:
+        conn.close()
+
+
+def test_cli_record_edit_dry_run(cli_ready, capsys):
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=percent", "--note", "normalise") == 0
+    out = capsys.readouterr().out
+    assert f"lab_result #{target}" in out
+    assert "unit: % -> percent" in out
+    assert "document: #1 (unchanged - a correction is not a re-attribution)" in out
+    assert "dry run: nothing was written - re-run with --apply" in out
+    assert _cli_field(cli_ready, "lab_result", target, "unit") == "%"
+
+
+def test_cli_record_edit_apply(cli_ready, capsys):
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=percent", "--note", "normalise",
+                "--attributed-to", "Jane", "--apply") == 0
+    out = capsys.readouterr().out
+    assert f"corrected lab_result #{target}" in out
+    assert _cli_field(cli_ready, "lab_result", target, "unit") == "percent"
+
+
+def test_cli_record_edit_clears_with_a_bare_name(cli_ready, capsys):
+    """`document edit`'s documented `"" clears` convention, carried over."""
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=", "--note", "the source states no unit",
+                "--apply") == 0
+    assert "unit: % -> (none)" in capsys.readouterr().out
+    assert _cli_field(cli_ready, "lab_result", target, "unit") is None
+
+
+def test_cli_record_edit_json_shape_is_stable(cli_ready, capsys):
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=percent", "--note", "normalise", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {
+        "record_type", "row_id", "person", "person_id", "document_id", "label",
+        "changes", "unchanged", "dedup_key", "dedup_base", "dedup_occurrence",
+        "note", "attributed_to", "edited_at", "applied",
+    }
+    assert payload["changes"] == [{"field": "unit", "old": "%", "new": "percent"}]
+    assert payload["applied"] is False
+
+
+def test_cli_record_rm_json_gained_the_edit_disclosure(cli_ready, capsys):
+    """Appended, never inserted: the `record rm` --json key set is a contract."""
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=percent", "--note", "normalise", "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [e["field"] for e in payload["edits_recorded"]] == ["unit"]
+
+
+def test_cli_record_edit_list(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "--list") == 0
+    assert "no record corrections recorded" in capsys.readouterr().out
+
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "unit=percent", "--note", "normalise", "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "--list", "lab_result") == 0
+    out = capsys.readouterr().out
+    assert "unit: % -> percent" in out and "HbA1c" in out
+
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "--list", "--json") == 0
+    entries = json.loads(capsys.readouterr().out)
+    assert len(entries) == 1 and entries[0]["field"] == "unit"
+
+
+def test_cli_record_edit_refusals_are_friendly_rc1(cli_ready, capsys):
+    target = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "test_name=A1c", "--note", "rename", "--apply") == 1
+    assert "part of the row's identity" in capsys.readouterr().err
+
+    assert _run(cli_ready, "record", "edit", "lab_result", "9999",
+                "--set", "unit=lb", "--note", "n", "--apply") == 1
+    assert "no lab_result with id 9999" in capsys.readouterr().err
+
+    assert _run(cli_ready, "record", "edit", "lab_result", str(target),
+                "--set", "value_num=abc", "--note", "n", "--apply") == 1
+    assert "value_num" in capsys.readouterr().err
+    assert _cli_field(cli_ready, "lab_result", target, "unit") == "%"
+
+
+@pytest.mark.parametrize("argv", [
+    ("record", "edit", "lab_result", "1", "--set", "unit", "--note", "n"),
+    ("record", "edit", "lab_result", "1", "--set", "unit=a", "--set", "unit=b",
+     "--note", "n"),
+    ("record", "edit", "lab_result", "1", "--set", "colour=blue", "--note", "n"),
+    ("record", "edit", "lab_result", "1", "--note", "n"),          # no --set
+    ("record", "edit", "lab_result", "1", "--set", "unit=lb"),     # no --note
+    ("record", "edit", "lab_result", "--set", "unit=lb", "--note", "n"),  # no row id
+    ("record", "edit", "family_history", "1", "--set", "unit=lb", "--note", "n"),
+])
+def test_cli_record_edit_misuse_is_argparse_rc2(cli_ready, argv):
+    with pytest.raises(SystemExit) as exc:
+        _run(cli_ready, *argv)
+    assert exc.value.code == 2

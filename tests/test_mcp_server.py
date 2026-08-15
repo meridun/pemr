@@ -498,3 +498,15 @@ def test_record_assert_is_not_on_the_mcp_surface():
     for spelling in ("assert", "attest", "record_assert", "attestation"):
         assert spelling not in surface, spelling
     assert "record_assert" not in mcp_server.WRITE_TOOLS
+
+
+def test_record_edit_is_not_on_the_mcp_surface():
+    """Trust boundary (issue #129): `record edit` mutates a stored clinical value with no
+    new source behind the change, so the row stops matching what its document says on one
+    person's say-so. Same standing as `record assert` — CLI-only, and not in AGENTS.md's
+    blessed write set (commit_extraction/person_add/person_edit/ingest/
+    document_set_text)."""
+    surface = " ".join(mcp_server.TOOL_NAMES).lower()
+    for spelling in ("record_edit", "edit_record", "record_edits"):
+        assert spelling not in surface, spelling
+    assert "record_edit" not in mcp_server.WRITE_TOOLS

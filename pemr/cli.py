@@ -411,6 +411,7 @@ def _with_document_conn(args: argparse.Namespace, work):
             documents.OcrTextPresentError,
             records.RecordNotFoundError,
             records.AnchoredConflictError,
+            records.FieldNotEditableError,
             curation.CurationNotFoundError,
             curation.FamilyNotFoundError,
             curation.RowNotFoundError,
@@ -870,6 +871,7 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
                 "conflicts_reanchored": report.conflicts_reanchored,
                 # Appended, never inserted: the --json key set is a contract.
                 "curation_retired": report.curation_retired,
+                "edits_recorded": report.edits_recorded,
                 "applied": report.applied,
             })
             return 0
@@ -904,11 +906,140 @@ def _cmd_record_rm(args: argparse.Namespace) -> int:
                 f"  curation verdict (row scope) {lifted}: "
                 f"{curation.describe(verdict)}"
             )
+        if report.edits_recorded:
+            # Kept, not lifted (issue #129) — the opposite of the verdict above, and the
+            # difference is worth stating out loud on the one screen that shows both.
+            print(
+                f"  {len(report.edits_recorded)} recorded correction(s) name this row; "
+                "the ledger is append-only, so they are kept as history"
+            )
+            for entry in report.edits_recorded:
+                print(f"    {_edit_change_line(entry)}  ({entry['edited_at'][:10]})")
         if report.applied:
             print(f"removed {report.record_type} #{report.row_id}")
         else:
             print(
                 "dry run: nothing was deleted - re-run with --apply "
+                "(back up first: `pemr backup`)"
+            )
+        return 0
+
+    return _with_document_conn(args, work)
+
+
+# --------------------------------------------------------------------------- #
+# in-place correction of non-key fields (`record edit`) - issue #129
+# --------------------------------------------------------------------------- #
+
+def _fmt_edit_value(value: object) -> str:
+    """A ledger value for display. ``None`` is the column being unset, and printing it
+    as an empty string would make "cleared" indistinguishable from "set to ''"."""
+    return "(none)" if value is None else str(value)
+
+
+def _edit_change_line(change: dict) -> str:
+    """``field: old -> new`` — shared by the report body and `record rm`'s disclosure."""
+    return (
+        f"{change['field']}: {_fmt_edit_value(change['old'])} -> "
+        f"{_fmt_edit_value(change['new'])}"
+    )
+
+
+def _edit_row_line(entry: dict) -> str:
+    """One `--list` line, in the `_curation_row_line` style: which row, what moved, when.
+
+    A ledger entry outlives the row it names (issue #129), so an entry with no live label
+    is annotated rather than hidden — it is history, not an error.
+    """
+    gone = "" if entry["label"] else "  (no live row)"
+    who = f"  [{entry['attributed_to']}]" if entry["attributed_to"] else ""
+    return (
+        f"{entry['record_type']:12}  #{entry['record_id']:<6}  "
+        f"{(entry['edited_at'] or '')[:10]:10}  {entry['label']}  "
+        f"{_edit_change_line(entry)}{who}{gone}"
+    )
+
+
+def _print_record_edit_report(report: "records.RecordEditReport") -> None:
+    """The human block, shaped like `_cmd_record_rm`'s: the fact, then what moves."""
+    print(
+        f"{report.record_type} #{report.row_id}  {_fmt(report.person_slug)}  "
+        f"{report.label}"
+    )
+    for change in report.changes:
+        print(f"  {_edit_change_line(change)}")
+    for name in report.unchanged:
+        print(f"  {name}: unchanged (already that value)")
+    owner = f"#{report.document_id}" if report.document_id is not None else "none"
+    print(f"  document: {owner} (unchanged - a correction is not a re-attribution)")
+    print(f"  identity: dedup_key {report.dedup_key[:12]}... (unchanged)")
+    print(f"  note: {report.note}")
+    if report.attributed_to:
+        print(f"  attributed to: {report.attributed_to}")
+
+
+def _cmd_record_edit(args: argparse.Namespace) -> int:
+    """`record edit` — list recorded corrections, or correct one row's non-key fields.
+
+    Two modes on one subparser, the `_cmd_record_assert` shape: `--list` takes an
+    optional table and no payload; otherwise the table, the row id and at least one
+    `--set` are required. The handler owns the rules argparse cannot express across
+    ``nargs='?'``.
+    """
+    parser = args.edit_parser
+    if args.list:
+        def work(conn):
+            entries = records.list_edits(conn, args.table)
+            if args.json:
+                _print_json(entries)
+                return 0
+            if not entries:
+                print("no record corrections recorded")
+                return 0
+            print(f"{'type':12}  {'row':7}  {'edited':10}  label  field: old -> new")
+            for entry in entries:
+                print(_edit_row_line(entry))
+            return 0
+
+        return _with_document_conn(args, work)
+
+    if args.table is None or args.row_id is None:
+        parser.error("table and row id are required unless --list is given")
+    if not args.set:
+        parser.error(
+            "at least one --set NAME=VALUE is required - the field being corrected"
+        )
+    if not args.note:
+        parser.error("--note is required: why the correction is being made")
+
+    updates = _parse_set_args(parser, args.table, args.set)
+    dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+
+    def work(conn):
+        report = records.edit_record(
+            conn,
+            args.table,
+            args.row_id,
+            updates,
+            dictionary,
+            note=args.note,
+            attributed_to=args.attributed_to,
+            apply=args.apply,
+        )
+        if args.json:
+            _print_json(report.as_dict())
+            return 0
+        _print_record_edit_report(report)
+        if not report.changes:
+            print("nothing to do: every named field already holds that value")
+        elif report.applied:
+            print(
+                f"corrected {report.record_type} #{report.row_id} "
+                f"({len(report.changes)} field(s), recorded in the edit ledger)"
+            )
+        else:
+            print(
+                "dry run: nothing was written - re-run with --apply "
                 "(back up first: `pemr backup`)"
             )
         return 0
@@ -1533,6 +1664,53 @@ def _parse_field_args(
         else:
             payload[name] = value
     return payload
+
+
+def _parse_set_args(
+    parser: argparse.ArgumentParser, table: str, raw: list[str] | None
+) -> dict:
+    """``--set NAME=VALUE`` repeats -> an update dict for :func:`records.edit_record`.
+
+    :func:`_parse_field_args` with two differences, both of them the point of the verb:
+
+    * unknown names are checked against :func:`dedup.editable_fields`, so the usage
+      error names the **editable** set rather than every column — an operator who tried
+      to `--set collected_at=...` needs to be told it is an identity field, and the
+      engine's :class:`records.FieldNotEditableError` says exactly that, so a
+      key-participating name is passed through rather than caught here;
+    * a bare ``NAME=`` yields ``None`` — clear the column — matching `document edit`'s
+      documented "\"\" clears" convention.
+    """
+    editable = dedup.editable_fields(table)
+    spec = dedup.FIELD_SPECS[table]
+    updates: dict = {}
+    for item in raw or []:
+        name, sep, value = item.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            parser.error(f"--set expects NAME=VALUE, got {item!r}")
+        if name not in spec:
+            parser.error(
+                f"unknown {table} field '{name}' - editable fields: "
+                f"{', '.join(editable)}"
+            )
+        if name in updates:
+            parser.error(f"--set {name} given twice")
+        if value == "":
+            updates[name] = None
+            continue
+        types = spec[name][0]
+        if isinstance(types, tuple) and int in types:
+            try:
+                updates[name] = int(value)
+            except ValueError:
+                try:
+                    updates[name] = float(value)
+                except ValueError:
+                    updates[name] = value
+        else:
+            updates[name] = value
+    return updates
 
 
 def _attested_row_line(row: dict) -> str:
@@ -2826,6 +3004,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_rm.add_argument("--json", action="store_true", help="machine-readable output")
     r_rm.set_defaults(func=_cmd_record_rm)
+
+    # --- in-place correction of non-key display fields (issue #129) ---
+    r_edit = record_sub.add_parser(
+        "edit",
+        help="correct one row's non-key fields in place, leaving document_id, "
+             "dedup_key and the source blob untouched (dry run by default); every "
+             "change is recorded in an append-only ledger. CLI-only, never an MCP tool",
+    )
+    # Both optional so `--list` can take an optional table and no row; the handler
+    # enforces "table and row id unless --list" with the usage line.
+    r_edit.add_argument("table", nargs="?", choices=list(dedup.KNOWN_TYPES))
+    r_edit.add_argument("row_id", type=int, nargs="?", metavar="ID")
+    r_edit.add_argument(
+        "--set", action="append", metavar="NAME=VALUE",
+        help="one field to correct; repeat for each (e.g. --set unit=lb). A bare "
+             "NAME= clears the column. Identity fields are refused - correcting one "
+             "is a dictionary edit + `pemr rekey`, not an edit. Note that correcting "
+             "a compared field (e.g. unit) makes a later re-ingest of the original "
+             "document stage a conflict rather than dedup, which is honest: the row "
+             "no longer says what its source says",
+    )
+    r_edit.add_argument(
+        "--note", help="required: why the correction is being made"
+    )
+    r_edit.add_argument("--attributed-to", help="who made the correction")
+    r_edit.add_argument(
+        "--list", action="store_true",
+        help="list recorded corrections and exit",
+    )
+    r_edit.add_argument(
+        "--apply", action="store_true", help="write the edit (default: report only)"
+    )
+    r_edit.add_argument(
+        "--dictionary", help="synonym dictionary TOML (overrides default)"
+    )
+    r_edit.add_argument("--json", action="store_true", help="machine-readable output")
+    r_edit.set_defaults(func=_cmd_record_edit, edit_parser=r_edit)
 
     # --- recorded human verdicts (curation overlay, issue #109) ---
     r_annotate = record_sub.add_parser(
