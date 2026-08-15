@@ -2,12 +2,13 @@
 
 import json
 import sqlite3
+import time
 import zipfile
 import subprocess
 
 import pytest
 
-from pemr import db, ingest, persons
+from pemr import db, ingest, persons, query
 from pemr.models import Person
 
 
@@ -739,6 +740,45 @@ def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "
     return p
 
 
+_CCDA_SECTIONS = (
+    "<section><title>Allergies</title><text>"
+    "<paragraph>No known drug allergies</paragraph>"
+    "</text></section>",
+    "<section><title>Results</title><text><table>"
+    "<thead><tr><th>Test</th><th>Value</th></tr></thead>"
+    "<tbody><tr><td>Ferritin</td><td>201 ng/mL</td></tr></tbody>"
+    "</table></text></section>",
+)
+
+
+def _make_ccda(
+    tmp_path,
+    name="DOC0001.XML",
+    patient=("Jane", "Doe"),
+    birth="19620314",
+    sections=_CCDA_SECTIONS,
+):
+    given, family = patient
+    birth_el = f'<birthTime value="{birth}"/>' if birth else ""
+    body = (
+        f"<component><structuredBody>"
+        + "".join(f"<component>{s}</component>" for s in sections)
+        + "</structuredBody></component>"
+    ) if sections else ""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+        "<recordTarget><patientRole><patient>"
+        f"<name><given>{given}</given><family>{family}</family></name>"
+        f"{birth_el}"
+        "</patient></patientRole></recordTarget>"
+        f"{body}</ClinicalDocument>"
+    )
+    p = tmp_path / name
+    p.write_text(doc, encoding="utf-8")
+    return p
+
+
 def test_pointer_stub_is_refused_pre_write(conn, tmp_path, sources):
     stub = _make_stub(tmp_path)
     with pytest.raises(ingest.IngestError) as excinfo:
@@ -797,6 +837,509 @@ def test_extract_text_reads_xlsx(conn, tmp_path, sources):
     src = _make_xlsx(tmp_path)
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
     assert result.document.ocr_text == "test\tvalue\nsodium\t140"
+
+
+# --- CCDA (issue #138) ---------------------------------------------------------
+# `.xml` used to reach tesseract, which cannot decode it, so every portal export
+# ("download my record" produces CCDA) landed with no `ocr_text` *and* an unverified
+# owner. Detection is on the parsed root element, never the suffix.
+
+
+def test_extract_text_reads_ccda_xml(conn, tmp_path, sources):
+    src = _make_ccda(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    text = result.document.ocr_text
+    assert result.ocr_text_populated
+    assert text.startswith("Patient: Jane Doe\nDOB: 1962-03-14")
+    assert "Allergies\nNo known drug allergies" in text
+    # header and value survive on one tab-delimited line each
+    assert "Test\tValue" in text
+    assert "Ferritin\t201 ng/mL" in text
+
+
+# The shapes a real portal export carries that `_make_ccda` only approximates: a
+# multi-`<given>` legal name, a second `<name nullFlavor="UNK"/>`, a section nested
+# inside another section's `<component>`, `<list>/<item>` narrative, and inline
+# markup (`<content>`, `<sub>`) splitting text mid-cell.
+_CCDA_VENDOR = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+    "<recordTarget><patientRole><patient>"
+    '<name use="L"><given>Jane</given><given>Amelia</given><family>Doe</family></name>'
+    '<name use="P" nullFlavor="UNK"/>'
+    '<birthTime value="19620314000000-0600"/>'
+    "</patient></patientRole></recordTarget>"
+    "<component><structuredBody><component><section><title>Results</title><text>"
+    "<table><thead><tr><th>Test</th><th>Result</th></tr></thead>"
+    "<tbody><tr><td><content ID='res1'>Ferritin</content></td>"
+    "<td>11.<sub>2</sub></td></tr></tbody></table>"
+    '<renderMultiMedia referencedObject="MM1"/>'
+    "</text>"
+    "<component><section><title>Results Addendum</title><text>"
+    "<list><item>Repeat ferritin in 8 weeks.</item>"
+    "<item><content ID='med27'>Ferrous sulfate 325 MG</content> - 1 tablet daily</item>"
+    "</list></text></section></component>"
+    "</section></component></structuredBody></component>"
+    "</ClinicalDocument>"
+)
+
+
+def test_ccda_renders_real_vendor_export_shapes(conn, tmp_path, sources):
+    src = tmp_path / "DOC0003.XML"
+    src.write_text(_CCDA_VENDOR, encoding="utf-8")
+    text = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).document.ocr_text
+    # every `<given>` joins into the one name the owner check tokenises
+    assert text.startswith("Patient: Jane Amelia Doe\nDOB: 1962-03-14")
+    assert "Patient: \n" not in text   # the nullFlavor name contributes no line
+    # inline markup is flattened, not dropped, and does not split the cell
+    assert "Ferritin\t11.2" in text
+    # a nested section renders under its own title, exactly once
+    assert "Results Addendum" in text
+    assert text.count("Repeat ferritin in 8 weeks.") == 1
+    # `<list>` recurses, `<item>` flattens with its own tail text
+    assert "Ferrous sulfate 325 MG - 1 tablet daily" in text
+
+
+def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
+    def boom(path):  # pragma: no cover - the assertion is that this never runs
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", boom)
+    src = _make_ccda(tmp_path)
+    assert ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).ocr_text_populated
+
+
+@pytest.mark.parametrize(
+    "name, payload",
+    [
+        # an IHE_XDM manifest sitting beside the documents
+        ("METADATA.XML",
+         '<?xml version="1.0"?><Manifest><Doc>DOC0001.XML</Doc></Manifest>'),
+        ("plain.xml", "<root><a>1</a></root>"),
+        # right namespace, wrong root: the parsed root tag is the authority
+        ("other.xml", '<Bundle xmlns="urn:hl7-org:v3"><ClinicalDocument/></Bundle>'),
+    ],
+)
+def test_non_ccda_xml_still_reaches_tesseract(
+    conn, tmp_path, sources, monkeypatch, name, payload
+):
+    seen: list[str] = []
+
+    def fake_run_ocr(path):
+        seen.append(str(path))
+        return "Ferritin 201 nanograms"
+
+    monkeypatch.setattr(ingest, "run_ocr", fake_run_ocr)
+    src = _make_file(tmp_path, name, payload.encode("utf-8"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "Ferritin 201 nanograms"
+
+
+def test_malformed_ccda_xml_does_not_raise(conn, tmp_path, sources, capsys, monkeypatch):
+    monkeypatch.setattr(ingest, "run_ocr", lambda _: None)   # tesseract declines
+    src = _make_file(
+        tmp_path, "broken.xml",
+        b'<?xml version="1.0"?><ClinicalDocument xmlns="urn:hl7-org:v3">'
+        b"<recordTarget><patientRole",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"           # the document still lands
+    assert result.document.ocr_text is None
+    assert "--ocr-text-file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("wrapper", ["content", "list", "paragraph"])
+def test_deeply_nested_ccda_narrative_does_not_raise(
+    conn, tmp_path, sources, wrapper
+):
+    """Nesting depth is document-controlled and unbounded, and ~1500 levels fits in
+    30 KB — far under the extraction cap. A recursive walk raised `RecursionError`
+    (a `RuntimeError`, so outside `_EXTRACT_ERRORS`) straight out of
+    `extract_text_routed`, breaking its "never raises" contract and losing the
+    document entirely."""
+    narrative = "Ferritin 201 ng/mL"
+    for _ in range(1500):
+        narrative = f"<{wrapper}>{narrative}</{wrapper}>"
+    src = _make_ccda(
+        tmp_path,
+        sections=(f"<section><title>Results</title><text>{narrative}</text></section>",),
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                       # the document still lands
+    assert "Ferritin 201 ng/mL" in result.document.ocr_text   # ...and is readable
+
+
+def test_recursion_error_degrades_like_any_other_extraction_failure(
+    conn, tmp_path, sources, capsys, monkeypatch
+):
+    """Our own walk is iterative, but the stdlib's are not (`Element.itertext()` is a
+    recursive generator), so the best-effort handler has to cover `RecursionError`
+    too — it is a `RuntimeError` and would otherwise escape the contract."""
+    def boom(_):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    def never(path):  # pragma: no cover - the degrade is native, not a fallback to OCR
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "_extract_ccda", boom)
+    monkeypatch.setattr(ingest, "run_ocr", never)
+    src = _make_ccda(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                # the document still lands
+    assert result.document.ocr_text is None
+    assert "text extraction failed" in capsys.readouterr().err
+
+
+def test_ccda_doctype_is_not_parsed_natively(conn, tmp_path, sources, monkeypatch):
+    """stdlib `ET` expands internal entities, so a `<!DOCTYPE` is refused before the
+    parse rather than after — a billion-laughs file is small enough to clear the cap."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="doctype-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>", '?><!DOCTYPE ClinicalDocument [<!ENTITY a "aaaa">]>', 1
+        ),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+@pytest.mark.parametrize(
+    "prolog",
+    [
+        # the markers sit in a leading comment, so the file still sniffs as a CCDA
+        # while the DOCTYPE is padded past any fixed head window
+        '<!-- urn:hl7-org:v3 ClinicalDocument --><!-- ' + "x" * 9000 + " -->",
+        # a comment carrying something that *looks* like the root element: stopping at
+        # the first `<` instead of stepping over comments would end the scan here
+        '<!-- urn:hl7-org:v3 --><!-- <ClinicalDocument xmlns="urn:hl7-org:v3"> -->',
+    ],
+    ids=["padded-past-the-sniff-window", "comment-holding-a-fake-start-tag"],
+)
+def test_ccda_doctype_anywhere_in_the_prolog_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch, prolog
+):
+    """The DOCTYPE refusal scans the whole prolog, not a fixed head window.
+
+    A comment pushes the DOCTYPE past any window while the CCDA markers stay inside it,
+    and the internal subset it hides amplifies far past the byte cap — expat only checks
+    its ratio above 8 MiB of output, so everything under that expands silently."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="prolog-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "prolog-doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>",
+            f'?>{prolog}<!DOCTYPE ClinicalDocument [<!ENTITY a "aaaa">]>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_ccda_with_a_harmless_prolog_comment_still_reads_natively(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The other half of the guard: stepping over prolog markup must not make the
+    scanner over-eager. A real CCDA behind a comment — including one quoting a start
+    tag — has no DOCTYPE and is still rendered rather than shipped to tesseract."""
+    def never(path):  # pragma: no cover - a CCDA never reaches the OCR route
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", never)
+    body = _make_ccda(tmp_path, name="comment-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "commented.xml"
+    src.write_text(
+        body.replace("?>", "?><!-- exported <ClinicalDocument> 2026 -->", 1),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert "Ferritin" in result.document.ocr_text
+
+
+# --- the DOCTYPE guard has to be encoding-agnostic (issue #138 audit) ------------- #
+#
+# Two byte scanners were bypassed before the current expat probe. The second one
+# matched raw ASCII `<!--`/`<?`/`<!doctype`, which in UTF-16 are `<\x00!\x00...`: the
+# first `<` looked like a start tag, the scan declared the prolog over, and the DOCTYPE
+# went unseen. The file still *sniffed* as a CCDA because ASCII marker bytes are
+# trivially smuggled into a UTF-16 comment — one CJK character carries two of them —
+# so the bomb took the native route and a 1.4 KB file rendered 1 MB of text.
+
+def _utf16_smuggled(marker: str, big_endian: bool = False) -> str:
+    """Characters whose UTF-16 bytes spell ``marker`` in ASCII (for the sniff)."""
+    hi, lo = (0, 8) if big_endian else (8, 0)
+    return "".join(
+        chr((ord(marker[i]) << lo) | (ord(marker[i + 1]) << hi))
+        for i in range(0, len(marker), 2)
+    )
+
+
+def _entity_bomb_doctype(levels=7, width=4, leaf=64):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+    chain = "".join(
+        f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
+    )
+    return f'<!DOCTYPE ClinicalDocument [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+
+
+@pytest.mark.parametrize(
+    "encoding, bom, big_endian",
+    [
+        ("utf-16-le", b"\xff\xfe", False),
+        ("utf-16-be", b"\xfe\xff", True),
+    ],
+    ids=["utf-16-le", "utf-16-be"],
+)
+def test_ccda_doctype_in_a_utf16_document_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch, encoding, bom, big_endian
+):
+    """The refusal must hold in an encoding whose bytes no ASCII scan can read.
+
+    Non-vacuous by construction: the smuggled markers make the file pass the ASCII
+    sniff, so it *is* a CCDA candidate and only the DOCTYPE guard stands between it and
+    a parse that expands the internal subset."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    markers = _utf16_smuggled("urn:hl7-org:v3", big_endian) + _utf16_smuggled(
+        "ClinicalDocument", big_endian
+    )
+    body = _make_ccda(tmp_path, name="utf16-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+        .replace("?>", f"?><!-- {markers} -->{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "utf16-doctype.xml"
+    src.write_bytes(bom + doc.encode(encoding))
+
+    raw = src.read_bytes()
+    assert b"urn:hl7-org:v3" in raw and b"ClinicalDocument" in raw   # sniffs as CCDA
+    assert ingest._xml_declares_doctype(raw) is True
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]                       # fell through to today's route
+    assert result.document.ocr_text == "scanned"    # no amplified text stored
+    assert "A" * 200 not in (result.document.ocr_text or "")
+
+
+def test_utf16_ccda_without_a_doctype_keeps_the_unchanged_ocr_route(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The mirror case, pinned as a deliberate product decision rather than an accident.
+
+    The sniff matches ASCII marker bytes, so a *genuine* UTF-16 CCDA is not detected and
+    keeps today's tesseract route. Narrowing the negative filter costs nothing beyond
+    the status quo (US portal exports are UTF-8); it is the DOCTYPE refusal, not the
+    sniff, that has to be right for every encoding."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="utf16-plain-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "utf16-plain.xml"
+    # a well-formed UTF-16 CCDA (declaration and BOM agree), not a mangled one
+    src.write_bytes(body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+                    .encode("utf-16"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_doctype_probe_refuses_before_the_internal_subset_expands(tmp_path):
+    """Unit-level proof of *why* the probe is safe: expat reports the DOCTYPE before it
+    reads the subset, so the amplification never happens. A 1.4 KB file that would
+    render ~1 MB is refused, and refusing it does not cost the expansion."""
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="bomb-src.XML").read_text(encoding="utf-8")
+    doc = body.replace("?>", f"?>{doctype}", 1).replace(
+        "Ferritin 201 ng/mL", f"&e{levels};"
+    )
+    src = tmp_path / "bomb.xml"
+    src.write_text(doc, encoding="utf-8")
+    assert src.stat().st_size < 4096            # small enough to clear the byte cap
+    assert ingest._xml_declares_doctype(src.read_bytes()) is True
+    assert ingest._extract_ccda(src) is None    # never rendered, so never amplified
+
+
+def test_a_doctype_the_probe_cannot_reach_still_falls_through(tmp_path):
+    """A parse error is the other ``False`` arm, and it is safe because it is the same
+    expat: whatever the probe cannot read, the `ET.fromstring` after it cannot read
+    either, so the file takes the unchanged non-CCDA route. Pinned on a lowercase
+    ``<!doctype``, which is not well-formed XML at all."""
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="lower-src.XML").read_text(encoding="utf-8")
+    doc = body.replace(
+        "?>", f"?>{doctype.replace('<!DOCTYPE', '<!doctype')}", 1
+    ).replace("Ferritin 201 ng/mL", f"&e{levels};")
+    src = tmp_path / "lowercase-doctype.xml"
+    src.write_text(doc, encoding="utf-8")
+    assert ingest._xml_declares_doctype(src.read_bytes()) is False
+    assert ingest._extract_ccda(src) is None    # refused all the same
+
+
+# --- the guard's equivalence class, not just its fixtures (issue #138 verify) ----- #
+#
+# Three shapes the UTF-16 pair does not cover: a 4-byte encoding, a BOM that contradicts
+# the declaration, and a DOCTYPE with no internal subset at all. Each is refused, and the
+# point of pinning them is that all three arrive at that refusal by a *different* arm.
+
+
+def test_ccda_doctype_in_a_utf32_document_never_reaches_the_parser(
+    conn, tmp_path, sources, monkeypatch
+):
+    """UTF-32 is refused by the *sniff*, not the DOCTYPE probe — and that is fine.
+
+    A 4-byte encoding cannot smuggle a contiguous ASCII run (every character carries two
+    zero bytes), so the marker sniff fails and the file keeps today's OCR route before
+    anything is parsed. Pinned because the safety of the whole design rests on the sniff
+    being a *negative* filter: it is free for it to be conservative, so a shape it cannot
+    read must fall through rather than be special-cased into the native path."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="utf32-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-32"', 1)
+        .replace("?>", f"?>{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "utf32-doctype.xml"
+    src.write_bytes(b"\xff\xfe\x00\x00" + doc.encode("utf-32-le"))
+
+    head = src.read_bytes()[:ingest._CCDA_SNIFF_BYTES]
+    assert b"urn:hl7-org:v3" not in head       # the sniff is what stops it here
+    assert ingest._extract_ccda(src) is None
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_ccda_whose_bom_contradicts_its_declaration_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch
+):
+    """A UTF-8 BOM under an ``encoding="UTF-16"`` declaration: the file sniffs as a CCDA
+    (its bytes are ASCII-compatible) but no parser can agree with it.
+
+    This is the ``ExpatError`` arm rather than the DOCTYPE arm, and it is safe for the
+    reason that arm exists: the probe is the same expat the `ET.fromstring` below it uses,
+    so a file the probe cannot read is one the parse cannot read either — the DOCTYPE it
+    carries is never expanded because the document is never parsed at all."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="bom-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+        .replace("?>", f"?>{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "bom-mismatch.xml"
+    src.write_bytes(b"\xef\xbb\xbf" + doc.encode("utf-8"))   # BOM says UTF-8
+
+    raw = src.read_bytes()
+    assert b"urn:hl7-org:v3" in raw and b"ClinicalDocument" in raw   # sniffs as CCDA
+    assert ingest._xml_declares_doctype(raw) is False                # the parse-error arm
+    assert ingest._extract_ccda(src) is None
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+    assert "A" * 200 not in (result.document.ocr_text or "")
+
+
+def test_an_external_doctype_is_refused_without_fetching_it(tmp_path):
+    """A DOCTYPE with an external ``SYSTEM`` id and **no** internal subset.
+
+    Two properties at once. It is still refused — the guard keys on the declaration, not
+    on whether a subset follows — and refusing it costs no network: the ``SYSTEM`` id
+    points at TEST-NET-1, which blackholes rather than refuses, so a resolver would stall
+    for seconds instead of returning. Local-first has no exception for a schema fetch."""
+    body = _make_ccda(tmp_path, name="external-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "external-doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>",
+            '?><!DOCTYPE ClinicalDocument SYSTEM "http://192.0.2.1/CDA.dtd">',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    assert ingest._xml_declares_doctype(src.read_bytes()) is True
+    assert ingest._extract_ccda(src) is None
+    assert time.monotonic() - started < 2.0     # nothing was dereferenced
+
+
+def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
+    """The point of the issue: `recordTarget` is an identity the check can use, so a
+    CCDA no longer degrades to "filed on your say-so"."""
+    _seed_roster(conn)
+    # no `birthTime`, so the name is the only signal — `<given>`/`<family>` have no
+    # whitespace of their own and must not flatten into one unmatchable token
+    src = _make_ccda(tmp_path, birth="")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "match"
+    assert result.owner_check.blocks is False
+    # ...and the protective half still fires on this route.
+    # `pii-allow`: the roster placeholder "Robert Alan Roe" (see BOB above), split into
+    # CDA's `<given>`/`<family>` — the scanner reads the given half as first+last.
+    other = _make_ccda(
+        tmp_path, name="DOC0002.XML",
+        patient=("Robert Alan", "Roe"),  # pii-allow
+        birth="",
+    )
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, other, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "bob-roe"
+
+
+def test_ccda_birth_time_is_rendered_matchably(conn, tmp_path, sources):
+    """`19620314` is not a form `dob_candidates` knows; the ISO reformat is what makes
+    the DOB half of the check work at all."""
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, patient=("Unreadable", "Smudge"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "match"
+
+
+def test_ccda_stranger_is_unverified_not_suspect(conn, tmp_path, sources):
+    """Route-scoped anchors, same as `.docx`/`.xlsx`: a CCDA naming a non-roster
+    stranger is `unverified`. No regression — it used to yield no text at all."""
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, patient=("Karen", "Fields"), birth="19710909")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.owner_check.verdict == "unverified"
+    assert result.status == "new"
+
+
+def test_find_sees_ccda_narrative(conn, tmp_path, sources):
+    """The headline symptom: `find` was blind to every CCDA."""
+    ingest.ingest_document(conn, _make_ccda(tmp_path), "jane-doe", sources, ocr=True)
+    hits = query.find(conn, "jane-doe", "ferritin")
+    assert [hit["person"] for hit in hits] == ["jane-doe"]
+
+
+def test_ccda_without_structured_body_still_yields_identity(conn, tmp_path, sources):
+    _seed_roster(conn)
+    src = _make_ccda(tmp_path, sections=())
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Patient: Jane Doe\nDOB: 1962-03-14"
+    assert result.owner_check.verdict == "match"
 
 
 def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys, monkeypatch):
@@ -1075,7 +1618,7 @@ def test_ocr_route_still_produces_suspect(conn, tmp_path, sources, monkeypatch):
 # `word/document.xml`). Over the cap degrades like any other extraction failure.
 
 
-@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt"])
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt", "ccda"])
 def test_oversized_extraction_degrades_instead_of_reading_it(
     conn, tmp_path, sources, capsys, monkeypatch, kind
 ):
@@ -1084,6 +1627,10 @@ def test_oversized_extraction_degrades_instead_of_reading_it(
         src = _make_docx(tmp_path, paragraphs=("a" * 500,))
     elif kind == "xlsx":
         src = _make_xlsx(tmp_path)
+    elif kind == "ccda":
+        # over the cap degrades *native* with the cap note, rather than falling
+        # through to a tesseract failure that says nothing useful
+        src = _make_ccda(tmp_path)
     else:
         src = _make_file(tmp_path, "big.txt", b"x" * 500)
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)

@@ -196,7 +196,8 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
   beats tesseract on messy scans.
 - **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
   It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
-  `.docx`/`.xlsx` parsed from their OOXML, everything else (images, unknown suffixes)
+  `.docx`/`.xlsx` parsed from their OOXML, a CCDA `.xml` (a portal "download my record"
+  export) rendered from its section narrative, everything else (images, unknown suffixes)
   through tesseract. A `.pdf` is read page by page — embedded text layer where there is one, a
   300-dpi render OCR'd where there isn't (first 20 pages, joined by `\f`); that route needs the
   optional `pip install pemr[ocr]` extra, and without it a PDF stores no text and says so on
@@ -229,7 +230,8 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
 **refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
 the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
-— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set — because in a
+— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set, CCDA `.xml`
+included — because in a
 structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
 route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
 with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /

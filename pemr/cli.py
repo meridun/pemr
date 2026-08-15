@@ -3255,7 +3255,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument(
         "--ocr",
         choices=["auto"],
-        help="pre-fill ocr_text: text/.docx/.xlsx read natively, PDF page by page "
+        help="pre-fill ocr_text: text/.docx/.xlsx/CCDA .xml read natively, "
+             "PDF page by page "
              "(text layer + rendered-page OCR), other files via tesseract "
              "(soft dependency)",
     )

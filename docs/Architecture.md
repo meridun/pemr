@@ -22,7 +22,10 @@ re-inventing logic each request.
 
 ## Non-goals
 
-- No HIPAA/PHI compliance layer, no provider interoperability (HL7/FHIR/CCD).
+- No HIPAA/PHI compliance layer, no HL7/FHIR message exchange or provider-system
+  integration. Reading a clinical export *file* is not interoperability: document-level
+  **text extraction** from formats like CCDA/CCD is in scope (issue #138) — one more
+  document format feeding `find` and the owner check.
 - No always-on server, no multi-writer concurrency (family scale, one machine).
 - No clinical decision-making — the system assists prep/research, doesn't advise.
 
@@ -788,6 +791,36 @@ type allows (issue #66), with only the image and PDF routes reaching outside the
 parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
 allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image.
 
+A **CCDA** `.xml` (C-CDA / HL7 CDA R2 — what a US portal's "download my record" produces)
+is read natively too (issue #138): each `structuredBody` section's title and narrative,
+tables as tab-delimited rows, prefixed with the `recordTarget` patient name and birth
+time so the owner check has an identity to match. Detection is the parsed **root element**
+(`{urn:hl7-org:v3}ClinicalDocument`), never the suffix — `.xml` is a container, so any
+other XML keeps the OCR route. A `<!DOCTYPE` is refused before parsing (stdlib
+`ElementTree` expands internal entities, and the size cap does not bound expansion: a
+1.4 KB file rendered 1 MB of text, a 2 MB one 210 MB). That refusal is **encoding-agnostic
+by construction** — it asks expat, through a probe that aborts at whichever comes first,
+the DOCTYPE declaration or the root start tag, rather than scanning for byte patterns.
+Two hand-rolled scanners were bypassed before it: a fixed head window (a leading comment
+pads the DOCTYPE past it while the CCDA markers stay inside), then a whole-prolog ASCII
+scan (in UTF-16 every marker is `<\x00!\x00…`, so the scan read the first `<` as a start
+tag and never saw the DOCTYPE, while ASCII marker bytes smuggled into a CJK comment kept
+the file sniffing as a CCDA). Establishing the encoding is exactly what a byte scanner
+must re-implement to be correct, and expat has already done it — from the BOM and the
+`encoding=` pseudo-attribute — before it reports either event, so asking it is both
+cheaper and the version that cannot be re-bypassed. Detection itself stays a *cheap ASCII
+negative* over the first 8 KB, which means a genuine UTF-16 CCDA is not read natively and
+keeps today's OCR route: a deliberate narrowing, since a negative filter can be
+conservative for free while the refusal cannot. A malformed file is simply "not detectably
+a CCDA" and falls through. The narrative walk
+is **iterative, not recursive**: nesting depth is document-controlled and ~1500 levels fit
+in 30 KB, so a recursive walk hit `RecursionError` — a `RuntimeError`, outside the
+best-effort handler — and cost the whole document. `RecursionError` is caught there now
+as well, since the stdlib's own `itertext()` walk is a recursive generator. Only the narrative
+is read: CCDA's coded entries are out of scope, since in real exports they are only
+selectively trustworthy (medication codes arrive `nullFlavor="UNK"` with the drug name
+only in the narrative, and historical entries carry a synthetic placeholder prescriber).
+
 `.pdf` takes its own branch inside `run_ocr` (issue #70), because `tesseract` alone cannot
 read a PDF at all — its Leptonica backend has no PDF decoder, so a scanned PDF is no better
 off than a text-layer one. Instead a PDF is read page by page: a page with an embedded text
@@ -809,14 +842,18 @@ gigabyte of `word/document.xml`).
 
 Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
 only to an agent transcription or a tesseract pass, never to natively-extracted text —
-the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set. In a structured export
+the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set, CCDA `.xml` included. In a
+structured export
 `Patient`/`DOB`/`MRN` are column labels and field keys, and counting them as an identity
 header refuses ordinary lab exports as belonging to a stranger. The line is the *route*
 rather than how prose-like the format is, because the route is what the extractor actually
 knows; the cost is that a prose transcript saved as `.txt` and ingested with `--ocr auto`
 loses the anchor check too. That is no worse than before native extraction existed (such a
 file went to tesseract, which declined, so there was no text and no check either), and the
-`--ocr-text-file` path keeps full coverage. `mismatch` — an affirmative name/DOB match on a
+`--ocr-text-file` path keeps full coverage. A CCDA is the same trade with a better floor:
+its rendered `recordTarget` header is an affirmative name/DOB signal, so an export naming
+the person ingesting it verdicts `match` — only the "names a stranger nobody on the roster
+knows" case softens to `unverified`. `mismatch` — an affirmative name/DOB match on a
 *different* roster person — is the half that actually prevents misfiling, and it blocks on
 every route.
 
