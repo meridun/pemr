@@ -232,6 +232,24 @@ def test_timeline_excludes_family_history(seeded):
     assert not any(e["date"] == "2001-01-01" for e in events)
 
 
+def test_timeline_surfaces_functional_observations(seeded):
+    """Issue #132: a caregiver-observed functional fact needs no new rendering — it rides
+    the generic observation loop, dated, with its `obs_type key` detail and its value."""
+    doc = _doc(seeded, "jane-doe", ocr="ledger transcription")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "functional", "key": "financial_self_management",
+         "observed_at": "2025-07-20",
+         "value_text": "running balance column stops mid-page"},
+    ]})
+    events = query.query_timeline(seeded, "jane-doe")
+    hit = [e for e in events if "functional" in e["summary"]]
+    assert len(hit) == 1
+    assert hit[0]["date"] == "2025-07-20"
+    assert hit[0]["type"] == "observation"
+    assert "financial_self_management" in hit[0]["summary"]
+    assert "running balance column stops mid-page" in hit[0]["summary"]
+
+
 def test_timeline_carries_provenance(seeded):
     events = query.query_timeline(seeded, "jane-doe")
     assert all("document_id" in e for e in events)

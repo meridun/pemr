@@ -281,8 +281,9 @@ CREATE TABLE observation (
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
                                            -- 'blood_pressure'/'weight'), 'order',
-                                           -- 'screening', 'immunization'
-                                           -- (condition/allergy graduated in 006)
+                                           -- 'screening', 'immunization', 'functional'
+                                           -- ('functional' alone requires observed_at;
+                                           -- condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
   value_num      REAL,
