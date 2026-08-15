@@ -112,8 +112,9 @@ def test_review_conflicts_listing_shows_occurrences_and_the_both_hint(ready, cap
     _stage_repeat_draw(tmp_path, capsys)
     assert _run(tmp_path, "review-conflicts") == 0
     out = capsys.readouterr().out
-    assert "--keep existing|incoming|both" in out
+    assert "--keep existing|incoming|both|merge" in out
     assert "occurrences:" not in out          # family of 1 -> nothing to say yet
+    assert "--field NAME=existing|incoming" in out
 
     assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "both") == 0
     scan = tmp_path / "g3.txt"
@@ -131,6 +132,102 @@ def test_review_conflicts_listing_shows_occurrences_and_the_both_hint(ready, cap
     out = capsys.readouterr().out
     assert "occurrences: 2 rows already stored under this key" in out
     assert out.isascii()
+
+
+# --- keep merge through the CLI (issue #140) ---------------------------------
+
+def _stage_med_refinement(tmp_path, capsys, stored: dict, incoming: dict):
+    """The issue's shape end to end: a stored medication row, then a portal export
+    that refines some fields and is silent about others -> one open conflict."""
+    identity = {"name": "metformin", "dose": "500 mg", "started_on": "2024-01-05"}
+    for i, payload in enumerate((stored, incoming), start=1):
+        scan = tmp_path / f"m{i}.txt"
+        scan.write_bytes(f"metformin {i}".encode())
+        assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                    "--sources", str(tmp_path / "sources")) == 0
+        doc = _write_json(tmp_path, f"m{i}.json",
+                          {"medication": [identity | payload]})
+        assert _run(tmp_path, "commit-extraction", "--document", str(i),
+                    "--json", str(doc)) == 0
+    capsys.readouterr()
+
+
+def test_review_conflicts_merge_writes_and_names_the_fields(ready, capsys):
+    tmp_path = ready
+    _stage_med_refinement(
+        tmp_path, capsys,
+        {"prescriber": "Dr Who", "route": "oral"},
+        {"route": "oral", "status": "active"},
+    )
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "merge",
+                "--note", "Jane confirms the portal list") == 0
+    out = capsys.readouterr().out
+    assert "resolved conflict #1 (keep-merge -> medication #1" in out
+    assert "from incoming: status" in out and "kept: prescriber" in out
+    assert "Dr Who" not in out                 # field names only, never values
+    assert out.isascii()
+
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload) == 1                   # merged in place, not forked
+    assert payload[0]["status"] == "active"    # the refinement landed
+    assert payload[0]["prescriber"] == "Dr Who"   # and the silent field survived
+
+
+def test_review_conflicts_merge_collision_exits_1_and_leaves_it_open(ready, capsys):
+    tmp_path = ready
+    _stage_med_refinement(
+        tmp_path, capsys,
+        {"status": "ordered", "prescriber": "Dr Who"},
+        {"status": "completed"},
+    )
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "merge") == 1
+    captured = capsys.readouterr()
+    assert "error: " in captured.err and "status" in captured.err
+    assert "ordered" not in captured.err and "completed" not in captured.err
+    assert captured.err.isascii()
+
+    assert _run(tmp_path, "review-conflicts") == 0
+    assert "[open]" in capsys.readouterr().out
+
+
+def test_review_conflicts_merge_field_override_resolves(ready, capsys):
+    tmp_path = ready
+    _stage_med_refinement(
+        tmp_path, capsys,
+        {"status": "ordered", "prescriber": "Dr Who"},
+        {"status": "completed"},
+    )
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "merge",
+                "--field", "status=incoming") == 0
+    assert "settled: status=incoming" in capsys.readouterr().out
+
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload[0]["status"], payload[0]["prescriber"]) == ("completed", "Dr Who")
+
+
+def test_review_conflicts_malformed_field_argument_exits_1(ready, capsys):
+    tmp_path = ready
+    _stage_med_refinement(
+        tmp_path, capsys, {"status": "ordered"}, {"status": "completed"})
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "merge",
+                "--field", "status") == 1
+    assert "NAME=existing|incoming" in capsys.readouterr().err
+
+
+def test_review_conflicts_field_without_merge_exits_1(ready, capsys):
+    tmp_path = ready
+    _stage_med_refinement(
+        tmp_path, capsys, {"status": "ordered"}, {"status": "completed"})
+
+    assert _run(tmp_path, "review-conflicts", "--resolve", "1", "--keep", "incoming",
+                "--field", "status=incoming") == 1
+    assert "only apply to keep 'merge'" in capsys.readouterr().err
 
 
 def test_keep_both_after_a_rekey_does_not_wedge_rekey(ready, capsys):

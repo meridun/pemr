@@ -377,6 +377,31 @@ enrichment cannot launder a disagreement into a silent overwrite. The same readi
 `keep incoming` on these types: it writes the fields the incoming row states and leaves the
 rest as stored, so a one-field adjudication doesn't erase the row's other payload.
 
+**On the dated types that reading is deliberately unavailable at commit time, and deliberately
+available at review time** (issue #140). A cleared field on a lab or a medication IS news, so
+enrichment must not fire automatically there — otherwise a later document could blank-then-refill
+a column with nobody looking. But that left no field-level path at all: a portal export that
+refines a medication's `status` and sig while carrying no prescriber could only be resolved by
+dropping the refinement (`keep existing`), erasing the prescriber (`keep incoming`), or forking one
+prescription into two rows (`keep both`). `review-conflicts --resolve --keep merge` is the missing
+middle, and it is safe precisely because it is **operator-driven**: a human is already looking at
+both rows. Per payload column it takes what the incoming row states over a stored NULL, keeps what
+the incoming row is silent about, and leaves agreeing values alone (through the same normalization
+as the duplicate-vs-conflict comparison, so a `MG/DL`/`mg/dL` variant is agreement, not a
+disagreement).
+
+Where both rows state *different* values, merge **refuses the whole resolution** — nothing written,
+the conflict still open, the colliding field names reported. That is the only genuinely lossy
+decision in the shape, so it stays explicit rather than being smeared across every field:
+`--field NAME=existing|incoming` settles one collision and leaves every other column on the
+automatic rule. A field choice naming a column that does not collide is refused too, so a typo or a
+stale retry can't quietly leave the real collision unsettled. On the standing-fact types merge
+always refuses, and needs no type gate to: a conflict there is present-and-different by
+construction, because the NULL-vs-stated case was already absorbed at commit time as a gain.
+Provenance is unchanged from `keep incoming` — the row takes the winning document's `document_id`,
+and with it the attestation supersession above. The resolution text, the CLI success line and the
+MCP payload record which fields came from which side by **name only**, never value.
+
 **Document provenance outranks an attestation** (issue #110). An attested row keys exactly
 like a document-sourced one, so a later `commit-extraction` of the same fact lands in the
 same identity family and the ordinary duplicate/conflict split decides the outcome — no new
@@ -923,7 +948,8 @@ pemr person add|list|show|edit|deactivate|reactivate|remove
 pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
 pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
-pemr review-conflicts [--resolve <id> --keep existing|incoming|both [--note ...]] [--dictionary <toml>]
+pemr review-conflicts [--resolve <id> --keep existing|incoming|both|merge
+                       [--field NAME=existing|incoming ...] [--note ...]] [--dictionary <toml>]
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field

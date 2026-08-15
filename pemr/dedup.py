@@ -728,6 +728,25 @@ def _norm_unit(value: object) -> str:
     return "" if value is None else str(value).strip().lower()
 
 
+def _values_agree(name: str, ev: object, iv: object) -> bool:
+    """Do two *stated* payload values for column ``name`` mean the same thing?
+
+    The single source of the normalization shared by the duplicate-vs-conflict decision
+    (:func:`_rows_equal`) and the operator-driven field merge (:func:`_merge_plan`), so
+    the two can never drift apart on what "the same value" means. It deliberately does
+    **not** implement the None rules: silence reads differently in each caller (sparse
+    types, and merge's take/preserve split), so that stays with them.
+    """
+    # Unit strings are compared case-insensitively so casing variants across
+    # documents don't stage a spurious conflict.
+    if name == "unit":
+        return _norm_unit(ev) == _norm_unit(iv)
+    # Numeric columns round-trip through SQLite as float; compare numerically.
+    if isinstance(ev, _NUM) and isinstance(iv, _NUM):
+        return float(ev) == float(iv)
+    return ev == iv
+
+
 def _rows_equal(
     record_type: str, existing: sqlite3.Row | dict, incoming: dict
 ) -> bool:
@@ -750,17 +769,7 @@ def _rows_equal(
         # Standing facts: one side simply not stating a field is silence, not a change.
         if sparse and (ev is None or iv is None):
             continue
-        # Unit strings are compared case-insensitively so casing variants across
-        # documents don't stage a spurious conflict.
-        if name == "unit":
-            if _norm_unit(ev) != _norm_unit(iv):
-                return False
-            continue
-        # Numeric columns round-trip through SQLite as float; compare numerically.
-        if isinstance(ev, _NUM) and isinstance(iv, _NUM):
-            if float(ev) != float(iv):
-                return False
-        elif ev != iv:
+        if not _values_agree(name, ev, iv):
             return False
     return True
 
@@ -1178,12 +1187,105 @@ class ResolveResult:
     dedup_key: str | None = None
     dedup_base: str | None = None
     no_op: bool = False          # keep-both that matched an existing sibling
-    # Sparse-type fields the matched sibling was missing and the staged payload
-    # supplies; filled in place so a no-op still can't drop stated data (issue #63).
+    # Fields written from the staged payload: on a keep-both no-op the sparse-type
+    # columns the matched sibling was missing (issue #63), on keep-merge the columns
+    # the stored row left NULL (or the operator settled toward incoming) - the same
+    # meaning either way, so `_resolution_text` audits both by field name.
     gains: dict = field(default_factory=dict)
+    # keep-merge only: columns left as stored because the incoming row is silent about
+    # them (or the operator settled toward existing).
+    preserved: list = field(default_factory=list)
+    # keep-merge only: field -> 'existing'|'incoming', the collisions the operator ruled
+    # on explicitly. Everything else on a merge was decided by the silence rule alone.
+    settled: dict = field(default_factory=dict)
 
 
-KEEP_CHOICES = ("existing", "incoming", "both")
+@dataclass
+class MergePlan:
+    """What a ``keep='merge'`` resolution would do to one stored row, field by field.
+
+    Computed before the transaction opens so a collision refuses without a partial
+    write (same discipline as :func:`_plan_keep_both`).
+    """
+    taken: dict = field(default_factory=dict)       # field -> incoming value to write
+    preserved: list = field(default_factory=list)   # stored value kept as-is
+    settled: dict = field(default_factory=dict)     # field -> side, from an override
+    collisions: list = field(default_factory=list)  # both stated, differing, unsettled
+
+
+def _merge_plan(
+    record_type: str,
+    stored: sqlite3.Row | dict,
+    incoming: dict,
+    overrides: dict[str, str],
+) -> MergePlan:
+    """Plan a field-level merge of ``incoming`` onto ``stored``.
+
+    The rule, per payload column: the incoming row's statement fills a stored NULL, the
+    stored value survives a silent incoming row, agreeing values are left alone, and a
+    genuine disagreement is a **collision** unless ``overrides`` names the winning side.
+    An absent key and a ``None`` value are the same thing ("not stated"), matching
+    :func:`_sparse_gains`.
+
+    Why this only exists as an *operator* path: at commit time a stored NULL under a
+    stated value is news for the dated types (see :data:`_SPARSE_TYPES`), so an automatic
+    merge would let a later document blank-then-refill a column unwatched. At
+    ``review-conflicts`` time a human is already adjudicating both rows, which is exactly
+    when "take the refinement, keep what the incoming row is silent about" is safe.
+    """
+    stored_map = dict(stored)
+    plan = MergePlan()
+    for name in _COMPARE_FIELDS[record_type]:
+        ev = stored_map.get(name)
+        iv = incoming.get(name)
+        if ev is None and iv is None:
+            continue
+        if ev is None:              # the document supplies what the record lacked
+            plan.taken[name] = iv
+            continue
+        if iv is None:              # the document is silent: do not erase the record
+            plan.preserved.append(name)
+            continue
+        if _values_agree(name, ev, iv):
+            continue
+        side = overrides.get(name)
+        if side is None:
+            plan.collisions.append(name)
+        elif side == "incoming":
+            plan.settled[name] = side
+            plan.taken[name] = iv
+        else:
+            plan.settled[name] = side
+            plan.preserved.append(name)
+    return plan
+
+
+def _merge_overrides(
+    record_type: str, fields: dict[str, str] | None
+) -> dict[str, str]:
+    """Validate the operator's per-field choices against the type's payload columns.
+
+    A typo'd field name or an unrecognized side is refused by name rather than ignored:
+    silently dropping one would leave the collision it was meant to settle unsettled, and
+    the merge would refuse for a reason the operator thought they had already answered.
+    """
+    overrides = dict(fields or {})
+    valid = _COMPARE_FIELDS[record_type]
+    for name, side in overrides.items():
+        if name not in valid:
+            raise ValueError(
+                f"field choice {name!r}: not a mergeable {record_type} field - "
+                f"choose from {', '.join(valid)}"
+            )
+        if side not in ("existing", "incoming"):
+            raise ValueError(
+                f"field choice {name!r}: side must be 'existing' or 'incoming', "
+                f"got {side!r}"
+            )
+    return overrides
+
+
+KEEP_CHOICES = ("existing", "incoming", "both", "merge")
 
 
 def resolve_conflict(
@@ -1192,12 +1294,24 @@ def resolve_conflict(
     keep: str,
     note: str | None = None,
     dictionary: dict[str, str] | None = None,
+    fields: dict[str, str] | None = None,
 ) -> ResolveResult:
     """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row),
-    'incoming' (overwrite the stored record's payload fields with the incoming row) or
+    'incoming' (overwrite the stored record's payload fields with the incoming row),
     'both' (admit the incoming row *alongside* the stored one as the next occurrence of
     that identity — the recovery path for a genuine repeat the source cannot timestamp,
-    issue #58).
+    issue #58) or 'merge' (field-level rather than row-level, issue #140).
+
+    ``keep='merge'`` takes each field the incoming row states over a stored NULL, keeps
+    each field the incoming row is silent about, and **refuses the whole resolution**
+    when both rows state different values for a field — naming those fields, writing
+    nothing, leaving the conflict open. That is the case where something genuinely has to
+    be lost, so it stays an explicit operator decision: ``fields`` maps one colliding
+    field to the side that wins (``'existing'`` | ``'incoming'``), and only fields that
+    actually collide may appear there. On a :data:`_SPARSE_TYPES` row a merge always
+    refuses, because a conflict there is present-and-different by construction (the
+    NULL-vs-stated case never gets that far — :func:`_sparse_gains` absorbs it at commit
+    time).
 
     Overwriting touches only the payload columns (``_COMPARE_FIELDS``) whose
     disagreement defined the conflict, plus provenance ``document_id``. Identity
@@ -1216,7 +1330,15 @@ def resolve_conflict(
     """
     db.require_migrated(conn)
     if keep not in KEEP_CHOICES:
-        raise ValueError("keep must be 'existing', 'incoming' or 'both'")
+        raise ValueError(
+            "keep must be " + " or ".join(
+                (", ".join(repr(c) for c in KEEP_CHOICES[:-1]), repr(KEEP_CHOICES[-1]))
+            )
+        )
+    if fields and keep != "merge":
+        raise ValueError(
+            f"per-field choices only apply to keep 'merge', not {keep!r}"
+        )
 
     row = conn.execute(
         "SELECT * FROM conflict WHERE conflict_id = ?", (conflict_id,)
@@ -1239,6 +1361,8 @@ def resolve_conflict(
             occurrence=int(anchor["dedup_occurrence"]),
             dedup_key=anchor["dedup_key"], dedup_base=anchor["dedup_base"],
         )
+    elif keep == "merge":
+        result = _plan_keep_merge(conn, row, dictionary, fields)
     else:
         result = ResolveResult(
             kept=keep, record_type=record_type, dedup_key=row["dedup_key"]
@@ -1250,6 +1374,10 @@ def resolve_conflict(
             incoming = json.loads(row["incoming_json"])
             _overwrite_record(
                 conn, record_type, int(result.row_id), row["document_id"], incoming
+            )
+        elif keep == "merge":
+            _merge_record(
+                conn, record_type, int(result.row_id), row["document_id"], result.gains
             )
         elif keep == "both" and result.no_op:
             if result.gains:
@@ -1271,9 +1399,33 @@ def resolve_conflict(
     return result
 
 
+def merge_summary(result: ResolveResult) -> str:
+    """How a keep-merge resolution describes itself, for the audit trail *and* the CLI
+    success line — one wording so the stored resolution and what the operator was told
+    can't drift.
+
+    Field **names** and sides only, never values: this is an audit trail, not a place to
+    echo clinical data (same rule as the sparse-gains reporting).
+    """
+    parts = [f"keep-merge -> {result.record_type} #{result.row_id}"]
+    if result.gains:
+        parts.append(f"from incoming: {', '.join(sorted(result.gains))}")
+    if result.preserved:
+        parts.append(f"kept: {', '.join(sorted(result.preserved))}")
+    if result.settled:
+        parts.append(
+            "settled: "
+            + ", ".join(f"{n}={s}" for n, s in sorted(result.settled.items()))
+        )
+    return "; ".join(parts)
+
+
 def _resolution_text(result: ResolveResult) -> str:
     """The auditable resolution string stored on the conflict row. keep-both records
-    which row it admitted (or matched) so the decision stays reconstructable."""
+    which row it admitted (or matched), keep-merge which fields came from which side, so
+    the decision stays reconstructable."""
+    if result.kept == "merge":
+        return merge_summary(result)
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
@@ -1427,6 +1579,53 @@ def _plan_keep_both(
     return ResolveResult(
         kept="both", record_type=record_type, occurrence=occurrence,
         dedup_key=occurrence_key(base, occurrence), dedup_base=base,
+    )
+
+
+def _plan_keep_merge(
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None,
+    fields: dict[str, str] | None,
+) -> ResolveResult:
+    """Validate + plan the field-level write a ``keep='merge'`` resolution would make.
+
+    Everything that can refuse the resolution happens here, before the transaction opens.
+
+    Planned against the **live anchor row**, never ``conflict.existing_json``: that
+    snapshot is frozen at staging time, so an enrichment or a sibling resolution since
+    then would make the plan re-NULL columns the stored row has meanwhile gained - the
+    exact loss keep-merge exists to prevent.
+    """
+    record_type = conflict["record_type"]
+    overrides = _merge_overrides(record_type, fields)
+    # Same anchor (and same empty-family refusal) as keep-incoming: a family with no
+    # rows left can no longer be merged onto.
+    anchor = _anchor_row(conn, conflict, dictionary)
+    plan = _merge_plan(
+        record_type, anchor, json.loads(conflict["incoming_json"]), overrides
+    )
+    stale = sorted(set(overrides) - set(plan.settled))
+    if stale:
+        raise ValueError(
+            f"conflict {conflict['conflict_id']}: nothing to settle for "
+            f"{', '.join(stale)} - a field choice applies only where both rows state a "
+            "different value, and these do not. Nothing was written"
+        )
+    if plan.collisions:
+        raise ValueError(
+            f"conflict {conflict['conflict_id']}: keep-merge cannot decide "
+            f"{', '.join(plan.collisions)} - both rows state a different value there, "
+            "and choosing is a human call. Settle each with a field choice "
+            "(`--field NAME=existing|incoming`), or resolve the row as a whole with "
+            "keep 'existing', 'incoming' or 'both'. Nothing was written"
+        )
+    return ResolveResult(
+        kept="merge", record_type=record_type,
+        row_id=int(anchor[f"{record_type}_id"]),
+        occurrence=int(anchor["dedup_occurrence"]),
+        dedup_key=anchor["dedup_key"], dedup_base=anchor["dedup_base"],
+        gains=plan.taken, preserved=plan.preserved, settled=plan.settled,
     )
 
 
@@ -2068,4 +2267,42 @@ def _overwrite_record(
         raise ValueError(
             f"keep-incoming matched no {record_type} row (id {row_id}) - refusing to "
             "resolve the conflict, the incoming row would have been discarded"
+        )
+
+
+def _merge_record(
+    conn: sqlite3.Connection,
+    record_type: str,
+    row_id: int,
+    document_id: int | None,
+    values: dict,
+) -> None:
+    """Apply a :func:`_merge_plan`'s ``taken`` fields to one stored row, by primary key.
+
+    Only the planned columns are assigned, so every field the incoming row was silent
+    about keeps its stored value - the whole point of keep-merge. Identity fields,
+    ``dedup_key``, ``dedup_base`` and ``dedup_occurrence`` are never touched.
+
+    ``document_id`` is written unconditionally, exactly as :func:`_overwrite_record`
+    does, even when ``values`` is empty: provenance handling is deliberately unchanged
+    from keep-incoming, and so therefore is the attestation supersession it carries
+    (issue #110). The ``rowcount`` guard mirrors that function's for the same reason - a
+    zero-row UPDATE would stamp the conflict resolved having written nothing.
+    """
+    assignments = ["document_id = ?"]
+    params: list[object] = [document_id]
+    for name in _COMPARE_FIELDS[record_type]:      # planned column names only
+        if name in values:
+            assignments.append(f"{name} = ?")
+            params.append(values[name])
+    params.append(row_id)
+    cur = conn.execute(
+        f"UPDATE {record_type} SET {', '.join(assignments)} "
+        f"WHERE {record_type}_id = ?",
+        params,
+    )
+    if cur.rowcount != 1:
+        raise ValueError(
+            f"keep-merge matched no {record_type} row (id {row_id}) - refusing to "
+            "resolve the conflict, the merged fields would have been discarded"
         )
