@@ -460,9 +460,20 @@ describe('computeLanes', () => {
 
   it('excludes wip/hold/needs-human from eligible and orders by priority then FIFO', () => {
     const { lanes } = computeLanes(issues);
-    // 11 (critical) before 10 (future); 12 (wip) and 13 (hold) excluded;
-    // 14 is dual-stage but still eligible for build.
-    assert.deepEqual(lanes.build.eligible, [11, 10, 14]);
+    // 11 (critical) › 14 (unlabeled) › 10 (future); 12 (wip) and 13 (hold)
+    // excluded; 14 is dual-stage but still eligible for build.
+    assert.deepEqual(lanes.build.eligible, [11, 14, 10]);
+  });
+
+  it('sorts unlabeled between critical and future, FIFO within a tier', () => {
+    const { lanes } = computeLanes([
+      { number: 20, createdAt: '2026-07-01T00:00:00Z', labels: ['stage:build', 'priority:future'] },
+      { number: 21, createdAt: '2026-07-02T00:00:00Z', labels: ['stage:build'] },
+      { number: 22, createdAt: '2026-07-03T00:00:00Z', labels: ['stage:build', 'priority:critical'] },
+      { number: 23, createdAt: '2026-07-04T00:00:00Z', labels: ['stage:build', 'priority:critical'] },
+      { number: 24, createdAt: '2026-07-05T00:00:00Z', labels: ['stage:build'] },
+    ]);
+    assert.deepEqual(lanes.build.eligible, [22, 23, 21, 24, 20]);
   });
 
   it('flags multi-stage issues and stage-less issues carrying machine flags', () => {
