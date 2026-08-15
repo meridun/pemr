@@ -58,6 +58,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { assertClean } from './pii-scan.mjs';
+
 // --- Adapt to your repo -------------------------------------------------------
 // These are the only project-specific knobs. `<DEFAULT_BRANCH>` is the
 // integration branch PRs target; `<PROD_BRANCH>` is the release branch no
@@ -935,7 +937,34 @@ export function scoreDupCandidates(query, issues, opts = {}) {
 
 // --- I/O boundary: gh / git executors (injectable for tests) -------------------
 
-const defaultGh = (args) => execFileSync('gh', args, { encoding: 'utf8' });
+/**
+ * Every outbound `gh` write funnels through here, so the privacy guard lives
+ * here too rather than at each `issue comment` call site — a new call site
+ * cannot forget it.
+ *
+ * This matters because the dispatcher's whole job is quoting diffs, repro steps
+ * and issue text back into comments: a real identifier that reaches the repo
+ * once gets republished by the lanes many times over. See AGENTS.md
+ * §"Privacy posture".
+ */
+export function guardOutboundBody(args, scan = assertClean) {
+  const isComment = args.includes('comment') || args.includes('create') || args.includes('edit');
+  if (!isComment) return;
+  const bodyIdx = args.indexOf('--body');
+  if (bodyIdx !== -1 && args[bodyIdx + 1] != null) {
+    scan(String(args[bodyIdx + 1]), 'this issue comment');
+  }
+  const fileIdx = args.indexOf('--body-file');
+  if (fileIdx !== -1 && args[fileIdx + 1] != null) {
+    const p = String(args[fileIdx + 1]);
+    if (p !== '-' && fs.existsSync(p)) scan(fs.readFileSync(p, 'utf8'), `this comment body (${p})`);
+  }
+}
+
+const defaultGh = (args) => {
+  guardOutboundBody(args);
+  return execFileSync('gh', args, { encoding: 'utf8' });
+};
 const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8' });
 
 /** Fetch an issue's label names via gh. */
