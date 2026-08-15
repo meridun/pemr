@@ -78,6 +78,12 @@ side: it mutates a *stored clinical value* with no new source backing the change
 matching what its document says on one person's say-so — which is exactly the kind of write that
 must carry a named human, not an agent.
 
+The verbs above are CLI-only; verdict *content* is not. Since issue #131, `query`
+(`kind` = `labs`/`meds`/`timeline`) carries each row's `curation` verdict on the MCP read
+payload, same as `--json` — an agent reading `query` sees which rows a human has marked
+`superseded`, `erroneous-in-source`, `merged-into`, or `disputed`, and why. That is unchanged
+from the rule above: an agent may read a verdict, never write or clear one.
+
 ## MUST rules
 
 ### 1. Extraction naming

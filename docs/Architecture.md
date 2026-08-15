@@ -918,9 +918,15 @@ pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--n
                                                          # pre-emptive exclusion; ingests and copies nothing
 pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
-pemr query labs --person jane --test hba1c --since 2023-01-01
-pemr query meds --person jane --active
-pemr query timeline --person jane --since 2024-01-01     # merged event stream
+pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
+pemr query meds --person jane --active [--raw]
+pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
+                                                         # all three (issue #131): filtered at read
+                                                         # time against the curation overlay, same
+                                                         # rule §6 describes for render - a suppressed
+                                                         # row prints a "N hidden; --raw to include"
+                                                         # note; --raw restores them, marked; --json
+                                                         # always carries the verdict regardless
 pemr find --person jane "cholesterol"                    # full-text over ocr_text + records
 pemr find "mmr booster"                                  # omit --person: whole-household, slug-prefixed hits
 pemr trends --person jane --test hba1c                   # min/max/latest/slope
@@ -958,6 +964,13 @@ replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). E
 same `--json`-shaped payload as the CLI; the MCP server (`pemr/mcp_server.py`) parses args and
 calls the same Python functions the CLI calls — one implementation, two front doors. `readOnlyHint`
 annotations expose the read/write split to the client.
+
+Since issue #131, `query`'s MCP payload also carries the `curation` overlay — every row/event
+that resolved a verdict is annotated, unfiltered (the MCP surface mirrors `--json`, never the
+human view's suppression). The nested verdict's `dedup_base` is a **breadcrumb, never a lookup
+key** (§2/§3): it can go stale across a `rekey`, so a caller keys on `status`, not on it. This is
+the one place verdict *content* reaches an agent — the write verbs (`record annotate`,
+`record reaffirm`, below) stay CLI-only regardless.
 
 `AGENTS.md` documents this contract so any agent (Cowork, Claude Code, local) knows to
 **call tools, not reinvent** — and specifically: never write to the DB except through
@@ -1010,7 +1023,19 @@ with no verdicts renders byte-identically to before the overlay existed. This do
 the purity rule: the filter is a read, and output changes after a verdict because the
 *database* changed. Resolution is **per row**: a row-scoped verdict affects only its own
 occurrence — the sibling of a `--keep both` pair renders untouched — and beats the family
-verdict for that row. One consequence of the read-time join: if a dictionary-driven `rekey`
+verdict for that row.
+
+The read layer's three `query` verbs (`meds`/`labs`/`timeline`, §5) apply the same rule as of
+issue #131, via shared stampers in `pemr/curation.py` (`annotate_rows`/`annotate_events`) that
+`render` now delegates to rather than duplicates: their default human-readable output suppresses
+appendix-status rows the same way, `--raw` opts back into the unfiltered view (marked), and
+`--json` — like the MCP `query` tool, §5 — always carries the verdict under a `_curation` key
+regardless of suppression, so a programmatic caller can filter for itself. That verdict payload
+is now part of the `--json` **and MCP** read contract: its `dedup_base` is a breadcrumb (§2/§3),
+not a lookup key, since a dictionary `rekey` can move it out from under a stale reference — a
+consumer should key on `status`, not on it.
+
+One consequence of the read-time join: if a dictionary-driven `rekey`
 (§3) has renamed a family since its verdict was recorded, a *family*-scoped verdict's join
 misses and the family renders as if unannotated (`pemr verify` flags the orphan; nothing
 re-attaches it automatically). A *row*-scoped verdict is immune — it joins on the row id,
