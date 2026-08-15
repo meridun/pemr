@@ -145,7 +145,7 @@ const RULES = [
   {
     id: 'bare-slug',
     // A `given-surname` token in prose, with no `--person` in front of it. This
-    // is how the real leak actually travelled: "Real repro (charlotte-dickinson,
+    // is how the real leak actually travelled: "Real repro (melanie-ashworth,
     // medication omeprazole)". Context-gated so ordinary hyphenated compounds
     // (`fan-out`, `byte-identical`) stay quiet.
     re: /\b([a-z]{3,15})-([a-z]{3,15})\b/g,
@@ -163,7 +163,7 @@ const RULES = [
   },
   {
     id: 'full-name',
-    // `Michael Dickinson` in prose — the same identity as the slug, but spelled
+    // `Gregory Ashworth` in prose — the same identity as the slug, but spelled
     // out. Gated on person context so ordinary Capitalised Pairs stay quiet.
     // Match the whole capitalised run, so a middle name (`Robert Alan Roe`)
     // cannot hide the placeholder surname that ends it.
@@ -275,7 +275,11 @@ export function assertClean(text, what = 'text') {
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'sources', 'exports', 'inbox', 'backups', 'data', 'vdm-diag', '.venv', 'pemr.egg-info']);
 const TEXT_EXT = new Set(['.py', '.mjs', '.js', '.ts', '.md', '.json', '.toml', '.yml', '.yaml', '.txt', '.csv', '.sql', '.cfg', '.ini']);
-// This file and its test necessarily contain the shapes they describe.
+// This file and its test necessarily contain the shapes they describe, so the
+// scanner cannot scan them — which makes them the one blind spot in the repo.
+// Every identity used as an example here MUST therefore be invented: a given
+// name from the list above plus a surname that belongs to nobody. Never
+// illustrate a rule with the real identity that motivated it.
 const SKIP_FILES = new Set(['scripts/pii-scan.mjs', 'test/pii-scan.test.mjs']);
 
 function trackedFiles() {

@@ -17,31 +17,31 @@ const rules = (text) => scanText(text).map((f) => f.rule);
 
 describe('pii-scan: catches real identities', () => {
   it('flags a person slug that is not on the roster', () => {
-    assert.ok(rules('pemr ingest scan.pdf --person charlotte-dickinson').includes('person-slug'));
+    assert.ok(rules('pemr ingest scan.pdf --person melanie-ashworth').includes('person-slug'));
   });
 
   it('flags a bare given-surname slug in prose — how the leak actually travelled', () => {
-    const t = 'Real repro (charlotte-dickinson, medication omeprazole): four stored rows.';
+    const t = 'Real repro (melanie-ashworth, medication omeprazole): four stored rows.';
     assert.ok(rules(t).includes('bare-slug'));
   });
 
   it('flags a full name spelled out in prose', () => {
-    const t = 'The patient record was filed under Michael Dickinson by mistake.';
+    const t = 'The patient record was filed under Gregory Ashworth by mistake.';
     assert.ok(rules(t).includes('full-name'));
   });
 
   it('flags a DOB that is not an allowlisted synthetic date', () => {
-    assert.ok(rules('Patient: DOE, JOHN Q   DOB: 1978-05-04').includes('dob'));
+    assert.ok(rules('Patient: DOE, JOHN Q   DOB: 1968-02-11').includes('dob'));
   });
 
   it('sees through a literal \\n escape gluing the label to the previous token', () => {
     // `...^\nDOB:` reads as `nDOB` and defeats a naive word boundary.
-    const t = 'PatientName = "STRANGER^SAM^\\nDOB: 1978-05-04"';
+    const t = 'PatientName = "STRANGER^SAM^\\nDOB: 1968-02-11"';
     assert.ok(rules(t).includes('dob'));
   });
 
   it('flags a patient name whose surname is not a placeholder', () => {
-    assert.ok(rules('Patient: DICKINSON, MICHAEL J').includes('patient-name'));
+    assert.ok(rules('Patient: ASHWORTH, GREGORY J').includes('patient-name'));
   });
 
   it('flags SSNs, concrete MRNs and card numbers outright', () => {
@@ -92,13 +92,13 @@ describe('pii-scan: stays quiet on synthetic and technical text', () => {
   });
 
   it('honours the pii-allow escape hatch', () => {
-    assert.deepEqual(scanText('DOB: 1978-05-04  # pii-allow'), []);
+    assert.deepEqual(scanText('DOB: 1968-02-11  # pii-allow'), []);
   });
 });
 
 describe('assertClean', () => {
   it('throws with the offending rule named', () => {
-    assert.throws(() => assertClean('Patient: DOE, JOHN Q  DOB: 1978-05-04', 'a comment'), /dob/);
+    assert.throws(() => assertClean('Patient: DOE, JOHN Q  DOB: 1968-02-11', 'a comment'), /dob/);
   });
 
   it('passes clean text through silently', () => {
@@ -109,7 +109,7 @@ describe('assertClean', () => {
 describe('guardOutboundBody: the dispatcher cannot republish an identity', () => {
   it('refuses an issue comment carrying a real identity', () => {
     assert.throws(
-      () => guardOutboundBody(['issue', 'comment', '61', '--body', 'repro: charlotte-dickinson meds']),
+      () => guardOutboundBody(['issue', 'comment', '61', '--body', 'repro: melanie-ashworth meds']),
       /patient identity/,
     );
   });
