@@ -258,6 +258,19 @@ def test_record_assert_output_is_console_safe(ready, capsys):
         _run(ready, "record", "assert", "--help")
     _assert_console_safe(capsys.readouterr().out)
 
+    # Issue #127: the subcommand's one-line help states a tool-surface exclusion,
+    # not a ban on an agent invoking the verb at the CLI -- the wording
+    # docs/Architecture.md and pemr/attestations.py already use. argparse renders
+    # that string in the *parent* listing (`pemr record --help`), wrapped to the
+    # terminal width, so collapse whitespace before matching.
+    with pytest.raises(SystemExit):
+        _run(ready, "record", "--help")
+    out = capsys.readouterr().out
+    _assert_console_safe(out)
+    listing = " ".join(out.split())
+    assert "never an agent write" not in listing
+    assert "CLI-only, never an MCP tool" in listing
+
     argv = ("record", "assert", "medication", "--person", "jane-doe",
             "--attributed-to", "Mom", "--date", "2026-08-09",
             "--field", "name=Metformin", "--field", "dose=500 mg")
