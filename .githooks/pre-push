@@ -44,9 +44,12 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
   done
 
-  if ! git diff "$range" 2>/dev/null | node "$scanner" --stdin "the outgoing diff" >/dev/null 2>&1; then
-    echo "pii-guard: push blocked — the outgoing diff carries a real identity:" >&2
-    git diff "$range" 2>/dev/null | node "$scanner" --stdin "the outgoing diff" >&2 2>&1
+  # --diff scans only introduced lines, so a scrub commit is not blocked by the
+  # old value sitting on its own removal lines, and the scanner's own exempt
+  # files stay exempt. A guard that cries wolf gets bypassed.
+  if ! git diff "$range" 2>/dev/null | node "$scanner" --diff >/dev/null 2>&1; then
+    echo "pii-guard: push blocked — the outgoing diff introduces a real identity:" >&2
+    git diff "$range" 2>/dev/null | node "$scanner" --diff >&2 2>&1
     status=1
   fi
 done

@@ -309,6 +309,38 @@ function main(argv) {
   const flags = argv.slice(2).filter((a) => a.startsWith('-'));
   const explicit = argv.slice(2).filter((a) => !a.startsWith('-'));
 
+  // `--diff` reads a unified diff and scans only the lines it *introduces*,
+  // skipping the files the scanner necessarily exempts. Without both of those
+  // every scrub commit trips its own guard — a removal line still carries the
+  // old value — and a guard that cries wolf just teaches people --no-verify.
+  if (flags.includes('--diff')) {
+    let raw = '';
+    try {
+      raw = fs.readFileSync(0, 'utf8');
+    } catch {
+      raw = '';
+    }
+    let file = '<diff>';
+    let skipping = false;
+    const added = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const hdr = /^\+\+\+ b\/(.+)$/.exec(line);
+      if (hdr) {
+        file = hdr[1].trim();
+        skipping = SKIP_FILES.has(file);
+        continue;
+      }
+      if (line.startsWith('---') || line.startsWith('+++')) continue;
+      if (!line.startsWith('+') || skipping) continue;
+      added.push({ file, text: line.slice(1) });
+    }
+    const found = [];
+    for (const a of added) {
+      for (const f of scanText(a.text, a.file)) found.push(f);
+    }
+    return report(found, `${added.length} added line(s)`);
+  }
+
   // `--stdin` scans arbitrary text — a commit message, a PR body, a shell
   // command line. This is what the git and Claude Code hooks use, so every
   // surface shares exactly one set of patterns.

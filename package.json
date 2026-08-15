@@ -11,6 +11,7 @@
     "check:pii": "node scripts/pii-scan.mjs",
     "setup:hooks": "node scripts/setup-hooks.mjs",
     "check:hooks": "node scripts/setup-hooks.mjs --check",
+    "prepare": "node scripts/setup-hooks.mjs",
     "sdlc": "node scripts/sdlc.mjs",
     "test": "node --test"
   }

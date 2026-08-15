@@ -28,6 +28,9 @@ jobs:
       # This repo is public: fail the build before a real identity lands in it.
       # See AGENTS.md §"Privacy posture".
       - run: npm run check:pii
+      # `core.hooksPath` is per-clone, so CI checks the hook scripts are valid
+      # rather than that this runner installed them.
+      - run: sh -n .githooks/commit-msg && sh -n .githooks/pre-push
       - run: npm test
 
   # The tree is only one surface. A PR's title and body are just as public, are

@@ -44,7 +44,15 @@ if (check) {
 }
 
 if (current !== DIR) {
-  git(['config', 'core.hooksPath', DIR]);
+  try {
+    git(['config', 'core.hooksPath', DIR]);
+  } catch {
+    // Runs from `prepare`, so it fires in tarball installs and sandboxes with
+    // no git repo. Not being able to install hooks is not a reason to fail an
+    // install; CI checks the hook scripts separately.
+    console.log('setup-hooks: not a git repo, skipping');
+    process.exit(0);
+  }
 }
 
 // core.hooksPath ignores the executable bit on Windows, but honours it on
