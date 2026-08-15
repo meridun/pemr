@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from pemr import cli, db, dedup, persons
+from pemr import cli, curation, db, dedup, persons, render
 
 DICT_ARG = ["--dictionary", str(
     __import__("pathlib").Path(__file__).resolve().parent.parent
@@ -272,3 +272,203 @@ def test_query_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     rc = _run(tmp_path, "query", "labs", "--person", "jane-doe")
     assert rc == 1
     assert "migrate" in capsys.readouterr().err
+
+
+# --- the curation overlay reaches `query` too (issue #131) --------------------
+#
+# The defect: `render summary` consulted the overlay and `query` did not, so the two
+# verbs disagreed about which medications a person is on -- and the verb that overstated
+# the active list was the one a lookup reaches for. The overlay is still additive: with
+# no verdicts every one of these commands is unchanged (the regression test below).
+
+
+def _annotate(tmp_path, record_type, column, value, **kwargs):
+    """Record a family verdict on the family holding one seeded row."""
+    conn = db.connect(tmp_path / "cli.db")
+    base = conn.execute(
+        f"SELECT dedup_base FROM {record_type} WHERE {column} = ?", (value,)
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(conn, record_type, base, apply=True, **kwargs)
+    conn.close()
+    return base
+
+
+@pytest.fixture()
+def curated(ready):
+    """`ready` plus the verdicts the overlay has to honour.
+
+    Medications: Breo Ellipta superseded (still 'current' by dates -- the issue's exact
+    shape), Prednisone a superseded 2016 course, Lisinopril disputed, Metformin
+    untouched. Labs: Ferritin superseded, TSH disputed, the two A1c draws untouched.
+    """
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Breo Ellipta", "dose": "100mcg", "started_on": "2023-01-01"},
+            {"name": "Lisinopril", "dose": "10mg", "started_on": "2023-06-01"},
+            {"name": "Prednisone", "dose": "5mg", "started_on": "2016-01-01",
+             "ended_on": "2016-01-31"},
+        ],
+        "lab_result": [
+            {"test_name": "Ferritin", "collected_at": "2025-05-05", "value_num": 15.0,
+             "unit": "ng/mL"},
+            {"test_name": "TSH", "collected_at": "2025-05-05", "value_num": 3.0,
+             "unit": "mIU/L"},
+        ],
+    }, d)
+    conn.close()
+    _annotate(ready, "medication", "name", "Breo Ellipta", status="superseded",
+              note="stopped in 2024; not on the current list")
+    _annotate(ready, "medication", "name", "Prednisone", status="superseded",
+              note="a completed 30-day course")
+    _annotate(ready, "medication", "name", "Lisinopril", status="disputed",
+              note="two documents disagree")
+    _annotate(ready, "lab_result", "test_name", "Ferritin", status="superseded",
+              note="requisition coding artifact")
+    _annotate(ready, "lab_result", "test_name", "TSH", status="disputed",
+              note="value contested")
+    return ready
+
+
+def test_query_meds_suppresses_superseded_and_marks_disputed(curated, capsys):
+    """The issue's repro: a superseded med must stop printing as '(current)'."""
+    assert _run(curated, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "Breo Ellipta" not in out and "Prednisone" not in out
+    assert "Metformin" in out
+    lisinopril = next(line for line in out.splitlines() if "Lisinopril" in line)
+    assert "[DISPUTED: two documents disagree]" in lisinopril
+    # Disclosed, never silently shortened.
+    assert "(2 superseded/corrected medications hidden; --raw to include)" in out
+
+
+def test_query_meds_raw_restores_the_rows_and_says_why_they_were_hidden(curated, capsys):
+    assert _run(curated, "query", "meds", "--person", "jane-doe", "--raw") == 0
+    out = capsys.readouterr().out
+    breo = next(line for line in out.splitlines() if "Breo Ellipta" in line)
+    assert "[superseded - stopped in 2024; not on the current list]" in breo
+    assert "Prednisone" in out and "Metformin" in out
+    assert "[DISPUTED: two documents disagree]" in out   # unchanged by --raw
+    assert "hidden; --raw to include" not in out
+
+
+def test_query_meds_json_always_carries_the_verdict(curated, capsys):
+    """--json is the programmatic contract: nothing suppressed, verdict on every row
+    that has one, and unaffected by --raw."""
+    assert _run(curated, "query", "meds", "--person", "jane-doe", "--json") == 0
+    default = json.loads(capsys.readouterr().out)
+    by_name = {m["name"]: m for m in default}
+    assert {"Breo Ellipta", "Prednisone", "Lisinopril", "Metformin"} <= set(by_name)
+    assert by_name["Breo Ellipta"]["_curation"]["status"] == "superseded"
+    assert by_name["Lisinopril"]["_curation"]["status"] == "disputed"
+    assert "_curation" not in by_name["Metformin"]       # additive: no verdict, no key
+    assert "dedup_base" not in by_name["Metformin"]      # the read contract still holds
+
+    assert _run(curated, "query", "meds", "--person", "jane-doe", "--json", "--raw") == 0
+    assert json.loads(capsys.readouterr().out) == default
+
+
+def test_query_meds_hidden_note_survives_an_entirely_hidden_list(ready, capsys):
+    """Suppressing a clinical list into silence with no signal is the one failure this
+    must not introduce."""
+    _annotate(ready, "medication", "name", "Metformin", status="superseded",
+              note="stopped")
+    assert _run(ready, "query", "meds", "--person", "jane-doe", "--active") == 0
+    out = capsys.readouterr().out
+    assert "no active medications" in out
+    assert "(1 superseded/corrected medications hidden; --raw to include)" in out
+
+
+def test_query_labs_suppression_marking_and_json(curated, capsys):
+    assert _run(curated, "query", "labs", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "Ferritin" not in out
+    assert "HbA1c" in out and "A1c" in out
+    tsh = next(line for line in out.splitlines() if "TSH" in line)
+    assert "[DISPUTED: value contested]" in tsh
+    assert "(1 superseded/corrected lab results hidden; --raw to include)" in out
+
+    assert _run(curated, "query", "labs", "--person", "jane-doe", "--raw") == 0
+    raw = capsys.readouterr().out
+    assert "[superseded - requisition coding artifact]" in raw
+
+    assert _run(curated, "query", "labs", "--person", "jane-doe", "--json") == 0
+    by_test = {r["test_name"]: r for r in json.loads(capsys.readouterr().out)}
+    assert by_test["Ferritin"]["_curation"]["status"] == "superseded"
+    assert by_test["TSH"]["_curation"]["status"] == "disputed"
+    assert "_curation" not in by_test["HbA1c"]
+
+
+def test_query_timeline_suppression_and_no_identity_leak(curated, capsys):
+    assert _run(curated, "query", "timeline", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    # Prednisone contributes med-start *and* med-stop; both go.
+    assert "Prednisone" not in out and "Breo Ellipta" not in out and "Ferritin" not in out
+    assert "started Metformin" in out
+    assert "[DISPUTED: two documents disagree]" in out
+    assert "superseded/corrected events hidden; --raw to include" in out
+
+    assert _run(curated, "query", "timeline", "--person", "jane-doe", "--raw") == 0
+    raw = capsys.readouterr().out
+    assert "started Prednisone" in raw and "stopped Prednisone" in raw
+    assert "[superseded - a completed 30-day course]" in raw
+
+    assert _run(curated, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    events = json.loads(capsys.readouterr().out)
+    assert any(e.get("_curation", {}).get("status") == "superseded" for e in events)
+    assert any(e.get("_curation", {}).get("status") == "disputed" for e in events)
+    assert any("Prednisone" in e["summary"] for e in events)   # nothing suppressed here
+    # `with_identity=True` scaffolding must never reach the payload -- `dedup_base` is
+    # an internal column, and this is the only DB state where the keys exist at all.
+    for key in ("record_type", "dedup_base", "record_id"):
+        assert all(key not in e for e in events)
+
+
+def test_query_with_no_verdicts_is_unchanged(ready, capsys):
+    """The additive-only guard: an unannotated database sees the exact output it saw
+    before the overlay reached `query` -- no marker, no note, --raw a no-op."""
+    for argv in (
+        ["query", "meds", "--person", "jane-doe"],
+        ["query", "labs", "--person", "jane-doe"],
+        ["query", "timeline", "--person", "jane-doe"],
+    ):
+        assert _run(ready, *argv) == 0
+        plain = capsys.readouterr().out
+        assert "hidden; --raw to include" not in plain
+        assert "DISPUTED" not in plain
+        assert _run(ready, *argv, "--raw") == 0
+        assert capsys.readouterr().out == plain
+
+        assert _run(ready, *argv, "--json") == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload and all("_curation" not in row for row in payload)
+
+
+def test_query_meds_active_agrees_with_render_summary(curated, capsys):
+    """The actual defect: two verbs disagreeing about who is on what."""
+    assert _run(curated, "query", "meds", "--person", "jane-doe", "--active",
+                "--json") == 0
+    listed = {m["name"] for m in json.loads(capsys.readouterr().out)
+              if not curation.is_appendix(m)}
+
+    conn = db.connect(curated / "cli.db")
+    try:
+        md = render.render_summary(
+            conn, "jane-doe", dictionary=dedup.load_dictionary(DICT_ARG[1])
+        )
+    finally:
+        conn.close()
+    section = md.split("## Active Medications", 1)[1].split("\n## ", 1)[0]
+    rendered = {line[2:].split("  ")[0].split(" ")[0]
+                for line in section.splitlines() if line.startswith("- ")}
+
+    assert listed == {"Metformin", "Lisinopril"}
+    assert {name.split(" ")[0] for name in listed} == rendered
+    assert "Breo Ellipta" not in section and "Prednisone" not in section
+    # ... and the one the summary *would* have listed is accounted for, not lost.
+    # (Prednisone is absent from both sides: an ended 2016 course never reaches the
+    # Active Medications query in the first place, so nothing about it is suppressed.)
+    appendix = md.split("## Superseded / corrected", 1)[1]
+    assert "Breo Ellipta" in appendix

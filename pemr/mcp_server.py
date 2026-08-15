@@ -32,6 +32,7 @@ from typing import Any
 # Engine modules are underscore-aliased so the public tool named `query` (and any future
 # tool sharing a module name) can't shadow the module it delegates to.
 from . import __version__, cli, db
+from . import curation as _curation
 from . import dedup as _dedup
 from . import documents as _documents
 from . import ingest as _ingest
@@ -391,14 +392,30 @@ def query(
 ) -> list[dict[str, Any]]:
     """[read] Structured reads over the record tables. ``kind`` is ``labs`` | ``meds`` |
     ``timeline`` (mirrors ``pemr query <kind>`` rather than fanning out to three tools).
+
+    Every row carries its curation verdict under ``_curation`` when a human recorded one
+    (issue #131), and **nothing is suppressed**: this payload is the structured contract,
+    the same call the CLI's ``--json`` makes, so it discloses the verdict and lets the
+    caller decide. The suppression rule is the human-readable view's alone.
     """
     try:
+        verdicts = _curation.load_verdicts(conn)
         if kind == "labs":
             rows = _query.query_labs(conn, person, test=test, since=since, dictionary=_dictionary())
+            _curation.annotate_rows(rows, "lab_result", verdicts)
         elif kind == "meds":
             rows = _query.query_meds(conn, person, active=active)
+            _curation.annotate_rows(rows, "medication", verdicts)
         elif kind == "timeline":
-            rows = _query.query_timeline(conn, person, since=since)
+            rows = _query.query_timeline(
+                conn, person, since=since, with_identity=bool(verdicts)
+            )
+            _curation.annotate_events(rows, verdicts)
+            # Resolution scaffolding, not payload — the CLI strips the same three keys.
+            rows = [
+                {k: v for k, v in e.items() if k not in cli._QUERY_IDENTITY_KEYS}
+                for e in rows
+            ]
         else:
             raise ToolError(f"unknown query kind '{kind}' (known: labs, meds, timeline)")
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
