@@ -1012,6 +1012,63 @@ def test_ccda_doctype_is_not_parsed_natively(conn, tmp_path, sources, monkeypatc
     assert result.document.ocr_text == "scanned"
 
 
+@pytest.mark.parametrize(
+    "prolog",
+    [
+        # the markers sit in a leading comment, so the file still sniffs as a CCDA
+        # while the DOCTYPE is padded past any fixed head window
+        '<!-- urn:hl7-org:v3 ClinicalDocument --><!-- ' + "x" * 9000 + " -->",
+        # a comment carrying something that *looks* like the root element: stopping at
+        # the first `<` instead of stepping over comments would end the scan here
+        '<!-- urn:hl7-org:v3 --><!-- <ClinicalDocument xmlns="urn:hl7-org:v3"> -->',
+    ],
+    ids=["padded-past-the-sniff-window", "comment-holding-a-fake-start-tag"],
+)
+def test_ccda_doctype_anywhere_in_the_prolog_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch, prolog
+):
+    """The DOCTYPE refusal scans the whole prolog, not a fixed head window.
+
+    A comment pushes the DOCTYPE past any window while the CCDA markers stay inside it,
+    and the internal subset it hides amplifies far past the byte cap — expat only checks
+    its ratio above 8 MiB of output, so everything under that expands silently."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="prolog-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "prolog-doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>",
+            f'?>{prolog}<!DOCTYPE ClinicalDocument [<!ENTITY a "aaaa">]>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_ccda_with_a_harmless_prolog_comment_still_reads_natively(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The other half of the guard: stepping over prolog markup must not make the
+    scanner over-eager. A real CCDA behind a comment — including one quoting a start
+    tag — has no DOCTYPE and is still rendered rather than shipped to tesseract."""
+    def never(path):  # pragma: no cover - a CCDA never reaches the OCR route
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", never)
+    body = _make_ccda(tmp_path, name="comment-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "commented.xml"
+    src.write_text(
+        body.replace("?>", "?><!-- exported <ClinicalDocument> 2026 -->", 1),
+        encoding="utf-8",
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert "Ferritin" in result.document.ocr_text
+
+
 def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
     """The point of the issue: `recordTarget` is an identity the check can use, so a
     CCDA no longer degrades to "filed on your say-so"."""

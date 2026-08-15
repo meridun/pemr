@@ -797,8 +797,11 @@ tables as tab-delimited rows, prefixed with the `recordTarget` patient name and 
 time so the owner check has an identity to match. Detection is the parsed **root element**
 (`{urn:hl7-org:v3}ClinicalDocument`), never the suffix — `.xml` is a container, so any
 other XML keeps the OCR route. A `<!DOCTYPE` is refused before parsing (stdlib
-`ElementTree` expands internal entities, and the size cap does not bound expansion), and
-a malformed file is simply "not detectably a CCDA" and falls through. The narrative walk
+`ElementTree` expands internal entities, and the size cap does not bound expansion) — the
+refusal scans the **whole prolog**, stepping over comments and PIs rather than a fixed
+head window, because a leading comment pads the DOCTYPE past any window while the CCDA
+markers stay inside it. A malformed file is simply "not detectably a CCDA" and falls
+through. The narrative walk
 is **iterative, not recursive**: nesting depth is document-controlled and ~1500 levels fit
 in 30 KB, so a recursive walk hit `RecursionError` — a `RuntimeError`, outside the
 best-effort handler — and cost the whole document. `RecursionError` is caught there now

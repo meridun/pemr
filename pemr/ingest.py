@@ -631,6 +631,38 @@ def _ccda_header(root: ET.Element) -> list[str]:
     return lines
 
 
+def _xml_declares_doctype(data: bytes) -> bool:
+    """True when a ``<!DOCTYPE`` sits in the XML **prolog**.
+
+    The prolog — everything before the root element's start tag — is the only place a
+    DOCTYPE may legally appear, and comments and processing instructions are the only
+    other markup allowed there, so the scan steps over those and stops at the first
+    element. Scanning a fixed head window instead is not enough: a leading comment pads
+    the DOCTYPE past any window while the CCDA markers stay inside it, and the internal
+    subset it smuggles through is an entity-amplification bomb the byte cap does not
+    bound (a 2 MB file rendered 197 MB of text; issue #138 audit). Stepping over
+    comments rather than stopping at the first ``<`` matters for the same reason: a
+    comment may itself contain something that looks like a start tag.
+    """
+    i = 0
+    while (start := data.find(b"<", i)) >= 0:
+        if data.startswith(b"<!--", start):
+            end = data.find(b"-->", start + 4)
+            if end < 0:
+                return False           # unterminated: no root element follows either
+            i = end + 3
+        elif data.startswith(b"<?", start):
+            end = data.find(b"?>", start + 2)
+            if end < 0:
+                return False
+            i = end + 2
+        elif data[start:start + 9].lower() == b"<!doctype":
+            return True
+        else:
+            return False               # a start tag (or junk) — the prolog is over
+    return False
+
+
 def _extract_ccda(path: Path) -> str | None:
     """CCDA narrative text, or ``None`` when the file is **not** a CCDA.
 
@@ -646,17 +678,18 @@ def _extract_ccda(path: Path) -> str | None:
         )
     with path.open("rb") as fh:
         head = fh.read(_CCDA_SNIFF_BYTES)
+    # Cheap negative first, so an ordinary `.xml` is never read whole or parsed.
+    if b"urn:hl7-org:v3" not in head or b"ClinicalDocument" not in head:
+        return None
+    data = path.read_bytes()           # bounded by the cap checked above
     # A conformant CCDA has no internal subset, and stdlib `ET` *does* expand internal
     # entities — so a `<!DOCTYPE` is refused here rather than parsed (billion-laughs on
     # a file whose bytes are well under the cap). Falling through costs nothing: today
     # such a file goes to tesseract anyway.
-    if b"<!doctype" in head.lower():
-        return None
-    # Cheap negative first, so an ordinary `.xml` is never fully parsed.
-    if b"urn:hl7-org:v3" not in head or b"ClinicalDocument" not in head:
+    if _xml_declares_doctype(data):
         return None
     try:
-        root = ET.parse(path).getroot()
+        root = ET.fromstring(data)     # the bytes already in hand, not a second read
     except ET.ParseError:
         # Malformed XML is not *detectably* a CCDA, so it takes today's path.
         return None
