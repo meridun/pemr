@@ -942,7 +942,12 @@ default to the same exclusion unless a human explicitly decides otherwise.
   abnormal labs, open follow-ups, open conflicts. One query bundle → Markdown. The
   conflicts section is not decoration: an open conflict means a stored value is disputed
   and its correction is still staged, so the summary would otherwise print the stale
-  value silently (the brief carries the same section, but it is per-appointment).
+  value silently (the brief carries the same section, but it is per-appointment). An
+  order in `Orders & Referrals` leaves the section once a matching `lab_result` lands
+  (issue #128) — matching is deliberately narrow (exact `key_token` plus a tight,
+  edge-tested date window) and biased toward under-suppression, since age alone is never
+  a signal and a hidden-but-still-open order would be the worse failure; the window
+  constants are guarded by a pinned edge test so a casual widening doesn't slip through.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.

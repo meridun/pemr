@@ -291,14 +291,126 @@ def test_summary_orders_undated_earlier_row_keeps_the_count(seeded):
     assert "first" not in section
 
 
-def test_summary_orders_newest_first_undated_last(seeded):
-    """Orders are actionable events, so the section leads with the most recent (the other
-    event sections' ordering), undated last then alphabetical."""
+def test_summary_orders_oldest_first_undated_last(seeded):
+    """Issue #128: what survives suppression is what is still *outstanding*, and the
+    order open longest is the most actionable row -- so this section leads with the
+    oldest, diverging from the other event sections' newest-first. Undated last, then
+    alphabetical."""
     _seed_orders(seeded, [{"key": "sleep study", "observed_at": "2026-07-01"}])
     section = _orders_section(seeded)
-    assert (section.index("sleep study")
-            < section.index("cervical collar")
-            < section.index("outpatient physical therapy"))
+    assert (section.index("cervical collar")                  # 2026-02-01
+            < section.index("sleep study")                    # 2026-07-01
+            < section.index("outpatient physical therapy"))   # undated
+
+
+# --- issue #128: an order with a result is no longer outstanding ---------------
+#
+# `Orders & Referrals` listed every `obs_type='order'` row ever stored, so a section
+# meant to read as "still open" filled up with orders resulted years ago -- most of them
+# on the order date itself. Suppression is render-only inference (no FK exists) and is
+# biased hard toward *under*-suppressing: hiding a genuinely open order is the miss this
+# section exists to prevent. The `seeded` fixture already carries jane's four results --
+# HbA1c 2024-01-01, LDL 2025-01-01, Glucose fasting 2026-01-01, TSH 2023-01-01.
+
+def test_summary_orders_resulted_order_is_suppressed(seeded):
+    """The common case from the problem statement: ordered and resulted the same day."""
+    _seed_orders(seeded, [{"key": "HbA1c", "observed_at": "2024-01-01"}])
+    section = _orders_section(seeded)
+    assert "HbA1c" not in section
+    assert "cervical collar" in section          # control: unresulted rows untouched
+
+
+def test_summary_orders_result_within_window_suppresses(seeded):
+    """Matching is a bounded window around the order date, not exact-date equality: a
+    draw that lands a few days after the order still closes it."""
+    _seed_orders(seeded, [{"key": "LDL", "observed_at": "2024-12-20"}])  # result 2025-01-01
+    assert "LDL" not in _orders_section(seeded)
+
+
+def test_summary_orders_match_window_edges_are_exact(seeded):
+    """...and the window is a hard `[-1, +30]` days around the order date, pinned on
+    both edges so any later widening is a deliberate edit rather than a drift (widening
+    is the over-suppression risk this design is built against). A result on day +30
+    closes its order, day +31 does not; a draw dated one day *ahead* of the order text
+    still closes it, two days ahead does not -- that one answered an earlier order."""
+    _seed_orders(seeded, [
+        {"key": "TSH", "observed_at": "2022-12-02"},               # result +30d: closed
+        {"key": "HbA1c", "observed_at": "2023-12-01"},             # result +31d: open
+        {"key": "LDL", "observed_at": "2025-01-02"},               # result -1d: closed
+        {"key": "Glucose, fasting", "observed_at": "2026-01-03"},  # result -2d: open
+    ])
+    section = _orders_section(seeded)
+    assert "TSH" not in section
+    assert "LDL" not in section
+    assert "- HbA1c  (ordered 2023-12-01)" in section
+    assert "- Glucose, fasting  (ordered 2026-01-03)" in section
+
+
+def test_summary_orders_open_order_is_never_aged_out(seeded):
+    """Age is never a suppression signal (the issue's whole point): a 2019 order no
+    result answers keeps rendering, and a result four years adrift does not close it."""
+    _seed_orders(seeded, [{"key": "TSH", "observed_at": "2019-01-01"}])  # result 2023-01-01
+    assert "- TSH  (ordered 2019-01-01)" in _orders_section(seeded)
+
+
+def test_summary_orders_referral_without_result_still_renders(seeded):
+    """Referral/DME orders have no `lab_result` by construction, so they fall through the
+    matching untouched -- which is already the wanted "still open" behaviour."""
+    _seed_orders(seeded, [{"key": "HbA1c", "observed_at": "2024-01-01"}])
+    section = _orders_section(seeded)
+    assert "- cervical collar - Dr. Smith, ortho  (ordered 2026-02-01)" in section
+    assert "- outpatient physical therapy" in section
+    assert "HbA1c" not in section                # the lab order beside them is gone
+
+
+def test_summary_orders_qualifier_result_does_not_close_plain_order(seeded):
+    """Matching runs on the same `key_token` the grouping fold uses (issue #71), so the
+    two layers can never disagree about what one item is: a plain `HbA1c` result does not
+    close a point-of-care `HbA1c (POC)` order."""
+    _seed_orders(seeded, [{"key": "HbA1c (POC)", "observed_at": "2024-01-01"}])
+    assert "HbA1c (POC)" in _orders_section(seeded)
+
+
+def test_summary_orders_suppression_decides_on_the_latest_row(seeded):
+    """Suppression is asked of the group's *latest* row -- the live restatement the
+    bullet already speaks for -- and runs after the fold, so the `+N earlier` disclosure
+    is unchanged for what still renders (issue #93 preserved)."""
+    _seed_orders(seeded, [
+        {"key": "HbA1c", "observed_at": "2024-01-01"},   # resulted the same day
+        {"key": "HbA1c", "observed_at": "2026-06-01"},   # re-ordered, no result yet
+    ])
+    section = _orders_section(seeded)
+    assert section.count("HbA1c") == 1
+    assert "- HbA1c  (ordered 2026-06-01; +1 earlier, first 2024-01-01)" in section
+
+
+def test_summary_orders_superseded_result_does_not_suppress(seeded):
+    """A result a human ruled superseded sits in the appendix, not in the record -- so it
+    cannot be the thing that closed an order, and the order comes back."""
+    _seed_orders(seeded, [{"key": "HbA1c", "observed_at": "2024-01-01"}])
+    assert "HbA1c" not in _orders_section(seeded)
+    _annotate(seeded, "lab_result", "test_name", "HbA1c", status="superseded",
+              note="wrong patient")
+    assert "- HbA1c  (ordered 2024-01-01)" in _orders_section(seeded)
+
+
+def test_summary_orders_other_person_result_does_not_suppress(seeded):
+    """`person_id` scoping: john's identically-named result must not close jane's order
+    (his LDL is collected 2026-01-01, jane's own a year earlier and out of window)."""
+    _seed_orders(seeded, [{"key": "LDL", "observed_at": "2026-01-01"}])
+    assert "- LDL  (ordered 2026-01-01)" in _orders_section(seeded)
+
+
+def test_summary_orders_suppression_is_render_only(seeded):
+    """AC8: nothing is deleted or mutated -- the suppressed order is still in the DB,
+    exactly where `record show` would find it."""
+    _seed_orders(seeded, [{"key": "HbA1c", "observed_at": "2024-01-01"}])
+    before = _row_counts(seeded)
+    assert "HbA1c" not in _orders_section(seeded)
+    assert _row_counts(seeded) == before
+    assert seeded.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order' AND key='HbA1c'"
+    ).fetchone()["n"] == 1
 
 
 def test_summary_latest_vitals_pick(seeded):
