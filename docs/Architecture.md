@@ -797,11 +797,22 @@ tables as tab-delimited rows, prefixed with the `recordTarget` patient name and 
 time so the owner check has an identity to match. Detection is the parsed **root element**
 (`{urn:hl7-org:v3}ClinicalDocument`), never the suffix — `.xml` is a container, so any
 other XML keeps the OCR route. A `<!DOCTYPE` is refused before parsing (stdlib
-`ElementTree` expands internal entities, and the size cap does not bound expansion) — the
-refusal scans the **whole prolog**, stepping over comments and PIs rather than a fixed
-head window, because a leading comment pads the DOCTYPE past any window while the CCDA
-markers stay inside it. A malformed file is simply "not detectably a CCDA" and falls
-through. The narrative walk
+`ElementTree` expands internal entities, and the size cap does not bound expansion: a
+1.4 KB file rendered 1 MB of text, a 2 MB one 210 MB). That refusal is **encoding-agnostic
+by construction** — it asks expat, through a probe that aborts at whichever comes first,
+the DOCTYPE declaration or the root start tag, rather than scanning for byte patterns.
+Two hand-rolled scanners were bypassed before it: a fixed head window (a leading comment
+pads the DOCTYPE past it while the CCDA markers stay inside), then a whole-prolog ASCII
+scan (in UTF-16 every marker is `<\x00!\x00…`, so the scan read the first `<` as a start
+tag and never saw the DOCTYPE, while ASCII marker bytes smuggled into a CJK comment kept
+the file sniffing as a CCDA). Establishing the encoding is exactly what a byte scanner
+must re-implement to be correct, and expat has already done it — from the BOM and the
+`encoding=` pseudo-attribute — before it reports either event, so asking it is both
+cheaper and the version that cannot be re-bypassed. Detection itself stays a *cheap ASCII
+negative* over the first 8 KB, which means a genuine UTF-16 CCDA is not read natively and
+keeps today's OCR route: a deliberate narrowing, since a negative filter can be
+conservative for free while the refusal cannot. A malformed file is simply "not detectably
+a CCDA" and falls through. The narrative walk
 is **iterative, not recursive**: nesting depth is document-controlled and ~1500 levels fit
 in 30 KB, so a recursive walk hit `RecursionError` — a `RuntimeError`, outside the
 best-effort handler — and cost the whole document. `RecursionError` is caught there now

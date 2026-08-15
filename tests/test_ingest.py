@@ -1069,6 +1069,126 @@ def test_ccda_with_a_harmless_prolog_comment_still_reads_natively(
     assert "Ferritin" in result.document.ocr_text
 
 
+# --- the DOCTYPE guard has to be encoding-agnostic (issue #138 audit) ------------- #
+#
+# Two byte scanners were bypassed before the current expat probe. The second one
+# matched raw ASCII `<!--`/`<?`/`<!doctype`, which in UTF-16 are `<\x00!\x00...`: the
+# first `<` looked like a start tag, the scan declared the prolog over, and the DOCTYPE
+# went unseen. The file still *sniffed* as a CCDA because ASCII marker bytes are
+# trivially smuggled into a UTF-16 comment — one CJK character carries two of them —
+# so the bomb took the native route and a 1.4 KB file rendered 1 MB of text.
+
+def _utf16_smuggled(marker: str, big_endian: bool = False) -> str:
+    """Characters whose UTF-16 bytes spell ``marker`` in ASCII (for the sniff)."""
+    hi, lo = (0, 8) if big_endian else (8, 0)
+    return "".join(
+        chr((ord(marker[i]) << lo) | (ord(marker[i + 1]) << hi))
+        for i in range(0, len(marker), 2)
+    )
+
+
+def _entity_bomb_doctype(levels=7, width=4, leaf=64):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+    chain = "".join(
+        f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
+    )
+    return f'<!DOCTYPE ClinicalDocument [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+
+
+@pytest.mark.parametrize(
+    "encoding, bom, big_endian",
+    [
+        ("utf-16-le", b"\xff\xfe", False),
+        ("utf-16-be", b"\xfe\xff", True),
+    ],
+    ids=["utf-16-le", "utf-16-be"],
+)
+def test_ccda_doctype_in_a_utf16_document_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch, encoding, bom, big_endian
+):
+    """The refusal must hold in an encoding whose bytes no ASCII scan can read.
+
+    Non-vacuous by construction: the smuggled markers make the file pass the ASCII
+    sniff, so it *is* a CCDA candidate and only the DOCTYPE guard stands between it and
+    a parse that expands the internal subset."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    markers = _utf16_smuggled("urn:hl7-org:v3", big_endian) + _utf16_smuggled(
+        "ClinicalDocument", big_endian
+    )
+    body = _make_ccda(tmp_path, name="utf16-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+        .replace("?>", f"?><!-- {markers} -->{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "utf16-doctype.xml"
+    src.write_bytes(bom + doc.encode(encoding))
+
+    raw = src.read_bytes()
+    assert b"urn:hl7-org:v3" in raw and b"ClinicalDocument" in raw   # sniffs as CCDA
+    assert ingest._xml_declares_doctype(raw) is True
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]                       # fell through to today's route
+    assert result.document.ocr_text == "scanned"    # no amplified text stored
+    assert "A" * 200 not in (result.document.ocr_text or "")
+
+
+def test_utf16_ccda_without_a_doctype_keeps_the_unchanged_ocr_route(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The mirror case, pinned as a deliberate product decision rather than an accident.
+
+    The sniff matches ASCII marker bytes, so a *genuine* UTF-16 CCDA is not detected and
+    keeps today's tesseract route. Narrowing the negative filter costs nothing beyond
+    the status quo (US portal exports are UTF-8); it is the DOCTYPE refusal, not the
+    sniff, that has to be right for every encoding."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    body = _make_ccda(tmp_path, name="utf16-plain-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "utf16-plain.xml"
+    # a well-formed UTF-16 CCDA (declaration and BOM agree), not a mangled one
+    src.write_bytes(body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+                    .encode("utf-16"))
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_doctype_probe_refuses_before_the_internal_subset_expands(tmp_path):
+    """Unit-level proof of *why* the probe is safe: expat reports the DOCTYPE before it
+    reads the subset, so the amplification never happens. A 1.4 KB file that would
+    render ~1 MB is refused, and refusing it does not cost the expansion."""
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="bomb-src.XML").read_text(encoding="utf-8")
+    doc = body.replace("?>", f"?>{doctype}", 1).replace(
+        "Ferritin 201 ng/mL", f"&e{levels};"
+    )
+    src = tmp_path / "bomb.xml"
+    src.write_text(doc, encoding="utf-8")
+    assert src.stat().st_size < 4096            # small enough to clear the byte cap
+    assert ingest._xml_declares_doctype(src.read_bytes()) is True
+    assert ingest._extract_ccda(src) is None    # never rendered, so never amplified
+
+
+def test_a_doctype_the_probe_cannot_reach_still_falls_through(tmp_path):
+    """A parse error is the other ``False`` arm, and it is safe because it is the same
+    expat: whatever the probe cannot read, the `ET.fromstring` after it cannot read
+    either, so the file takes the unchanged non-CCDA route. Pinned on a lowercase
+    ``<!doctype``, which is not well-formed XML at all."""
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="lower-src.XML").read_text(encoding="utf-8")
+    doc = body.replace(
+        "?>", f"?>{doctype.replace('<!DOCTYPE', '<!doctype')}", 1
+    ).replace("Ferritin 201 ng/mL", f"&e{levels};")
+    src = tmp_path / "lowercase-doctype.xml"
+    src.write_text(doc, encoding="utf-8")
+    assert ingest._xml_declares_doctype(src.read_bytes()) is False
+    assert ingest._extract_ccda(src) is None    # refused all the same
+
+
 def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
     """The point of the issue: `recordTarget` is an identity the check can use, so a
     CCDA no longer degrades to "filed on your say-so"."""

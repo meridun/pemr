@@ -48,6 +48,7 @@ import subprocess
 import sqlite3
 import sys
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 import zipfile
 import uuid
 from dataclasses import dataclass
@@ -631,36 +632,56 @@ def _ccda_header(root: ET.Element) -> list[str]:
     return lines
 
 
+class _DoctypeFound(Exception):
+    """Sentinel: the prolog probe reached a ``<!DOCTYPE`` declaration."""
+
+
+class _PrologOver(Exception):
+    """Sentinel: the prolog probe reached the root element's start tag."""
+
+
 def _xml_declares_doctype(data: bytes) -> bool:
     """True when a ``<!DOCTYPE`` sits in the XML **prolog**.
 
     The prolog — everything before the root element's start tag — is the only place a
-    DOCTYPE may legally appear, and comments and processing instructions are the only
-    other markup allowed there, so the scan steps over those and stops at the first
-    element. Scanning a fixed head window instead is not enough: a leading comment pads
-    the DOCTYPE past any window while the CCDA markers stay inside it, and the internal
-    subset it smuggles through is an entity-amplification bomb the byte cap does not
-    bound (a 2 MB file rendered 197 MB of text; issue #138 audit). Stepping over
-    comments rather than stopping at the first ``<`` matters for the same reason: a
-    comment may itself contain something that looks like a start tag.
+    DOCTYPE may legally appear, and the internal subset it can carry is an
+    entity-amplification bomb the byte cap does not bound (a 1.4 KB file rendered 1 MB
+    of text, a 2 MB one 210 MB; issue #138 audit).
+
+    The check is **encoding-agnostic by construction**: it asks expat — the same parser
+    :func:`_extract_ccda` is about to hand the bytes to — rather than scanning for byte
+    patterns. Two hand-rolled byte scanners were bypassed before this one: a fixed head
+    window (a leading comment pads the DOCTYPE past it while the CCDA markers stay
+    inside), and a whole-prolog scan for ASCII ``<!--``/``<?``/``<!doctype`` (in a
+    UTF-16 document every marker is ``<\\x00!\\x00…``, so the scan mistook the first
+    ``<`` for a start tag and the DOCTYPE was never seen). Establishing the encoding is
+    exactly the work a scanner has to re-implement to be correct, and expat has already
+    done it — from the BOM and the ``encoding=`` pseudo-attribute — by the time it
+    reports either event.
+
+    Nothing expands: expat fires ``StartDoctypeDeclHandler`` *before* it reads the
+    internal subset, and the probe aborts out of the parse there. A document with no
+    DOCTYPE costs only the prolog — the parse aborts at the root start tag rather than
+    reading the body. A parse error means expat cannot read the file at all, so the
+    :func:`ET.fromstring` below cannot either (same parser): ``False`` sends it down the
+    unchanged non-CCDA route.
     """
-    i = 0
-    while (start := data.find(b"<", i)) >= 0:
-        if data.startswith(b"<!--", start):
-            end = data.find(b"-->", start + 4)
-            if end < 0:
-                return False           # unterminated: no root element follows either
-            i = end + 3
-        elif data.startswith(b"<?", start):
-            end = data.find(b"?>", start + 2)
-            if end < 0:
-                return False
-            i = end + 2
-        elif data[start:start + 9].lower() == b"<!doctype":
-            return True
-        else:
-            return False               # a start tag (or junk) — the prolog is over
-    return False
+    def _doctype(*_args: object) -> None:
+        raise _DoctypeFound
+
+    def _element(*_args: object) -> None:
+        raise _PrologOver
+
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = _doctype
+    parser.StartElementHandler = _element
+    try:
+        parser.Parse(data, True)
+    except _DoctypeFound:
+        return True
+    except (_PrologOver, expat.ExpatError):
+        return False
+    return False                       # no root element at all — `ET` will reject it too
 
 
 def _extract_ccda(path: Path) -> str | None:
@@ -678,7 +699,13 @@ def _extract_ccda(path: Path) -> str | None:
         )
     with path.open("rb") as fh:
         head = fh.read(_CCDA_SNIFF_BYTES)
-    # Cheap negative first, so an ordinary `.xml` is never read whole or parsed.
+    # Cheap negative first, so an ordinary `.xml` is never read whole or parsed. The
+    # markers are matched as raw ASCII, so a CCDA in an encoding that is not
+    # ASCII-compatible (UTF-16/UTF-32) sniffs as non-CCDA and keeps today's tesseract
+    # route. That narrowing is deliberate: US portal exports are UTF-8, and the sniff
+    # is a *negative* filter — being conservative here costs nothing beyond the status
+    # quo, whereas the DOCTYPE refusal below has to be right for every encoding, which
+    # is why it asks expat instead of matching bytes.
     if b"urn:hl7-org:v3" not in head or b"ClinicalDocument" not in head:
         return None
     data = path.read_bytes()           # bounded by the cap checked above
