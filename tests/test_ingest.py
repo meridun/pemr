@@ -1023,8 +1023,13 @@ def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
     assert result.owner_check.verdict == "match"
     assert result.owner_check.blocks is False
     # ...and the protective half still fires on this route.
-    other = _make_ccda(tmp_path, name="DOC0002.XML", patient=("Robert Alan", "Roe"),
-                       birth="")
+    # `pii-allow`: the roster placeholder "Robert Alan Roe" (see BOB above), split into
+    # CDA's `<given>`/`<family>` — the scanner reads the given half as first+last.
+    other = _make_ccda(
+        tmp_path, name="DOC0002.XML",
+        patient=("Robert Alan", "Roe"),  # pii-allow
+        birth="",
+    )
     with pytest.raises(ingest.OwnerMismatchError) as excinfo:
         ingest.ingest_document(conn, other, "jane-doe", sources, ocr=True)
     assert excinfo.value.check.verdict == "mismatch"
