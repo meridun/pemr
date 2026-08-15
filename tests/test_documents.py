@@ -1484,3 +1484,58 @@ def test_cli_document_reocr_leaves_records_and_keys_untouched(cli_ready, capsys)
     assert sorted(
         p.read_bytes() for p in (cli_ready / "sources").rglob("*.txt")
     ) == blob_bytes
+
+
+def test_cli_document_reocr_names_truncation_on_the_write_path_too(
+    cli_ready, capsys, monkeypatch
+):
+    """The dry-run names an over-cap document; so must the run that writes for real.
+    A sweep is exactly where the operator is *not* looking at the document, so a
+    truncation notice that only appears under `--dry-run` is a notice nobody sees."""
+    _ingest_textless(cli_ready, "bundle.txt", b"a long scanned bundle of pages")
+    monkeypatch.setattr(ingest, "pdf_page_count", lambda src: 21)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  written" in out
+    assert f"pages: 21 (over the {ingest.OCR_MAX_PAGES}-page cap" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) == "a long scanned bundle of pages"
+
+
+def test_cli_document_reocr_stores_what_ingest_would_have_stored(cli_ready, capsys):
+    """The anti-drift claim at the operator's surface: the same bytes ingested with
+    `--ocr auto` today, and ingested textless then repaired with `reocr`, end up with
+    byte-identical `ocr_text`. Two archives, because layer-1 dedup rightly refuses the
+    same sha twice inside one."""
+    content = b"MERIDIAN FAMILY CLINIC\nSodium 140 mmol/L\nrepeat panel in six months\n"
+    blob = cli_ready / "panel.txt"
+    blob.write_bytes(content)
+
+    # Archive A - ingested after the extractor could read it.
+    other = cli_ready / "other"
+    other.mkdir()
+    assert cli.main(["--db", str(other / "cli.db"), "migrate", "--create"]) == 0
+    assert cli.main(["--db", str(other / "cli.db"), "person", "add",
+                     "--slug", "jane-doe", "--name", "Jane"]) == 0
+    assert cli.main(["--db", str(other / "cli.db"), "ingest", str(blob),
+                     "--person", "jane-doe", "--sources", str(other / "sources"),
+                     "--ocr", "auto"]) == 0
+
+    # Archive B - the #143 population: same bytes, ingested before it could.
+    _ingest_textless(cli_ready, "panel-copy.txt", content)
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+
+    conn = db.connect(other / "cli.db")
+    try:
+        at_ingest = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    assert at_ingest, "the --ocr auto ingest stored nothing; the comparison is vacuous"
+    assert _ocr_text_of(cli_ready, 2) == at_ingest
