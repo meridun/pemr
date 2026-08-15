@@ -444,6 +444,79 @@ def test_review_conflicts_listing_reports_family_size(seeded, tmp_path, monkeypa
     assert mcp_server.review_conflicts(seeded)[0]["occurrences"] == 2
 
 
+def _stage_med_conflict(seeded, tmp_path, monkeypatch, stored, incoming) -> int:
+    """One open medication conflict on a single identity (issue #140's shape: a portal
+    export refining some fields and silent about others); returns its conflict id."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    identity = {"name": "metformin", "dose": "500 mg", "started_on": "2024-01-05"}
+    for name, payload in (("m1.txt", stored), ("m2.txt", incoming)):
+        scan = tmp_path / name
+        scan.write_bytes(name.encode())
+        doc = mcp_server.ingest_document(
+            seeded, file=str(scan), person="jane-doe", ocr_text="metformin",
+        )["document"]["document_id"]
+        mcp_server.commit_extraction(seeded, document_id=doc, records={
+            "medication": [identity | payload],
+        })
+    return mcp_server.review_conflicts(seeded)[0]["conflict_id"]
+
+
+def test_review_conflicts_merge_requires_signoff_and_reports_fields(
+    seeded, tmp_path, monkeypatch
+):
+    """`merge` writes, so it goes through the *same* sign-off gate - no new bypass -
+    and its payload names the fields per side without echoing any value."""
+    cid = _stage_med_conflict(
+        seeded, tmp_path, monkeypatch,
+        {"prescriber": "Dr Who", "route": "oral"},
+        {"route": "oral", "status": "active"},
+    )
+    with pytest.raises(mcp_server.ToolError, match="sign-off"):
+        mcp_server.review_conflicts(seeded, resolve=cid, keep="merge")
+    assert seeded.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+    res = mcp_server.review_conflicts(
+        seeded, resolve=cid, keep="merge",
+        signoff="Jane said take the portal status and keep the prescriber",
+    )
+    assert res["keep"] == "merge" and res["record_type"] == "medication"
+    assert (res["taken"], res["preserved"], res["settled"]) == (
+        ["status"], ["prescriber"], {})
+    assert "Dr Who" not in str(res)
+    row = seeded.execute(
+        "SELECT * FROM medication WHERE medication_id = ?", (res["row_id"],)
+    ).fetchone()
+    assert (row["status"], row["prescriber"]) == ("active", "Dr Who")
+
+
+def test_review_conflicts_merge_collision_refuses_until_a_field_is_settled(
+    seeded, tmp_path, monkeypatch
+):
+    cid = _stage_med_conflict(
+        seeded, tmp_path, monkeypatch,
+        {"status": "ordered", "prescriber": "Dr Who"},
+        {"status": "completed"},
+    )
+    with pytest.raises(mcp_server.ToolError, match="status"):
+        mcp_server.review_conflicts(seeded, resolve=cid, keep="merge",
+                                    signoff="Jane said merge them")
+    assert seeded.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+    res = mcp_server.review_conflicts(
+        seeded, resolve=cid, keep="merge", fields={"status": "incoming"},
+        signoff="Jane said the portal status wins",
+    )
+    assert res["settled"] == {"status": "incoming"}
+    row = seeded.execute(
+        "SELECT * FROM medication WHERE medication_id = ?", (res["row_id"],)
+    ).fetchone()
+    assert (row["status"], row["prescriber"]) == ("completed", "Dr Who")
+
+
 def test_review_conflicts_rejects_an_unknown_keep(seeded, tmp_path, monkeypatch):
     cid = _stage_repeat_draw(seeded, tmp_path, monkeypatch)
     with pytest.raises(mcp_server.ToolError, match="keep must be"):

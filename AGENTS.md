@@ -282,8 +282,8 @@ Agents never resolve staged conflicts silently.
 
 - `review_conflicts` with no `resolve` id **lists** conflicts — call it freely.
 - **Resolution requires explicit human sign-off.** The human must have named the specific conflict
-  and the chosen resolution (`keep existing` / `keep incoming` / `keep both`) in the current
-  session. "Clean this up", silence, or a standing general instruction is **not** sign-off.
+  and the chosen resolution (`keep existing` / `keep incoming` / `keep both` / `keep merge`) in the
+  current session. "Clean this up", silence, or a standing general instruction is **not** sign-off.
 - Mechanically: `review_conflicts(resolve=…)` requires a non-empty `signoff` param quoting the
   human's instruction verbatim; the wrapper refuses the write otherwise and stores the sign-off
   text with the resolution.
@@ -305,6 +305,15 @@ Agents never resolve staged conflicts silently.
   disagreement (`criticality: high` vs `low`) does not also erase a `reaction` the incoming
   document simply didn't repeat. On the dated types an unstated field IS a clearing and is written
   as one.
+- `keep merge` is the field-level resolution for exactly that dated-type case: a document that
+  **refines** some fields and is silent about others (a portal export restating a medication with a
+  better sig and no prescriber). It takes what the incoming row states over a stored NULL, keeps
+  what it leaves unstated, and does **not** guess where both rows state different values — it
+  refuses the whole resolution and names the colliding fields. Report that refusal to the human and
+  ask which side wins per field; `fields={"<field>": "existing"|"incoming"}` (CLI: `--field
+  NAME=existing|incoming`) settles one, and only a field that genuinely collides may appear there.
+  On a standing-fact type merge always refuses, because a conflict there is present-and-different by
+  construction — use `keep incoming` for those.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
   that is an extraction error, not a conflict. For `observation`, re-read the source for times; if
   there genuinely are none, submit them separately and ask the human about `keep both`. For

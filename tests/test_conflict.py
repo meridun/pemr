@@ -524,3 +524,251 @@ def test_keep_existing_and_incoming_still_return_a_result(conn, staged):
     result = dedup.resolve_conflict(conn, staged, keep="existing")
     assert (result.kept, result.row_id, result.occurrence) == ("existing", None, None)
     assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 1
+
+
+# --- keep merge: field-level resolution (issue #140) --------------------------
+#
+# The shape the row-level keeps cannot express: a portal export restates a current
+# medication list, refining `status` and the sig while carrying no prescriber. `keep
+# existing` drops the refinement, `keep incoming` erases the prescriber the record
+# already had, `keep both` forks one prescription into two rows.
+
+def _med(**payload):
+    """One medication identity (name/dose/started_on), payload fields per call."""
+    return {"name": "metformin", "dose": "500 mg", "started_on": "2024-01-05"} | payload
+
+
+def _stage_med(conn, stored: dict, incoming: dict) -> int:
+    """One open medication conflict from two documents; returns its conflict_id."""
+    dedup.commit_extraction(conn, _doc(conn, "med-a"), {"medication": [_med(**stored)]})
+    summary = dedup.commit_extraction(
+        conn, _doc(conn, "med-b"), {"medication": [_med(**incoming)]}
+    )
+    assert summary.counts["conflict"] == 1
+    return dedup.list_conflicts(conn)[-1]["conflict_id"]
+
+
+def _med_row(conn):
+    return conn.execute("SELECT * FROM medication").fetchone()
+
+
+def test_merge_fills_a_stored_null_from_incoming(conn):
+    cid = _stage_med(conn, {"route": "oral"}, {"route": "oral", "status": "active"})
+    result = dedup.resolve_conflict(conn, cid, keep="merge")
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 1
+    assert _med_row(conn)["status"] == "active"
+    assert (result.kept, result.gains) == ("merge", {"status": "active"})
+
+
+def test_merge_preserves_a_field_the_incoming_row_leaves_null(conn):
+    """The headline regression: the incoming row is *silent* about prescriber, which
+    keep-incoming would write as a clearing on a dated type."""
+    cid = _stage_med(
+        conn,
+        {"prescriber": "Dr Who", "frequency": "1 tablet twice a day"},
+        {"prescriber": None, "frequency": "1 tablet twice a day", "status": "active"},
+    )
+    result = dedup.resolve_conflict(conn, cid, keep="merge")
+
+    row = _med_row(conn)
+    assert (row["prescriber"], row["status"]) == ("Dr Who", "active")
+    assert result.preserved == ["prescriber"]
+
+
+def test_merge_leaves_agreeing_fields_unchanged(conn):
+    cid = _stage_med(
+        conn,
+        {"route": "oral", "prescriber": "Dr Who"},
+        {"route": "oral", "prescriber": "Dr Who", "status": "active"},
+    )
+    result = dedup.resolve_conflict(conn, cid, keep="merge")
+
+    assert _med_row(conn)["route"] == "oral"
+    assert "route" not in result.gains and "route" not in result.preserved
+
+
+def test_merge_inherits_the_duplicate_comparisons_unit_normalization(conn):
+    """`_values_agree` is shared with `_rows_equal`, so a casing variant of a stated
+    unit is agreement here too - not a collision to refuse over."""
+    dedup.commit_extraction(conn, _doc(conn, "u-a"), {"lab_result": [
+        {"test_name": "glucose", "collected_at": "2026-02-01",
+         "value_num": 99, "unit": "mg/dL"}]})
+    dedup.commit_extraction(conn, _doc(conn, "u-b"), {"lab_result": [
+        {"test_name": "glucose", "collected_at": "2026-02-01",
+         "value_num": 99, "unit": "MG/DL", "flag": "normal"}]})
+    cid = dedup.list_conflicts(conn)[-1]["conflict_id"]
+
+    result = dedup.resolve_conflict(conn, cid, keep="merge")
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert row["unit"] == "mg/dL"            # stored display casing untouched
+    assert (row["flag"], result.gains) == ("normal", {"flag": "normal"})
+
+
+def test_merge_refuses_a_true_collision(conn):
+    """The issue's second case: `ordered` -> `completed` is a real disagreement, so
+    keep-merge refuses rather than picking a side."""
+    cid = _stage_med(
+        conn,
+        {"status": "ordered", "prescriber": "Dr Who", "ended_on": "2024-11-11"},
+        {"status": "completed", "prescriber": None},
+    )
+    with pytest.raises(ValueError, match="keep-merge cannot decide status"):
+        dedup.resolve_conflict(conn, cid, keep="merge")
+
+    row = _med_row(conn)
+    assert (row["status"], row["prescriber"], row["ended_on"]) == (
+        "ordered", "Dr Who", "2024-11-11")
+    assert row["document_id"] == 1            # provenance untouched too
+    conflict = conn.execute(
+        "SELECT * FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()
+    assert (conflict["status"], conflict["resolved_at"]) == ("open", None)
+
+
+def test_merge_collision_error_names_every_colliding_field_and_no_values(conn):
+    cid = _stage_med(
+        conn,
+        {"status": "ordered", "route": "oral"},
+        {"status": "completed", "route": "subcutaneous"},
+    )
+    with pytest.raises(ValueError) as exc:
+        dedup.resolve_conflict(conn, cid, keep="merge")
+    message = str(exc.value)
+    assert "route, status" in message or "status, route" in message
+    assert "ordered" not in message and "subcutaneous" not in message
+    assert message.isascii()                  # printed by the CLI (issue #23)
+
+
+def test_merge_settles_a_collision_with_an_explicit_field_choice(conn):
+    """The issue's first case end to end: status is a gain, the sig a settled
+    collision, the prescriber preserved."""
+    cid = _stage_med(
+        conn,
+        {"prescriber": "Dr Who", "frequency": "1 tablet twice a day"},
+        {"status": "active",
+         "frequency": "Take 1 tablet by mouth in the morning and 1 before bedtime."},
+    )
+    result = dedup.resolve_conflict(
+        conn, cid, keep="merge", fields={"frequency": "incoming"}
+    )
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 1
+    row = _med_row(conn)
+    assert row["status"] == "active"
+    assert row["frequency"].startswith("Take 1 tablet by mouth")
+    assert row["prescriber"] == "Dr Who"
+    assert sorted(result.gains) == ["frequency", "status"]
+    assert (result.preserved, result.settled) == (
+        ["prescriber"], {"frequency": "incoming"})
+
+
+def test_merge_field_choice_can_keep_the_stored_side(conn):
+    cid = _stage_med(conn, {"status": "ordered"}, {"status": "completed"})
+    result = dedup.resolve_conflict(
+        conn, cid, keep="merge", fields={"status": "existing"}
+    )
+    assert _med_row(conn)["status"] == "ordered"
+    assert (result.gains, result.preserved) == ({}, ["status"])
+
+
+def test_merge_field_choice_rejects_an_unknown_field(conn):
+    cid = _stage_med(conn, {"status": "ordered"}, {"status": "completed"})
+    with pytest.raises(ValueError, match="not a mergeable medication field"):
+        dedup.resolve_conflict(conn, cid, keep="merge", fields={"dose": "incoming"})
+
+
+def test_merge_field_choice_rejects_a_non_colliding_field(conn):
+    """A stale retry or a typo'd name must not be silently absorbed - it would leave
+    the collision the operator meant to settle still unsettled."""
+    cid = _stage_med(conn, {"status": "ordered"}, {"status": "completed"})
+    with pytest.raises(ValueError, match="nothing to settle for route"):
+        dedup.resolve_conflict(conn, cid, keep="merge", fields={"route": "incoming"})
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+
+def test_merge_field_choice_rejects_an_invalid_side(conn):
+    cid = _stage_med(conn, {"status": "ordered"}, {"status": "completed"})
+    with pytest.raises(ValueError, match="side must be"):
+        dedup.resolve_conflict(conn, cid, keep="merge", fields={"status": "newest"})
+
+
+def test_field_choices_are_rejected_for_the_other_keeps(conn, staged):
+    with pytest.raises(ValueError, match="only apply to keep 'merge'"):
+        dedup.resolve_conflict(
+            conn, staged, keep="incoming", fields={"unit": "incoming"}
+        )
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (staged,)
+    ).fetchone()["status"] == "open"
+
+
+def test_merge_records_an_auditable_resolution(conn):
+    cid = _stage_med(
+        conn,
+        {"prescriber": "Dr Who", "status": "ordered"},
+        {"status": "completed", "route": "oral"},
+    )
+    dedup.resolve_conflict(
+        conn, cid, keep="merge", fields={"status": "incoming"}, note="Jane confirmed"
+    )
+    resolution = conn.execute(
+        "SELECT resolution FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["resolution"]
+
+    assert resolution.startswith("keep-merge -> medication #1")
+    assert "from incoming: route, status" in resolution
+    assert "kept: prescriber" in resolution
+    assert "settled: status=incoming" in resolution
+    assert "Jane confirmed" in resolution
+    for value in ("Dr Who", "ordered", "completed", "oral"):
+        assert value not in resolution.split("Jane confirmed")[0]
+
+
+def test_merge_takes_provenance_like_keep_incoming(conn):
+    """Deliberately unchanged from keep-incoming: the human ruled for the document, so
+    the row takes its document_id (and with it the issue #110 supersession)."""
+    cid = _stage_med(conn, {"route": "oral"}, {"route": "oral", "status": "active"})
+    dedup.resolve_conflict(conn, cid, keep="merge")
+    assert _med_row(conn)["document_id"] == 2
+
+
+def test_merge_never_touches_identity_or_key_columns(conn):
+    cid = _stage_med(conn, {"route": "oral"}, {"route": "oral", "status": "active"})
+    before = dict(_med_row(conn))
+    dedup.resolve_conflict(conn, cid, keep="merge")
+    after = dict(_med_row(conn))
+    for column in ("name", "dose", "started_on",
+                   "dedup_key", "dedup_base", "dedup_occurrence"):
+        assert after[column] == before[column]
+
+
+def test_merge_refuses_when_the_family_is_empty(conn, orphaned_family):
+    """Same anchor rule as keep-incoming: nothing left to merge onto is a refusal, not
+    a success that wrote nothing."""
+    _drop_occurrence(conn, 1)
+    with pytest.raises(ValueError, match="no stored lab_result row left"):
+        dedup.resolve_conflict(conn, orphaned_family, keep="merge")
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (orphaned_family,)
+    ).fetchone()["status"] == "open"
+
+
+def test_merge_on_a_sparse_type_always_refuses(conn):
+    """No type gate, and none needed: a conflict on a standing-fact type is
+    present-and-different by construction (the NULL-vs-stated case is absorbed at commit
+    time as an `enriched` gain), so the collision rule refuses it truthfully."""
+    dedup.commit_extraction(conn, _doc(conn, "al-a"), {"allergy": [
+        {"substance": "penicillin", "criticality": "high"}]})
+    summary = dedup.commit_extraction(conn, _doc(conn, "al-b"), {"allergy": [
+        {"substance": "penicillin", "criticality": "low", "reaction": "hives"}]})
+    assert summary.counts["conflict"] == 1
+    cid = dedup.list_conflicts(conn)[-1]["conflict_id"]
+
+    with pytest.raises(ValueError, match="keep-merge cannot decide criticality"):
+        dedup.resolve_conflict(conn, cid, keep="merge")
+    assert conn.execute(
+        "SELECT criticality FROM allergy"
+    ).fetchone()["criticality"] == "high"

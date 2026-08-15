@@ -326,21 +326,28 @@ def review_conflicts(
     keep: str = "existing",
     signoff: str | None = None,
     note: str | None = None,
+    fields: dict[str, str] | None = None,
     all: bool = False,
 ) -> Any:
     """[read to list / write to resolve] List or resolve staged dedup conflicts.
 
     Listing is free, and reports ``occurrences`` — how many rows are already stored
     under the conflict's identity. Resolution takes ``keep`` = ``"existing"`` (drop the
-    incoming row), ``"incoming"`` (overwrite the stored one) or ``"both"`` (admit the
+    incoming row), ``"incoming"`` (overwrite the stored one), ``"both"`` (admit the
     incoming row *alongside* the stored one as a new occurrence of that identity — for a
-    genuine repeat, e.g. two same-day draws on a report that prints no collection times).
+    genuine repeat, e.g. two same-day draws on a report that prints no collection times)
+    or ``"merge"`` (field level: take what the incoming row states over a stored NULL,
+    keep what it leaves unstated, so accepting a refinement doesn't erase the fields the
+    document is simply silent about). ``"merge"`` **refuses** when both rows state a
+    different value for a field, naming those fields and writing nothing; pass
+    ``fields`` = ``{"<field>": "existing"|"incoming"}`` to settle one, and only for a
+    field that actually collides.
 
     Listing is free. **Resolution requires explicit human sign-off** (``AGENTS.md``
-    conflict discipline) — ``"both"`` included, it admits a row rather than choosing one:
-    ``signoff`` must quote the human's instruction verbatim, or the write is refused. The
-    sign-off text is threaded into the stored resolution note so the record shows who
-    authorized it.
+    conflict discipline) — ``"both"`` and ``"merge"`` included, and a ``fields`` choice is
+    itself a decision the human has to have made: ``signoff`` must quote the human's
+    instruction verbatim, or the write is refused. The sign-off text is threaded into the
+    stored resolution note so the record shows who authorized it.
     """
     if resolve is not None:
         if not (signoff and signoff.strip()):
@@ -352,7 +359,8 @@ def review_conflicts(
         merged_note = f"signoff: {signoff.strip()}" + (f" — {note}" if note else "")
         try:
             result = _dedup.resolve_conflict(
-                conn, resolve, keep=keep, note=merged_note, dictionary=_dictionary()
+                conn, resolve, keep=keep, note=merged_note, dictionary=_dictionary(),
+                fields=fields,
             )
         # ValueError covers ValidationError, raised when a keep-both payload no longer
         # validates as a row.
@@ -365,6 +373,16 @@ def review_conflicts(
                 "row_id": result.row_id,
                 "occurrence": result.occurrence,
                 "no_op": result.no_op,
+            }
+        elif keep == "merge":
+            # Field names and sides only, never values - same rule as the stored
+            # resolution text (this payload is an audit trail too).
+            payload |= {
+                "record_type": result.record_type,
+                "row_id": result.row_id,
+                "taken": sorted(result.gains),
+                "preserved": sorted(result.preserved),
+                "settled": result.settled,
             }
         return payload
 
@@ -612,9 +630,10 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     @server.tool(name="review_conflicts", annotations=rw)
     def review_conflicts_tool(resolve: int | None = None, keep: str = "existing",
                               signoff: str | None = None, note: str | None = None,
+                              fields: dict[str, str] | None = None,
                               all: bool = False) -> object:
         return _run(review_conflicts, resolve=resolve, keep=keep, signoff=signoff,
-                    note=note, all=all)
+                    note=note, fields=fields, all=all)
 
     return server
 

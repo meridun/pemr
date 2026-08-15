@@ -2268,7 +2268,7 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
             if args.resolve is not None:
                 result = dedup.resolve_conflict(
                     conn, args.resolve, keep=args.keep, note=args.note,
-                    dictionary=dictionary,
+                    dictionary=dictionary, fields=_field_choices(args.fields),
                 )
                 print(f"resolved conflict #{args.resolve} ({_resolved_as(result)})")
                 return 0
@@ -2304,11 +2304,34 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
         count = occurrences.get(row["conflict_id"], 0)
         if count > 1:
             print(f"    occurrences: {count} rows already stored under this key")
+    # Built from KEEP_CHOICES so the hint cannot drift as modes are added.
     print(
         "\nresolve: `pemr review-conflicts --resolve <id> --keep "
-        "existing|incoming|both [--note ...]`"
+        f"{'|'.join(dedup.KEEP_CHOICES)} [--note ...]`"
+        "\n         merge = per field: take what the incoming row adds, keep what it "
+        "leaves unstated;"
+        "\n         settle a field both rows state differently with "
+        "`--field NAME=existing|incoming`"
     )
     return 0
+
+
+def _field_choices(items: list[str] | None) -> dict[str, str]:
+    """Parse repeated `--field NAME=SIDE` into the mapping `resolve_conflict` takes.
+
+    Only the *shape* is checked here; which fields are mergeable and which sides are
+    legal is `dedup`'s call, so the CLI and the MCP tool refuse identically. Both raise
+    ValueError, which `_cmd_review_conflicts` already renders as `error: ...` + exit 1.
+    """
+    choices: dict[str, str] = {}
+    for item in items or []:
+        name, sep, side = item.partition("=")
+        if not sep or not name.strip() or not side.strip():
+            raise ValueError(
+                f"--field expects NAME=existing|incoming, got {item!r}"
+            )
+        choices[name.strip()] = side.strip()
+    return choices
 
 
 def _resolved_as(result: dedup.ResolveResult) -> str:
@@ -2318,8 +2341,11 @@ def _resolved_as(result: dedup.ResolveResult) -> str:
     fills the matched sibling's NULL columns from the staged payload (issue #63). Naming
     those fields keeps the operator's line honest about the write, matching what
     `dedup._resolution_text` persists on the conflict. Field names only, never values --
-    the resolution text is an audit trail, not a place to echo clinical data.
+    the resolution text is an audit trail, not a place to echo clinical data. keep-merge
+    reports through `dedup.merge_summary`, the same wording it persists.
     """
+    if result.kept == "merge":
+        return dedup.merge_summary(result)
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
@@ -3306,9 +3332,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument(
         "--keep", choices=list(dedup.KEEP_CHOICES), default="existing",
         help="on --resolve: keep the stored row, overwrite it with the incoming one, "
-             "or 'both' = admit the incoming row alongside the stored one as a new "
+             "'both' = admit the incoming row alongside the stored one as a new "
              "occurrence of the same identity (use for a genuine repeat the source "
-             "cannot timestamp). Default existing",
+             "cannot timestamp), or 'merge' = per field, take what the incoming row "
+             "adds over a stored NULL and keep what it leaves unstated, refusing when "
+             "both rows state a different value (settle those with --field). "
+             "Default existing",
+    )
+    p_review.add_argument(
+        "--field", action="append", dest="fields", metavar="NAME=SIDE",
+        help="only with --keep merge; repeatable. Settles one field both rows state "
+             "differently: NAME=existing keeps the stored value, NAME=incoming takes "
+             "the document's. Fields that do not collide are rejected",
     )
     p_review.add_argument("--note", help="optional resolution note")
     p_review.add_argument(
