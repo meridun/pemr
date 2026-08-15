@@ -429,6 +429,57 @@ def test_validate_rejects_non_iso_date_across_record_types():
         dedup.validate_row("observation", {"obs_type": "vital", "observed_at": "2026/01/02"})
 
 
+@pytest.mark.parametrize("key", ["financial_self_management", "meal_regularity",
+                                  "medication_self_administration", "iadl_bathing"])
+def test_validate_accepts_functional_observation_keys(key):
+    # Issue #132: `functional` is a fifth obs_type and its `key` vocabulary is only
+    # lightly controlled — any sensible snake_case token validates, no dictionary gate.
+    dedup.validate_row(
+        "observation",
+        {"obs_type": "functional", "key": key, "observed_at": "2026-07-14",
+         "value_text": "stopped keeping the running balance mid-page"},
+    )
+
+
+def test_validate_accepts_functional_ordinal_value():
+    # An ordinal/scale rating is as legal as a free-text description.
+    dedup.validate_row(
+        "observation",
+        {"obs_type": "functional", "key": "meal_regularity",
+         "observed_at": "2026-07", "value_num": 2},
+    )
+
+
+def test_validate_rejects_functional_without_observed_at():
+    # The one field `functional` requires that the other families don't: an undated
+    # functional observation is the unqueryable prose the record type exists to replace.
+    with pytest.raises(dedup.ValidationError,
+                       match=r"missing required field 'observed_at'.*functional"):
+        dedup.validate_row(
+            "observation",
+            {"obs_type": "functional", "key": "financial_self_management",
+             "value_text": "stopped balancing the register"},
+        )
+
+
+@pytest.mark.parametrize("obs_type", ["vital", "order", "screening", "immunization"])
+def test_validate_still_accepts_other_obs_types_without_observed_at(obs_type):
+    # Scoping regression: the observed_at requirement is `functional`-only. Widening it
+    # would reject already-valid extractions (an undated vital or order is routine).
+    dedup.validate_row("observation", {"obs_type": obs_type, "key": "anything"})
+
+
+def test_validate_functional_date_check_runs_before_required_check():
+    # The new rule must not shadow DATE_FIELDS: a present-but-junk observed_at still
+    # reports as an ISO-date error, not as a missing field.
+    with pytest.raises(dedup.ValidationError, match=r"observed_at.*ISO date"):
+        dedup.validate_row(
+            "observation",
+            {"obs_type": "functional", "key": "meal_regularity",
+             "observed_at": "July 2026"},
+        )
+
+
 def test_commit_bad_date_rolls_back_whole_batch(conn):
     # End-to-end: a non-ISO date in a committed batch rolls the whole thing back.
     doc = _make_document(conn)
@@ -713,6 +764,66 @@ def test_serial_same_day_observations_are_distinct_rows(conn):
     summary = dedup.commit_extraction(conn, doc, {"observation": rows}, d)
     assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0, "promoted": 0}
     assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 2
+
+
+# --- functional observations (issue #132) -------------------------------------
+
+def _functional(observed_at, key="financial_self_management",
+                value_text="running balance column stops mid-page"):
+    return {"obs_type": "functional", "key": key, "observed_at": observed_at,
+            "value_text": value_text}
+
+
+def test_functional_observation_commits_without_a_migration(conn):
+    # A caregiver-observed functional fact stated by an ingested document lands as an
+    # ordinary observation row carrying that document as its provenance.
+    doc = _make_document(conn)
+    summary = dedup.commit_extraction(conn, doc, {"observation": [_functional("2026-07-14")]})
+    assert summary.counts["new"] == 1
+    row = conn.execute("SELECT * FROM observation WHERE obs_type='functional'").fetchone()
+    assert row["key"] == "financial_self_management"
+    assert row["observed_at"] == "2026-07-14"
+    assert row["document_id"] == doc
+
+
+def test_functional_observation_never_creates_a_condition(conn):
+    # The load-bearing invariant: no diagnostic code without clinician documentation.
+    # A functional observation records what was observed and stops there — nothing may
+    # promote it into the problem list.
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"observation": [
+        _functional("2026-07-14"),
+        _functional("2026-08-02", key="meal_regularity",
+                    value_text="one meal most days, skipped others"),
+    ]})
+    assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 0
+
+
+def test_functional_series_keeps_one_row_per_date(conn):
+    # The dated series *is* the trend: same key on two dates = two rows, while a second
+    # document restating the same key+date collapses.
+    doc1 = _make_document(conn)
+    doc2 = _make_document(conn)
+    dedup.commit_extraction(conn, doc1, {"observation": [_functional("2026-07-14")]})
+    same = dedup.commit_extraction(conn, doc2, {"observation": [_functional("2026-07-14")]})
+    assert same.counts["duplicate"] == 1
+    later = dedup.commit_extraction(conn, doc2, {"observation": [_functional("2026-08-14")]})
+    assert later.counts["new"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='functional'"
+    ).fetchone()["n"] == 2
+
+
+def test_functional_commit_without_observed_at_is_rejected(conn):
+    # The validation rule holds through the real commit path, and the batch is atomic.
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError, match="missing required field 'observed_at'"):
+        dedup.commit_extraction(conn, doc, {"observation": [
+            {"obs_type": "functional", "key": "meal_regularity",
+             "value_text": "skipping meals"},
+        ]})
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
 
 
 # --- intra-payload collisions (issue #58) -------------------------------------

@@ -712,3 +712,27 @@ def test_the_mcp_read_payload_uses_the_same_rule(conn, jane):
     at_cli = [_cli._clean(r) for r in query.query_meds(conn, "jane-doe")]
     assert over_mcp == at_cli
     assert over_mcp[0]["attested_by"] == "Mom"
+
+
+def test_cli_assert_a_functional_observation_without_a_document(cli_ready, capsys):
+    """Issue #132: AGENTS.md §2 names `record assert` as the home for a functional fact
+    known only from family knowledge, so that path has to honour the family's rules —
+    the row lands unsourced, and an undated one is refused like any other."""
+    argv = (
+        "record", "assert", "observation", "--person", "jane-doe",
+        "--attributed-to", "Daughter", "--date", "2026-08-09",
+        "--field", "obs_type=functional", "--field", "key=meal_regularity",
+        "--field", "observed_at=2026-08-01",
+        "--field", "value_text=one meal most days",
+    )
+    assert _run(cli_ready, *argv, "--apply") == 0
+    assert "wrote observation #1" in capsys.readouterr().out
+    assert _run(cli_ready, "record", "assert", "--list") == 0
+    assert "needs source" in capsys.readouterr().out
+
+    assert _run(
+        cli_ready, "record", "assert", "observation", "--person", "jane-doe",
+        "--attributed-to", "Daughter", "--date", "2026-08-09",
+        "--field", "obs_type=functional", "--field", "key=meal_regularity", "--apply",
+    ) == 1
+    assert "missing required field 'observed_at'" in capsys.readouterr().err
