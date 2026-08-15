@@ -61,7 +61,7 @@ prints it correctly instead of ``?`` (issue #46). Literal vs. data are orthogona
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 
 from . import curation, db, query
 from .dedup import enum_token, is_attested, key_token
@@ -69,6 +69,19 @@ from .dedup import enum_token, is_attested, key_token
 # Observation obs_type conventions this layer reads (see module docstring).
 OBS_VITAL = "vital"
 OBS_ORDER = "order"
+
+# How an order is matched to the `lab_result` that answered it (issue #128). No FK links
+# the two tables, so the linkage is *inferred* at render time from item-name and date
+# proximity -- and deliberately narrowly. Over-suppression hides a genuinely open order,
+# the exact miss this section exists to prevent; under-suppression merely leaves the
+# noise the section already had. Every ambiguity therefore resolves to "still open" (see
+# `_is_resulted`), and age is never a suppression signal on its own.
+#: How long after an order a result may land and still count as *that* order's result.
+ORDER_RESULT_WINDOW_DAYS = 30
+#: Slack on the early side, for a document dating the draw a day ahead of the order
+#: text. A result genuinely predating its order answers an *earlier* order, so this side
+#: stays tight.
+ORDER_RESULT_BACKDATE_DAYS = 1
 
 # `condition.status` buckets, one rendered section each (family history last: it is
 # context about relatives, not the patient's own record).
@@ -97,6 +110,22 @@ def _date_part(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip().replace("T", " ").split(" ")[0]
+
+
+def _as_date(value: object) -> date | None:
+    """:func:`_date_part` parsed to a real date; ``None`` for empty or malformed input.
+
+    Never raises. ``observation.observed_at`` is nullable and free-form-ish and
+    ``lab_result.collected_at`` is only ``NOT NULL``, not validated to ISO -- a
+    malformed date must not crash a summary, it must merely fail to close an order.
+    """
+    text = _date_part(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _generated_at(now: datetime | None) -> str:
@@ -432,13 +461,74 @@ def _order_display(row: dict) -> str:
     return row["key"] or row["value_text"] or "(unspecified)"
 
 
+def _result_index(
+    conn: sqlite3.Connection,
+    person_id: int,
+    dictionary: dict[str, str] | None,
+    cur: "_CurationPass | None" = None,
+) -> dict[str, list[date]]:
+    """``key_token`` -> collection dates of this person's live ``lab_result`` rows.
+
+    The lookup side of the order/result linkage (issue #128). Keyed by the *same*
+    :func:`key_token` -- and the same ``dictionary`` -- the order grouping folds on, so
+    matching can never disagree with #71/#93 about what counts as one item: a
+    qualifier-bearing order (``HbA1c (POC)``) is not closed by a plain-stem result.
+
+    Scoped to ``person_id``: one person's results can never close another's order.
+
+    Verdicts are read **directly** rather than through :func:`_apply_curation`, on
+    purpose. A result in :data:`curation.APPENDIX_STATUSES` must not close an order, but
+    this helper runs *before* ``_abnormal_labs``, and filing appendix entries from here
+    would re-order ``## Superseded / corrected`` for existing records. Reading without
+    recording keeps the overlay additive. ``disputed``/``confirmed``/``distinct``
+    results still count: they are live rows.
+    """
+    index: dict[str, list[date]] = {}
+    rows = conn.execute(
+        "SELECT * FROM lab_result WHERE person_id = ?", (person_id,)
+    ).fetchall()
+    annotated = cur is not None and bool(cur.verdicts)   # fast path: no verdicts at all
+    for raw in rows:
+        row = dict(raw)
+        if annotated:
+            verdict = cur.verdicts.for_row(
+                "lab_result", row["dedup_base"], row.get("lab_result_id")
+            )
+            if verdict is not None and verdict["status"] in curation.APPENDIX_STATUSES:
+                continue
+        token = key_token(row["test_name"], dictionary)
+        when = _as_date(row["collected_at"])
+        if token and when:
+            index.setdefault(token, []).append(when)
+    return index
+
+
+def _is_resulted(
+    token: str, observed_at: object, index: dict[str, list[date]]
+) -> bool:
+    """Has a ``lab_result`` landed that plausibly answers this order? (issue #128)
+
+    An unusable identity token and an unusable order date both answer *no*: the section
+    exists to surface still-open orders, so every ambiguity resolves to "render".
+    Matching is exact-token plus a bounded window around the order date -- never a
+    substring match, never an unbounded window, and never age alone.
+    """
+    ordered = _as_date(observed_at)
+    if not token or ordered is None:
+        return False
+    return any(
+        -ORDER_RESULT_BACKDATE_DAYS <= (d - ordered).days <= ORDER_RESULT_WINDOW_DAYS
+        for d in index.get(token, ())
+    )
+
+
 def _grouped_orders(
     conn: sqlite3.Connection,
     person_id: int,
     dictionary: dict[str, str] | None,
     cur: "_CurationPass | None" = None,
 ) -> list[dict]:
-    """``obs_type='order'`` rows folded to one entry per normalized item, newest first.
+    """Still-open ``obs_type='order'`` rows, folded per normalized item, oldest first.
 
     A repeated order/referral is restated by every document that mentions it, so a raw
     row dump renders one identical bullet per document (issue #93). Orders are *events*,
@@ -456,6 +546,15 @@ def _grouped_orders(
     Each returned dict is the group's **latest** row (most recent ``observed_at``, then
     highest ``observation_id``) plus ``group_count`` and ``group_first`` (earliest dated
     ``observed_at`` among the *earlier* rows, ``""`` when none of them is dated).
+
+    A group whose item already has a matching ``lab_result`` is then dropped entirely
+    (issue #128): the section is a list of things still outstanding, and before this it
+    listed every order ever placed -- inverting its meaning, since most were resulted on
+    the order date itself. The question is asked **after** the fold, of the group's
+    *latest* row -- the live restatement the bullet already speaks for -- so
+    ``group_count``/``+N earlier`` disclosure is unchanged for everything that still
+    renders. Referral-type orders have no ``lab_result`` by construction and so are
+    never suppressed by this; closing them needs a mechanism that does not exist yet.
     """
     rows = conn.execute(
         "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
@@ -470,19 +569,34 @@ def _grouped_orders(
         token = key_token(r["key"], dictionary) or key_token(r["value_text"], dictionary)
         groups.setdefault(token or ("", r["observation_id"]), []).append(r)
 
-    out = []
-    for members in groups.values():
+    # Carry each group's identity token alongside it: the suppression lookup needs the
+    # very token the fold grouped on, and a keyless group (identity is the
+    # `("", observation_id)` fallback tuple) has none -- so it is never suppressed.
+    folded: list[tuple[str, dict]] = []
+    for identity, members in groups.items():
         latest = members[-1]                      # ascending -> last is the latest
         earlier = sorted(
             d for d in (_date_part(m["observed_at"]) for m in members[:-1]) if d
         )
-        out.append(dict(latest, group_count=len(members),
-                        group_first=earlier[0] if earlier else ""))
-    # Two stable passes: alphabetical, then latest-date descending (undated sorts last,
-    # keeping its alphabetical order). Orders are actionable events, so recency leads --
-    # matching the other event sections rather than the vitals panel's fixed A-Z.
+        folded.append((
+            identity if isinstance(identity, str) else "",
+            dict(latest, group_count=len(members),
+                 group_first=earlier[0] if earlier else ""),
+        ))
+
+    # Drop what a result already answered (issue #128), asking the group's latest row.
+    index = _result_index(conn, person_id, dictionary, cur) if folded else {}
+    out = [g for token, g in folded
+           if not _is_resulted(token, g["observed_at"], index)]
+
+    # Two stable passes: alphabetical, then order-date ascending (undated sorts last,
+    # keeping its alphabetical order). This section diverges from the other event
+    # sections' newest-first on purpose (issue #128): what is left after suppression is
+    # what is still outstanding, and an order still open after years is the *most*
+    # actionable row on the page, not the least.
     out.sort(key=lambda g: (_order_display(g).lower(), g["observation_id"]))
-    out.sort(key=lambda g: _date_part(g["observed_at"]), reverse=True)
+    out.sort(key=lambda g: (not _date_part(g["observed_at"]),
+                            _date_part(g["observed_at"])))
     return out
 
 
