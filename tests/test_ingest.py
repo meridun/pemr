@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import time
 import zipfile
 import subprocess
 
@@ -1187,6 +1188,100 @@ def test_a_doctype_the_probe_cannot_reach_still_falls_through(tmp_path):
     src.write_text(doc, encoding="utf-8")
     assert ingest._xml_declares_doctype(src.read_bytes()) is False
     assert ingest._extract_ccda(src) is None    # refused all the same
+
+
+# --- the guard's equivalence class, not just its fixtures (issue #138 verify) ----- #
+#
+# Three shapes the UTF-16 pair does not cover: a 4-byte encoding, a BOM that contradicts
+# the declaration, and a DOCTYPE with no internal subset at all. Each is refused, and the
+# point of pinning them is that all three arrive at that refusal by a *different* arm.
+
+
+def test_ccda_doctype_in_a_utf32_document_never_reaches_the_parser(
+    conn, tmp_path, sources, monkeypatch
+):
+    """UTF-32 is refused by the *sniff*, not the DOCTYPE probe — and that is fine.
+
+    A 4-byte encoding cannot smuggle a contiguous ASCII run (every character carries two
+    zero bytes), so the marker sniff fails and the file keeps today's OCR route before
+    anything is parsed. Pinned because the safety of the whole design rests on the sniff
+    being a *negative* filter: it is free for it to be conservative, so a shape it cannot
+    read must fall through rather than be special-cased into the native path."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="utf32-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-32"', 1)
+        .replace("?>", f"?>{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "utf32-doctype.xml"
+    src.write_bytes(b"\xff\xfe\x00\x00" + doc.encode("utf-32-le"))
+
+    head = src.read_bytes()[:ingest._CCDA_SNIFF_BYTES]
+    assert b"urn:hl7-org:v3" not in head       # the sniff is what stops it here
+    assert ingest._extract_ccda(src) is None
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+
+
+def test_ccda_whose_bom_contradicts_its_declaration_is_not_parsed_natively(
+    conn, tmp_path, sources, monkeypatch
+):
+    """A UTF-8 BOM under an ``encoding="UTF-16"`` declaration: the file sniffs as a CCDA
+    (its bytes are ASCII-compatible) but no parser can agree with it.
+
+    This is the ``ExpatError`` arm rather than the DOCTYPE arm, and it is safe for the
+    reason that arm exists: the probe is the same expat the `ET.fromstring` below it uses,
+    so a file the probe cannot read is one the parse cannot read either — the DOCTYPE it
+    carries is never expanded because the document is never parsed at all."""
+    seen: list[str] = []
+    monkeypatch.setattr(ingest, "run_ocr", lambda p: seen.append(str(p)) or "scanned")
+    doctype, levels = _entity_bomb_doctype()
+    body = _make_ccda(tmp_path, name="bom-src.XML").read_text(encoding="utf-8")
+    doc = (
+        body.replace('encoding="UTF-8"', 'encoding="UTF-16"', 1)
+        .replace("?>", f"?>{doctype}", 1)
+        .replace("Ferritin 201 ng/mL", f"&e{levels};")
+    )
+    src = tmp_path / "bom-mismatch.xml"
+    src.write_bytes(b"\xef\xbb\xbf" + doc.encode("utf-8"))   # BOM says UTF-8
+
+    raw = src.read_bytes()
+    assert b"urn:hl7-org:v3" in raw and b"ClinicalDocument" in raw   # sniffs as CCDA
+    assert ingest._xml_declares_doctype(raw) is False                # the parse-error arm
+    assert ingest._extract_ccda(src) is None
+
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert seen == [str(src)]
+    assert result.document.ocr_text == "scanned"
+    assert "A" * 200 not in (result.document.ocr_text or "")
+
+
+def test_an_external_doctype_is_refused_without_fetching_it(tmp_path):
+    """A DOCTYPE with an external ``SYSTEM`` id and **no** internal subset.
+
+    Two properties at once. It is still refused — the guard keys on the declaration, not
+    on whether a subset follows — and refusing it costs no network: the ``SYSTEM`` id
+    points at TEST-NET-1, which blackholes rather than refuses, so a resolver would stall
+    for seconds instead of returning. Local-first has no exception for a schema fetch."""
+    body = _make_ccda(tmp_path, name="external-src.XML").read_text(encoding="utf-8")
+    src = tmp_path / "external-doctype.xml"
+    src.write_text(
+        body.replace(
+            "?>",
+            '?><!DOCTYPE ClinicalDocument SYSTEM "http://192.0.2.1/CDA.dtd">',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    assert ingest._xml_declares_doctype(src.read_bytes()) is True
+    assert ingest._extract_ccda(src) is None
+    assert time.monotonic() - started < 2.0     # nothing was dereferenced
 
 
 def test_ccda_owner_check_matches_record_target(conn, tmp_path, sources):
