@@ -312,6 +312,9 @@ Agents never resolve staged conflicts silently.
   refuses the whole resolution and names the colliding fields. Report that refusal to the human and
   ask which side wins per field; `fields={"<field>": "existing"|"incoming"}` (CLI: `--field
   NAME=existing|incoming`) settles one, and only a field that genuinely collides may appear there.
+  Provenance moves the same way `keep incoming`'s does — the row takes the winning document's
+  `document_id`, which supersedes an existing attestation on that row (issue #110) even when merge
+  takes no field, because the row is now filed under a different document.
   On a standing-fact type merge always refuses, because a conflict there is present-and-different by
   construction — use `keep incoming` for those.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
