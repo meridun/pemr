@@ -273,8 +273,17 @@ export function assertClean(text, what = 'text') {
   );
 }
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'sources', 'exports', 'inbox', 'backups', 'data', 'vdm-diag', '.venv', 'pemr.egg-info']);
-const TEXT_EXT = new Set(['.py', '.mjs', '.js', '.ts', '.md', '.json', '.toml', '.yml', '.yaml', '.txt', '.csv', '.sql', '.cfg', '.ini']);
+// No directory skip-list. The sweep enumerates `git ls-files`, so the runtime
+// directories worth excluding (sources/, exports/, inbox/, backups/, the venv)
+// are gitignored and can never appear. An explicit list only ever hid *tracked*
+// files — `data/` and `vdm-diag/` sat behind it, unscanned, for exactly that
+// reason. Untracked content is not this check's problem; the pre-push hook and
+// CI both operate on what is committed.
+const TEXT_EXT = new Set([
+  '.py', '.mjs', '.js', '.ts', '.md', '.json', '.toml', '.yml', '.yaml',
+  '.txt', '.csv', '.tsv', '.sql', '.cfg', '.ini', '.ps1', '.sh', '.bat',
+  '.xml', '.html', '.rst', '.env-example', '.example',
+]);
 // This file and its test necessarily contain the shapes they describe, so the
 // scanner cannot scan them — which makes them the one blind spot in the repo.
 // Every identity used as an example here MUST therefore be invented: a given
@@ -359,9 +368,8 @@ function main(argv) {
     const norm = f.split(path.sep).join('/');
     if (SKIP_FILES.has(norm)) return false;
     // Explicit paths are a deliberate ask (a hook handing us .git/COMMIT_EDITMSG);
-    // only the default whole-tree sweep applies the directory/extension filters.
+    // only the default sweep applies the extension filter.
     if (explicit.length) return true;
-    if (norm.split('/').some((seg) => SKIP_DIRS.has(seg))) return false;
     return TEXT_EXT.has(path.extname(f));
   });
 
