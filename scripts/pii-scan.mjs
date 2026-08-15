@@ -290,13 +290,79 @@ function trackedFiles() {
   }
 }
 
+function report(all, whatScanned) {
+  if (all.length === 0) {
+    console.log(`pii-scan: clean (${whatScanned})`);
+    return 0;
+  }
+  console.error(`pii-scan: ${all.length} finding(s)\n`);
+  for (const f of all) {
+    console.error(`${f.label}:${f.line}  [${f.rule}] ${f.message}`);
+    console.error(`    ${f.excerpt}`);
+  }
+  console.error('\nAGENTS.md §"Privacy posture": describe the shape, never the value.');
+  console.error('Add the persona to SYNTHETIC_ROSTER in scripts/pii-scan.mjs, or mark the line `pii-allow`.');
+  return 1;
+}
+
 function main(argv) {
+  const flags = argv.slice(2).filter((a) => a.startsWith('-'));
   const explicit = argv.slice(2).filter((a) => !a.startsWith('-'));
+
+  // `--diff` reads a unified diff and scans only the lines it *introduces*,
+  // skipping the files the scanner necessarily exempts. Without both of those
+  // every scrub commit trips its own guard — a removal line still carries the
+  // old value — and a guard that cries wolf just teaches people --no-verify.
+  if (flags.includes('--diff')) {
+    let raw = '';
+    try {
+      raw = fs.readFileSync(0, 'utf8');
+    } catch {
+      raw = '';
+    }
+    let file = '<diff>';
+    let skipping = false;
+    const added = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const hdr = /^\+\+\+ b\/(.+)$/.exec(line);
+      if (hdr) {
+        file = hdr[1].trim();
+        skipping = SKIP_FILES.has(file);
+        continue;
+      }
+      if (line.startsWith('---') || line.startsWith('+++')) continue;
+      if (!line.startsWith('+') || skipping) continue;
+      added.push({ file, text: line.slice(1) });
+    }
+    const found = [];
+    for (const a of added) {
+      for (const f of scanText(a.text, a.file)) found.push(f);
+    }
+    return report(found, `${added.length} added line(s)`);
+  }
+
+  // `--stdin` scans arbitrary text — a commit message, a PR body, a shell
+  // command line. This is what the git and Claude Code hooks use, so every
+  // surface shares exactly one set of patterns.
+  if (flags.includes('--stdin')) {
+    const label = explicit[0] || '<stdin>';
+    let text = '';
+    try {
+      text = fs.readFileSync(0, 'utf8');
+    } catch {
+      text = '';
+    }
+    return report(scanText(text, label), label);
+  }
+
   const files = (explicit.length ? explicit : trackedFiles()).filter((f) => {
     const norm = f.split(path.sep).join('/');
     if (SKIP_FILES.has(norm)) return false;
+    // Explicit paths are a deliberate ask (a hook handing us .git/COMMIT_EDITMSG);
+    // only the default whole-tree sweep applies the directory/extension filters.
+    if (explicit.length) return true;
     if (norm.split('/').some((seg) => SKIP_DIRS.has(seg))) return false;
-    return explicit.length ? true : TEXT_EXT.has(path.extname(f));
+    return TEXT_EXT.has(path.extname(f));
   });
 
   let all = [];
@@ -310,18 +376,7 @@ function main(argv) {
     all = all.concat(scanText(text, f));
   }
 
-  if (all.length === 0) {
-    console.log(`pii-scan: clean (${files.length} files)`);
-    return 0;
-  }
-  console.error(`pii-scan: ${all.length} finding(s)\n`);
-  for (const f of all) {
-    console.error(`${f.label}:${f.line}  [${f.rule}] ${f.message}`);
-    console.error(`    ${f.excerpt}`);
-  }
-  console.error('\nAGENTS.md §"Privacy posture": fixtures are synthetic only.');
-  console.error('Add the persona to SYNTHETIC_ROSTER in scripts/pii-scan.mjs, or mark the line `pii-allow`.');
-  return 1;
+  return report(all, `${files.length} files`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('pii-scan.mjs')) {

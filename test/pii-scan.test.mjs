@@ -9,6 +9,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 
 import { scanText, assertClean, SYNTHETIC_ROSTER } from '../scripts/pii-scan.mjs';
 import { guardOutboundBody } from '../scripts/sdlc.mjs';
@@ -103,6 +104,47 @@ describe('assertClean', () => {
 
   it('passes clean text through silently', () => {
     assert.doesNotThrow(() => assertClean('sdlc:claim dispatch-20260815-0407 design'));
+  });
+});
+
+describe('diff mode: only what a change introduces', () => {
+  const run = (diff) => {
+    const r = spawnSync(process.execPath, ['scripts/pii-scan.mjs', '--diff'], {
+      input: diff, encoding: 'utf8',
+    });
+    return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
+  };
+
+  it('flags an identity on an added line', () => {
+    const diff = '--- a/x.md\n+++ b/x.md\n@@\n+repro for melanie-ashworth medication\n';
+    assert.equal(run(diff).code, 1);
+  });
+
+  it('ignores an identity that a change is REMOVING', () => {
+    // Otherwise every scrub commit trips its own guard and people learn to
+    // pass --no-verify, which is worse than having no hook.
+    const diff = '--- a/x.md\n+++ b/x.md\n@@\n-repro for melanie-ashworth medication\n+repro for jane-doe\n';
+    assert.equal(run(diff).code, 0);
+  });
+
+  it('ignores the files the scanner necessarily exempts', () => {
+    const diff = '--- a/test/pii-scan.test.mjs\n+++ b/test/pii-scan.test.mjs\n@@\n+  const t = "melanie-ashworth medication";\n';
+    assert.equal(run(diff).code, 0);
+  });
+});
+
+describe('stdin mode: arbitrary text surfaces', () => {
+  const run = (text) => spawnSync(
+    process.execPath, ['scripts/pii-scan.mjs', '--stdin', 'a message'],
+    { input: text, encoding: 'utf8' },
+  ).status;
+
+  it('rejects a commit message naming an identity', () => {
+    assert.equal(run('fix: repro for melanie-ashworth meds'), 1);
+  });
+
+  it('accepts an ordinary message', () => {
+    assert.equal(run('fix(render): suppress resulted orders'), 0);
   });
 });
 
