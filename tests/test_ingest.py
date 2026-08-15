@@ -856,6 +856,51 @@ def test_extract_text_reads_ccda_xml(conn, tmp_path, sources):
     assert "Ferritin\t201 ng/mL" in text
 
 
+# The shapes a real portal export carries that `_make_ccda` only approximates: a
+# multi-`<given>` legal name, a second `<name nullFlavor="UNK"/>`, a section nested
+# inside another section's `<component>`, `<list>/<item>` narrative, and inline
+# markup (`<content>`, `<sub>`) splitting text mid-cell.
+_CCDA_VENDOR = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+    "<recordTarget><patientRole><patient>"
+    '<name use="L"><given>Jane</given><given>Amelia</given><family>Doe</family></name>'
+    '<name use="P" nullFlavor="UNK"/>'
+    '<birthTime value="19620314000000-0600"/>'
+    "</patient></patientRole></recordTarget>"
+    "<component><structuredBody><component><section><title>Results</title><text>"
+    "<table><thead><tr><th>Test</th><th>Result</th></tr></thead>"
+    "<tbody><tr><td><content ID='res1'>Ferritin</content></td>"
+    "<td>11.<sub>2</sub></td></tr></tbody></table>"
+    '<renderMultiMedia referencedObject="MM1"/>'
+    "</text>"
+    "<component><section><title>Results Addendum</title><text>"
+    "<list><item>Repeat ferritin in 8 weeks.</item>"
+    "<item><content ID='med27'>Ferrous sulfate 325 MG</content> - 1 tablet daily</item>"
+    "</list></text></section></component>"
+    "</section></component></structuredBody></component>"
+    "</ClinicalDocument>"
+)
+
+
+def test_ccda_renders_real_vendor_export_shapes(conn, tmp_path, sources):
+    src = tmp_path / "DOC0003.XML"
+    src.write_text(_CCDA_VENDOR, encoding="utf-8")
+    text = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).document.ocr_text
+    # every `<given>` joins into the one name the owner check tokenises
+    assert text.startswith("Patient: Jane Amelia Doe\nDOB: 1962-03-14")
+    assert "Patient: \n" not in text   # the nullFlavor name contributes no line
+    # inline markup is flattened, not dropped, and does not split the cell
+    assert "Ferritin\t11.2" in text
+    # a nested section renders under its own title, exactly once
+    assert "Results Addendum" in text
+    assert text.count("Repeat ferritin in 8 weeks.") == 1
+    # `<list>` recurses, `<item>` flattens with its own tail text
+    assert "Ferrous sulfate 325 MG - 1 tablet daily" in text
+
+
 def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
     def boom(path):  # pragma: no cover - the assertion is that this never runs
         raise AssertionError(f"run_ocr must not be called for {path}")
