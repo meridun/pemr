@@ -205,7 +205,9 @@ def query_timeline(
     Opt-in and **default-off** on purpose: ``dedup_base`` is one of
     :data:`dedup.INTERNAL_COLUMNS`, deliberately stripped from the CLI ``--json`` and
     MCP read payloads, so widening the default event shape would leak an unstable key
-    into both contracts.
+    into both contracts. Since issue #131 the `pemr query timeline` CLI handler and the
+    MCP ``query`` tool turn it on too — the same overlay `render_journal` applies — and
+    both strip the three keys again before emitting anything.
     """
     person_id = resolve_person_id(conn, slug)
     events: list[dict] = []
