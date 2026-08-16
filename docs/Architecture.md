@@ -827,7 +827,13 @@ from instead of re-reading the source every time. It extracts by whatever route 
 type allows (issue #66), with only the image and PDF routes reaching outside the stdlib:
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
 parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
-allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image.
+allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Every
+OOXML member goes through one guarded parse helper that applies the same encoding-agnostic
+`<!DOCTYPE` refusal described for CCDA below before `ElementTree` sees the bytes (issue
+#155): the byte cap bounds a member's *declared* uncompressed size, not entity expansion,
+so a 355-byte `.docx` expanded to 4,194,304 stored chars before the guard. A DOCTYPE on
+any member refuses the whole file, degrading exactly like a malformed one — stderr note,
+no `ocr_text`, document kept.
 
 A **CCDA** `.xml` (C-CDA / HL7 CDA R2 — what a US portal's "download my record" produces)
 is read natively too (issue #138): each `structuredBody` section's title and narrative,

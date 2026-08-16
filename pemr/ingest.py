@@ -481,11 +481,33 @@ def _member_reader(zf: zipfile.ZipFile) -> Callable[[str], bytes]:
     return read
 
 
+def _parse_ooxml_member(read: Callable[[str], bytes], name: str) -> ET.Element:
+    """Read one OOXML member and parse it — refusing a `<!DOCTYPE` first (issue #155).
+
+    The only convenient way to parse a zip member, deliberately: `_member_reader`'s cap
+    bounds a member's *declared* uncompressed size, which does not bound entity
+    expansion — an internal subset expands after that check passes (a 355-byte `.docx`
+    rendered 4,194,304 chars). A future extractor that reaches for a fourth member must
+    not be able to forget the probe, so the probe lives here rather than inline at each
+    call site.
+
+    The probe is :func:`_xml_declares_doctype` (encoding-agnostic by construction — the
+    argument is on that function; do not reimplement it as a byte scan), and it runs on
+    the exact bytes handed to `ET.fromstring`, with no re-read between them. `ValueError`
+    is what a malformed member already raises, so :func:`extract_text_routed` degrades a
+    refusal to "no ocr_text" at exactly the cost of today's malformed-file path.
+    """
+    data = read(name)
+    if _xml_declares_doctype(data):
+        raise ValueError(f"{name} declares a DOCTYPE; refusing to parse")
+    return ET.fromstring(data)
+
+
 def _extract_docx(path: Path) -> str:
     """`.docx` body text: concat `w:t` runs, one line per `w:p` paragraph."""
     with zipfile.ZipFile(path) as zf:
         read_member = _member_reader(zf)
-        root = ET.fromstring(read_member("word/document.xml"))
+        root = _parse_ooxml_member(read_member, "word/document.xml")
     return "\n".join(
         _xml_text(para, f"{_WORD_NS}t") for para in root.iter(f"{_WORD_NS}p")
     )
@@ -519,7 +541,7 @@ def _extract_xlsx(path: Path) -> str:
         names = zf.namelist()
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(read_member("xl/sharedStrings.xml"))
+            root = _parse_ooxml_member(read_member, "xl/sharedStrings.xml")
             shared = [
                 _xml_text(si, f"{_SHEET_NS}t") for si in root.iter(f"{_SHEET_NS}si")
             ]
@@ -531,7 +553,10 @@ def _extract_xlsx(path: Path) -> str:
         )
         lines: list[str] = []
         for name in sheets:
-            root = ET.fromstring(read_member(name))
+            # A DOCTYPE on any one member refuses the whole workbook: the `ValueError`
+            # propagates out to `extract_text_routed`, deliberately not caught per sheet
+            # (all-or-nothing degrade, as on the CCDA route — not a best-effort result).
+            root = _parse_ooxml_member(read_member, name)
             for row in root.iter(f"{_SHEET_NS}row"):
                 lines.append("\t".join(
                     _cell_text(cell, shared) for cell in row.iter(f"{_SHEET_NS}c")
