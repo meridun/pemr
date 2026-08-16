@@ -360,6 +360,40 @@ day or month the source didn't state, and never fall back to stashing an impreci
   second stages a conflict. Emitting a time you invented is never the fix — the recovery path is
   `keep both` under human sign-off (§5).
 
+### 8. Medication discontinue reason
+
+A med-list status cell often states **why** a drug stopped, in the same cell as the status word:
+`Discontinued (Reorder)`, `Discontinued (Therapy Completed)`, `Discontinued (Patient Stopped
+Taking)`, `Discontinued (Substitution/Alternate Therapy Placed)`. The two halves go to two fields.
+
+- The **lifecycle word** goes in `medication.status` (`discontinued`), exactly as today.
+- The **parenthetical** goes in `medication.status_reason`, **verbatim, parentheses stripped**
+  (`Reorder`, `Therapy Completed`, ...). Preserve the source's own casing and spacing.
+- NEVER concatenate the two into `status` (`discontinued (reorder)`, `discontinued-reorder`) —
+  `status` stays a lifecycle word, and the reason is the read layer's own axis.
+- OMIT `status_reason` when the source states no reason. Never invent one and never write `none` /
+  `n/a` — a bare `Discontinued` row is absent-reason, and behaves exactly as it always has.
+- The field is **free text**, not a closed vocabulary: a reason this list doesn't name (`Never
+  Started`, `Provider Discontinued`, ...) is emitted **as stated** rather than forced into a
+  familiar one.
+
+Why it is worth a field of its own: `(Reorder)` and `(Therapy Completed)` are **opposites**. A
+reorder means the prescription was renewed and therapy continues, so its `ended_on` is the end of an
+authorization period; a therapy-completed row is a genuine end. The read layer treats only a
+*renewal* reason as non-terminal (`query.RENEWAL_MED_REASONS`) and every other reason — recognized
+or not — as ending the course, so an unfamiliar reason degrades safely rather than silently
+resurrecting a stopped drug.
+
+Re-ingesting the same medication with a *different* `status_reason` stages a **conflict** (§5), like
+a differing `status` does — it is a real disagreement between documents, not noise to be smoothed.
+
+**Rows committed before migration 014 have `status_reason IS NULL`** — there is no automated
+backfill, because matching an `ocr_text` table line back to an already-committed row is a name/date
+heuristic over PHI and belongs to a human-in-the-loop curation pass, not a migration. The reason is
+not lost, though: it still sits verbatim in `document.ocr_text` for any already-ingested CCDA, and is
+recoverable per row with `pemr record edit medication <id> --set status_reason="Reorder"` (this does
+not move `dedup_key` — §5's identity guarantee holds for this field like any other editable one).
+
 ## Privacy posture
 
 This repository is **public**. It is framework + documentation only.

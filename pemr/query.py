@@ -38,6 +38,20 @@ _WORD = re.compile(r"\w+", re.UNICODE)
 # terminal values like completed/stopped as well), so matching is lowercased and trimmed.
 TERMINAL_MED_STATUSES = frozenset({"completed", "stopped", "discontinued"})
 
+# Medication ``status_reason`` values that mean the prescription was RENEWED rather than
+# stopped (issue #159). A CCDA med table states the reason beside the status word
+# (``Discontinued (Reorder)``), and a reorder's ``ended_on`` is the end of an
+# authorization period, not of therapy — so those rows stay current while every *other*
+# reason (``Therapy Completed``, ``Patient Stopped Taking``, ``Substitution/Alternate
+# Therapy Placed``, or anything unrecognized) keeps ending the course. Matched on
+# ``enum_token``, so stored casing/spacing is irrelevant.
+#
+# **Closed by design.** ``status_reason`` is free text precisely so an unfamiliar reason
+# from another EHR still commits; the safety of that rests on unrecognized reasons
+# degrading to today's terminal behavior. Widening this set is a decision on its own
+# issue, not a build-time convenience.
+RENEWAL_MED_REASONS = frozenset({"reorder", "re-order", "renewal", "renewed"})
+
 
 def _row_get(row: sqlite3.Row | dict, key: str) -> object:
     """Column access that tolerates a missing key on either a dict or ``sqlite3.Row``."""
@@ -86,10 +100,24 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
     ``ended_on`` was extracted — the contradiction behind issue #21, where a
     ``completed`` med with a null ``ended_on`` rendered as ``(current)``.
 
+    A **renewal** ``status_reason`` (:data:`RENEWAL_MED_REASONS`) keeps the course open
+    whatever the dates say (issue #159). A CCDA med table records why a drug stopped
+    beside the status word, and ``Discontinued (Reorder)`` does not mean stopped — the
+    prescription was renewed, so its ``ended_on`` is the end of an *authorization
+    period*, not of therapy. Reading that date as an end is the documented harm: a
+    reviewer had to overturn it by hand from clinical knowledge. Every other reason
+    (``Therapy Completed``, ``Patient Stopped Taking``, ``Substitution/Alternate Therapy
+    Placed``, or one this layer doesn't recognize) still ends the course. The trade is
+    deliberate: a renewed drug may over-report as current — the paired fresh row from the
+    same export is a separate row, so one drug can list twice — which beats silently
+    ending a live therapy.
+
     ``now`` is injectable for deterministic tests/renders, like the ``render`` layer's.
     """
     status = str(_row_get(row, "status") or "").strip().lower()
     ended_on = _row_get(row, "ended_on")
+    if enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS:
+        return True
     if ended_on:
         end = _end_of_period(ended_on)
         if end is not None and end < (now or datetime.now()).date():
@@ -166,8 +194,11 @@ def query_meds(
     (Architecture.md §5, :func:`med_is_current`). A terminal status
     (completed/stopped/discontinued) ends the course even without an ``ended_on``
     (issue #21), and a *past* ``ended_on`` ends it even under ``status='active'``
-    (issue #57), so both are excluded from ``active``. ``now`` is injectable so the
-    render layer's deterministic clock reaches the currency test."""
+    (issue #57), so both are excluded from ``active``. The one exception is a renewal
+    ``status_reason`` (``Reorder``, :data:`RENEWAL_MED_REASONS`): a renewed prescription
+    is kept in ``active`` even with a past ``ended_on``, because that date ends an
+    authorization period rather than the therapy (issue #159). ``now`` is injectable so
+    the render layer's deterministic clock reaches the currency test."""
     person_id = resolve_person_id(conn, slug)
     sql = ("SELECT * FROM medication WHERE person_id = ? "
            "ORDER BY (started_on IS NULL), started_on, name")

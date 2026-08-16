@@ -954,6 +954,135 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
+# The five status cells a CCDA med table prints, in the shape the reason arrives in:
+# inline `<content>` inside the same cell as the lifecycle word. The sixth row is the
+# paired fresh prescription a reorder produces in the same export.
+_CCDA_MED_ROWS = (
+    ("Amoxicillin 500 MG", "08/28/2025", "Discontinued"),
+    ("Lisinopril 10 MG", "11/11/2024", "Discontinued<content> (Therapy Completed)</content>"),
+    ("Levothyroxine 50 MCG", "06/11/2026", "Discontinued<content> (Reorder)</content>"),
+    ("Atorvastatin 20 MG", "03/02/2025",
+     "Discontinued<content> (Patient Stopped Taking)</content>"),
+    ("Omeprazole 20 MG", "05/09/2025",
+     "Discontinued<content> (Substitution/Alternate Therapy Placed)</content>"),
+    ("Levothyroxine 50 MCG", "06/12/2026", "Active"),
+)
+
+
+def _ccda_with_med_table(tmp_path, name="DOC0159.XML"):
+    rows = "".join(
+        f"<tr><td>{drug}</td><td>{date}</td><td>{cell}</td></tr>"
+        for drug, date, cell in _CCDA_MED_ROWS
+    )
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+        "<recordTarget><patientRole><patient>"
+        "<name><given>Jane</given><family>Doe</family></name>"
+        '<birthTime value="19620314"/>'
+        "</patient></patientRole></recordTarget>"
+        "<component><structuredBody><component><section>"
+        "<title>Medications</title><text><table>"
+        "<thead><tr><th>Medication</th><th>Date</th><th>Status</th></tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "</table></text></section></component></structuredBody></component>"
+        "</ClinicalDocument>"
+    )
+    p = tmp_path / name
+    p.write_text(doc, encoding="utf-8")
+    return p
+
+
+def test_ccda_discontinue_reason_survives_ingest_to_query_end_to_end(ready, capsys):
+    """Issue #159 through the CLI, whole chain: a CCDA med table's discontinue reason
+    reaches `ocr_text` (#138), lands on `medication.status_reason` at commit time, and
+    changes what `query meds --active` says - a renewal stays current while a completed
+    course does not. Pre-#159 every variant collapsed to a bare `discontinued` and the
+    renewal read as stopped."""
+    tmp_path = ready
+    src = _ccda_with_med_table(tmp_path)
+
+    assert _run(tmp_path, "ingest", str(src), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    assert "ingested document #1" in capsys.readouterr().out
+
+    # 1. the reason reaches ocr_text attached to its own row's status word (#138)
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        text = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    for drug, _date, cell in _CCDA_MED_ROWS:
+        expected = cell.replace("<content>", "").replace("</content>", "")
+        assert any(line.startswith(drug) and line.endswith(expected)
+                   for line in text.splitlines()), (drug, expected)
+
+    # 2. the lifecycle word and the parenthetical split across two fields (AGENTS.md 8)
+    meds = _write_json(tmp_path, "meds.json", {"medication": [
+        {"name": "Amoxicillin", "dose": "500 MG", "started_on": "2025-08-01",
+         "ended_on": "2025-08-28", "status": "discontinued"},
+        {"name": "Lisinopril", "dose": "10 MG", "started_on": "2024-10-01",
+         "ended_on": "2024-11-11", "status": "discontinued",
+         "status_reason": "Therapy Completed"},
+        {"name": "Levothyroxine", "dose": "50 MCG", "started_on": "2025-06-11",
+         "ended_on": "2026-06-11", "status": "discontinued",
+         "status_reason": "Reorder"},
+        {"name": "Atorvastatin", "dose": "20 MG", "started_on": "2025-01-02",
+         "ended_on": "2025-03-02", "status": "discontinued",
+         "status_reason": "Patient Stopped Taking"},
+        {"name": "Omeprazole", "dose": "20 MG", "started_on": "2025-02-09",
+         "ended_on": "2025-05-09", "status": "discontinued",
+         "status_reason": "Substitution/Alternate Therapy Placed"},
+        {"name": "Levothyroxine", "dose": "50 MCG", "started_on": "2026-06-12",
+         "status": "active"},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(meds)) == 0
+    assert "6 new" in capsys.readouterr().out
+
+    # 3. each reason is stored verbatim and readable off the row - no ocr_text parsing
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--json") == 0
+    stored = {(m["name"], m["started_on"]): m
+              for m in json.loads(capsys.readouterr().out)}
+    assert [stored[k]["status_reason"] for k in (
+        ("Amoxicillin", "2025-08-01"), ("Lisinopril", "2024-10-01"),
+        ("Levothyroxine", "2025-06-11"), ("Atorvastatin", "2025-01-02"),
+        ("Omeprazole", "2025-02-09"), ("Levothyroxine", "2026-06-12"),
+    )] == [None, "Therapy Completed", "Reorder", "Patient Stopped Taking",
+           "Substitution/Alternate Therapy Placed", None]
+    # ...and `status` stays lifecycle-only: the reason is never smuggled back into it
+    assert {m["status"] for m in stored.values()} == {"discontinued", "active"}
+
+    # 4. the human-readable listing shows the reason and marks the renewal
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert out.isascii()                                        # issue #23
+    levo = next(x for x in out.splitlines() if "2026-06-11" in x)
+    assert "[discontinued: Reorder]" in levo
+    assert "-> 2026-06-11 (renewed)" in levo
+    amox = next(x for x in out.splitlines() if "Amoxicillin" in x)
+    assert "[discontinued]" in amox and "(renewed)" not in amox  # bare: unchanged
+    for reason in ("Therapy Completed", "Patient Stopped Taking",
+                   "Substitution/Alternate Therapy Placed"):
+        row = next(x for x in out.splitlines() if reason in x)
+        assert f"[discontinued: {reason}]" in row
+        assert "(renewed)" not in row                            # still terminal
+
+    # 5. the verdict that matters: the renewal survives --active, the completed course
+    #    does not. Both have a terminal status and a past end date.
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--active",
+                "--json") == 0
+    active = {(m["name"], m["started_on"]) for m in json.loads(capsys.readouterr().out)}
+    assert ("Levothyroxine", "2025-06-11") in active     # renewed -> still current
+    assert ("Levothyroxine", "2026-06-12") in active     # the paired fresh row
+    assert ("Lisinopril", "2024-10-01") not in active    # therapy completed -> ended
+    assert ("Atorvastatin", "2025-01-02") not in active
+    assert ("Omeprazole", "2025-02-09") not in active
+    assert ("Amoxicillin", "2025-08-01") not in active   # bare discontinued -> ended
+
+
 def _ooxml_entity_bomb(root, levels=7, width=4, leaf=64):
     """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
     chain = "".join(

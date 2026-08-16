@@ -918,6 +918,50 @@ def test_ccda_renders_real_vendor_export_shapes(conn, tmp_path, sources):
     assert "Ferrous sulfate 325 MG - 1 tablet daily" in text
 
 
+# The medication-table shape #159 rests on: the discontinue reason is inline `<content>`
+# inside the same status cell as the lifecycle word. This pins the #138 extraction that
+# `medication.status_reason` depends on, so a narrative regression is caught here rather
+# than in a live corpus.
+_CCDA_MEDS = (
+    "<section><title>Medications</title><text><table>"
+    "<thead><tr><th>Medication</th><th>Date</th><th>Status</th></tr></thead>"
+    "<tbody>"
+    "<tr><td>Amoxicillin 500 MG</td><td>08/28/2025</td><td>Discontinued</td></tr>"
+    "<tr><td>Lisinopril 10 MG</td><td>11/11/2024</td>"
+    "<td>Discontinued<content> (Therapy Completed)</content></td></tr>"
+    "<tr><td>Levothyroxine 50 MCG</td><td>06/11/2026</td>"
+    "<td>Discontinued<content> (Reorder)</content></td></tr>"
+    "<tr><td>Atorvastatin 20 MG</td><td>03/02/2025</td>"
+    "<td>Discontinued<content> (Patient Stopped Taking)</content></td></tr>"
+    "<tr><td>Omeprazole 20 MG</td><td>05/09/2025</td>"
+    "<td>Discontinued<content> (Substitution/Alternate Therapy Placed)</content></td>"
+    "</tr>"
+    "</tbody></table></text></section>",
+)
+
+
+@pytest.mark.parametrize("drug, cell", [
+    ("Amoxicillin 500 MG", "Discontinued"),
+    ("Lisinopril 10 MG", "Discontinued (Therapy Completed)"),
+    ("Levothyroxine 50 MCG", "Discontinued (Reorder)"),
+    ("Atorvastatin 20 MG", "Discontinued (Patient Stopped Taking)"),
+    ("Omeprazole 20 MG", "Discontinued (Substitution/Alternate Therapy Placed)"),
+])
+def test_ccda_med_table_keeps_the_discontinue_reason_in_its_cell(
+    conn, tmp_path, sources, drug, cell
+):
+    """Each status cell reaches ocr_text whole - reason attached to its own row's status
+    word, never split across cells or dropped (issue #159's extraction dependency)."""
+    src = _make_ccda(tmp_path, name="DOC0159.XML", sections=_CCDA_MEDS)
+    text = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).document.ocr_text
+    assert f"{drug}\t" in text
+    assert text.count(cell) >= 1
+    row = next(line for line in text.splitlines() if line.startswith(drug))
+    assert row.endswith(cell)
+
+
 def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
     def boom(path):  # pragma: no cover - the assertion is that this never runs
         raise AssertionError(f"run_ocr must not be called for {path}")

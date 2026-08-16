@@ -115,6 +115,62 @@ def test_query_meds_terminal_status_renders_ended_not_current(ready, capsys):
     assert "(current)" in metformin
 
 
+def test_query_meds_shows_the_discontinue_reason_and_marks_a_renewal(ready, capsys):
+    """Issue #159: the reason prints beside the lifecycle word, and a renewed
+    prescription's end date is marked rather than reading as a flat stop."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "started_on": "2024-11-01",
+             "ended_on": "2024-11-11", "status": "discontinued",
+             "status_reason": "Therapy Completed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    levo = next(line for line in out.splitlines() if "Levothyroxine" in line)
+    assert "[discontinued: Reorder]" in levo
+    assert "-> 2026-06-11 (renewed)" in levo
+    amox = next(line for line in out.splitlines() if "Amoxicillin" in line)
+    assert "[discontinued: Therapy Completed]" in amox
+    assert "(renewed)" not in amox
+    assert out.isascii()
+
+    # ...and only the renewal survives --active.
+    assert _run(ready, "query", "meds", "--person", "jane-doe", "--active",
+                "--json") == 0
+    names = [m["name"] for m in json.loads(capsys.readouterr().out)]
+    assert "Levothyroxine" in names and "Amoxicillin" not in names
+
+
+def test_query_meds_bare_discontinued_line_is_unchanged(ready, capsys):
+    """A row with no reason prints exactly as it always did - no empty bracket, no
+    stray separator (issue #159's no-regression bar)."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": "Atorvastatin", "dose": "20mg",
+                        "started_on": "2025-01-01", "ended_on": "2025-08-28",
+                        "status": "discontinued"}],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    line = next(x for x in capsys.readouterr().out.splitlines()
+                if "Atorvastatin" in x)
+    assert "[discontinued]" in line
+    assert "-> 2025-08-28" in line and "(renewed)" not in line
+    assert ": ]" not in line
+
+
 def test_query_meds_active_drops_expired_course_labelled_active(ready, capsys):
     """Issue #57 repro: a 2024 ten-day course carrying status='active' must not come
     back from `query meds --active`; a future end date under the same status must."""
