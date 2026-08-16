@@ -1089,7 +1089,12 @@ default to the same exclusion unless a human explicitly decides otherwise.
   A *compound* order key (one order naming several analytes, `cbc,cmp,ldh`) decomposes on
   `,`/`/` at parenthesis depth 0 into component tokens, each still matched exactly, and
   leaves the section only when **every** component resulted in window (issue #145) — the
-  order side alone decomposes, and a partially resulted panel is still outstanding. Those
+  order side alone decomposes, and a partially resulted panel is still outstanding. A
+  decomposed component drops structural words that name no analyte (`panel`, `profile`,
+  `extensive`), so `Immunofixation Panel` can match an `Immunofixation` result; if that
+  leaves a component with nothing readable, the whole key is voided rather than the
+  component dropped, so the surviving analytes can't suppress an order still naming
+  something unread. Those
   separators are content, not structure, inside many single analytes' names (`Glucose,
   fasting`, `Kappa/Lambda Ratio`), so two guards keep #128's behaviour reachable: a key
   the dictionary declares as one analyte is never split, and the whole-key match is tried

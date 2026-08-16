@@ -599,7 +599,12 @@ def _order_tokens(
     parenthetical (see :func:`_split_components`).
 
     ``()`` for an empty or wholly unusable key, which :func:`_all_resulted` reads as
-    "nothing known" -> render.
+    "nothing known" -> render. Decomposition **fails closed** on the same rule: if any one
+    component tokenizes empty -- it was entirely noise words (``CBC, Extensive Panel``), or
+    whitespace-equivalent after normalization -- the whole key returns ``()``. Dropping just
+    that component would silently narrow all-or-nothing to all-*remaining* and let the
+    surviving analytes suppress an order naming something this layer could not read, which
+    is the one direction (#128's inversion) the section must never fail in.
     """
     if value is None:
         return ()
@@ -617,8 +622,9 @@ def _order_tokens(
                 w for w in part.split() if w.lower() not in _ORDER_NOISE_WORDS
             )
         token = key_token(part, dictionary)
-        if token:
-            tokens.append(token)
+        if not token:
+            return ()                            # one unreadable component -> render
+        tokens.append(token)
     return tuple(dict.fromkeys(tokens))          # de-dup, order preserved
 
 

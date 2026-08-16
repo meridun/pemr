@@ -549,6 +549,25 @@ def test_summary_orders_malformed_compound_key_renders(seeded):
     assert "- HbA1c,  (ordered 2026-03-03)" in section
 
 
+def test_summary_orders_unreadable_component_does_not_let_the_rest_suppress(seeded):
+    """Decomposition fails **closed**: a component that tokenizes empty -- all noise words
+    (`Extensive Panel`), or whitespace-equivalent after normalization -- is not dropped from
+    the set, it voids the whole key. Dropping it would narrow all-or-nothing to
+    all-*remaining* and let a lone `CBC` result suppress an order still naming something this
+    layer could not read, which is the one direction the section must never fail in."""
+    _seed_orders(seeded, [
+        {"key": "CBC, Extensive Panel", "observed_at": "2026-03-01"},
+        {"key": "Sodium, ()", "observed_at": "2026-03-02"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "CBC", "collected_at": "2026-03-01", "value_num": 1.0},
+        {"test_name": "Sodium", "collected_at": "2026-03-02", "value_num": 140},
+    ])
+    section = _orders_section(seeded)
+    assert "- CBC, Extensive Panel  (ordered 2026-03-01)" in section
+    assert "- Sodium, ()  (ordered 2026-03-02)" in section
+
+
 # A `,` or `/` is structure in a panel key but *content* in many single analytes' names
 # (`Glucose, fasting`, `Kappa/Lambda Ratio`). Decomposing one of those asks for analytes
 # that were never ordered, so the order stops suppressing -- #128's inversion, re-created
