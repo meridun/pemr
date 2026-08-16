@@ -1086,6 +1086,10 @@ default to the same exclusion unless a human explicitly decides otherwise.
   edge-tested date window) and biased toward under-suppression, since age alone is never
   a signal and a hidden-but-still-open order would be the worse failure; the window
   constants are guarded by a pinned edge test so a casual widening doesn't slip through.
+  A *compound* order key (one order naming several analytes, `cbc,cmp,ldh`) decomposes on
+  `,`/`/` at parenthesis depth 0 into component tokens, each still matched exactly, and
+  leaves the section only when **every** component resulted in window (issue #145) — the
+  order side alone decomposes, and a partially resulted panel is still outstanding.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.

@@ -82,6 +82,14 @@ ORDER_RESULT_WINDOW_DAYS = 30
 #: text. A result genuinely predating its order answers an *earlier* order, so this side
 #: stays tight.
 ORDER_RESULT_BACKDATE_DAYS = 1
+#: Separators a *compound* order key uses to name several analytes at once (issue #145),
+#: e.g. ``cbc,cmp,ldh`` or ``spep / immunofixation panel``. Only the two actually observed
+#: in order text; extended on evidence, never speculatively -- every extra separator is a
+#: new way to split an identity that was never compound.
+_ORDER_SEPARATORS = (",", "/")
+#: Structural words in a compound key that name no analyte, dropped so a component can
+#: match the result that answered it. Deliberately tiny, for the same reason.
+_ORDER_NOISE_WORDS = frozenset({"panel", "profile", "extensive"})
 
 # `condition.status` buckets, one rendered section each (family history last: it is
 # context about relatives, not the patient's own record).
@@ -515,6 +523,92 @@ def _is_resulted(
     )
 
 
+def _split_components(text: str) -> list[str]:
+    """``text`` split on :data:`_ORDER_SEPARATORS` occurring at parenthesis depth 0.
+
+    Parts are stripped and empties dropped, so a leading/trailing/doubled separator
+    contributes nothing. Depth is clamped at 0: a stray ``)`` (OCR loses brackets) must
+    not drive it negative and start splitting inside a later parenthetical. A
+    parenthetical is identity-bearing (issue #71), so a separator inside one is content,
+    not structure -- ``SLE Profile (Profile A, Scleroderma)`` is one component, not two.
+
+    Never raises: like :func:`_as_date`, a malformed key must render, not crash.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in _ORDER_SEPARATORS:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [p for p in (part.strip() for part in parts) if p]
+
+
+def _order_tokens(
+    value: object, dictionary: dict[str, str] | None = None
+) -> tuple[str, ...]:
+    """An order's identity token **set** -- one token per analyte it names (issue #145).
+
+    ``_is_resulted`` compares a single :func:`key_token`, so a *panel* order (one key
+    naming several analytes: ``cbc,cmp,ldh``) yields one token no single-analyte result
+    can ever equal, and the order never leaves the section however completely it was
+    resulted. Decomposing the order side fixes that without loosening the match itself:
+    every component is still compared exact-token, never by substring.
+
+    Only the **order** side decomposes. A ``lab_result.test_name`` names one analyte by
+    construction, so splitting it would invent components that were never ordered.
+
+    A key with no top-level separator returns exactly today's single token -- original
+    text, no word stripping -- so single-analyte behaviour is unchanged by construction,
+    not merely by test. Noise-word removal applies only to a key that actually
+    decomposed, and never inside a parenthetical (see :func:`_split_components`).
+
+    ``()`` for an empty or wholly unusable key, which :func:`_all_resulted` reads as
+    "nothing known" -> render.
+    """
+    if value is None:
+        return ()
+    text = str(value).strip()
+    if not text:
+        return ()
+    parts = _split_components(text)
+    if len(parts) <= 1:
+        token = key_token(text, dictionary)
+        return (token,) if token else ()
+    tokens: list[str] = []
+    for part in parts:
+        if "(" not in part:
+            part = " ".join(
+                w for w in part.split() if w.lower() not in _ORDER_NOISE_WORDS
+            )
+        token = key_token(part, dictionary)
+        if token:
+            tokens.append(token)
+    return tuple(dict.fromkeys(tokens))          # de-dup, order preserved
+
+
+def _all_resulted(
+    tokens: tuple[str, ...], observed_at: object, index: dict[str, list[date]]
+) -> bool:
+    """Is **every** analyte this order names already resulted? (issue #145)
+
+    All-or-nothing, composing :func:`_is_resulted` per component: one component still
+    outstanding keeps the whole panel rendering, because a partially resulted panel *is*
+    outstanding work. An empty token set answers no, on the same "ambiguity renders"
+    rule as an unusable single token.
+    """
+    if not tokens:
+        return False
+    return all(_is_resulted(token, observed_at, index) for token in tokens)
+
+
 def _grouped_orders(
     conn: sqlite3.Connection,
     person_id: int,
@@ -548,6 +642,12 @@ def _grouped_orders(
     ``group_count``/``+N earlier`` disclosure is unchanged for everything that still
     renders. Referral-type orders have no ``lab_result`` by construction and so are
     never suppressed by this; closing them needs a mechanism that does not exist yet.
+
+    A **compound** key -- one order naming several analytes (``cbc,cmp,ldh``) -- is asked
+    the same question per component (issue #145): the group's identity text decomposes to
+    a token *set* (:func:`_order_tokens`) and the order drops only when every one of them
+    resulted in window. Grouping still folds on the single :func:`key_token`, so #93's
+    ``+N earlier`` disclosure is untouched; only the suppression question changed.
     """
     rows = conn.execute(
         "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
@@ -562,25 +662,33 @@ def _grouped_orders(
         token = key_token(r["key"], dictionary) or key_token(r["value_text"], dictionary)
         groups.setdefault(token or ("", r["observation_id"]), []).append(r)
 
-    # Carry each group's identity token alongside it: the suppression lookup needs the
-    # very token the fold grouped on, and a keyless group (identity is the
-    # `("", observation_id)` fallback tuple) has none -- so it is never suppressed.
-    folded: list[tuple[str, dict]] = []
+    # Carry each group's identity token *set* alongside it: the suppression lookup asks
+    # about the very text the fold grouped on, decomposed per analyte (issue #145), and a
+    # keyless group (identity is the `("", observation_id)` fallback tuple) has none --
+    # so it is never suppressed.
+    folded: list[tuple[tuple[str, ...], dict]] = []
     for identity, members in groups.items():
         latest = members[-1]                      # ascending -> last is the latest
         earlier = sorted(
             d for d in (_date_part(m["observed_at"]) for m in members[:-1]) if d
         )
+        tokens: tuple[str, ...] = ()
+        if isinstance(identity, str):
+            # Same test the fold used, so the decomposition speaks for the same text.
+            source = (latest["key"] if key_token(latest["key"], dictionary)
+                      else latest["value_text"])
+            tokens = _order_tokens(source, dictionary)
         folded.append((
-            identity if isinstance(identity, str) else "",
+            tokens,
             dict(latest, group_count=len(members),
                  group_first=earlier[0] if earlier else ""),
         ))
 
-    # Drop what a result already answered (issue #128), asking the group's latest row.
+    # Drop what a result already answered (issue #128), asking the group's latest row --
+    # and, for a compound key, only when every analyte it names resulted (issue #145).
     index = _result_index(conn, person_id, dictionary, cur) if folded else {}
-    out = [g for token, g in folded
-           if not _is_resulted(token, g["observed_at"], index)]
+    out = [g for tokens, g in folded
+           if not _all_resulted(tokens, g["observed_at"], index)]
 
     # Two stable passes: alphabetical, then order-date ascending (undated sorts last,
     # keeping its alphabetical order). This section diverges from the other event
