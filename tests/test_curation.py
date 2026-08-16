@@ -63,6 +63,38 @@ def seeded(conn):
     return {"conn": conn, "jane": jane, "doc": doc_id}
 
 
+@pytest.fixture()
+def two_people(conn):
+    """Jane and John each own a document holding the *same* facts (issue #161).
+
+    A ``dedup_base`` folds ``person_id`` in, so "Type 2 Diabetes" lands under two
+    different, unrelated bases here — nothing collides, which is precisely why a merge
+    across them is silent without an explicit person check.
+    """
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    john = persons.add_person(conn, "john-doe", "John Doe")
+    jane_doc = _insert_document(conn, jane.person_id, "aa11bb22cc33dd44")
+    john_doc = _insert_document(conn, john.person_id, "bb22cc33dd44ee55")
+    dedup.commit_extraction(conn, jane_doc, RECORDS)
+    dedup.commit_extraction(conn, john_doc, RECORDS)
+    return {"conn": conn, "jane": jane, "john": john}
+
+
+def _person_row_id(conn, record_type, column, value, person_id):
+    return int(conn.execute(
+        f"SELECT {record_type}_id FROM {record_type} "
+        f"WHERE {column} = ? AND person_id = ?",
+        (value, person_id),
+    ).fetchone()[f"{record_type}_id"])
+
+
+def _person_base(conn, record_type, column, value, person_id):
+    return conn.execute(
+        f"SELECT dedup_base FROM {record_type} WHERE {column} = ? AND person_id = ?",
+        (value, person_id),
+    ).fetchone()["dedup_base"]
+
+
 def _row_id(conn, record_type, column, value):
     return int(conn.execute(
         f"SELECT {record_type}_id FROM {record_type} WHERE {column} = ?", (value,)
@@ -235,6 +267,175 @@ def test_merge_target_must_be_a_live_other_family(seeded):
             merged_into_base=base,
         )
     assert _curation_count(conn) == 0
+
+
+# --- the merge target's person (issue #161) -----------------------------------
+#
+# A dedup_base is person-scoped, so two people's same-named families never collide and a
+# merge across them is silent: the fact leaves one chart and appears on neither, while
+# `verify` sees a live target and reports no orphan.
+
+
+def _cross_person_bases(two_people):
+    """``(conn, jane's condition base, john's condition base)`` for the same label."""
+    conn = two_people["conn"]
+    return (
+        conn,
+        _person_base(conn, "condition", "name", "Type 2 Diabetes",
+                     two_people["jane"].person_id),
+        _person_base(conn, "condition", "name", "Type 2 Diabetes",
+                     two_people["john"].person_id),
+    )
+
+
+def test_the_same_fact_gets_a_different_base_per_person(two_people):
+    """The premise of the guard — without it nothing would need checking."""
+    _conn, jane_base, john_base = _cross_person_bases(two_people)
+    assert jane_base != john_base
+
+
+def test_annotate_merged_into_refuses_a_cross_person_target(two_people):
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    with pytest.raises(ValueError, match="belongs to a different person"):
+        curation.annotate_record(
+            conn, "condition", jane_base, status="merged-into",
+            note="same condition, two charts", merged_into_base=john_base, apply=True,
+        )
+    assert _curation_count(conn) == 0
+
+
+def test_annotate_cross_person_refusal_fires_in_dry_run(two_people):
+    """Validation is front-loaded, so the refusal is identical with and without
+    ``--apply`` — a dry run must not report a write that would be refused."""
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    with pytest.raises(ValueError, match="belongs to a different person"):
+        curation.annotate_record(
+            conn, "condition", jane_base, status="merged-into", note="x",
+            merged_into_base=john_base,
+        )
+    assert _curation_count(conn) == 0
+
+
+def test_annotate_cross_person_refusal_names_both_people(two_people):
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    with pytest.raises(ValueError) as exc:
+        curation.annotate_record(
+            conn, "condition", jane_base, status="merged-into", note="x",
+            merged_into_base=john_base,
+        )
+    message = str(exc.value)
+    assert "jane-doe" in message and "john-doe" in message
+    assert "--allow-cross-person" in message
+    assert "nothing was written" in message
+    assert message.isascii()
+
+
+def test_annotate_merged_into_refuses_cross_person_at_row_scope(two_people):
+    """Row scope resolves the ruled person off the *row*, not off occurrence 0."""
+    conn = two_people["conn"]
+    jane_row = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                              two_people["jane"].person_id)
+    john_row = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                              two_people["john"].person_id)
+    with pytest.raises(ValueError, match="belongs to a different person"):
+        curation.annotate_record(
+            conn, "condition", str(jane_row), row=True, status="merged-into",
+            note="x", merged_into_base=str(john_row), apply=True,
+        )
+    assert _curation_count(conn) == 0
+
+
+def test_annotate_allows_cross_person_merge_with_the_override(two_people):
+    """The check must not make a legitimate cross-person merge impossible — only
+    explicit."""
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    report = curation.annotate_record(
+        conn, "condition", jane_base, status="merged-into",
+        note="one person, two records in this database",
+        merged_into_base=john_base, allow_cross_person=True, apply=True,
+    )
+    assert report.cross_person is True
+    assert report.as_dict()["cross_person"] is True
+    stored = curation.get_verdict(conn, "condition", jane_base)
+    assert stored["merged_into_base"] == john_base
+    assert _curation_count(conn) == 1
+
+
+def test_annotate_same_person_merge_is_unchanged(two_people):
+    """No regression to the common case, nor to the report's key set (contract)."""
+    conn = two_people["conn"]
+    jane_id = two_people["jane"].person_id
+    base = _person_base(conn, "condition", "name", "Prediabetes", jane_id)
+    target = _person_base(conn, "condition", "name", "Type 2 Diabetes", jane_id)
+    report = curation.annotate_record(
+        conn, "condition", base, status="merged-into", note="evolved into the same dx",
+        merged_into_base=target, apply=True,
+    )
+    assert report.cross_person is False
+    assert set(report.as_dict()) == {
+        "record_type", "dedup_base", "status", "note", "attributed_to", "created_at",
+        "merged_into_base", "label", "family_size", "previous", "action", "applied",
+        "record_id", "scope", "cross_person",
+    }
+    assert curation.get_verdict(conn, "condition", base)["merged_into_base"] == target
+
+
+def test_annotate_allow_cross_person_is_a_no_op_on_a_same_person_merge(two_people):
+    """A redundant override never fails: scripted same-person annotates stay robust."""
+    conn = two_people["conn"]
+    jane_id = two_people["jane"].person_id
+    base = _person_base(conn, "condition", "name", "Prediabetes", jane_id)
+    target = _person_base(conn, "condition", "name", "Type 2 Diabetes", jane_id)
+    report = curation.annotate_record(
+        conn, "condition", base, status="merged-into", note="evolved",
+        merged_into_base=target, allow_cross_person=True, apply=True,
+    )
+    assert report.cross_person is False
+
+
+def test_annotate_row_merged_into_its_own_family_still_allowed(seeded):
+    """The #116 narrowing shape survives the new guard — the person check is skipped
+    when the target *is* the annotated family."""
+    conn = seeded["conn"]
+    row_id = _row_id(conn, "condition", "name", "Prediabetes")
+    base = _base(conn, "condition", "name", "Prediabetes")
+    report = curation.annotate_record(
+        conn, "condition", str(row_id), row=True, status="merged-into",
+        note="absorbed into its own family", merged_into_base=base, apply=True,
+    )
+    assert report.applied is True and report.cross_person is False
+    assert curation.get_verdict(
+        conn, "condition", base, record_id=row_id
+    )["merged_into_base"] == base
+
+
+def test_annotate_allow_cross_person_is_rejected_on_other_statuses(seeded):
+    """Mirrors the `--merged-into` flag rule sitting next to it."""
+    conn = seeded["conn"]
+    base = _base(conn, "condition", "name", "Prediabetes")
+    with pytest.raises(
+        ValueError, match="only meaningful with status 'merged-into'"
+    ):
+        curation.annotate_record(
+            conn, "condition", base, status="confirmed", note="x",
+            allow_cross_person=True, apply=True,
+        )
+    assert _curation_count(conn) == 0
+
+
+def test_person_lookups_report_an_unknown_person_rather_than_raising(two_people):
+    """The `family_label`/`row_label` convention: a gone family or row is described,
+    never raised on. That is what keeps the guard from refusing on absence — an unknown
+    person is not evidence of a mismatch, and refusing there would break the
+    orphan-repair paths this module exists to keep runnable."""
+    conn, jane_base, _john_base = _cross_person_bases(two_people)
+    jane_id = two_people["jane"].person_id
+    jane_row = _person_row_id(conn, "condition", "name", "Type 2 Diabetes", jane_id)
+    assert curation.family_person(conn, "condition", jane_base) == (
+        jane_id, "jane-doe")
+    assert curation.row_person(conn, "condition", jane_row) == (jane_id, "jane-doe")
+    assert curation.family_person(conn, "condition", "deadbeef" * 8) == (None, "")
+    assert curation.row_person(conn, "condition", 9999) == (None, "")
 
 
 def test_a_bad_verdict_never_overwrites_a_good_one(seeded):
@@ -1568,7 +1769,7 @@ def test_cli_annotate_json_shape_is_stable(cli_ready, capsys):
     expected = {
         "record_type", "dedup_base", "status", "note", "attributed_to",
         "created_at", "merged_into_base", "label", "family_size", "previous",
-        "action", "applied", "record_id", "scope",
+        "action", "applied", "record_id", "scope", "cross_person",
     }
     capsys.readouterr()
     assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
@@ -1625,6 +1826,86 @@ def test_cli_annotate_clear(cli_ready, capsys):
                 "--clear", "--apply") == 0
     assert "cleared curation verdict for lab_result" in capsys.readouterr().out
     assert _cli_curation_count(cli_ready) == 0
+
+
+@pytest.fixture()
+def cli_two_people(cli_ready):
+    """`cli_ready` plus John, holding the same facts under his own bases (issue #161)."""
+    assert _run(cli_ready, "person", "add", "--slug", "john-doe",
+                "--name", "John") == 0
+    scan = cli_ready / "scan2.txt"
+    scan.write_bytes(b"visit note for john: hba1c 5.7 percent, glucose 95")
+    assert _run(cli_ready, "ingest", str(scan), "--person", "john-doe",
+                "--sources", str(cli_ready / "sources"), "--ocr-text-file",
+                str(scan)) == 0
+    payload = cli_ready / "extract2.json"
+    payload.write_text(json.dumps(RECORDS), encoding="utf-8")
+    assert _run(cli_ready, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+    return cli_ready
+
+
+def _cli_person_base(tmp_path, record_type, column, value, slug):
+    conn = _cli_conn(tmp_path)
+    try:
+        person_id = int(conn.execute(
+            "SELECT person_id FROM person WHERE slug = ?", (slug,)
+        ).fetchone()["person_id"])
+        return _person_base(conn, record_type, column, value, person_id)
+    finally:
+        conn.close()
+
+
+def _cli_person_row_id(tmp_path, record_type, column, value, slug):
+    conn = _cli_conn(tmp_path)
+    try:
+        person_id = int(conn.execute(
+            "SELECT person_id FROM person WHERE slug = ?", (slug,)
+        ).fetchone()["person_id"])
+        return _person_row_id(conn, record_type, column, value, person_id)
+    finally:
+        conn.close()
+
+
+def test_cli_annotate_cross_person_exits_1_and_writes_nothing(cli_two_people, capsys):
+    """The refusal reaches the operator as this codebase's usual friendly rc=1, naming
+    both people and the escape hatch."""
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    capsys.readouterr()
+
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "same condition", "--apply") == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "jane-doe" in err and "john-doe" in err
+    assert "--allow-cross-person" in err and err.isascii()
+    assert _cli_curation_count(cli_two_people) == 0
+
+
+def test_cli_annotate_allow_cross_person_writes_and_discloses(cli_two_people, capsys):
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    capsys.readouterr()
+
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "one person, filed twice", "--allow-cross-person",
+                "--json", "--apply") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cross_person"] is True and payload["applied"] is True
+
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "one person, filed twice", "--allow-cross-person") == 0
+    out = capsys.readouterr().out
+    assert "cross-person merge: allowed by --allow-cross-person" in out
+    assert _cli_curation_count(cli_two_people) == 1
 
 
 def test_cli_annotate_requires_table_and_target_unless_list(cli_ready):
@@ -2080,6 +2361,45 @@ def test_cli_reaffirm_skips_a_merge_target_with_no_successor(cli_ready, capsys):
     assert _cli_curation_rows(cli_ready) == before
 
 
+def test_cli_reaffirm_skips_a_cross_person_merge_target(cli_two_people, capsys):
+    """The #161 guard, refused in the *plan*: `annotate_record` would raise on this
+    successor, and a mid-batch raise would stop the run after N partial writes. No
+    `--map-file` key plumbs the override through — `rekey` never rewrites `person_id`,
+    so this state is only reachable from a hand-edited map."""
+    prediabetes = _cli_person_base(cli_two_people, "condition", "name", "Prediabetes",
+                                   "jane-doe")
+    diabetes = _cli_person_base(cli_two_people, "condition", "name",
+                                "Type 2 Diabetes", "jane-doe")
+    johns = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                             "john-doe")
+    assert _run(cli_two_people, "record", "annotate", "condition", prediabetes,
+                "--status", "merged-into", "--merged-into", diabetes,
+                "--note", "evolved into the same dx", "--apply") == 0
+    # Remove the merge target's only row: the verdict is now a dangling-merge orphan.
+    assert _run(cli_two_people, "record", "rm", "condition",
+                str(_cli_person_row_id(cli_two_people, "condition", "name",
+                                       "Type 2 Diabetes", "jane-doe")),
+                "--apply") == 0
+
+    capsys.readouterr()
+    assert _run(cli_two_people, "record", "reaffirm", "--json") == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [e["kinds"] for e in listed] == [[curation.ORPHAN_DANGLING_MERGE]]
+    # Hand-edited: the successor named is the *other person's* family.
+    listed[0]["successor_merge_base"] = johns
+    mapped = cli_two_people / "hand-edited.json"
+    mapped.write_text(json.dumps(listed), encoding="utf-8")
+    before = _cli_curation_rows(cli_two_people)
+
+    assert _run(cli_two_people, "record", "reaffirm", "--map-file", str(mapped),
+                "--apply") == 1
+    out = capsys.readouterr().out
+    assert "belongs to a different person" in out
+    assert "jane-doe" in out and "john-doe" in out
+    assert "--allow-cross-person" in out
+    assert _cli_curation_rows(cli_two_people) == before
+
+
 def test_cli_reaffirm_skips_a_row_verdict_whose_row_is_gone(cli_ready, capsys):
     """A restored or hand-edited database can hold a row verdict whose merge target moved
     *and* whose own row is gone. Refused in the plan, with the `--clear` pointer, rather
@@ -2343,3 +2663,96 @@ def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
     assert "warnings       2" in capsys.readouterr().out
+
+
+# --- smoke: the cross-person merge accident, end to end through the CLI ------
+
+
+def _summary_section(tmp_path, slug, heading, capsys):
+    """The named `## <heading>` block of one person's rendered master summary."""
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "summary", "--person", slug) == 0
+    body = capsys.readouterr().out.split(f"## {heading}\n", 1)[1]
+    return body.split("\n## ", 1)[0]
+
+
+def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys):
+    """The reporter's story, driven entirely through the CLI (issue #161).
+
+    The unit tests prove the guard fires; this one earns the guard the way the
+    reporter found the bug — two people who each carry "Type 2 Diabetes", an
+    `annotate` that points one at the other, and a `render` showing what the
+    accident costs. The last two steps are the load-bearing ones: with
+    `--allow-cross-person` the fact really does leave jane's chart without ever
+    appearing on john's, and `pemr verify` really is clean while it happens, so the
+    refusal is the only thing standing between an operator and a silent loss.
+    """
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    jane_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "jane-doe")
+    john_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "john-doe")
+    # The premise: the same clinical label, two unrelated person-scoped bases, so
+    # nothing collides at dedup time and nothing warns.
+    assert jane != john
+
+    # 1. The accident, at family scope - refused in dry run *and* under --apply,
+    #    since the check is front-loaded ahead of every write.
+    for extra in ([], ["--apply"]):
+        capsys.readouterr()
+        assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                    "--status", "merged-into", "--merged-into", john,
+                    "--note", "looks like the same dx", *extra) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("error: ") and err.isascii()
+        assert "jane-doe" in err and "john-doe" in err
+        assert "--allow-cross-person" in err
+        assert "nothing was written" in err
+
+    # 2. The same accident at row scope, where the ruled person comes off the row.
+    capsys.readouterr()
+    assert _run(cli_two_people, "record", "annotate", "condition", str(jane_row),
+                "--row", "--status", "merged-into", "--merged-into", str(john_row),
+                "--note", "looks like the same dx", "--apply") == 1
+    assert "belongs to a different person" in capsys.readouterr().err
+    assert _cli_curation_count(cli_two_people) == 0
+
+    # 3. No collateral damage: jane's own same-person merge still lands, and her
+    #    chart still shows the condition the accident was aimed at.
+    prediabetes = _cli_person_base(cli_two_people, "condition", "name",
+                                   "Prediabetes", "jane-doe")
+    assert _run(cli_two_people, "record", "annotate", "condition", prediabetes,
+                "--status", "merged-into", "--merged-into", jane,
+                "--note", "progressed to the same dx", "--apply") == 0
+    assert "Type 2 Diabetes" in _summary_section(
+        cli_two_people, "jane-doe", "Active Problems", capsys)
+
+    # 4. What the guard is standing in front of: forced through with the escape
+    #    hatch, the fact leaves jane's chart and never arrives on john's...
+    capsys.readouterr()
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "deliberate, for the smoke", "--allow-cross-person",
+                "--apply") == 0
+    assert "cross-person merge: allowed by --allow-cross-person" in (
+        capsys.readouterr().out)
+    jane_problems = _summary_section(cli_two_people, "jane-doe",
+                                     "Active Problems", capsys)
+    john_problems = _summary_section(cli_two_people, "john-doe",
+                                     "Active Problems", capsys)
+    assert "Type 2 Diabetes" not in jane_problems
+    assert john_problems.count("Type 2 Diabetes") == 1   # john's own row, not jane's
+
+    # ...and `verify` stays clean throughout, because the target family genuinely
+    # exists. Nothing in the database is broken; a fact simply stopped rendering.
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+
+    # 5. And it is reversible: lifting the verdict restores jane's chart.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--clear", "--apply") == 0
+    assert "Type 2 Diabetes" in _summary_section(
+        cli_two_people, "jane-doe", "Active Problems", capsys)
