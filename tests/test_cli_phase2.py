@@ -954,6 +954,59 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
+def _ooxml_entity_bomb(root, levels=7, width=4, leaf=64):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+    chain = "".join(
+        f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
+    )
+    return f'<!DOCTYPE {root} [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx"])
+def test_ocr_auto_refuses_a_doctype_bearing_ooxml_end_to_end(ready, capsys, kind):
+    """Issue #155 through the CLI: a DOCTYPE member is refused before parsing, and
+    the refusal costs a note — never the document. Pre-fix these ~800-byte files
+    stored 1,048,576 chars of `AAAA…` as `native` text."""
+    tmp_path = ready
+    if kind == "docx":
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("w:document")
+        member = "word/document.xml"
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>{doctype}'
+            f'<w:document xmlns:w="{ns}"><w:body>'
+            f"<w:p><w:r><w:t>&e{levels};</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+    else:
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("worksheet")
+        member = "xl/worksheets/sheet1.xml"
+        body = (
+            f'{doctype}<worksheet xmlns="{ns}"><sheetData>'
+            f'<row><c t="str"><v>&e{levels};</v></c></row>'
+            "</sheetData></worksheet>"
+        )
+    src = tmp_path / f"bomb.{kind}"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(member, body)
+    assert src.stat().st_size < 4096          # well under the extraction byte cap
+
+    assert _run(tmp_path, "ingest", str(src), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto",
+                "--force") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out          # the document is kept
+    assert f"{member} declares a DOCTYPE" in out.err   # named, before any parse
+    assert "no ocr_text stored" in out.err
+    assert "A" * 200 not in out.err
+
+    # nothing expanded into the archive: the amplified text is unfindable
+    assert _run(tmp_path, "find", "--person", "jane-doe", "AAAA") == 0
+    assert "no matches" in capsys.readouterr().out
+
+
 def test_ocr_tesseract_is_rejected(ready, capsys):
     """Issue #91: the misleading `tesseract` alias is gone; argparse names `auto`."""
     tmp_path = ready
@@ -1698,3 +1751,71 @@ def test_functional_observation_cli_roundtrip(ready, capsys):
         assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
     finally:
         conn.close()
+
+
+# --- a display preference must not touch dedup (issues #129 + #136) ----------
+
+def _reingest_after_a_unit_correction(root, *, with_pref):
+    """ingest -> commit -> `record edit` the unit -> (optionally set a canonical display
+    unit) -> re-commit the *same* extraction off the same document.
+
+    Returns everything the second commit did: its exit code, the conflict rows it
+    staged, and the surviving observation rows.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+
+    def run(*argv):
+        return cli.main(["--db", str(root / "cli.db"), *argv])
+
+    assert run("migrate", "--create") == 0
+    assert run("person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
+    scan = root / "scan.txt"
+    scan.write_bytes(b"weight 180 lbs")
+    assert run("ingest", str(scan), "--person", "jane-doe",
+               "--sources", str(root / "sources")) == 0
+    payload = _write_json(root, "extract.json", {"observation": [
+        {"obs_type": "vital", "key": "weight", "observed_at": "2026-01-02",
+         "value_num": 180.0, "unit": "lbs"},
+    ]})
+    assert run("commit-extraction", "--document", "1", "--json", str(payload)) == 0
+    # Issue #129's scalpel: correct the mislabelled unit in place, provenance intact.
+    assert run("record", "edit", "observation", "1", "--set", "unit=lb",
+               "--note", "normalise unit spelling", "--apply") == 0
+    if with_pref:
+        assert run("person", "unit-pref", "set", "jane-doe", "--key", "weight",
+                   "--unit", "lb") == 0
+
+    rc = run("commit-extraction", "--document", "1", "--json", str(payload))
+    conn = db.connect(root / "cli.db")
+    try:
+        conflicts = [dict(r) for r in conn.execute(
+            "SELECT record_type, dedup_key, existing_json, incoming_json, status "
+            "FROM conflict ORDER BY conflict_id"
+        ).fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT key, value_num, unit, dedup_key FROM observation "
+            "ORDER BY observation_id"
+        ).fetchall()]
+    finally:
+        conn.close()
+    return rc, conflicts, rows
+
+
+def test_a_display_unit_preference_cannot_change_re_ingest_dedup(tmp_path):
+    """Issue #136 AC-7. `unit` is in `dedup._COMPARE_FIELDS`, so a row whose unit was
+    corrected by `record edit` diverges from its own source document on re-ingest --
+    deliberately and loudly (#129's "Re-ingest divergence"). #136 must not quietly
+    change that either way: it is a *display* lever, so the property to prove is **no
+    change at all**, with a preference set or not.
+    """
+    plain = _reingest_after_a_unit_correction(tmp_path / "plain", with_pref=False)
+    preferred = _reingest_after_a_unit_correction(tmp_path / "preferred",
+                                                  with_pref=True)
+    assert plain == preferred
+
+    rc, conflicts, rows = preferred
+    # And the outcome is #129's documented one, so this cannot pass by both sides
+    # silently becoming no-ops.
+    assert rc == 0
+    assert [c["record_type"] for c in conflicts] == ["observation"]
+    assert [(r["unit"], r["value_num"]) for r in rows] == [("lb", 180.0)]

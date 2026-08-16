@@ -697,7 +697,10 @@ def _make_stub(tmp_path, name="budget.gsheet", payload=None):
     return p
 
 
-def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
+def _make_docx(
+    tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",), doctype=""
+):
+    """A minimal `.docx`; `doctype` injects one into `word/document.xml`'s prolog."""
     body = "".join(
         f"<w:p><w:r><w:t>{part}</w:t></w:r></w:p>" for part in paragraphs
     )
@@ -706,6 +709,8 @@ def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
         f'2006/main"><w:body>{body}</w:body></w:document>'
     )
+    if doctype:
+        document = document.replace("?>", f"?>{doctype}", 1)
     p = tmp_path / name
     with zipfile.ZipFile(p, "w") as zf:
         zf.writestr("[Content_Types].xml", "<Types/>")
@@ -713,7 +718,13 @@ def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
     return p
 
 
-def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "140"))):
+def _make_xlsx(
+    tmp_path,
+    name="labs.xlsx",
+    rows=(("test", "value"), ("sodium", "140")),
+    doctype="",
+    doctype_member="xl/sharedStrings.xml",
+):
     strings: list[str] = []
     for row in rows:
         for cell in row:
@@ -732,11 +743,16 @@ def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "
         for row in rows
     )
     sheet = f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'
+    members = {"xl/sharedStrings.xml": shared, "xl/worksheets/sheet1.xml": sheet}
+    if doctype:
+        # These fixtures carry no XML declaration, so the prolog *is* the leading
+        # DOCTYPE — well-formed, and the same position the CCDA tests inject at.
+        members[doctype_member] = doctype + members[doctype_member]
     p = tmp_path / name
     with zipfile.ZipFile(p, "w") as zf:
         zf.writestr("[Content_Types].xml", "<Types/>")
-        zf.writestr("xl/sharedStrings.xml", shared)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        for member, content in members.items():
+            zf.writestr(member, content)
     return p
 
 
@@ -1088,12 +1104,15 @@ def _utf16_smuggled(marker: str, big_endian: bool = False) -> str:
     )
 
 
-def _entity_bomb_doctype(levels=7, width=4, leaf=64):
-    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+def _entity_bomb_doctype(levels=7, width=4, leaf=64, root="ClinicalDocument"):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB.
+
+    ``root`` names the declared root element so the OOXML reuses (issue #155) can
+    build a bomb that is a plausible `.docx`/`.xlsx` member, not just a CCDA one."""
     chain = "".join(
         f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
     )
-    return f'<!DOCTYPE ClinicalDocument [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+    return f'<!DOCTYPE {root} [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
 
 
 @pytest.mark.parametrize(
@@ -1427,6 +1446,88 @@ def test_malformed_docx_degrades_instead_of_losing_the_document(
     assert "extraction failed" in capsys.readouterr().err
 
 
+# --- OOXML DOCTYPE refusal (issue #155) ------------------------------------------
+# `_member_reader`'s cap bounds a member's *declared* uncompressed size, which is not a
+# bound on entity expansion: a 355-byte `.docx` expanded to 4,194,304 chars and was
+# stored as `native` text. The CCDA route was guarded in #138; these pin the same guard
+# on the OOXML route, all-or-nothing per file.
+
+
+def _explode_on_parse(monkeypatch):
+    """Make any `ET.fromstring` a test failure — refusal must precede the parse."""
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("ET.fromstring reached a DOCTYPE-bearing member")
+    monkeypatch.setattr(ingest.ET, "fromstring", _explode)
+
+
+def test_docx_doctype_is_refused_before_parsing(tmp_path, monkeypatch):
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    src = _make_docx(
+        tmp_path, name="bomb.docx", paragraphs=(f"&e{levels};",), doctype=doctype
+    )
+    assert src.stat().st_size < 4096            # well under the byte cap
+    _explode_on_parse(monkeypatch)
+    # refused, not merely empty: the parse that would amplify never runs
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_xlsx_doctype_in_shared_strings_is_refused(tmp_path, monkeypatch):
+    doctype, levels = _entity_bomb_doctype(root="sst")
+    src = _make_xlsx(tmp_path, name="bomb-shared.xlsx", doctype=doctype)
+    _explode_on_parse(monkeypatch)
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_xlsx_doctype_in_a_worksheet_refuses_the_whole_workbook(tmp_path, capsys):
+    """All-or-nothing: benign shared strings do not buy a best-effort partial result."""
+    doctype, _levels = _entity_bomb_doctype(root="worksheet")
+    src = _make_xlsx(
+        tmp_path,
+        name="bomb-sheet.xlsx",
+        doctype=doctype,
+        doctype_member="xl/worksheets/sheet1.xml",
+    )
+    assert ingest.extract_text_routed(src) == (None, "native")
+    err = capsys.readouterr().err
+    # refused at that member, and nothing expanded on the way there
+    assert "xl/worksheets/sheet1.xml declares a DOCTYPE" in err
+    assert "A" * 200 not in err
+
+
+def test_ooxml_doctype_refusal_is_encoding_agnostic(tmp_path, monkeypatch):
+    """A UTF-16 member with the DOCTYPE padded behind a comment — the two bypass
+    classes documented against the CCDA probe must not reopen on this route."""
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    document = (
+        '<?xml version="1.0" encoding="UTF-16" standalone="yes"?>'
+        f"<!-- padding so no fixed head window sees it -->{doctype}"
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+        f'2006/main"><w:body><w:p><w:r><w:t>&e{levels};</w:t></w:r></w:p>'
+        "</w:body></w:document>"
+    )
+    src = tmp_path / "utf16-bomb.docx"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", b"\xff\xfe" + document.encode("utf-16-le"))
+    _explode_on_parse(monkeypatch)
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_docx_doctype_stores_the_document_without_ocr_text(
+    conn, tmp_path, sources, capsys
+):
+    """The "never costs you the document" contract, at the level the caller sees."""
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    src = _make_docx(
+        tmp_path, name="bomb2.docx", paragraphs=(f"&e{levels};",), doctype=doctype
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                # the document itself is kept
+    assert result.document.ocr_text is None
+    assert not result.ocr_text_populated
+    assert "extraction failed" in capsys.readouterr().err
+
+
 def test_supplied_ocr_text_still_beats_extraction(conn, tmp_path, sources):
     src = _make_docx(tmp_path, paragraphs=("extracted body",))
     result = ingest.ingest_document(
@@ -1664,3 +1765,328 @@ def test_extraction_cap_is_one_budget_shared_across_the_archive(
     assert result.status == "new"
     assert result.document.ocr_text is None
     assert "sheet2.xml" in capsys.readouterr().err
+
+
+# --- re-extraction against a stored blob (issue #143) --------------------------
+#
+# `reocr_documents` is a selector plus a policy layer over `extract_text_routed` and
+# `documents.set_document_text`. These tests exercise the policy; the extraction fakes
+# above stand in for PyMuPDF/tesseract, so the CI contract (neither installed) holds.
+
+
+def _file_document(conn, tmp_path, sources, name="scan.txt", content=b"stored blob",
+                   person="jane-doe", ocr_text=None, force=False):
+    """Ingest a real blob into `sources` and return its `document` row."""
+    src = _make_file(tmp_path, name, content)
+    result = ingest.ingest_document(
+        conn, src, person, sources, ocr_text=ocr_text, force=force
+    )
+    return result.document
+
+
+def _stored_text(conn, document_id):
+    return conn.execute(
+        "SELECT ocr_text FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()["ocr_text"]
+
+
+def _forbid_extraction(monkeypatch):
+    """Fail loudly if extraction runs at all - proves a skip happened before the work."""
+    def boom(path):
+        raise AssertionError(f"extraction must not run: {path}")
+    monkeypatch.setattr(ingest, "extract_text_routed", boom)
+    monkeypatch.setattr(ingest, "pdf_page_count", boom)
+
+
+def test_reocr_fills_an_empty_document_from_its_stored_blob(conn, tmp_path, sources):
+    doc = _file_document(conn, tmp_path, sources, content=b"acute pericarditis noted")
+    assert doc.ocr_text is None
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "written"
+    assert result.route == "native"
+    assert result.previous_chars == 0
+    assert result.chars == len("acute pericarditis noted")
+    assert _stored_text(conn, doc.document_id) == "acute pericarditis noted"
+
+
+def test_reocr_refuses_a_populated_document_without_force(
+    conn, tmp_path, sources, monkeypatch
+):
+    doc = _file_document(conn, tmp_path, sources, ocr_text="human transcription")
+    _forbid_extraction(monkeypatch)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "has-text"
+    assert result.previous_chars == len("human transcription")
+    assert _stored_text(conn, doc.document_id) == "human transcription"
+
+
+def test_reocr_force_replaces_existing_text(conn, tmp_path, sources):
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"machine text", ocr_text="old transcription"
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "written"
+    assert result.previous_chars == len("old transcription")
+    assert _stored_text(conn, doc.document_id) == "machine text"
+
+
+def test_reocr_dry_run_reports_chars_and_writes_nothing(conn, tmp_path, sources):
+    doc = _file_document(conn, tmp_path, sources, content=b"twenty four characters!!")
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, dry_run=True)
+
+    assert result.status == "would-write"
+    assert result.chars == 24
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_dry_run_names_a_pdf_over_the_page_cap(
+    conn, tmp_path, sources, monkeypatch
+):
+    doc = _file_document(
+        conn, tmp_path, sources, name="long.pdf", content=b"%PDF-1.4 fake bytes"
+    )
+    pages = [
+        _FakePage(text="page text long enough to skip ocr entirely")
+        for _ in range(21)
+    ]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, dry_run=True)
+
+    assert result.status == "would-write"
+    assert result.pages == 21
+    assert result.truncated is True
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_under_the_page_cap_is_not_flagged_as_truncated(
+    conn, tmp_path, sources, monkeypatch
+):
+    doc = _file_document(
+        conn, tmp_path, sources, name="short.pdf", content=b"%PDF-1.4 fake bytes"
+    )
+    pages = [
+        _FakePage(text="page text long enough to skip ocr entirely") for _ in range(3)
+    ]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.pages == 3
+    assert result.truncated is False
+
+
+def test_reocr_routes_a_pdf_through_the_same_dispatch_as_ingest(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The anti-drift guarantee: re-run text is `extract_text_routed`'s text, because
+    it *is* `extract_text_routed` - not a second extraction path that can rot apart."""
+    doc = _file_document(
+        conn, tmp_path, sources, name="mixed.pdf", content=b"%PDF-1.4 fake bytes"
+    )
+    pages = [
+        _FakePage(text="searchable page with a real embedded text layer"),
+        _FakePage(text="", scanned="rasterized page read by tesseract"),
+    ]
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc(pages)))
+    _install_tesseract(monkeypatch)
+    blob = sources / doc.source_path
+    expected_text, expected_route = ingest.extract_text_routed(blob)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.route == expected_route == "ocr"
+    assert _stored_text(conn, doc.document_id) == expected_text
+    assert "searchable page" in expected_text and "rasterized page" in expected_text
+
+
+def test_reocr_reports_an_owner_mismatch_and_writes_nothing(conn, tmp_path, sources):
+    _seed_roster(conn)
+    doc = _file_document(conn, tmp_path, sources, content=b"Patient: ROE, ROBERT ALAN")
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "owner-mismatch"
+    assert result.owner_check.verdict == "mismatch"
+    assert result.owner_check.matched_slug == "bob-roe"
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_force_stores_despite_an_owner_mismatch(conn, tmp_path, sources):
+    _seed_roster(conn)
+    doc = _file_document(conn, tmp_path, sources, content=b"Patient: ROE, ROBERT ALAN")
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "written"
+    assert result.owner_check.verdict == "mismatch"
+    assert _stored_text(conn, doc.document_id) == "Patient: ROE, ROBERT ALAN"
+
+
+def test_reocr_stores_and_warns_on_a_suspect_verdict(
+    conn, tmp_path, sources, monkeypatch
+):
+    """The recorded design call: unlike ingest, a `suspect` verdict does not refuse.
+
+    The document is already filed under that owner, so withholding the text does not
+    un-file it - it only keeps the document invisible to `find`, which is the bug this
+    verb exists to close. The text names nobody on the roster, so nothing leaks across
+    household members either.
+    """
+    _seed_roster(conn)
+    # `.png`, not `.txt`: `suspect` is only reachable on the OCR route, where a
+    # `Patient:` header is a printed identity claim rather than a column label.
+    doc = _file_document(conn, tmp_path, sources, name="scan.png", content=b"pixels")
+    monkeypatch.setattr(ingest.shutil, "which", lambda _: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        ingest.subprocess, "run",
+        _fake_tesseract(b"Patient: SMITH, KAREN  DOB: 09/09/1971"),
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "written"
+    assert result.route == "ocr"
+    assert result.owner_check.verdict == "suspect"
+    assert result.owner_check.evidence
+    assert _stored_text(conn, doc.document_id).startswith("Patient: SMITH")
+
+
+def test_reocr_native_route_does_not_trust_anchors(conn, tmp_path, sources):
+    """A `Patient ID` column header is a label, not an identity claim - the same
+    `trust_anchors` rule ingest applies, reached through the same route value."""
+    _seed_roster(conn)
+    doc = _file_document(
+        conn, tmp_path, sources, name="labs.csv",
+        content=b"Patient ID,Test,Value\n1,HbA1c,5.7\n",
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.route == "native"
+    assert result.status == "written"
+    assert result.owner_check.verdict == "unverified"
+
+
+def test_reocr_reports_a_missing_blob_without_writing(conn, tmp_path, sources):
+    doc = _file_document(conn, tmp_path, sources, content=b"about to vanish")
+    (sources / doc.source_path).unlink()
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "missing-blob"
+    assert result.blob_path and doc.sha256 in result.blob_path
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_skips_a_study_blob(conn, tmp_path, sources, monkeypatch):
+    """A study's ocr_text is a DICOM-header summary, not text extracted from the blob -
+    re-deriving it is a different pipeline, so `reocr` reports and leaves it alone."""
+    doc = _file_document(conn, tmp_path, sources, content=b"packed study stand-in")
+    with conn:
+        conn.execute(
+            "UPDATE document SET source_path = ? WHERE document_id = ?",
+            (f"aa/{doc.sha256}{ingest.STUDY_EXT}", doc.document_id),
+        )
+    _forbid_extraction(monkeypatch)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "study-blob"
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_recovering_nothing_is_a_warning_not_an_error(conn, tmp_path, sources):
+    doc = _file_document(conn, tmp_path, sources, name="blank.txt", content=b"   \n")
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "no-text"
+    assert result.refused is False       # an expected sweep outcome, not a refusal
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_unknown_document_id_raises_before_any_work(conn, tmp_path, sources):
+    doc = _file_document(conn, tmp_path, sources, content=b"never touched")
+
+    with pytest.raises(ingest.IngestError) as excinfo:
+        ingest.reocr_documents(conn, [doc.document_id, 999], sources)
+
+    assert "999" in str(excinfo.value)
+    # A typo in one id must not half-run the sweep.
+    assert _stored_text(conn, doc.document_id) is None
+
+
+def test_reocr_sweeps_several_documents_independently(conn, tmp_path, sources):
+    empty = _file_document(conn, tmp_path, sources, name="a.txt", content=b"recovered")
+    populated = _file_document(
+        conn, tmp_path, sources, name="b.txt", content=b"other bytes",
+        ocr_text="already transcribed",
+    )
+
+    results = ingest.reocr_documents(
+        conn, [empty.document_id, populated.document_id], sources
+    )
+
+    assert [r.status for r in results] == ["written", "has-text"]
+    # Each write is its own transaction, so a refusal later in the list cannot roll
+    # back an earlier success.
+    assert _stored_text(conn, empty.document_id) == "recovered"
+    assert _stored_text(conn, populated.document_id) == "already transcribed"
+
+
+def test_reocr_repairs_an_invisible_only_row_without_force(conn, tmp_path, sources):
+    """Issue #87's invisible-character rows are part of the target population: they
+    read as populated to raw truthiness and as empty to `normalize_document_text`."""
+    doc = _file_document(conn, tmp_path, sources, content=b"real text at last")
+    with conn:
+        conn.execute(
+            "UPDATE document SET ocr_text = ? WHERE document_id = ?",
+            ("​﻿", doc.document_id),
+        )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "written"
+    assert result.previous_chars == 0
+    assert _stored_text(conn, doc.document_id) == "real text at last"
+
+
+def test_reocr_on_an_unmigrated_db_raises(tmp_path, sources):
+    raw = db.connect(tmp_path / "empty.db")
+    try:
+        with pytest.raises(db.NotMigratedError):
+            ingest.reocr_documents(raw, [1], sources)
+    finally:
+        raw.close()
+
+
+def test_pdf_page_count_counts_pages_and_degrades_to_none(tmp_path, monkeypatch):
+    src = _pdf(tmp_path)
+    _install_backend(monkeypatch, _FakeBackend(_FakeDoc([_FakePage(), _FakePage()])))
+    assert ingest.pdf_page_count(src) == 2
+
+    # Not a PDF -> not a question this function answers.
+    assert ingest.pdf_page_count(_make_file(tmp_path, "notes.txt")) is None
+
+    # Encrypted and unreadable are both "don't know", never a raise: a caller may only
+    # claim truncation on positive evidence.
+    _install_backend(
+        monkeypatch, _FakeBackend(_FakeDoc([_FakePage()], needs_pass=True))
+    )
+    assert ingest.pdf_page_count(src) is None
+    _install_backend(monkeypatch, _FakeBackend(error=RuntimeError("broken pdf")))
+    assert ingest.pdf_page_count(src) is None
+
+    # Backend absent (no `pemr[ocr]` extra) -> also None, no note, no crash.
+    _install_backend(monkeypatch, None)
+    assert ingest.pdf_page_count(src) is None

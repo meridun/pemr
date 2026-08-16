@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import curation, db, dedup, persons, query, render
+from pemr import curation, db, dedup, persons, query, render, units
 
 DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
 
@@ -1292,3 +1292,170 @@ def test_a_disputed_attested_row_carries_both_markers(seeded):
     )
     line = next(l for l in md.splitlines() if "Amlodipine" in l)
     assert line.index("[DISPUTED:") < line.index("(attested by")
+
+
+# --- display units: per-person canonical unit at render time (issue #136) -----
+#
+# The overlay is display-only: a preference converts what a summary *prints* and
+# never touches a stored row, so every test here asserts both halves.
+
+_NOW = datetime(2026, 6, 1)
+
+
+def _summary(conn, slug="jane-doe"):
+    return render.render_summary(
+        conn, slug, dictionary=dedup.load_dictionary(DICT_PATH), now=_NOW
+    )
+
+
+def _line(md, needle):
+    return next(line for line in md.splitlines() if needle in line)
+
+
+def _observation_rows(conn):
+    return [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM observation ORDER BY observation_id"
+        ).fetchall()
+    ]
+
+
+def test_summary_without_a_preference_is_unchanged(seeded):
+    """AC-6: a person with no preference set sees pre-#136 output, byte for byte -- and
+    a preference on a key they have no rows for changes nothing either."""
+    before = _summary(seeded)
+    units.set_pref(seeded, "jane-doe", "height", "cm",
+                   dictionary=dedup.load_dictionary(DICT_PATH))
+    assert _summary(seeded) == before
+
+
+def test_summary_converts_a_vital_and_discloses_the_source(seeded):
+    units.set_pref(seeded, "jane-doe", "weight", "lb",
+                   dictionary=dedup.load_dictionary(DICT_PATH))
+    line = _line(_summary(seeded), "weight:")
+    assert "weight: 176.37 lb" in line
+    assert "[converted from 80.0 kg]" in line
+    # ...and the stored row still says what the document said.
+    row = next(r for r in _observation_rows(seeded) if r["key"] == "weight")
+    assert row["value_num"] == 80.0 and row["unit"] == "kg"
+
+
+def test_summary_converts_each_key_independently(seeded):
+    """The field-evidence case: one person's rows arrive in a second unit system, key by
+    key, and each converts under its own preference while the rest are untouched."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="metric vitals")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "key": "height", "observed_at": "2026-01-01",
+         "value_num": 165.1, "unit": "cm"},
+        {"obs_type": "vital", "key": "temperature", "observed_at": "2026-01-01",
+         "value_num": 36.6, "unit": "C"},
+    ]}, d)
+    before = _observation_rows(seeded)
+
+    for key, unit in (("weight", "lb"), ("height", "in"), ("temperature", "degF")):
+        units.set_pref(seeded, "jane-doe", key, unit, dictionary=d)
+    md = _summary(seeded)
+
+    assert "weight: 176.37 lb" in _line(md, "weight:")
+    assert "height: 65.0 in" in _line(md, "height:")
+    assert "temperature: 97.88 degF" in _line(md, "temperature:")
+    # Affine, not a bare scale factor: 36.6 C is 97.88 F, never 20.33.
+    assert "[converted from 36.6 C]" in _line(md, "temperature:")
+    # blood_pressure has no preference and renders exactly as before.
+    assert "blood_pressure: 118.0 mmHg  (2026-01-01)" in md
+    assert _observation_rows(seeded) == before      # nothing was rewritten
+
+
+def test_summary_converts_a_lab_value_with_its_reference_interval(seeded):
+    """A value printed in lb beside a reference interval still in kg is a clinical
+    misread, so the bounds move in the same step or not at all."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="dialysis flowsheet")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Dry Weight", "collected_at": "2026-02-01", "value_num": 90.0,
+         "unit": "kg", "ref_low": 70.0, "ref_high": 80.0},
+    ]}, d)
+    units.set_pref(seeded, "jane-doe", "Dry Weight", "lb", dictionary=d)
+
+    line = _line(_summary(seeded), "Dry Weight")
+    assert "198.42 lb" in line
+    assert "(ref 154.32-176.37)" in line
+    assert "[converted from 90.0 kg]" in line
+    row = seeded.execute(
+        "SELECT * FROM lab_result WHERE test_name = 'Dry Weight'"
+    ).fetchone()
+    assert row["value_num"] == 90.0 and row["unit"] == "kg" and row["ref_high"] == 80.0
+
+
+def test_a_preference_cannot_change_which_labs_are_abnormal(seeded):
+    """Section membership is decided on stored values, so a conversion can neither
+    smuggle a normal lab into the section nor drop an abnormal one out of it."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="dialysis flowsheet")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        # Abnormal only by its reference interval, with no flag.
+        {"test_name": "Dry Weight", "collected_at": "2026-02-01", "value_num": 90.0,
+         "unit": "kg", "ref_high": 80.0},
+        # Comfortably normal.
+        {"test_name": "Post Weight", "collected_at": "2026-02-01", "value_num": 75.0,
+         "unit": "kg", "ref_low": 70.0, "ref_high": 80.0},
+    ]}, d)
+    plain = _summary(seeded)
+    for key in ("Dry Weight", "Post Weight"):
+        units.set_pref(seeded, "jane-doe", key, "lb", dictionary=d)
+    converted = _summary(seeded)
+
+    assert "Dry Weight" in plain and "Dry Weight" in converted
+    assert "Post Weight" not in plain and "Post Weight" not in converted
+
+
+def test_rows_that_cannot_convert_render_exactly_as_before(seeded):
+    """An unregistered unit, a unit-less row and a text-only vital all resolve to
+    "print the stored value", with no suffix -- never a guessed scale."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="mixed vitals")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "key": "pain_score", "observed_at": "2026-01-01",
+         "value_num": 4.0, "unit": "widgets"},
+        {"obs_type": "vital", "key": "spo2", "observed_at": "2026-01-01",
+         "value_num": 97.0},
+        {"obs_type": "vital", "key": "gait", "observed_at": "2026-01-01",
+         "value_text": "steady"},
+    ]}, d)
+    for key, unit in (("pain_score", "lb"), ("spo2", "%"), ("gait", "lb"),
+                      ("weight", "cm")):   # cross-dimension preference on weight
+        units.set_pref(seeded, "jane-doe", key, unit, dictionary=d)
+    md = _summary(seeded)
+
+    assert "pain_score: 4.0 widgets" in md
+    assert "spo2: 97.0  (2026-01-01)" in md
+    assert "gait: steady" in md
+    assert "weight: 80.0 kg" in md          # kg -> cm is refused, not fudged
+    assert "converted from" not in md
+
+
+def test_converted_renders_stay_ascii_and_read_only(seeded):
+    d = dedup.load_dictionary(DICT_PATH)
+    before = _row_counts(seeded)
+    for key, unit in (("weight", "lb"), ("hba1c", "%")):
+        units.set_pref(seeded, "jane-doe", key, unit, dictionary=d)
+    md = _summary(seeded)
+    assert "converted from" in md
+    assert md.isascii()
+    md.encode("cp437")                       # cp1252/cp437 console contract
+    render.render_brief(seeded, _upcoming_appt_id(seeded), dictionary=d)
+    render.render_journal(seeded, "jane-doe")
+    assert _row_counts(seeded) == before
+
+
+def test_brief_and_journal_are_deliberately_not_converted(seeded):
+    """Only the two read paths the issue named honour a preference; widening that
+    silently would be scope this feature did not ask for."""
+    d = dedup.load_dictionary(DICT_PATH)
+    units.set_pref(seeded, "jane-doe", "weight", "lb", dictionary=d)
+    brief = render.render_brief(seeded, _upcoming_appt_id(seeded), dictionary=d,
+                                now=_NOW)
+    journal = render.render_journal(seeded, "jane-doe", now=_NOW)
+    assert "80.0 kg" in brief and "converted from" not in brief
+    assert "80.0 kg" in journal and "converted from" not in journal

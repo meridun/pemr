@@ -1,5 +1,7 @@
 """Person CRUD + `pemr person` CLI surface."""
 
+import json
+
 import pytest
 
 from pemr import cli, db, persons
@@ -262,3 +264,86 @@ def test_cli_person_remove_childless(tmp_path, capsys):
     assert _run(tmp_path, "person", "remove", "typo") == 0
     assert "removed person" in capsys.readouterr().out
     assert _run(tmp_path, "person", "show", "typo") == 1
+
+
+# --- unit-pref (canonical display unit per measurement key, issue #136) ---
+#
+# A display lever: these verbs write `person_unit_pref` and nothing else. What the two
+# read paths do with it is covered in test_render.py / test_query.py.
+
+DICT_ARG = ["--dictionary", str(
+    __import__("pathlib").Path(__file__).resolve().parent.parent
+    / "data" / "dictionary.example.toml"
+)]
+
+
+@pytest.fixture()
+def roster(tmp_path):
+    _run(tmp_path, "migrate", "--create")
+    _run(tmp_path, "person", "add", "--slug", "jane", "--name", "Jane")
+    return tmp_path
+
+
+def test_cli_unit_pref_set_list_and_clear(roster, capsys):
+    assert _run(roster, "person", "unit-pref", "list", "jane") == 0
+    assert "no display units set for jane" in capsys.readouterr().out
+
+    assert _run(roster, "person", "unit-pref", "set", "jane", "--key", "A1c",
+                "--unit", "percent", *DICT_ARG) == 0
+    # Key stored as its key_token, unit as its canonical id.
+    assert "hba1c displays in %" in capsys.readouterr().out
+
+    assert _run(roster, "person", "unit-pref", "list", "jane") == 0
+    out = capsys.readouterr().out
+    assert "hba1c" in out and "%" in out
+
+    assert _run(roster, "person", "unit-pref", "clear", "jane", "--key",
+                "Hemoglobin A1c", *DICT_ARG) == 0
+    assert "cleared display unit for hba1c" in capsys.readouterr().out
+
+    assert _run(roster, "person", "unit-pref", "list", "jane") == 0
+    assert "no display units set for jane" in capsys.readouterr().out
+
+
+def test_cli_unit_pref_list_json(roster, capsys):
+    _run(roster, "person", "unit-pref", "set", "jane", "--key", "weight",
+         "--unit", "lbs")
+    capsys.readouterr()
+    assert _run(roster, "person", "unit-pref", "list", "jane", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [(r["key"], r["unit"]) for r in payload] == [("weight", "lb")]
+    assert "set_at" in payload[0]
+
+
+def test_cli_unit_pref_set_overwrites_rather_than_duplicating(roster, capsys):
+    _run(roster, "person", "unit-pref", "set", "jane", "--key", "weight", "--unit", "kg")
+    _run(roster, "person", "unit-pref", "set", "jane", "--key", "weight", "--unit", "lb")
+    capsys.readouterr()
+    assert _run(roster, "person", "unit-pref", "list", "jane", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [(r["key"], r["unit"]) for r in payload] == [("weight", "lb")]
+
+
+def test_cli_unit_pref_unknown_unit_names_the_known_ones_and_writes_nothing(
+    roster, capsys
+):
+    assert _run(roster, "person", "unit-pref", "set", "jane", "--key", "weight",
+                "--unit", "stone") == 1
+    err = capsys.readouterr().err
+    assert "unknown unit 'stone'" in err and "known units:" in err and "lb" in err
+    assert err.isascii()
+    assert _run(roster, "person", "unit-pref", "list", "jane") == 0
+    assert "no display units set" in capsys.readouterr().out
+
+
+def test_cli_unit_pref_unknown_slug_fails(roster, capsys):
+    assert _run(roster, "person", "unit-pref", "set", "nobody", "--key", "weight",
+                "--unit", "lb") == 1
+    assert "no person with slug" in capsys.readouterr().err
+    assert _run(roster, "person", "unit-pref", "list", "nobody") == 1
+    assert "no person with slug" in capsys.readouterr().err
+
+
+def test_cli_unit_pref_clear_of_an_unset_key_is_not_an_error(roster, capsys):
+    assert _run(roster, "person", "unit-pref", "clear", "jane", "--key", "weight") == 0
+    assert "no display unit was set for weight" in capsys.readouterr().out

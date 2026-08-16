@@ -48,6 +48,15 @@ every line builder: ``(attested by <who> <date>; no source document)``. It must 
 as a document-sourced fact. Once a document backs it the row is promoted and renders
 unmarked, like any other sourced fact.
 
+**Display units** (issue #136). A person may record one canonical display unit per
+measurement key (``person_unit_pref``, migration 013). ``render_summary`` reads that
+overlay the way it reads ``curation`` -- once, at the top -- and converts Latest Vitals
+and Recent Abnormal Labs into it, value and reference bounds together, disclosing every
+conversion with :func:`_unit_suffix`. The stored row is never touched, abnormality is
+still decided on stored values, and a person with no preference renders byte-identically
+to what they did before the overlay existed. Like curation, this is still a pure function
+of DB state: the preference *is* DB state.
+
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
 
@@ -63,7 +72,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, datetime
 
-from . import curation, db, query
+from . import curation, db, query, units
 from .dedup import enum_token, is_attested, key_token, norm
 
 # Observation obs_type conventions this layer reads (see module docstring).
@@ -331,6 +340,56 @@ def _attest_suffix(row: dict) -> str:
     when = str(row.get("attested_on") or "").strip()
     stamp = f" {when}" if when else ""
     return f"  (attested by {row['attested_by']}{stamp}; no source document)"
+
+
+def _unit_suffix(d: units.Displayed) -> str:
+    """``  [converted from 77.6 kg]`` for a display-converted number, ``""`` otherwise
+    (issue #136).
+
+    The :func:`_attest_suffix` shape, for the same reason: a derived number must never
+    read as the one the document printed. One predicate
+    (:attr:`units.Displayed.converted`), one suffix builder, appended at every line that
+    can carry a converted value -- and appended **last**, after
+    :func:`_dispute_suffix`/:func:`_attest_suffix`, so existing suffix ordering is
+    untouched.
+    """
+    if not d.converted:
+        return ""
+    return f"  [converted from {_fmt(d.source_value)} {d.source_unit}]"
+
+
+def _target_unit(
+    prefs: dict[str, str], name: object, dictionary: dict[str, str] | None
+) -> str | None:
+    """This person's canonical display unit for one measurement name, or ``None``.
+
+    Keyed by the same :func:`key_token` the vitals fold and the dedup key group on, so
+    a preference set as ``--key A1c`` reaches rows stored as ``HbA1c``. An empty
+    ``prefs`` short-circuits before the token is even derived -- the fast path that
+    keeps an unset person's render byte-identical *and* free.
+    """
+    if not prefs:
+        return None
+    return prefs.get(key_token(name, dictionary))
+
+
+def _converted_lab(row: dict, d: units.Displayed) -> dict:
+    """Shallow copy of a lab row with its value **and reference bounds** in ``d``'s unit.
+
+    The bounds are not optional: a value printed as ``171.08 lb`` beside a
+    ``(ref 70-100)`` still in kilograms is a clinical misread. They move in the same
+    step, through the same converter, or not at all.
+
+    Only the display copy is built -- the stored row is never touched, and
+    :func:`_is_abnormal` keeps reading the original, so no preference can change which
+    labs appear in a section.
+    """
+    bounds: dict[str, object] = {}
+    for name in ("ref_low", "ref_high"):
+        raw = row[name]
+        moved = None if raw is None else units.convert(raw, d.source_unit, d.unit)
+        bounds[name] = raw if moved is None else units.round_display(moved)
+    return dict(row, value_num=d.value, unit=d.unit, **bounds)
 
 
 def _appendix_section(entries: dict[tuple[str, str, int], dict]) -> str | None:
@@ -898,6 +957,10 @@ def render_summary(
     # Source rows stay a count of what is *stored*: the overlay hides nothing from the
     # database, only from the sections below.
     cur = _CurationPass(conn)
+    # The display-unit overlay (issue #136), read once alongside the curation one. Empty
+    # -- no preferences, or a pre-013 snapshot -- is the fast path: every conversion
+    # branch below is a no-op, which is what keeps an unset person's output identical.
+    prefs = units.load_prefs(conn, person_id)
 
     header = (
         f"# Master Summary: {person['full_name']}\n\n"
@@ -942,21 +1005,30 @@ def render_summary(
 
     vital_lines = []
     for v in _latest_vitals(conn, person_id, dictionary, cur):
-        value = v["value_num"] if v["value_num"] is not None else v["value_text"]
-        unit = f" {v['unit']}" if v["unit"] else ""
+        # A `value_text`-only vital has no number to convert, so `display` passes it
+        # through and the line is built exactly as before.
+        d = units.display(
+            v["value_num"], v["unit"], _target_unit(prefs, v["key"], dictionary)
+        )
+        value = d.value if v["value_num"] is not None else v["value_text"]
+        unit = f" {d.unit}" if d.unit else ""
         when = f"  ({_date_part(v['observed_at'])})" if v["observed_at"] else ""
         vital_lines.append(
             f"- {v['key']}: {_fmt(value)}{unit}{when}"
-            f"{_dispute_suffix(v)}{_attest_suffix(v)}"
+            f"{_dispute_suffix(v)}{_attest_suffix(v)}{_unit_suffix(d)}"
         )
 
     lab_lines = []
     for r in _abnormal_labs(conn, person_id, cur):
+        d = units.display(
+            r["value_num"], r["unit"], _target_unit(prefs, r["test_name"], dictionary)
+        )
+        shown = _converted_lab(r, d) if d.converted else r
         flag = f" [{r['flag']}]" if r["flag"] else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{_ref_range(r)}"
-            f"{_dispute_suffix(r)}{_attest_suffix(r)}"
+            f"{_lab_value(shown)}{flag}{_ref_range(shown)}"
+            f"{_dispute_suffix(r)}{_attest_suffix(r)}{_unit_suffix(d)}"
         )
 
     appt_lines = [
