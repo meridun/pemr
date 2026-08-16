@@ -3,11 +3,12 @@ stdout (the §5 redirect contract), --out file convenience, unknown-slug/appoint
 rc=1, and unmigrated-DB friendliness."""
 
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
-from pemr import cli, db, dedup, persons
+from pemr import cli, db, dedup, persons, render
 
 DICT_PATH = str(
     Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -291,6 +292,71 @@ def test_render_summary_keeps_panel_order_with_unreadable_component_end_to_end(
     ).fetchone()["n"] == 3
     conn.close()
     assert out.isascii()
+
+
+def test_render_summary_abnormal_labs_are_age_bounded_end_to_end(tmp_path, capsys):
+    """Issue #165 walked through the real command. The CLI injects no `now`, so this is
+    the one place the section is exercised against the wall clock the way a real record
+    ages -- rows are dated relative to today, not to a pinned datetime.
+
+    All four selection rules at once: an in-window draw renders, a stale draw of an
+    analyte that also has a recent one does not, and an analyte whose *only* abnormal
+    draw is years old still renders -- the keep-latest guard, without which a person on
+    a slow draw cadence reads as "nothing flagged" while the marker is live.
+
+    The boundary rows sit a day inside and two days outside the cutoff rather than on it:
+    the exact inclusive edge is pinned in `test_summary_abnormal_labs_window_edges_are_exact`,
+    which can pin `now`, and this test must stay green across a midnight crossing between
+    its own `date.today()` and the render's.
+    """
+    assert _run(tmp_path, "migrate", "--create") == 0
+    assert _run(tmp_path, "person", "add", "--slug", "jane-doe",
+                "--name", "Jane Doe", "--dob", "1980-01-01") == 0
+    today = date.today()
+    cutoff = render._months_before(today, render._ABNORMAL_LABS_WINDOW_MONTHS)
+    recent, edge = today - timedelta(days=10), cutoff + timedelta(days=1)
+    stale, ancient = cutoff - timedelta(days=2), cutoff - timedelta(days=300)
+    _commit_labs(tmp_path, "sha-window-labs", [
+        # LDL: a current draw plus the decade-old history the section used to dump
+        {"test_name": "LDL", "collected_at": recent.isoformat(),
+         "value_num": 161, "unit": "mg/dL", "flag": "H"},
+        {"test_name": "LDL", "collected_at": ancient.isoformat(),
+         "value_num": 158, "unit": "mg/dL", "flag": "H"},
+        # Glucose: a recent draw holds the guard open, so the two older rows test the
+        # window itself rather than being retained as the analyte's latest
+        {"test_name": "Glucose", "collected_at": edge.isoformat(),
+         "value_num": 210, "unit": "mg/dL", "flag": "H"},
+        {"test_name": "Glucose", "collected_at": stale.isoformat(),
+         "value_num": 205, "unit": "mg/dL", "flag": "H"},
+        # TSH: slow cadence, only abnormal draw is out of window -> keep-latest
+        {"test_name": "TSH", "collected_at": ancient.isoformat(),
+         "value_num": 9.4, "unit": "uIU/mL", "flag": "H"},
+        # normal and in window: never in this section at any window
+        {"test_name": "HbA1c", "collected_at": (today - timedelta(days=5)).isoformat(),
+         "value_num": 5.4, "unit": "%", "ref_low": 4.0, "ref_high": 5.7},
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    # heading built from the same constant that drives the filter -- they cannot desync
+    heading = f"## Abnormal Labs (last {render._ABNORMAL_LABS_WINDOW_MONTHS} months)"
+    assert heading in out
+    assert "## Abnormal Labs (last 12 months)" in out
+    section = out.split(heading)[1].split("\n## ")[0]
+    bullets = [ln for ln in section.splitlines() if ln.startswith("- ")]
+    assert [ln.split()[1:3] for ln in bullets] == [
+        [recent.isoformat(), "LDL"],           # in window
+        [edge.isoformat(), "Glucose"],         # in window, a day inside the cutoff
+        [ancient.isoformat(), "TSH"],          # keep-latest: not a false-empty
+    ]
+    assert stale.isoformat() not in section    # aged out
+    assert "HbA1c" not in section              # normal, window is not what excludes it
+    assert out.isascii()                       # cp1252/cp437 console contract
+    # render-only: every aged-out row is still in the database
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute("SELECT COUNT(*) AS n FROM lab_result").fetchone()["n"] == 6
+    conn.close()
 
 
 def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
