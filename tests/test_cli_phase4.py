@@ -253,6 +253,46 @@ def test_render_summary_hides_fully_resulted_panel_order_end_to_end(ready, capsy
     assert out.isascii()          # cp1252/cp437 console contract
 
 
+def test_render_summary_keeps_panel_order_with_unreadable_component_end_to_end(
+    ready, capsys
+):
+    """Issue #145's fail-closed rule, pinned at the same command boundary: a compound key
+    with one component this layer cannot read (`Extensive Panel` is all noise words; `()`
+    normalizes away) is voided whole, so the analytes it *can* read never close it. The
+    `Sodium, CBC` control keeps the fix honest -- decomposition still suppresses a panel
+    whose every component is both readable and resulted, so this is a narrowing, not a
+    disabling."""
+    tmp_path, _ = ready
+    _commit_labs(tmp_path, "sha-u-labs", [
+        {"test_name": "CBC", "collected_at": "2026-03-05", "value_num": 1, "unit": "x"},
+        {"test_name": "Sodium", "collected_at": "2026-03-05",
+         "value_num": 140, "unit": "mmol/L"},
+    ])
+    _commit_orders(tmp_path, "sha-u-orders", [
+        # a lone CBC result must not suppress an order still naming something unread
+        {"key": "CBC, Extensive Panel", "observed_at": "2026-03-01"},
+        # both components readable and resulted -> still suppressed
+        {"key": "Sodium, CBC", "observed_at": "2026-03-01"},
+        # component that normalizes to nothing, same rule
+        {"key": "Sodium, ()", "observed_at": "2026-03-02"},
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
+    assert [ln for ln in section.splitlines() if ln.startswith("- ")] == [
+        "- CBC, Extensive Panel  (ordered 2026-03-01)",
+        "- Sodium, ()  (ordered 2026-03-02)",
+    ]
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order'"
+    ).fetchone()["n"] == 3
+    conn.close()
+    assert out.isascii()
+
+
 def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     # Schema-less DB file, not an absent one - see issue #55's missing-database gate.
     unmigrated_db(tmp_path / "cli.db")
