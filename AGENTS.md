@@ -387,6 +387,13 @@ resurrecting a stopped drug.
 Re-ingesting the same medication with a *different* `status_reason` stages a **conflict** (§5), like
 a differing `status` does — it is a real disagreement between documents, not noise to be smoothed.
 
+**Rows committed before migration 014 have `status_reason IS NULL`** — there is no automated
+backfill, because matching an `ocr_text` table line back to an already-committed row is a name/date
+heuristic over PHI and belongs to a human-in-the-loop curation pass, not a migration. The reason is
+not lost, though: it still sits verbatim in `document.ocr_text` for any already-ingested CCDA, and is
+recoverable per row with `pemr record edit medication <id> --set status_reason="Reorder"` (this does
+not move `dedup_key` — §5's identity guarantee holds for this field like any other editable one).
+
 ## Privacy posture
 
 This repository is **public**. It is framework + documentation only.
