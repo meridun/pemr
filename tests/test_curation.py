@@ -2663,3 +2663,96 @@ def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
     assert "warnings       2" in capsys.readouterr().out
+
+
+# --- smoke: the cross-person merge accident, end to end through the CLI ------
+
+
+def _summary_section(tmp_path, slug, heading, capsys):
+    """The named `## <heading>` block of one person's rendered master summary."""
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "summary", "--person", slug) == 0
+    body = capsys.readouterr().out.split(f"## {heading}\n", 1)[1]
+    return body.split("\n## ", 1)[0]
+
+
+def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys):
+    """The reporter's story, driven entirely through the CLI (issue #161).
+
+    The unit tests prove the guard fires; this one earns the guard the way the
+    reporter found the bug — two people who each carry "Type 2 Diabetes", an
+    `annotate` that points one at the other, and a `render` showing what the
+    accident costs. The last two steps are the load-bearing ones: with
+    `--allow-cross-person` the fact really does leave jane's chart without ever
+    appearing on john's, and `pemr verify` really is clean while it happens, so the
+    refusal is the only thing standing between an operator and a silent loss.
+    """
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    jane_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "jane-doe")
+    john_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "john-doe")
+    # The premise: the same clinical label, two unrelated person-scoped bases, so
+    # nothing collides at dedup time and nothing warns.
+    assert jane != john
+
+    # 1. The accident, at family scope - refused in dry run *and* under --apply,
+    #    since the check is front-loaded ahead of every write.
+    for extra in ([], ["--apply"]):
+        capsys.readouterr()
+        assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                    "--status", "merged-into", "--merged-into", john,
+                    "--note", "looks like the same dx", *extra) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("error: ") and err.isascii()
+        assert "jane-doe" in err and "john-doe" in err
+        assert "--allow-cross-person" in err
+        assert "nothing was written" in err
+
+    # 2. The same accident at row scope, where the ruled person comes off the row.
+    capsys.readouterr()
+    assert _run(cli_two_people, "record", "annotate", "condition", str(jane_row),
+                "--row", "--status", "merged-into", "--merged-into", str(john_row),
+                "--note", "looks like the same dx", "--apply") == 1
+    assert "belongs to a different person" in capsys.readouterr().err
+    assert _cli_curation_count(cli_two_people) == 0
+
+    # 3. No collateral damage: jane's own same-person merge still lands, and her
+    #    chart still shows the condition the accident was aimed at.
+    prediabetes = _cli_person_base(cli_two_people, "condition", "name",
+                                   "Prediabetes", "jane-doe")
+    assert _run(cli_two_people, "record", "annotate", "condition", prediabetes,
+                "--status", "merged-into", "--merged-into", jane,
+                "--note", "progressed to the same dx", "--apply") == 0
+    assert "Type 2 Diabetes" in _summary_section(
+        cli_two_people, "jane-doe", "Active Problems", capsys)
+
+    # 4. What the guard is standing in front of: forced through with the escape
+    #    hatch, the fact leaves jane's chart and never arrives on john's...
+    capsys.readouterr()
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "deliberate, for the smoke", "--allow-cross-person",
+                "--apply") == 0
+    assert "cross-person merge: allowed by --allow-cross-person" in (
+        capsys.readouterr().out)
+    jane_problems = _summary_section(cli_two_people, "jane-doe",
+                                     "Active Problems", capsys)
+    john_problems = _summary_section(cli_two_people, "john-doe",
+                                     "Active Problems", capsys)
+    assert "Type 2 Diabetes" not in jane_problems
+    assert john_problems.count("Type 2 Diabetes") == 1   # john's own row, not jane's
+
+    # ...and `verify` stays clean throughout, because the target family genuinely
+    # exists. Nothing in the database is broken; a fact simply stopped rendering.
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+
+    # 5. And it is reversible: lifting the verdict restores jane's chart.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--clear", "--apply") == 0
+    assert "Type 2 Diabetes" in _summary_section(
+        cli_two_people, "jane-doe", "Active Problems", capsys)
