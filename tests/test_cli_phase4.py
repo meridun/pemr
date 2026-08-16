@@ -111,6 +111,25 @@ def _commit_orders(tmp_path, sha, rows):
                 "--json", str(payload)) == 0
 
 
+def _commit_labs(tmp_path, sha, rows):
+    """`_commit_orders`'s sibling for `lab_result` rows, committed the same way."""
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    cur = conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ingested_at) "
+        "VALUES (?, ?, 'aa/x.pdf', '2026-01-01T00:00:00')", (sha, pid)
+    )
+    conn.commit()
+    doc = cur.lastrowid
+    conn.close()
+    payload = tmp_path / f"extract-{sha}.json"
+    payload.write_text(json.dumps({"lab_result": rows}), encoding="utf-8")
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload)) == 0
+
+
 def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
     """Issue #93, walked through the real CLI: an order restated by three documents is
     one bullet carrying the latest detail plus the `+N earlier` disclosure; distinct and
@@ -182,6 +201,96 @@ def test_render_summary_hides_resulted_order_end_to_end(ready, capsys):
         "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order' AND key='LDL'"
     ).fetchone()["n"] == 1
     conn.close()
+
+
+def test_render_summary_hides_fully_resulted_panel_order_end_to_end(ready, capsys):
+    """Issue #145 through the real CLI, for the same reason #128 is pinned here: the
+    decomposition helpers are private, so the only honest proof that a *panel* order
+    leaves the section is the command boundary. Rendered **without** `--dictionary`,
+    which is also the path where a separator-bearing single analyte (`Ferritin, Serum`)
+    can only be rescued by the whole-key arm of the match, never by the dictionary."""
+    tmp_path, _ = ready
+    _commit_labs(tmp_path, "sha-p-labs", [
+        {"test_name": "Sodium", "collected_at": "2026-03-05",
+         "value_num": 140, "unit": "mmol/L"},
+        {"test_name": "Potassium", "collected_at": "2026-03-05",
+         "value_num": 4.1, "unit": "mmol/L"},
+        {"test_name": "Chloride", "collected_at": "2026-03-05",
+         "value_num": 101, "unit": "mmol/L"},
+        {"test_name": "Calcium", "collected_at": "2026-03-05",
+         "value_num": 9.4, "unit": "mg/dL"},
+        {"test_name": "Ferritin, Serum", "collected_at": "2026-03-05",
+         "value_num": 120, "unit": "ng/mL"},
+    ])
+    _commit_orders(tmp_path, "sha-p-orders", [
+        # every analyte resulted in window -> gone (issue #145)
+        {"key": "Sodium, Potassium, Chloride", "observed_at": "2026-03-01"},
+        # only Calcium resulted -> all-or-nothing keeps the panel outstanding
+        {"key": "Calcium, Phosphorus", "observed_at": "2026-03-01"},
+        # a comma is part of *this* analyte's name, not structure: #128's whole-key
+        # match still reaches it, with no dictionary to declare it
+        {"key": "Ferritin, Serum", "observed_at": "2026-03-01"},
+        # no separator, so no decomposition: a Sodium result must not close it
+        {"key": "Sodium Chloride Infusion", "observed_at": "2026-03-01"},
+        {"key": "cervical collar", "observed_at": "2026-03-01"},   # referral: still open
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
+    assert [ln for ln in section.splitlines() if ln.startswith("- ")] == [
+        "- Calcium, Phosphorus  (ordered 2026-03-01)",
+        "- cervical collar  (ordered 2026-03-01)",
+        "- Sodium Chloride Infusion  (ordered 2026-03-01)",
+    ]
+    # render-only: every order row, suppressed or not, is untouched in the DB
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order'"
+    ).fetchone()["n"] == 5
+    conn.close()
+    assert out.isascii()          # cp1252/cp437 console contract
+
+
+def test_render_summary_keeps_panel_order_with_unreadable_component_end_to_end(
+    ready, capsys
+):
+    """Issue #145's fail-closed rule, pinned at the same command boundary: a compound key
+    with one component this layer cannot read (`Extensive Panel` is all noise words; `()`
+    normalizes away) is voided whole, so the analytes it *can* read never close it. The
+    `Sodium, CBC` control keeps the fix honest -- decomposition still suppresses a panel
+    whose every component is both readable and resulted, so this is a narrowing, not a
+    disabling."""
+    tmp_path, _ = ready
+    _commit_labs(tmp_path, "sha-u-labs", [
+        {"test_name": "CBC", "collected_at": "2026-03-05", "value_num": 1, "unit": "x"},
+        {"test_name": "Sodium", "collected_at": "2026-03-05",
+         "value_num": 140, "unit": "mmol/L"},
+    ])
+    _commit_orders(tmp_path, "sha-u-orders", [
+        # a lone CBC result must not suppress an order still naming something unread
+        {"key": "CBC, Extensive Panel", "observed_at": "2026-03-01"},
+        # both components readable and resulted -> still suppressed
+        {"key": "Sodium, CBC", "observed_at": "2026-03-01"},
+        # component that normalizes to nothing, same rule
+        {"key": "Sodium, ()", "observed_at": "2026-03-02"},
+    ])
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    section = out.split("## Orders & Referrals")[1].split("\n## ")[0]
+    assert [ln for ln in section.splitlines() if ln.startswith("- ")] == [
+        "- CBC, Extensive Panel  (ordered 2026-03-01)",
+        "- Sodium, ()  (ordered 2026-03-02)",
+    ]
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order'"
+    ).fetchone()["n"] == 3
+    conn.close()
+    assert out.isascii()
 
 
 def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
