@@ -249,7 +249,9 @@ CREATE TABLE medication (
   started_on    TEXT,
   ended_on      TEXT,                     -- NULL = current
   prescriber    TEXT,
-  status        TEXT,                     -- active|discontinued|prn
+  status        TEXT,                     -- active|discontinued|prn; a discontinue
+                                          -- reason belongs in status_reason, not here
+  status_reason TEXT,                     -- verbatim discontinue reason; NULL = none stated
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
@@ -1058,7 +1060,15 @@ pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replac
 pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force]
                                                          # re-derive ocr_text from the stored blob using the ingest dispatch
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
-pemr query meds --person jane --active [--raw]
+pemr query meds --person jane --active [--raw]           # --active = query.med_is_current per row:
+                                                         # a past ended_on or a terminal status ends
+                                                         # the course, EXCEPT when status_reason is a
+                                                         # renewal (query.RENEWAL_MED_REASONS, e.g.
+                                                         # a CCDA's "Discontinued (Reorder)") - a
+                                                         # renewed prescription's end date closes an
+                                                         # authorization period, not the therapy, so
+                                                         # it stays current and prints "(renewed)".
+                                                         # Every other reason still ends the course
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
                                                          # all three (issue #131): filtered at read
                                                          # time against the curation overlay, same

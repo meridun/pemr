@@ -2749,14 +2749,19 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
         for r in shown:
             dose = f"  {r['dose']}" if r["dose"] else ""
             freq = f"  {r['frequency']}" if r["frequency"] else ""
+            current = query.med_is_current(r)
             if r["ended_on"]:
-                end = f" -> {r['ended_on']}"
-            elif query.med_is_current(r):
+                # A renewal's end date closes an authorization period, not the therapy
+                # (issue #159) - mark it, so a row that appears under --active does not
+                # read as flatly ended.
+                end = f" -> {r['ended_on']}" + (" (renewed)" if current else "")
+            elif current:
                 end = " -> (current)"
             else:  # terminal status but no explicit end date (issue #21)
                 end = " -> (ended)"
             span = _fmt(r["started_on"]) + end
-            status = f"  [{r['status']}]" if r["status"] else ""
+            bits = [str(b) for b in (r["status"], r.get("status_reason")) if b]
+            status = f"  [{': '.join(bits)}]" if bits else ""
             print(f"{r['name']:24}{dose}{freq}  {span}{status}"
                   f"{_verdict_suffix(r, raw=args.raw)}")
         if hidden:

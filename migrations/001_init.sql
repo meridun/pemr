@@ -52,7 +52,8 @@ CREATE TABLE medication (
   started_on    TEXT,
   ended_on      TEXT,                    -- NULL = current
   prescriber    TEXT,
-  status        TEXT,                    -- active|discontinued|prn
+  status        TEXT,                    -- active|discontinued|prn; a discontinue
+                                         -- reason belongs in status_reason (014), not here
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );

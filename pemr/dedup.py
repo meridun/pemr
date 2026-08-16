@@ -63,6 +63,11 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
         "ended_on": (str, False),
         "prescriber": (str, False),
         "status": (str, False),
+        # Verbatim discontinue reason, parentheses stripped (issue #159): a CCDA med
+        # table states WHY a drug stopped in the same cell as the status word, and
+        # `(Reorder)` (renewed) vs `(Therapy Completed)` (finished) are opposites. Free
+        # text, deliberately NOT an ENUM_FIELDS entry - see migrations/014.
+        "status_reason": (str, False),
     },
     "procedure": {
         "name": (str, True),
@@ -688,7 +693,8 @@ class CommitSummary:
 # value_num/value_text appear below.
 _COMPARE_FIELDS: dict[str, list[str]] = {
     "lab_result": ["value_num", "value_text", "unit", "ref_low", "ref_high", "flag", "loinc"],
-    "medication": ["route", "frequency", "ended_on", "prescriber", "status"],
+    "medication": ["route", "frequency", "ended_on", "prescriber", "status",
+                   "status_reason"],
     "procedure": ["provider", "outcome"],
     "appointment": ["specialty", "reason", "summary"],
     "observation": ["value_num", "value_text", "unit"],
