@@ -51,7 +51,7 @@ unmarked, like any other sourced fact.
 **Display units** (issue #136). A person may record one canonical display unit per
 measurement key (``person_unit_pref``, migration 013). ``render_summary`` reads that
 overlay the way it reads ``curation`` -- once, at the top -- and converts Latest Vitals
-and Recent Abnormal Labs into it, value and reference bounds together, disclosing every
+and Abnormal Labs into it, value and reference bounds together, disclosing every
 conversion with :func:`_unit_suffix`. The stored row is never touched, abnormality is
 still decided on stored values, and a person with no preference renders byte-identically
 to what they did before the overlay existed. Like curation, this is still a pure function
@@ -69,6 +69,7 @@ prints it correctly instead of ``?`` (issue #46). Literal vs. data are orthogona
 
 from __future__ import annotations
 
+import calendar
 import sqlite3
 from datetime import date, datetime
 
@@ -109,6 +110,17 @@ CONDITION_FAMILY = "family-history"
 # Default window for "recent labs" in an appointment brief (last N most recent).
 _BRIEF_RECENT_LABS = 10
 
+#: Age bound for the summary's abnormal-labs section (issue #165). Unlike
+#: `_BRIEF_RECENT_LABS` above this bounds *age*, not count: the summary is the document
+#: read between visits, and unbounded it renders the whole abnormal history -- on a real
+#: record 250 of 475 lines across 16 years, in which a marker abnormal now reads exactly
+#: like one abnormal a decade ago. 6 months was measured against real data and rejected:
+#: for a person on a slower draw cadence (most recent abnormal draw ~7 months old) it
+#: renders the section *empty*, and an empty section reads as "nothing flagged" -- a worse
+#: miss than the dump it bounds. The window controls volume; the keep-latest guard in
+#: `_abnormal_labs` controls that false-empty, which recurs at *any* fixed window.
+_ABNORMAL_LABS_WINDOW_MONTHS = 12
+
 
 class AppointmentNotFoundError(ValueError):
     """Raised when an appointment id does not resolve (friendly rc=1 at the CLI)."""
@@ -143,6 +155,19 @@ def _as_date(value: object) -> date | None:
         return date.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _months_before(day: date, months: int) -> date:
+    """``day`` shifted back ``months`` calendar months, day-of-month clamped *down* to the
+    target month's last day (2028-02-29 -> 2027-02-28).
+
+    Never raises: like :func:`_as_date` this sits on a render path, so it resolves every
+    input to a real date rather than letting a leap day crash a summary.
+    """
+    index = (day.year * 12 + day.month - 1) - months
+    year, month = divmod(index, 12)
+    month += 1
+    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
 
 
 def _generated_at(now: datetime | None) -> str:
@@ -839,8 +864,29 @@ def _order_line(row: dict) -> str:
 
 
 def _abnormal_labs(
-    conn: sqlite3.Connection, person_id: int, cur: "_CurationPass | None" = None
+    conn: sqlite3.Connection,
+    person_id: int,
+    today: str,
+    cur: "_CurationPass | None" = None,
 ) -> list[dict]:
+    """Abnormal results, newest first, bounded to the last
+    ``_ABNORMAL_LABS_WINDOW_MONTHS`` months of ``today`` (issue #165).
+
+    Four selection rules, applied in the query's newest-first order to rows the curation
+    overlay and :func:`_is_abnormal` have already decided on -- the window never
+    resurrects a row a verdict removed, and never changes what counts as abnormal:
+
+    * a row collected **on or after** the cutoff renders (the boundary is inclusive);
+    * the most recent abnormal result for an analyte (``test_name``) always renders, even
+      when it falls outside the window -- the *keep-latest guard*, without which a person
+      on a slow draw cadence sees an empty section while their marker is live and
+      abnormal;
+    * a row whose ``collected_at`` will not parse renders anyway: an undated row cannot be
+      *proven* stale, and the fail-open posture of :func:`_as_date` / :func:`_is_resulted`
+      holds here too -- a bad date must never silently empty a medical section. An
+      unparseable ``today`` skips the bound entirely, for the same reason;
+    * a future-dated row is untouched; only the old side is bounded.
+    """
     rows = conn.execute(
         # lab_result_id DESC breaks same-timestamp ties (a `--keep both` sibling shares
         # its date): newest-first ordering treats the later row id as the later point.
@@ -849,7 +895,22 @@ def _abnormal_labs(
         (person_id,),
     ).fetchall()
     kept = _apply_curation([dict(r) for r in rows], "lab_result", cur)
-    return [r for r in kept if _is_abnormal(r)]
+    abnormal = [r for r in kept if _is_abnormal(r)]
+    anchor = _as_date(today)
+    if anchor is None:
+        return abnormal
+    start = _months_before(anchor, _ABNORMAL_LABS_WINDOW_MONTHS)
+    # Filtered in place, never re-sorted: the query's ordering is load-bearing both for
+    # the same-date sibling rule (#58) and for "first row seen for an analyte" being that
+    # analyte's most recent -- which is what makes the guard a single pass.
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in abnormal:
+        when = _as_date(row["collected_at"])
+        if when is None or when >= start or row["test_name"] not in seen:
+            out.append(row)
+        seen.add(row["test_name"])
+    return out
 
 
 def _open_appointments(
@@ -1019,7 +1080,7 @@ def render_summary(
         )
 
     lab_lines = []
-    for r in _abnormal_labs(conn, person_id, cur):
+    for r in _abnormal_labs(conn, person_id, today, cur):
         d = units.display(
             r["value_num"], r["unit"], _target_unit(prefs, r["test_name"], dictionary)
         )
@@ -1045,7 +1106,11 @@ def render_summary(
         _section("Allergies", allergy_lines),
         _section("Orders & Referrals", order_lines),
         _section("Latest Vitals", vital_lines),
-        _section("Recent Abnormal Labs", lab_lines, empty="_none flagged_"),
+        _section(
+            f"Abnormal Labs (last {_ABNORMAL_LABS_WINDOW_MONTHS} months)",
+            lab_lines,
+            empty="_none flagged_",
+        ),
         _section("Upcoming / Open Appointments", appt_lines),
         _section(
             "Open Conflicts", _open_conflict_lines(conn, person_id), empty="_none_"

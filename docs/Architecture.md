@@ -1188,6 +1188,14 @@ default to the same exclusion unless a human explicitly decides otherwise.
   the dictionary declares as one analyte is never split, and the whole-key match is tried
   before the per-component one — decomposition can only ever move an order from
   "renders" toward "suppressed", never take away a suppression that already worked.
+  `Abnormal Labs` is bounded to the last 12 months of the render's `now` (issue #165) —
+  unbounded it renders the entire abnormal history, where a live marker reads exactly like
+  one abnormal a decade ago — with a **keep-latest-per-analyte guard** that always retains
+  an analyte's most recent abnormal result however old it is. The guard is not politeness:
+  a fixed window alone renders the section *empty* for a person on a slow draw cadence,
+  and an empty section reads as "nothing flagged", which is worse than the dump it
+  replaces. Like the #128 order constants the window is a named constant, and the heading
+  text is built from it, so the stated window and the actual filter cannot desync.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.
@@ -1236,7 +1244,7 @@ same fact is the intended behaviour.
 **Display-time unit canonicalisation** (issue #136) is a second read-time overlay, and it
 rests on exactly the same purity argument. When a person has recorded a canonical display
 unit for a measurement key (`person_unit_pref`, §2), `render summary` converts that key's
-Latest Vitals and Recent Abnormal Labs into it — value *and* reference interval together,
+Latest Vitals and Abnormal Labs into it — value *and* reference interval together,
 since a value in `lb` beside a `(ref ...)` still in kg is a clinical misread — and `trends`
 converts every point of the series **before** computing min/max/latest/slope, so the stats
 and the printed unit cannot disagree. Every converted number is disclosed where it prints

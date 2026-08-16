@@ -5,7 +5,7 @@ abnormal-lab selection, latest-vitals pick, brief scoping, journal ordering + pr
 footnotes, ASCII output (cp1252/cp437 console lesson), and the read-only guarantee
 (no row-count change after any render)."""
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -628,6 +628,13 @@ def test_summary_orders_comma_bearing_name_suppresses_without_a_dictionary(seede
     assert "cervical collar" in section
 
 
+def _abnormal_section(md):
+    """The abnormal-labs section body. Split on the constant-built heading (#165) so a
+    change to the window can't leave these tests silently matching nothing."""
+    heading = f"## Abnormal Labs (last {render._ABNORMAL_LABS_WINDOW_MONTHS} months)"
+    return md.split(heading)[1].split("\n## ")[0]
+
+
 def test_summary_latest_vitals_pick(seeded):
     md = render.render_summary(seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH))
     assert "blood_pressure: 118.0 mmHg" in md   # most recent per key
@@ -636,8 +643,10 @@ def test_summary_latest_vitals_pick(seeded):
 
 
 def test_summary_abnormal_lab_selection(seeded):
-    md = render.render_summary(seeded, "jane-doe")
-    section = md.split("## Recent Abnormal Labs")[1].split("##")[0]
+    # `now` is pinned because the section is age-bounded (#165): unpinned, this test
+    # would start reading the wall clock and drift out of window in real 2027.
+    md = render.render_summary(seeded, "jane-doe", now=_NOW)
+    section = _abnormal_section(md)
     assert "LDL" in section          # flagged abnormal
     assert "Glucose" in section      # outside ref_high
     assert "HbA1c" not in section    # within ref range
@@ -659,9 +668,121 @@ def test_summary_same_date_lab_siblings_order_by_row_id(seeded):
     admitted = dedup.resolve_conflict(seeded, conflict_id, keep="both")
     assert admitted.occurrence == 1
 
-    md = render.render_summary(seeded, "jane-doe", dictionary=d)
-    section = md.split("## Recent Abnormal Labs")[1].split("##")[0]
+    # Pinned for #165: the two siblings are one analyte, so once 2026-01-01 ages out the
+    # keep-latest guard would retain only the newer and this ordering assertion would
+    # silently stop testing an ordering at all.
+    md = render.render_summary(seeded, "jane-doe", dictionary=d, now=_NOW)
+    section = _abnormal_section(md)
     assert section.index("320.0") < section.index("200.0")
+
+
+# --- abnormal labs: the 12-month window + keep-latest guard (issue #165) -------
+#
+# The section is bounded by *age*, so every test here pins `now`. jane's seeded abnormal
+# rows are LDL 2025-01-01 (flag H) and Glucose, fasting 2026-01-01 (over ref_high); HbA1c
+# 2024-01-01 and TSH 2023-01-01 are normal and never in the section at any window.
+
+def _abnormal_for(conn, slug="jane-doe", *, now):
+    return _abnormal_section(render.render_summary(conn, slug, now=now))
+
+
+def test_summary_abnormal_labs_window_edges_are_exact(seeded):
+    """The cutoff is a hard, inclusive `today - 12 months`, pinned on both edges so a
+    later widening is a deliberate edit rather than a drift. Each analyte also carries a
+    recent in-window abnormal, which is what stops the keep-latest guard from masking the
+    drop -- without it the older row would be retained as the analyte's latest and the
+    boundary would go untested."""
+    d = dedup.load_dictionary(DICT_PATH)
+    now = datetime(2026, 6, 1)                       # cutoff: 2025-06-01, inclusive
+    dedup.commit_extraction(seeded, _doc(seeded, "john-doe"), {"lab_result": [
+        {"test_name": "Ferritin", "collected_at": "2026-05-01", "value_num": 900,
+         "unit": "ng/mL", "flag": "H"},              # recent: holds the guard
+        {"test_name": "Ferritin", "collected_at": "2025-06-01", "value_num": 800,
+         "unit": "ng/mL", "flag": "H"},              # exactly on the cutoff: kept
+        {"test_name": "Ceruloplasmin", "collected_at": "2026-05-01", "value_num": 60,
+         "unit": "mg/dL", "flag": "H"},              # recent: holds the guard
+        {"test_name": "Ceruloplasmin", "collected_at": "2025-05-31", "value_num": 55,
+         "unit": "mg/dL", "flag": "H"},              # cutoff - 1 day: dropped
+    ]}, d)
+    section = _abnormal_for(seeded, "john-doe", now=now)
+    assert "900" in section and "800" in section     # on the boundary still renders
+    assert "60.0" in section
+    assert "55.0" not in section                     # one day past it does not
+
+
+def test_summary_abnormal_labs_keep_latest_prevents_false_empty(seeded):
+    """AC2 and the reason the window alone is not enough: with every abnormal draw older
+    than the window, the section must still name each abnormal analyte once. An empty
+    section reads as "nothing flagged" while the markers are live -- a worse miss than
+    the unbounded dump this bounds."""
+    section = _abnormal_for(seeded, now=datetime(2030, 1, 1))
+    assert "_none flagged_" not in section
+    assert "LDL" in section and "Glucose" in section
+    assert "HbA1c" not in section and "TSH" not in section   # normal stays normal
+    # One row per analyte: the guard retains the latest, not the history.
+    assert len([ln for ln in section.splitlines() if ln.startswith("- ")]) == 2
+
+
+def test_summary_abnormal_labs_mixes_in_window_rows_with_keep_latest(seeded):
+    """AC3: an analyte with in-window abnormals shows those (and drops its superseded
+    older rows), while an analyte whose only abnormals are out of window is still
+    represented by its most recent one."""
+    d = dedup.load_dictionary(DICT_PATH)
+    now = datetime(2026, 6, 1)                       # cutoff: 2025-06-01
+    dedup.commit_extraction(seeded, _doc(seeded, "john-doe"), {"lab_result": [
+        {"test_name": "Ferritin", "collected_at": "2026-05-01", "value_num": 900,
+         "unit": "ng/mL", "flag": "H"},              # in window
+        {"test_name": "Ferritin", "collected_at": "2019-01-01", "value_num": 700,
+         "unit": "ng/mL", "flag": "H"},              # superseded and stale: dropped
+        {"test_name": "Ceruloplasmin", "collected_at": "2018-01-01", "value_num": 55,
+         "unit": "mg/dL", "flag": "H"},              # only abnormal, stale: kept
+    ]}, d)
+    section = _abnormal_for(seeded, "john-doe", now=now)
+    assert "900" in section                          # in-window row
+    assert "55.0" in section                         # keep-latest for its analyte
+    assert "700" not in section                      # not resurrected by the guard
+
+
+def test_summary_abnormal_labs_heading_states_the_window(seeded):
+    """AC4: the window is self-documenting, and the heading is built from the same
+    constant that drives the filter so the two cannot desync."""
+    md = render.render_summary(seeded, "jane-doe", now=_NOW)
+    assert "## Abnormal Labs (last 12 months)" in md
+    assert (
+        f"## Abnormal Labs (last {render._ABNORMAL_LABS_WINDOW_MONTHS} months)" in md
+    )
+
+
+def test_summary_abnormal_labs_undated_row_is_never_aged_out(seeded):
+    """Fail-open, mirroring `_is_resulted`: a `collected_at` that will not parse cannot
+    be *proven* stale, so it renders rather than being silently dropped -- a bad date must
+    never empty a medical section."""
+    seeded.execute(
+        "UPDATE lab_result SET collected_at = 'not-a-date' WHERE test_name = 'LDL' "
+        "AND person_id = (SELECT person_id FROM person WHERE slug = 'jane-doe')"
+    )
+    seeded.commit()
+    assert "LDL" in _abnormal_for(seeded, now=datetime(2030, 1, 1))
+
+
+def test_summary_abnormal_labs_unparseable_now_skips_the_bound(seeded):
+    """Same posture one level up: if the render's own date will not parse there is no
+    cutoff to apply, so the section falls back to every abnormal row."""
+    pid = seeded.execute(
+        "SELECT person_id FROM person WHERE slug = 'jane-doe'"
+    ).fetchone()["person_id"]
+    unbounded = render._abnormal_labs(seeded, pid, "")
+    assert unbounded == render._abnormal_labs(seeded, pid, "not-a-date")
+    # 2025's LDL is a year and a half stale at any plausible clock, and still renders.
+    assert [r["test_name"] for r in unbounded] == ["Glucose, fasting", "LDL"]
+
+
+def test_months_before_clamps_a_short_target_month():
+    """The leap-day case: 12 months before 2028-02-29 is 2027-02-28, not a ValueError."""
+    assert render._months_before(date(2028, 2, 29), 12) == date(2027, 2, 28)
+    assert render._months_before(date(2026, 3, 31), 1) == date(2026, 2, 28)
+    assert render._months_before(date(2026, 1, 15), 12) == date(2025, 1, 15)
+    assert render._months_before(date(2026, 1, 15), 13) == date(2024, 12, 15)
 
 
 def test_summary_upcoming_and_open_appointments(seeded):
@@ -711,7 +832,7 @@ def test_summary_empty_sections_are_explicit(seeded):
     assert "## Orders & Referrals" in md
     order_section = md.split("## Orders & Referrals")[1].split("##")[0]
     assert "_none recorded_" in order_section  # no orders -> explicit empty state
-    assert "## Recent Abnormal Labs" in md  # john has an abnormal LDL, so it appears
+    assert "## Abnormal Labs (last 12 months)" in md  # john's abnormal LDL appears
     assert "999" in md
 
 
