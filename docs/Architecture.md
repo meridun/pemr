@@ -259,7 +259,9 @@ CREATE TABLE medication (
   started_on    TEXT,
   ended_on      TEXT,                     -- NULL = current
   prescriber    TEXT,
-  status        TEXT,                     -- active|discontinued|prn
+  status        TEXT,                     -- active|discontinued|prn; a discontinue
+                                          -- reason belongs in status_reason, not here
+  status_reason TEXT,                     -- verbatim discontinue reason; NULL = none stated
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
@@ -1071,7 +1073,15 @@ pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replac
 pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force]
                                                          # re-derive ocr_text from the stored blob using the ingest dispatch
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
-pemr query meds --person jane --active [--raw]
+pemr query meds --person jane --active [--raw]           # --active = query.med_is_current per row:
+                                                         # a past ended_on or a terminal status ends
+                                                         # the course, EXCEPT when status_reason is a
+                                                         # renewal (query.RENEWAL_MED_REASONS, e.g.
+                                                         # a CCDA's "Discontinued (Reorder)") - a
+                                                         # renewed prescription's end date closes an
+                                                         # authorization period, not the therapy, so
+                                                         # it stays current and prints "(renewed)".
+                                                         # Every other reason still ends the course
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
                                                          # all three (issue #131): filtered at read
                                                          # time against the curation overlay, same
@@ -1164,6 +1174,20 @@ default to the same exclusion unless a human explicitly decides otherwise.
   edge-tested date window) and biased toward under-suppression, since age alone is never
   a signal and a hidden-but-still-open order would be the worse failure; the window
   constants are guarded by a pinned edge test so a casual widening doesn't slip through.
+  A *compound* order key (one order naming several analytes, `cbc,cmp,ldh`) decomposes on
+  `,`/`/` at parenthesis depth 0 into component tokens, each still matched exactly, and
+  leaves the section only when **every** component resulted in window (issue #145) — the
+  order side alone decomposes, and a partially resulted panel is still outstanding. A
+  decomposed component drops structural words that name no analyte (`panel`, `profile`,
+  `extensive`), so `Immunofixation Panel` can match an `Immunofixation` result; if that
+  leaves a component with nothing readable, the whole key is voided rather than the
+  component dropped, so the surviving analytes can't suppress an order still naming
+  something unread. Those
+  separators are content, not structure, inside many single analytes' names (`Glucose,
+  fasting`, `Kappa/Lambda Ratio`), so two guards keep #128's behaviour reachable: a key
+  the dictionary declares as one analyte is never split, and the whole-key match is tried
+  before the per-component one — decomposition can only ever move an order from
+  "renders" toward "suppressed", never take away a suppression that already worked.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.

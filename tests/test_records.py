@@ -622,6 +622,7 @@ FIELD_VALUES = {
         "ended_on": ("2026-01-01", "2026-02-01"),
         "prescriber": ("Dr Who", "Dr No"),
         "status": ("active", "discontinued"),
+        "status_reason": ("Reorder", "Therapy Completed"),
     },
     "procedure": {
         "name": ("Colonoscopy", "Endoscopy"),
@@ -731,6 +732,58 @@ def test_editable_fields_excludes_identity_and_never_names_provenance():
 def test_editable_fields_rejects_an_unknown_type():
     with pytest.raises(ValueError, match="lab_result"):
         dedup.editable_fields("family_history")
+
+
+# --- medication.status_reason (issue #159) -----------------------------------
+
+
+def _med(conn, name="Levothyroxine"):
+    return dict(conn.execute(
+        "SELECT * FROM medication WHERE name = ?", (name,)
+    ).fetchone())
+
+
+def test_commit_extraction_stores_the_discontinue_reason_verbatim(seeded):
+    """The reason survives commit with its source casing, on its own column - the whole
+    point of #159 is that it stops being reconstructible only from ocr_text."""
+    conn = seeded["conn"]
+    doc = _insert_document(conn, seeded["jane"].person_id, "bb22cc33dd44ee55")
+    dedup.commit_extraction(conn, doc, {"medication": [
+        {"name": "Levothyroxine", "dose": "50 mcg", "started_on": "2025-06-11",
+         "ended_on": "2026-06-11", "status": "discontinued",
+         "status_reason": "Substitution/Alternate Therapy Placed"},
+    ]})
+    assert _med(conn)["status_reason"] == "Substitution/Alternate Therapy Placed"
+
+
+def test_status_reason_is_editable_but_not_identity(seeded):
+    """`record edit` can set it (it is a non-key payload field), and doing so cannot
+    re-key the row - the property that keeps curation verdicts attached."""
+    conn = seeded["conn"]
+    assert "status_reason" in dedup.editable_fields("medication")
+    assert "status_reason" not in dedup.KEY_FIELDS["medication"]
+    row_id = _row_id(conn, "medication", "name", "Metformin")
+    before = _med(conn, "Metformin")["dedup_key"]
+    records.edit_record(conn, "medication", row_id, {"status_reason": "Reorder"},
+                        note="#159", apply=True)
+    after = _med(conn, "Metformin")
+    assert after["status_reason"] == "Reorder"
+    assert after["dedup_key"] == before
+
+
+def test_a_differing_status_reason_stages_a_conflict(seeded):
+    """Two documents disagreeing about *why* a med stopped is a real disagreement, so it
+    surfaces for review rather than deduping away (status_reason is in _COMPARE_FIELDS)."""
+    conn = seeded["conn"]
+    med = {"name": "Metformin", "dose": "500 mg", "started_on": "2025-06-01",
+           "status": "discontinued", "status_reason": "Reorder"}
+    first = _insert_document(conn, seeded["jane"].person_id, "cc33dd44ee55ff66")
+    dedup.commit_extraction(conn, first, {"medication": [med]})
+    second = _insert_document(conn, seeded["jane"].person_id, "dd44ee55ff66aa77")
+    summary = dedup.commit_extraction(conn, second, {
+        "medication": [{**med, "status_reason": "Therapy Completed"}],
+    })
+    assert summary.conflict, summary.counts
 
 
 # --- the module surface ------------------------------------------------------

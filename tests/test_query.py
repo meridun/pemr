@@ -151,9 +151,52 @@ NOW = datetime(2026, 8, 2, 9, 30)  # fixed "today" so the currency tests never a
     # a future one.
     ({"status": None, "ended_on": "2026-09-04"}, False),
     ({"status": "completed", "ended_on": "2026-09-04"}, False),
+    # issue #159: the CCDA discontinue reason. One row per status cell in the corpus
+    # distribution, each with a past end date and a terminal status - only a *renewal*
+    # keeps the course open, because its ended_on closes an authorization period.
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Reorder"}, True),
+    ({"status": "discontinued", "ended_on": "2024-11-11",
+      "status_reason": "Therapy Completed"}, False),
+    ({"status": "discontinued", "ended_on": "2024-11-11",
+      "status_reason": "Patient Stopped Taking"}, False),
+    ({"status": "discontinued", "ended_on": "2024-11-11",
+      "status_reason": "Substitution/Alternate Therapy Placed"}, False),
+    # A bare `Discontinued` (no parenthetical) is unchanged: terminal, as always.
+    ({"status": "discontinued", "ended_on": "2025-08-28",
+      "status_reason": None}, False),
+    ({"status": "discontinued", "ended_on": "2025-08-28",
+      "status_reason": ""}, False),
+    # Stored casing/spacing is irrelevant - the match runs through enum_token.
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "REORDER"}, True),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": " re-order "}, True),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Renewed"}, True),
+    # A reason this layer does not recognize keeps today's terminal behaviour (the safe
+    # default that lets status_reason stay free text).
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Provider Discontinued"}, False),
+    # A renewal with no end date at all is current too, over a terminal status.
+    ({"status": "discontinued", "ended_on": None, "status_reason": "Reorder"}, True),
 ])
 def test_med_is_current(row, expected):
     assert query.med_is_current(row, now=NOW) is expected
+
+
+def test_renewal_med_reasons_are_enum_token_stable():
+    """Every member is already in ``enum_token`` form, or it could never match a stored
+    value; and none of them is a *status* word (the two axes stay separate, #151/#159)."""
+    assert all(dedup.enum_token(v) == v for v in query.RENEWAL_MED_REASONS)
+    assert not (query.RENEWAL_MED_REASONS & query.TERMINAL_MED_STATUSES)
+
+
+def test_med_is_current_tolerates_a_row_without_the_status_reason_column():
+    """A pre-014 database (or a caller's hand-built dict) has no ``status_reason`` key —
+    ``_row_get`` must read that as 'no reason', not raise."""
+    assert query.med_is_current({"status": "active", "ended_on": None}) is True
+    assert query.med_is_current({"status": "completed", "ended_on": None}) is False
 
 
 def test_med_is_current_defaults_to_the_real_clock():
@@ -196,6 +239,30 @@ def test_query_meds_active_excludes_expired_course_labelled_active(seeded):
     active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True, now=NOW)}
     assert "Amoxicillin" not in active
     assert "Skyrizi" in active
+
+
+def test_query_meds_active_keeps_a_renewed_prescription(seeded):
+    """A renewed prescription stays current through the real read path, while a course
+    that ran to completion does not (issue #159) - same shape, opposite verdicts."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "frequency": "daily",
+             "started_on": "2025-06-11", "ended_on": "2026-06-11",
+             "status": "discontinued", "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-11-01", "ended_on": "2024-11-11",
+             "status": "discontinued", "status_reason": "Therapy Completed"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    rows = {m["name"]: m for m in query.query_meds(seeded, "jane-doe")}
+    assert {"Levothyroxine", "Amoxicillin"} <= set(rows)
+    # The reason is retrievable off the row itself - no ocr_text parsing - and verbatim.
+    assert rows["Levothyroxine"]["status_reason"] == "Reorder"
+    assert rows["Amoxicillin"]["status_reason"] == "Therapy Completed"
+    active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True, now=NOW)}
+    assert "Levothyroxine" in active
+    assert "Amoxicillin" not in active
 
 
 # --- structured: timeline -----------------------------------------------------

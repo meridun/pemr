@@ -226,8 +226,17 @@ def _seed_orders(conn, rows):
     }, dedup.load_dictionary(DICT_PATH))
 
 
-def _orders_section(conn):
-    md = render.render_summary(conn, "jane-doe")
+def _seed_results(conn, rows):
+    """Extra `lab_result` rows on jane, committed as their own document. The `seeded`
+    fixture's four results are a year apart, so no two of them share one 31-day window
+    and a panel case has to seed its own."""
+    dedup.commit_extraction(conn, _doc(conn, "jane-doe"), {
+        "lab_result": list(rows),
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def _orders_section(conn, dictionary=None):
+    md = render.render_summary(conn, "jane-doe", dictionary=dictionary)
     return md.split("## Orders & Referrals")[1].split("\n## ")[0]
 
 
@@ -411,6 +420,212 @@ def test_summary_orders_suppression_is_render_only(seeded):
     assert seeded.execute(
         "SELECT COUNT(*) AS n FROM observation WHERE obs_type='order' AND key='HbA1c'"
     ).fetchone()["n"] == 1
+
+
+# --- issue #145: compound / panel orders ---------------------------------------
+#
+# #128 compares one `key_token` per order, so a *panel* order -- one key naming several
+# analytes (`cbc,cmp,ldh`) -- yields a token no single-analyte result can ever equal and
+# never leaves the section, however completely it was resulted. The order side now
+# decomposes to a token *set*; the match itself is unchanged (still exact-token, never
+# substring) and the rule is all-or-nothing, so a partially resulted panel keeps
+# rendering. #128's stance is preserved throughout: every ambiguity resolves to render.
+
+def test_summary_orders_fully_resulted_panel_is_suppressed(seeded):
+    """AC1: every analyte a compound order names has an in-window result, so the panel
+    is done and the section stops claiming it is outstanding."""
+    _seed_orders(seeded, [{"key": "Sodium, Potassium", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Sodium", "collected_at": "2026-03-01", "value_num": 140},
+        {"test_name": "Potassium", "collected_at": "2026-03-05", "value_num": 4.1},
+    ])
+    section = _orders_section(seeded)
+    assert "Sodium" not in section and "Potassium" not in section
+    assert "cervical collar" in section          # control: unresulted rows untouched
+
+
+def test_summary_orders_partially_resulted_panel_still_renders(seeded):
+    """AC2: all-or-nothing. One component still outstanding *is* outstanding work, so the
+    bullet stays -- with #93's `+N earlier` disclosure intact, since the fold is unchanged."""
+    _seed_orders(seeded, [
+        {"key": "Sodium, Potassium", "observed_at": "2026-03-01"},
+        {"key": "Sodium, Potassium", "observed_at": "2026-02-01"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "Sodium", "collected_at": "2026-03-01", "value_num": 140},
+    ])
+    section = _orders_section(seeded)
+    assert ("- Sodium, Potassium  "
+            "(ordered 2026-03-01; +1 earlier, first 2026-02-01)") in section
+
+
+def test_summary_orders_single_component_is_unchanged_by_decomposition(seeded):
+    """AC3: a key with no top-level separator never decomposes, so it is never
+    word-stripped either -- `Lipid Panel` keeps today's whole-string token and a bare
+    `Lipid` result does not close it. The #128 block above runs unmodified for the rest."""
+    _seed_orders(seeded, [{"key": "Lipid Panel", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Lipid", "collected_at": "2026-03-01", "value_num": 1.0},
+    ])
+    assert "- Lipid Panel  (ordered 2026-03-01)" in _orders_section(seeded)
+
+
+def test_summary_orders_panel_is_never_suppressed_by_a_substring_result(seeded):
+    """AC4: components are matched exact-token, never by substring, in either direction --
+    a `Sodium Level` result does not answer the `Sodium` component, and an unrelated
+    panel-named result answers nothing."""
+    _seed_orders(seeded, [{"key": "Sodium, Potassium", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Sodium Level", "collected_at": "2026-03-01", "value_num": 140},
+        {"test_name": "Comprehensive Metabolic Panel", "collected_at": "2026-03-02",
+         "value_num": 1.0},
+    ])
+    assert "- Sodium, Potassium  (ordered 2026-03-01)" in _orders_section(seeded)
+
+
+def test_summary_orders_slash_separated_panel_drops_noise_words(seeded):
+    """`/` splits like `,` does, and a structural word that names no analyte (`panel`) is
+    dropped from a component -- otherwise `Immunofixation Panel` could never match the
+    `Immunofixation` result that answered it."""
+    _seed_orders(seeded, [
+        {"key": "Serum Protein Electrophoresis / Immunofixation Panel",
+         "observed_at": "2026-03-01"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "Serum Protein Electrophoresis", "collected_at": "2026-03-01",
+         "value_num": 1.0},
+        {"test_name": "Immunofixation", "collected_at": "2026-03-02", "value_num": 2.0},
+    ])
+    assert "Immunofixation" not in _orders_section(seeded)
+
+
+def test_summary_orders_panel_components_map_through_the_dictionary(seeded):
+    """Each component runs through the *same* dictionary the fold and the result index
+    use, so synonyms agree per analyte: `Sed Rate` -> esr, `Mg` -> magnesium."""
+    _seed_orders(seeded, [{"key": "Sed Rate, Mg", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "ESR", "collected_at": "2026-03-01", "value_num": 12},
+        {"test_name": "Magnesium", "collected_at": "2026-03-02", "value_num": 2.0},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "Sed Rate" not in section
+    assert "cervical collar" in section
+
+
+def test_summary_orders_parenthetical_component_is_not_split(seeded):
+    """A parenthetical is identity-bearing (#71), so a separator inside one is content:
+    the qualifier stays one opaque component and nothing inside it is word-stripped.
+    Results named after its innards therefore close nothing, and the order still renders."""
+    _seed_orders(seeded, [
+        {"key": "Sed Rate, SLE Profile (Profile A, Scleroderma)",
+         "observed_at": "2026-03-01"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "ESR", "collected_at": "2026-03-01", "value_num": 12},
+        {"test_name": "Profile A", "collected_at": "2026-03-02", "value_num": 1.0},
+        {"test_name": "Scleroderma", "collected_at": "2026-03-02", "value_num": 2.0},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert ("- Sed Rate, SLE Profile (Profile A, Scleroderma)  "
+            "(ordered 2026-03-01)") in section
+
+
+def test_summary_orders_malformed_compound_key_renders(seeded):
+    """The never-raises contract: separator-only, unbalanced-bracket and trailing-separator
+    keys all reach this layer from OCR'd documents. None may crash a summary, and each
+    degrades to "still open" -- including `HbA1c,`, which has no *second* component and so
+    keeps today's whole-string token rather than gaining a match it never had."""
+    _seed_orders(seeded, [
+        {"key": ",", "observed_at": "2026-03-01"},
+        {"key": "a) b, c", "observed_at": "2026-03-02"},
+        {"key": "HbA1c,", "observed_at": "2026-03-03"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "HbA1c", "collected_at": "2026-03-03", "value_num": 5.5},
+    ])
+    section = _orders_section(seeded)
+    assert "- ,  (ordered 2026-03-01)" in section
+    assert "- a) b, c  (ordered 2026-03-02)" in section
+    assert "- HbA1c,  (ordered 2026-03-03)" in section
+
+
+def test_summary_orders_unreadable_component_does_not_let_the_rest_suppress(seeded):
+    """Decomposition fails **closed**: a component that tokenizes empty -- all noise words
+    (`Extensive Panel`), or whitespace-equivalent after normalization -- is not dropped from
+    the set, it voids the whole key. Dropping it would narrow all-or-nothing to
+    all-*remaining* and let a lone `CBC` result suppress an order still naming something this
+    layer could not read, which is the one direction the section must never fail in."""
+    _seed_orders(seeded, [
+        {"key": "CBC, Extensive Panel", "observed_at": "2026-03-01"},
+        {"key": "Sodium, ()", "observed_at": "2026-03-02"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "CBC", "collected_at": "2026-03-01", "value_num": 1.0},
+        {"test_name": "Sodium", "collected_at": "2026-03-02", "value_num": 140},
+    ])
+    section = _orders_section(seeded)
+    assert "- CBC, Extensive Panel  (ordered 2026-03-01)" in section
+    assert "- Sodium, ()  (ordered 2026-03-02)" in section
+
+
+# A `,` or `/` is structure in a panel key but *content* in many single analytes' names
+# (`Glucose, fasting`, `Kappa/Lambda Ratio`). Decomposing one of those asks for analytes
+# that were never ordered, so the order stops suppressing -- #128's inversion, re-created
+# for a different class of key. Two guards, tested below: the dictionary is asked whether
+# the whole string is one declared analyte before any split, and the whole-key match of
+# #128 is tried first regardless, so no suppression that worked before can be lost.
+
+def test_summary_orders_declared_comma_bearing_analyte_is_not_decomposed(seeded):
+    """AC3: `data/dictionary.example.toml:37` declares `glucose, fasting` a single
+    analyte, so the order asks for *that* result, not for `glucose` plus `fasting`."""
+    _seed_orders(seeded, [{"key": "Glucose, fasting", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Glucose, fasting", "collected_at": "2026-03-02", "value_num": 92},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "Glucose" not in section
+    assert "cervical collar" in section          # control: unresulted rows untouched
+
+
+def test_summary_orders_declared_analyte_is_not_closed_by_one_component(seeded):
+    """The guard restores a *name*, it does not become a looser match: a bare `Glucose`
+    result answers `glucose`, which is not the `glucose_fasting` that was ordered."""
+    _seed_orders(seeded, [{"key": "Glucose, fasting", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Glucose", "collected_at": "2026-03-02", "value_num": 92},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "- Glucose, fasting  (ordered 2026-03-01)" in section
+
+
+def test_summary_orders_declared_analyte_holds_for_a_slash_and_a_stem(seeded):
+    """The same guard for the `/` spelling (`kappa/lambda ratio`, whose first component
+    would otherwise map to a *different* analyte) and for a declared **stem** carrying a
+    qualifier -- `identity` looks the stem up, so `norm` sees the hit either way."""
+    _seed_orders(seeded, [
+        {"key": "Kappa/Lambda Ratio", "observed_at": "2026-03-01"},
+        {"key": "Cholesterol, Total (Calculated)", "observed_at": "2026-03-01"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "Kappa/Lambda Ratio", "collected_at": "2026-03-02", "value_num": 1.2},
+        {"test_name": "Cholesterol, Total (Calculated)", "collected_at": "2026-03-02",
+         "value_num": 180},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "Kappa" not in section and "Cholesterol" not in section
+
+
+def test_summary_orders_comma_bearing_name_suppresses_without_a_dictionary(seeded):
+    """AC3 for the case no dictionary can speak for: an undeclared analyte whose name
+    carries a comma, rendered with no dictionary at all. #128's whole-key match is asked
+    first, so an identically-named result still closes it."""
+    _seed_orders(seeded, [{"key": "Ferritin, Serum", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Ferritin, Serum", "collected_at": "2026-03-02", "value_num": 30},
+    ])
+    section = _orders_section(seeded)
+    assert "Ferritin" not in section
+    assert "cervical collar" in section
 
 
 def test_summary_latest_vitals_pick(seeded):
@@ -693,11 +908,14 @@ def _annotate(conn, record_type, column, value, **kwargs):
 
 
 def _renders(conn):
+    # `now` is pinned: every header carries a second-resolution `Generated:` stamp, so a
+    # before/after byte-identity check straddling a second boundary fails spuriously.
     d = dedup.load_dictionary(DICT_PATH)
+    now = datetime(2026, 6, 1)
     return {
-        "summary": render.render_summary(conn, "jane-doe", dictionary=d),
-        "brief": render.render_brief(conn, _upcoming_appt_id(conn), dictionary=d),
-        "journal": render.render_journal(conn, "jane-doe"),
+        "summary": render.render_summary(conn, "jane-doe", dictionary=d, now=now),
+        "brief": render.render_brief(conn, _upcoming_appt_id(conn), dictionary=d, now=now),
+        "journal": render.render_journal(conn, "jane-doe", now=now),
     }
 
 

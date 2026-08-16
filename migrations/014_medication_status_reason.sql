@@ -1,0 +1,47 @@
+-- 014_medication_status_reason: the CCDA discontinue reason gets its own column
+-- (issue #159).
+--
+-- A CCDA medication table does not just say a drug was discontinued - it says why, in
+-- the same narrative cell as the status word:
+--
+--   <td>Discontinued<content> (Reorder)</content></td>
+--   <td>Discontinued<content> (Therapy Completed)</content></td>
+--
+-- Since #138 that parenthetical reaches `document.ocr_text` intact, but `medication` had
+-- nowhere to put it, so every variant collapsed to `status = 'discontinued'` plus an
+-- `ended_on` at commit time. That erases an opposition that matters: `(Therapy
+-- Completed)` means the course finished and `ended_on` is a true end, while `(Reorder)`
+-- means the prescription was RENEWED - therapy continues and `ended_on` is only the end
+-- of an authorization period. After commit the two were byte-identical, and a human
+-- reviewer had to overturn a stored `ended_on` from clinical knowledge twice to recover
+-- a fact the source had stated outright.
+--
+-- The column holds the parenthetical VERBATIM, parentheses stripped (`Reorder`,
+-- `Therapy Completed`, `Patient Stopped Taking`, `Substitution/Alternate Therapy
+-- Placed`, ...). NULL = the source stated no reason, which behaves exactly as before.
+--
+-- Deliberately NOT constrained:
+--
+--   * No `CHECK` and no `dedup.ENUM_FIELDS` entry. A closed vocabulary would hard-reject
+--     the reasons other EHR exports print (`Never Started`, `Provider Discontinued`, ...)
+--     and turn an unseen literal into a failed commit, and a `CHECK` would reject rows
+--     already stored. ENUM_FIELDS' own bar is "fields the read layer branches on, where a
+--     typo makes the row silently vanish" - a typo'd reason here degrades to today's
+--     behaviour (terminal, reason still stored and displayed), so it never vanishes.
+--   * Not part of identity. `medication.dedup_key` stays
+--     `person | norm(name) | dose | started_on` (`dedup.KEY_FIELDS`), so no family is
+--     re-keyed and no curation verdict is orphaned. It IS in `dedup._COMPARE_FIELDS`: a
+--     re-ingest stating a DIFFERENT reason stages a conflict, as a differing `status`
+--     already does.
+--
+-- The reading of the reason lives in Python, not here: `query.RENEWAL_MED_REASONS` is the
+-- closed set of spellings that mean "renewed", and `query.med_is_current` treats those as
+-- non-terminal; every other reason keeps ending the course (the safe default).
+--
+-- Purely additive: one nullable ALTER, no rebuild, no backfill. A pre-014 database just
+-- needs `pemr migrate`; readers use `query._row_get`, which tolerates the missing column.
+-- Rows committed before this migration keep `status_reason IS NULL` - their reasons are
+-- still recoverable from `document.ocr_text` via a `pemr record edit` curation pass, which
+-- is a human-in-the-loop job over PHI and deliberately not a migration.
+
+ALTER TABLE medication ADD COLUMN status_reason TEXT;   -- verbatim discontinue reason; NULL = none stated

@@ -50,6 +50,7 @@ ALL_MIGRATIONS = [
     "011_curation_distinct_status.sql",
     "012_record_edit.sql",
     "013_person_unit_pref.sql",
+    "014_medication_status_reason.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -80,6 +81,21 @@ def test_migrate_is_idempotent(conn):
 def test_migrate_records_versions(conn):
     db.migrate(conn)
     assert db.applied_versions(conn) == set(ALL_MIGRATIONS)
+
+
+def test_medication_has_status_reason_column(conn):
+    """Migration 014 (issue #159): the CCDA discontinue reason gets its own nullable
+    column, so a renewal is distinguishable from a completed course after commit."""
+    db.migrate(conn)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(medication)").fetchall()}
+    assert "status_reason" in cols
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO medication (person_id, name, dedup_key) VALUES (1, 'Metformin', 'k')"
+    )
+    assert conn.execute(
+        "SELECT status_reason FROM medication"
+    ).fetchone()["status_reason"] is None   # nullable, no backfill
 
 
 def test_person_has_deactivated_at_column(conn):
@@ -141,6 +157,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
+        "014_medication_status_reason.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -275,6 +292,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
+        "014_medication_status_reason.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -327,7 +345,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
     assert db.migrate(conn) == [
         "009_record_attestation.sql", "010_curation_row_scope.sql",
         "011_curation_distinct_status.sql", "012_record_edit.sql",
-        "013_person_unit_pref.sql",
+        "013_person_unit_pref.sql", "014_medication_status_reason.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -379,6 +397,7 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
     assert db.migrate(conn) == [
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
+        "014_medication_status_reason.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
@@ -463,7 +482,7 @@ def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
 
     assert db.migrate(conn) == [
         "011_curation_distinct_status.sql", "012_record_edit.sql",
-        "013_person_unit_pref.sql",
+        "013_person_unit_pref.sql", "014_medication_status_reason.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
