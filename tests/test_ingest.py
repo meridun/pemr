@@ -697,7 +697,10 @@ def _make_stub(tmp_path, name="budget.gsheet", payload=None):
     return p
 
 
-def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
+def _make_docx(
+    tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",), doctype=""
+):
+    """A minimal `.docx`; `doctype` injects one into `word/document.xml`'s prolog."""
     body = "".join(
         f"<w:p><w:r><w:t>{part}</w:t></w:r></w:p>" for part in paragraphs
     )
@@ -706,6 +709,8 @@ def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
         f'2006/main"><w:body>{body}</w:body></w:document>'
     )
+    if doctype:
+        document = document.replace("?>", f"?>{doctype}", 1)
     p = tmp_path / name
     with zipfile.ZipFile(p, "w") as zf:
         zf.writestr("[Content_Types].xml", "<Types/>")
@@ -713,7 +718,13 @@ def _make_docx(tmp_path, name="note.docx", paragraphs=("HbA1c 5.7 percent",)):
     return p
 
 
-def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "140"))):
+def _make_xlsx(
+    tmp_path,
+    name="labs.xlsx",
+    rows=(("test", "value"), ("sodium", "140")),
+    doctype="",
+    doctype_member="xl/sharedStrings.xml",
+):
     strings: list[str] = []
     for row in rows:
         for cell in row:
@@ -732,11 +743,16 @@ def _make_xlsx(tmp_path, name="labs.xlsx", rows=(("test", "value"), ("sodium", "
         for row in rows
     )
     sheet = f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'
+    members = {"xl/sharedStrings.xml": shared, "xl/worksheets/sheet1.xml": sheet}
+    if doctype:
+        # These fixtures carry no XML declaration, so the prolog *is* the leading
+        # DOCTYPE — well-formed, and the same position the CCDA tests inject at.
+        members[doctype_member] = doctype + members[doctype_member]
     p = tmp_path / name
     with zipfile.ZipFile(p, "w") as zf:
         zf.writestr("[Content_Types].xml", "<Types/>")
-        zf.writestr("xl/sharedStrings.xml", shared)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        for member, content in members.items():
+            zf.writestr(member, content)
     return p
 
 
@@ -1088,12 +1104,15 @@ def _utf16_smuggled(marker: str, big_endian: bool = False) -> str:
     )
 
 
-def _entity_bomb_doctype(levels=7, width=4, leaf=64):
-    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+def _entity_bomb_doctype(levels=7, width=4, leaf=64, root="ClinicalDocument"):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB.
+
+    ``root`` names the declared root element so the OOXML reuses (issue #155) can
+    build a bomb that is a plausible `.docx`/`.xlsx` member, not just a CCDA one."""
     chain = "".join(
         f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
     )
-    return f'<!DOCTYPE ClinicalDocument [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+    return f'<!DOCTYPE {root} [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
 
 
 @pytest.mark.parametrize(
@@ -1424,6 +1443,88 @@ def test_malformed_docx_degrades_instead_of_losing_the_document(
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
     assert result.status == "new"
     assert result.document.ocr_text is None
+    assert "extraction failed" in capsys.readouterr().err
+
+
+# --- OOXML DOCTYPE refusal (issue #155) ------------------------------------------
+# `_member_reader`'s cap bounds a member's *declared* uncompressed size, which is not a
+# bound on entity expansion: a 355-byte `.docx` expanded to 4,194,304 chars and was
+# stored as `native` text. The CCDA route was guarded in #138; these pin the same guard
+# on the OOXML route, all-or-nothing per file.
+
+
+def _explode_on_parse(monkeypatch):
+    """Make any `ET.fromstring` a test failure — refusal must precede the parse."""
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("ET.fromstring reached a DOCTYPE-bearing member")
+    monkeypatch.setattr(ingest.ET, "fromstring", _explode)
+
+
+def test_docx_doctype_is_refused_before_parsing(tmp_path, monkeypatch):
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    src = _make_docx(
+        tmp_path, name="bomb.docx", paragraphs=(f"&e{levels};",), doctype=doctype
+    )
+    assert src.stat().st_size < 4096            # well under the byte cap
+    _explode_on_parse(monkeypatch)
+    # refused, not merely empty: the parse that would amplify never runs
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_xlsx_doctype_in_shared_strings_is_refused(tmp_path, monkeypatch):
+    doctype, levels = _entity_bomb_doctype(root="sst")
+    src = _make_xlsx(tmp_path, name="bomb-shared.xlsx", doctype=doctype)
+    _explode_on_parse(monkeypatch)
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_xlsx_doctype_in_a_worksheet_refuses_the_whole_workbook(tmp_path, capsys):
+    """All-or-nothing: benign shared strings do not buy a best-effort partial result."""
+    doctype, _levels = _entity_bomb_doctype(root="worksheet")
+    src = _make_xlsx(
+        tmp_path,
+        name="bomb-sheet.xlsx",
+        doctype=doctype,
+        doctype_member="xl/worksheets/sheet1.xml",
+    )
+    assert ingest.extract_text_routed(src) == (None, "native")
+    err = capsys.readouterr().err
+    # refused at that member, and nothing expanded on the way there
+    assert "xl/worksheets/sheet1.xml declares a DOCTYPE" in err
+    assert "A" * 200 not in err
+
+
+def test_ooxml_doctype_refusal_is_encoding_agnostic(tmp_path, monkeypatch):
+    """A UTF-16 member with the DOCTYPE padded behind a comment — the two bypass
+    classes documented against the CCDA probe must not reopen on this route."""
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    document = (
+        '<?xml version="1.0" encoding="UTF-16" standalone="yes"?>'
+        f"<!-- padding so no fixed head window sees it -->{doctype}"
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+        f'2006/main"><w:body><w:p><w:r><w:t>&e{levels};</w:t></w:r></w:p>'
+        "</w:body></w:document>"
+    )
+    src = tmp_path / "utf16-bomb.docx"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", b"\xff\xfe" + document.encode("utf-16-le"))
+    _explode_on_parse(monkeypatch)
+    assert ingest.extract_text_routed(src) == (None, "native")
+
+
+def test_docx_doctype_stores_the_document_without_ocr_text(
+    conn, tmp_path, sources, capsys
+):
+    """The "never costs you the document" contract, at the level the caller sees."""
+    doctype, levels = _entity_bomb_doctype(root="w:document")
+    src = _make_docx(
+        tmp_path, name="bomb2.docx", paragraphs=(f"&e{levels};",), doctype=doctype
+    )
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                # the document itself is kept
+    assert result.document.ocr_text is None
+    assert not result.ocr_text_populated
     assert "extraction failed" in capsys.readouterr().err
 
 
