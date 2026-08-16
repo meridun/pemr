@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, persons, query
+from pemr import db, dedup, persons, query, verify
 
 DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
 
@@ -127,6 +127,10 @@ NOW = datetime(2026, 8, 2, 9, 30)  # fixed "today" so the currency tests never a
     ({"status": None, "ended_on": None}, True),          # nothing set -> current
     ({"status": "", "ended_on": None}, True),            # blank status -> current
     ({"status": "active", "ended_on": None}, True),      # explicitly active
+    # issue #151: `prn` is no longer a legal status (it is a dosing pattern, and belongs
+    # in `frequency`/`dose`). Classification is unchanged on purpose - a non-lifecycle
+    # value still reads as current, the safe default - but `verify` now reports it
+    # instead of letting it hide. See the vocabulary section below.
     ({"status": "prn", "ended_on": None}, True),         # prn is not terminal
     ({"status": "completed", "ended_on": None}, False),  # issue #21: terminal, no end date
     ({"status": "Stopped", "ended_on": None}, False),    # case-insensitive
@@ -196,6 +200,70 @@ def test_query_meds_active_excludes_expired_course_labelled_active(seeded):
     active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True, now=NOW)}
     assert "Amoxicillin" not in active
     assert "Skyrizi" in active
+
+
+# --- verify: medication status vocabulary -------------------------------------
+# The `verify` check lives beside the classifier it guards (issue #151), the same way
+# test_curation.py houses the orphan-verdict warning beside curation's own behavior.
+
+def _seed_med(conn, name, status):
+    """Commit one medication row for jane, then force ``status`` to an exact literal.
+
+    The UPDATE is deliberate: these cases are *about* the bytes in the column (NULL vs
+    ``''`` vs ``' Discontinued '``), which an emit path is free to normalize away.
+    """
+    doc = _doc(conn, "jane-doe")
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": name, "dose": "1mg", "started_on": "2019-09-01"}],
+    }, dedup.load_dictionary(DICT_PATH))
+    med_id = conn.execute(
+        "SELECT medication_id FROM medication WHERE name = ?", (name,)
+    ).fetchone()["medication_id"]
+    conn.execute(
+        "UPDATE medication SET status = ? WHERE medication_id = ?", (status, med_id)
+    )
+    conn.commit()
+    return med_id
+
+
+def _med_warnings(conn):
+    return [w for w in verify.verify_report(conn).warnings
+            if w.startswith("medication row")]
+
+
+def test_verify_warns_on_a_non_lifecycle_med_status(seeded):
+    """`prn` is a dosing pattern, not a lifecycle state: the row renders as current
+    forever *and* hides from an audit for rows with no status. `verify` names it."""
+    assert _med_warnings(seeded) == []
+    med_id = _seed_med(seeded, "Ibuprofen", "prn")
+
+    report = verify.verify_report(seeded)
+    warnings = [w for w in report.warnings if w.startswith("medication row")]
+    assert len(warnings) == 1
+    assert f"medication row #{med_id}" in warnings[0]
+    assert "'prn'" in warnings[0]
+    assert "Ibuprofen" not in warnings[0]  # row id + literal only: no drug, no person
+    assert warnings[0].isascii()             # issue #23
+    # A warning is an observation; it must not flip the exit code.
+    assert report.ok is True and report.problems == []
+
+
+def test_verify_is_silent_on_lifecycle_statuses(seeded):
+    """Recognized values, in every stored form: trimmed, cased, empty and NULL."""
+    for i, status in enumerate(
+        ["active", "completed", "discontinued", " Discontinued ", "", None]
+    ):
+        _seed_med(seeded, f"Lifecycle{i}", status)
+    assert _med_warnings(seeded) == []
+
+
+def test_lifecycle_med_statuses_covers_the_terminal_set():
+    """Drift guard: the recognized set must never fall behind the terminal one, or a
+    terminal status would start warning as unrecognized."""
+    assert query.TERMINAL_MED_STATUSES <= query.LIFECYCLE_MED_STATUSES
+    assert "active" in query.LIFECYCLE_MED_STATUSES
+    assert "prn" not in query.LIFECYCLE_MED_STATUSES
+    assert "ordered" not in query.LIFECYCLE_MED_STATUSES
 
 
 # --- structured: timeline -----------------------------------------------------

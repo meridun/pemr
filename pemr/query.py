@@ -34,9 +34,19 @@ _WORD = re.compile(r"\w+", re.UNICODE)
 
 # Medication ``status`` values that end the course even when no explicit ``ended_on``
 # date was extracted (issue #21). ``status`` is unconstrained at the DB layer
-# (migrations/001_init.sql documents active|discontinued|prn, but extraction agents emit
-# terminal values like completed/stopped as well), so matching is lowercased and trimmed.
+# (migrations/001_init.sql documents the lifecycle-only vocabulary
+# active|completed|discontinued|NULL, but nothing rejects a row that says otherwise, and
+# extraction agents have emitted ``stopped`` as well), so matching is lowercased and trimmed.
 TERMINAL_MED_STATUSES = frozenset({"completed", "stopped", "discontinued"})
+
+# Every ``status`` value the read layer *recognizes* as a lifecycle state: the terminal
+# set plus the one non-terminal lifecycle value. Deliberately wider than the vocabulary
+# AGENTS.md §MUST-8 tells extraction agents to emit (which omits ``stopped``): the emit
+# side is a contract for new rows, this side is tolerance for what is already stored.
+# Anything outside it is not a lifecycle state at all - :func:`med_is_current` still
+# treats it as current (the safe default), and ``pemr verify`` reports it (issue #151)
+# instead of letting it hide, which is the whole fix for ``prn``/``ordered``.
+LIFECYCLE_MED_STATUSES = TERMINAL_MED_STATUSES | frozenset({"active"})
 
 
 def _row_get(row: sqlite3.Row | dict, key: str) -> object:

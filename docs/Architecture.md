@@ -216,7 +216,8 @@ CREATE TABLE medication (
   started_on    TEXT,
   ended_on      TEXT,                     -- NULL = current
   prescriber    TEXT,
-  status        TEXT,                     -- active|discontinued|prn
+  status        TEXT,                     -- lifecycle only: active|completed|discontinued|NULL
+                                          -- (AGENTS.md §MUST-8; prn/ordered are not lifecycle)
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
