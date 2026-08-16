@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, persons, query
+from pemr import db, dedup, persons, query, units
 
 DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
 
@@ -590,3 +590,97 @@ def test_unknown_person_raises(seeded):
         query.trends(seeded, "nobody", "hba1c")
     with pytest.raises(query.PersonNotFoundError):
         query.find(seeded, "nobody", "cholesterol")
+
+
+# --- trends: per-person canonical display unit (issue #136) -------------------
+#
+# A series stated in two unit systems is the same wrong chart the assay split above
+# exists to prevent, so the conversion happens *before* the stats -- and never touches a
+# stored row.
+
+@pytest.fixture()
+def mixed_weights(seeded):
+    """A dialysis dry weight recorded in kg by one clinic and lb by another."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="dialysis flowsheets")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Dry Weight", "collected_at": "2026-01-01", "value_num": 90.0,
+         "unit": "kg"},
+        {"test_name": "Dry Weight", "collected_at": "2026-01-31", "value_num": 196.0,
+         "unit": "lb"},
+    ]}, d)
+    return seeded
+
+
+def test_trends_without_a_preference_is_unchanged(seeded):
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["canonical_unit"] is None
+    assert t["converted_count"] == 0 and t["unconverted_count"] == 0
+    assert t["unit"] == "%" and t["count"] == 3 and t["latest"] == 6.5
+
+
+def test_trends_converts_the_series_before_computing_its_stats(mixed_weights):
+    d = dedup.load_dictionary(DICT_PATH)
+    before = [dict(r) for r in mixed_weights.execute(
+        "SELECT * FROM lab_result ORDER BY lab_result_id"
+    ).fetchall()]
+    units.set_pref(mixed_weights, "jane-doe", "Dry Weight", "lb", dictionary=d)
+
+    t = query.trends(mixed_weights, "jane-doe", "Dry Weight", dictionary=d)
+    assert t["count"] == 2
+    assert t["canonical_unit"] == "lb"
+    assert t["converted_count"] == 1        # the kg row; the lb row needed no conversion
+    assert t["unconverted_count"] == 0
+    # Stats and the reported unit cannot disagree: 90 kg is 198.42 lb.
+    assert t["unit"] == "lb"
+    assert t["min"] == 196.0 and t["max"] == 198.42
+    assert t["latest"] == 196.0 and t["latest_at"] == "2026-01-31"
+    # ...and the slope is in lb/day, i.e. falling, not the rising kg-vs-lb artefact.
+    assert t["slope_per_day"] < 0
+    assert [dict(r) for r in mixed_weights.execute(
+        "SELECT * FROM lab_result ORDER BY lab_result_id"
+    ).fetchall()] == before
+
+
+def test_trends_without_a_preference_reports_the_mixed_series_honestly(mixed_weights):
+    """The pre-#136 behaviour the preference exists to fix: two units, so no unit can be
+    reported -- and the numbers are simply not comparable."""
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(mixed_weights, "jane-doe", "Dry Weight", dictionary=d)
+    assert t["unit"] is None and t["min"] == 90.0 and t["max"] == 196.0
+
+
+def test_trends_keeps_and_discloses_a_point_it_cannot_convert(mixed_weights):
+    """Dropping the point would be a wrong chart, and labelling the series `lb` while it
+    holds a value that is not in lb would be a wrong label. So: keep, disclose, fall
+    back."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(mixed_weights, "jane-doe", ocr="scale with no units printed")
+    dedup.commit_extraction(mixed_weights, doc, {"lab_result": [
+        {"test_name": "Dry Weight", "collected_at": "2026-02-15", "value_num": 195.0,
+         "unit": "stone-ish"},
+    ]}, d)
+    units.set_pref(mixed_weights, "jane-doe", "Dry Weight", "lb", dictionary=d)
+
+    t = query.trends(mixed_weights, "jane-doe", "Dry Weight", dictionary=d)
+    assert t["count"] == 3                   # kept in the series
+    assert t["converted_count"] == 1 and t["unconverted_count"] == 1
+    assert t["canonical_unit"] == "lb"
+    assert t["unit"] is None                 # falls back rather than mislabelling
+
+
+def test_trends_ignores_a_cross_dimension_preference(mixed_weights):
+    d = dedup.load_dictionary(DICT_PATH)
+    units.set_pref(mixed_weights, "jane-doe", "Dry Weight", "cm", dictionary=d)
+    t = query.trends(mixed_weights, "jane-doe", "Dry Weight", dictionary=d)
+    assert t["converted_count"] == 0 and t["unconverted_count"] == 2
+    assert t["min"] == 90.0 and t["max"] == 196.0 and t["unit"] is None
+
+
+def test_trends_preference_is_person_scoped(mixed_weights):
+    """john-doe's HbA1c must not move because jane-doe set a preference."""
+    d = dedup.load_dictionary(DICT_PATH)
+    units.set_pref(mixed_weights, "jane-doe", "hba1c", "%", dictionary=d)
+    john = query.trends(mixed_weights, "john-doe", "hba1c", dictionary=d)
+    assert john["canonical_unit"] is None and john["latest"] == 9.0

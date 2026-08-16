@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import (
     __version__, attestations, backup, curation, db, dedup, documents, ingest, persons,
-    query, records, render, restore, study, tombstones, verify,
+    query, records, render, restore, study, tombstones, units, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -380,6 +380,78 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
         conn.close()
     print(f"removed person #{person.person_id}: {person.slug}")
     return 0
+
+
+# --- per-person canonical display units (issue #136) ------------------------
+#
+# A display lever, not an identity one: these three verbs only ever write
+# `person_unit_pref`, which `render summary` and `trends` read at render time. No stored
+# row, unit string or dedup key moves - correcting a mislabelled unit *in place* is
+# `record edit` (issue #129), a different verb for a different problem.
+
+
+def _unit_pref_conn(args: argparse.Namespace, work):
+    """`_cmd_person_edit`'s error shape for the three unit-pref verbs: an unknown slug,
+    an unknown unit and an empty key are all ordinary user mistakes (rc=1 on stderr),
+    and none of them writes anything."""
+    conn = _connect_db(args)
+    try:
+        try:
+            return work(conn)
+        except (persons.PersonNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_person_unit_pref_set(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        pref = units.set_pref(
+            conn, args.slug, args.key, args.unit, dictionary=dictionary
+        )
+        print(
+            f"{args.slug}: {pref['key']} displays in {pref['unit']} "
+            f"(set {pref['set_at']})"
+        )
+        return 0
+
+    return _unit_pref_conn(args, work)
+
+
+def _cmd_person_unit_pref_clear(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        cleared = units.clear_pref(conn, args.slug, args.key, dictionary=dictionary)
+        token = dedup.key_token(args.key, dictionary)
+        if cleared:
+            print(f"{args.slug}: cleared display unit for {token}")
+        else:
+            # Not an error: the requested end state (no preference) already holds.
+            print(f"{args.slug}: no display unit was set for {token}")
+        return 0
+
+    return _unit_pref_conn(args, work)
+
+
+def _cmd_person_unit_pref_list(args: argparse.Namespace) -> int:
+    def work(conn):
+        rows = units.list_prefs(conn, args.slug)
+        if args.json:
+            _print_json(rows)
+            return 0
+        if not rows:
+            print(
+                f"no display units set for {args.slug} - `pemr person unit-pref set "
+                f"{args.slug} --key <key> --unit <unit>`"
+            )
+            return 0
+        for row in rows:
+            print(f"{row['key']:24} {row['unit']:8} set {row['set_at']}")
+        return 0
+
+    return _unit_pref_conn(args, work)
 
 
 # --------------------------------------------------------------------------- #
@@ -2762,6 +2834,25 @@ def _print_other_assays(result: dict) -> None:
     print(f"  note   {count} more row(s) of this analyte under another assay: {tokens}")
 
 
+def _print_unit_notes(result: dict) -> None:
+    """Disclose display-unit conversion in a `trends` series (issue #136).
+
+    A converted number must never read as the one the document printed, and a point the
+    preference could not reach must not hide inside a series labelled with that unit —
+    the same disclose-don't-drop rule as :func:`_print_other_assays`."""
+    canonical = result.get("canonical_unit")
+    if not canonical:
+        return
+    if result.get("converted_count"):
+        print(f"  note   converted to {canonical} (canonical unit for this key)")
+    left = result.get("unconverted_count", 0)
+    if left:
+        print(
+            f"  note   {left} point(s) left in their stored unit "
+            f"(not convertible to {canonical})"
+        )
+
+
 def _cmd_trends(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
@@ -2787,6 +2878,7 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             print("  slope  n/a (need >=2 distinct dates)")
         else:
             print(f"  slope  {result['slope_per_day']:+.4g}{unit}/day")
+        _print_unit_notes(result)
         _print_other_assays(result)
         return 0
 
@@ -3120,6 +3212,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_remove.add_argument("slug")
     p_remove.set_defaults(func=_cmd_person_remove)
+
+    # --- canonical display units (issue #136) -----------------------------
+    # A third level under `person`, the `document tombstone` precedent. `--dictionary`
+    # is on set/clear because the key is stored as a `key_token`, resolved exactly as
+    # `query`/`trends`/`render` resolve it.
+    p_unit_pref = person_sub.add_parser(
+        "unit-pref",
+        help="canonical display unit per measurement key (display-only; storage is "
+             "never rewritten)",
+    )
+    unit_pref_sub = p_unit_pref.add_subparsers(
+        dest="unit_pref_command", required=True
+    )
+
+    up_set = unit_pref_sub.add_parser(
+        "set", help="set the unit `render summary` and `trends` display this key in"
+    )
+    up_set.add_argument("slug")
+    up_set.add_argument(
+        "--key", required=True,
+        help="measurement key or analyte, e.g. weight, temperature, A1c",
+    )
+    up_set.add_argument(
+        "--unit", required=True,
+        help=f"canonical unit: {', '.join(units.known_units())}",
+    )
+    up_set.add_argument("--dictionary", help="synonym dictionary TOML (key resolution)")
+    up_set.set_defaults(func=_cmd_person_unit_pref_set)
+
+    up_clear = unit_pref_sub.add_parser(
+        "clear", help="drop the display unit for one key (rows are unaffected)"
+    )
+    up_clear.add_argument("slug")
+    up_clear.add_argument("--key", required=True, help="measurement key or analyte")
+    up_clear.add_argument(
+        "--dictionary", help="synonym dictionary TOML (key resolution)"
+    )
+    up_clear.set_defaults(func=_cmd_person_unit_pref_clear)
+
+    up_list = unit_pref_sub.add_parser(
+        "list", help="display units recorded for a person"
+    )
+    up_list.add_argument("slug")
+    up_list.add_argument("--json", action="store_true", help="machine-readable output")
+    up_list.set_defaults(func=_cmd_person_unit_pref_list)
 
     # --- document recovery (misfiled document escape hatch, issue #54) ----
     p_document = sub.add_parser(

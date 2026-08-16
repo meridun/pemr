@@ -183,6 +183,39 @@ divergence. The visible consequence: since `unit` is one of the compared payload
 (§4), re-ingesting the original document after a unit correction stages a **conflict**
 rather than deduping. That is the honest outcome, not a bug.
 
+The **display-unit overlay** (migration 013, issue #136) — one canonical *display* unit
+per person per measurement key:
+
+```sql
+-- Display-only lever. Nothing resolves through it: dedup, rekey, commit-extraction, the
+-- conflict resolver, verify's identity checks and the render curation overlay never read
+-- it. `unit` is a non-key field for lab_result and observation, which is what makes a
+-- display lever possible without touching identity at all. Only `render summary` and
+-- `query.trends` honour it, and each discloses every conversion on the line it changes.
+-- ON DELETE CASCADE, and deliberately absent from `persons._CHILD_TABLES`: a display
+-- preference is not medical history and must never block a childless `person remove`.
+CREATE TABLE person_unit_pref (
+  person_id INTEGER NOT NULL REFERENCES person(person_id) ON DELETE CASCADE,
+  key       TEXT NOT NULL,   -- dedup.key_token of the measurement key / analyte
+  unit      TEXT NOT NULL,   -- a pemr.units canonical unit id; validated in Python
+  set_at    TEXT NOT NULL,   -- ISO8601 UTC seconds
+  PRIMARY KEY (person_id, key)
+);
+```
+
+Canonicalising a unit is **display-time and per-person, and storage never mutates**. The
+obvious alternative — normalise at `commit-extraction` and migrate the corpus once — was
+rejected: a genuine unit-of-measure difference is not a spelling mistake, so rewriting a
+`kg` row into `lb` would mutate a document-sourced fact, and no person's internally
+consistent unit system is more correct than another's. The unit's measurement system is
+therefore **derived** from the stored unit string through a static registry in
+`pemr/units.py` rather than stored in a new column — which is what lets rows committed
+long before this shipped convert correctly. That registry is Python, not a
+`data/dictionary.toml` section, because the two differ in kind: the dictionary is
+user-grown medical *vocabulary* and an identity lever (it feeds `dedup_key`), a unit table
+is fixed physics and a display lever. Correcting a genuinely mislabelled unit *in place*
+remains `record edit`'s job (above) — a different verb for a different problem.
+
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
 005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
 in §3, omitted from the DDL below to keep the shapes readable):
@@ -963,6 +996,13 @@ one document type a human cannot eyeball to catch a misfile.
 
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
+pemr person unit-pref set <slug> --key <key> --unit <unit> [--dictionary <toml>]
+                                                         # the canonical unit `render summary` and `trends`
+                                                         # DISPLAY this key in (§2 person_unit_pref); stored
+                                                         # rows are never rewritten - to correct a genuinely
+                                                         # mislabelled unit use `record edit`
+pemr person unit-pref clear <slug> --key <key> [--dictionary <toml>]
+pemr person unit-pref list <slug> [--json]
 pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
 pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
@@ -1029,6 +1069,11 @@ pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stre
 pemr find --person jane "cholesterol"                    # full-text over ocr_text + records
 pemr find "mmr booster"                                  # omit --person: whole-household, slug-prefixed hits
 pemr trends --person jane --test hba1c                   # min/max/latest/slope
+                                                         # a canonical display unit for the key (above)
+                                                         # converts every point BEFORE the stats, so the
+                                                         # numbers and the printed unit cannot disagree;
+                                                         # a point that cannot be converted is kept and
+                                                         # disclosed, never dropped
 pemr due --person jane                                   # screening/vaccine gaps — NOT IMPLEMENTED (phase 7)
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
@@ -1150,6 +1195,22 @@ delete a record row (`record rm`, `document rm`) therefore name any row-scoped v
 doomed rows in their dry run and lift it in the same transaction as the delete. Family scope
 needs no such rule: `dedup_base` is content-derived, so re-attaching to a re-ingest of the
 same fact is the intended behaviour.
+
+**Display-time unit canonicalisation** (issue #136) is a second read-time overlay, and it
+rests on exactly the same purity argument. When a person has recorded a canonical display
+unit for a measurement key (`person_unit_pref`, §2), `render summary` converts that key's
+Latest Vitals and Recent Abnormal Labs into it — value *and* reference interval together,
+since a value in `lb` beside a `(ref ...)` still in kg is a clinical misread — and `trends`
+converts every point of the series **before** computing min/max/latest/slope, so the stats
+and the printed unit cannot disagree. Every converted number is disclosed where it prints
+(`[converted from 77.6 kg]` in the summary, a `note` line in `trends`), and unit conversion
+is arithmetic, never a relabel: temperature is affine, and an unknown unit, an absent unit,
+a non-numeric value or a cross-dimension preference all resolve to "print the stored value
+untouched" rather than guess at a scale. Two deliberate limits keep it inert everywhere
+else: **abnormality is still decided on stored values**, so no preference can change which
+labs appear in a section; and only the two read paths named here honour it — `render brief`,
+`render journal`, `query labs` and the MCP write surface are untouched. A person with no
+preference set renders byte-identically to before the overlay existed.
 
 Because they regenerate from truth, they never drift. Old exports are disposable.
 

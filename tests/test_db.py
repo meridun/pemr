@@ -19,6 +19,7 @@ EXPECTED_TABLES = {
     "conflict",
     "document_tombstone",
     "curation",
+    "person_unit_pref",
     "schema_migrations",
 }
 
@@ -48,6 +49,7 @@ ALL_MIGRATIONS = [
     "010_curation_row_scope.sql",
     "011_curation_distinct_status.sql",
     "012_record_edit.sql",
+    "013_person_unit_pref.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -138,7 +140,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
         "006_condition_allergy.sql", "007_document_tombstone.sql",
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
-        "012_record_edit.sql",
+        "012_record_edit.sql", "013_person_unit_pref.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -272,7 +274,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
     assert db.migrate(conn) == [
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
-        "012_record_edit.sql",
+        "012_record_edit.sql", "013_person_unit_pref.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -325,6 +327,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
     assert db.migrate(conn) == [
         "009_record_attestation.sql", "010_curation_row_scope.sql",
         "011_curation_distinct_status.sql", "012_record_edit.sql",
+        "013_person_unit_pref.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -375,7 +378,7 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
 
     assert db.migrate(conn) == [
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
-        "012_record_edit.sql",
+        "012_record_edit.sql", "013_person_unit_pref.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
@@ -460,6 +463,7 @@ def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
 
     assert db.migrate(conn) == [
         "011_curation_distinct_status.sql", "012_record_edit.sql",
+        "013_person_unit_pref.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
