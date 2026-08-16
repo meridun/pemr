@@ -954,6 +954,59 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
+def _ooxml_entity_bomb(root, levels=7, width=4, leaf=64):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+    chain = "".join(
+        f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
+    )
+    return f'<!DOCTYPE {root} [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx"])
+def test_ocr_auto_refuses_a_doctype_bearing_ooxml_end_to_end(ready, capsys, kind):
+    """Issue #155 through the CLI: a DOCTYPE member is refused before parsing, and
+    the refusal costs a note — never the document. Pre-fix these ~800-byte files
+    stored 1,048,576 chars of `AAAA…` as `native` text."""
+    tmp_path = ready
+    if kind == "docx":
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("w:document")
+        member = "word/document.xml"
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>{doctype}'
+            f'<w:document xmlns:w="{ns}"><w:body>'
+            f"<w:p><w:r><w:t>&e{levels};</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+    else:
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("worksheet")
+        member = "xl/worksheets/sheet1.xml"
+        body = (
+            f'{doctype}<worksheet xmlns="{ns}"><sheetData>'
+            f'<row><c t="str"><v>&e{levels};</v></c></row>'
+            "</sheetData></worksheet>"
+        )
+    src = tmp_path / f"bomb.{kind}"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(member, body)
+    assert src.stat().st_size < 4096          # well under the extraction byte cap
+
+    assert _run(tmp_path, "ingest", str(src), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto",
+                "--force") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out          # the document is kept
+    assert f"{member} declares a DOCTYPE" in out.err   # named, before any parse
+    assert "no ocr_text stored" in out.err
+    assert "A" * 200 not in out.err
+
+    # nothing expanded into the archive: the amplified text is unfindable
+    assert _run(tmp_path, "find", "--person", "jane-doe", "AAAA") == 0
+    assert "no matches" in capsys.readouterr().out
+
+
 def test_ocr_tesseract_is_rejected(ready, capsys):
     """Issue #91: the misleading `tesseract` alias is gone; argparse names `auto`."""
     tmp_path = ready
