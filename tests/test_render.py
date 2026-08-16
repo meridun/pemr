@@ -908,11 +908,14 @@ def _annotate(conn, record_type, column, value, **kwargs):
 
 
 def _renders(conn):
+    # `now` is pinned: every header carries a second-resolution `Generated:` stamp, so a
+    # before/after byte-identity check straddling a second boundary fails spuriously.
     d = dedup.load_dictionary(DICT_PATH)
+    now = datetime(2026, 6, 1)
     return {
-        "summary": render.render_summary(conn, "jane-doe", dictionary=d),
-        "brief": render.render_brief(conn, _upcoming_appt_id(conn), dictionary=d),
-        "journal": render.render_journal(conn, "jane-doe"),
+        "summary": render.render_summary(conn, "jane-doe", dictionary=d, now=now),
+        "brief": render.render_brief(conn, _upcoming_appt_id(conn), dictionary=d, now=now),
+        "journal": render.render_journal(conn, "jane-doe", now=now),
     }
 
 
