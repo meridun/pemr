@@ -544,6 +544,145 @@ def _cmd_document_set_text(args: argparse.Namespace) -> int:
     return _with_document_conn(args, work)
 
 
+def _reocr_json(result: "ingest.ReocrResult") -> dict:
+    """One :class:`ingest.ReocrResult` as a stable-key JSON dict.
+
+    ``owner_check`` is nested (or null) in the shape MCP's `ingest` already returns it,
+    so a caller that parses one parses both.
+    """
+    check = result.owner_check
+    return {
+        "document_id": result.document_id,
+        "status": result.status,
+        "chars": result.chars,
+        "previous_chars": result.previous_chars,
+        "route": result.route,
+        "pages": result.pages,
+        "truncated": result.truncated,
+        "blob_path": result.blob_path,
+        "owner_check": None if check is None else {
+            "verdict": check.verdict,
+            "matched_slug": check.matched_slug,
+            "evidence": check.evidence,
+        },
+    }
+
+
+def _print_reocr_result(result: "ingest.ReocrResult") -> None:
+    """One human line per document, plus the two things a sweep must not miss:
+    truncation against `OCR_MAX_PAGES`, and any owner verdict that isn't reassuring."""
+    was = (
+        f"was {result.previous_chars} chars"
+        if result.previous_chars
+        else "was empty"
+    )
+    route = f"  route {result.route}" if result.route else ""
+    if result.status == "written":
+        line = f"written      {result.chars} chars ({was}){route}"
+    elif result.status == "would-write":
+        line = f"would write  {result.chars} chars ({was}){route}  [dry run]"
+    elif result.status == "has-text":
+        line = (
+            f"skipped      already has ocr_text ({result.previous_chars} chars) - "
+            "pass --force to replace it"
+        )
+    elif result.status == "no-text":
+        line = f"no text      nothing could be extracted from the blob{route}"
+    elif result.status == "owner-mismatch":
+        line = "refused      owner verification failed - nothing written"
+    elif result.status == "missing-blob":
+        line = f"missing blob {result.blob_path}"
+    else:  # study-blob
+        line = (
+            "skipped      packed DICOM study; its ocr_text is a header summary, "
+            "not extracted text"
+        )
+    print(f"#{result.document_id}  {line}")
+
+    if result.truncated:
+        print(
+            f"    pages: {result.pages} (over the {ingest.OCR_MAX_PAGES}-page cap - "
+            "text is truncated)"
+        )
+    check = result.owner_check
+    if check is not None and check.verdict not in ("match", "unverified"):
+        if check.verdict == "mismatch":
+            print(
+                f"    owner: text matches '{check.matched_slug}', "
+                "not this document's owner"
+            )
+            print(
+                f"    fix with `pemr document reassign {result.document_id} "
+                f"--person {check.matched_slug}`, or store anyway with --force"
+            )
+        else:  # suspect - stored, but the operator should look
+            print(
+                "    owner: warning - the text carries an identity header naming "
+                "nobody on the roster"
+            )
+        if check.evidence:
+            print(f'    found in document text: "{check.evidence}"')
+
+
+def _cmd_document_reocr(args: argparse.Namespace) -> int:
+    # Exactly one selector, and `--person` only scopes the filter. An argparse error
+    # (usage + rc=2) rather than a silent guess, following `document rm`'s
+    # parser-on-the-namespace pattern - a sweep that selects the wrong set is worse
+    # than one that refuses to start.
+    if args.document_ids and args.where_empty:
+        args.parser.error(
+            "pass document ids or --where-empty, not both; nothing was written"
+        )
+    if not args.document_ids and not args.where_empty:
+        args.parser.error(
+            "nothing selected - pass document ids or --where-empty; "
+            "nothing was written"
+        )
+    if args.person and not args.where_empty:
+        args.parser.error(
+            "--person only scopes --where-empty; nothing was written"
+        )
+    sources_dir = _resolve_sources_dir(args)
+
+    def work(conn):
+        document_ids = args.document_ids or documents.list_documents_without_text(
+            conn, args.person
+        )
+        if not document_ids:
+            if args.json:
+                _print_json([])
+                return 0
+            print("no documents with empty ocr_text - nothing to do")
+            return 0
+        try:
+            results = ingest.reocr_documents(
+                conn, document_ids, sources_dir,
+                force=args.force, dry_run=args.dry_run,
+            )
+        except ingest.IngestError as exc:
+            # Not in `_with_document_conn`'s catch list (it is an engine-side
+            # RuntimeError, not one of the `documents` refusals), so translate it here
+            # to the same friendly rc=1 every other `document` verb gives.
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            _print_json([_reocr_json(r) for r in results])
+        else:
+            for result in results:
+                _print_reocr_result(result)
+            counts: dict[str, int] = {}
+            for result in results:
+                counts[result.status] = counts.get(result.status, 0) + 1
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(counts.items()))
+            print(f"{len(results)} document(s): {summary}")
+        # rc=1 when work the operator asked for was refused (see ReocrResult.refused);
+        # `no-text` stays rc=0 so a sweep does not exit non-zero on expected outcomes.
+        return 1 if any(r.refused for r in results) else 0
+
+    return _with_document_conn(args, work)
+
+
 def _cmd_document_edit(args: argparse.Namespace) -> int:
     # A flag left unset is None -> not part of the update; an explicit empty string
     # (e.g. --category "") clears that column (documents.py), same as `person edit`.
@@ -3025,6 +3164,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d_set_text.add_argument("--json", action="store_true", help="machine-readable output")
     d_set_text.set_defaults(func=_cmd_document_set_text)
+
+    # --- re-run extraction against the stored blob (issue #143) -----------
+    d_reocr = document_sub.add_parser(
+        "reocr",
+        help="re-derive ocr_text from a document's stored blob, using the same "
+             "extraction dispatch as `ingest`",
+    )
+    d_reocr.add_argument(
+        "document_ids", nargs="*", type=int, metavar="ID",
+        help="document id(s) to re-extract; omit and pass --where-empty instead",
+    )
+    d_reocr.add_argument(
+        "--where-empty", dest="where_empty", action="store_true",
+        help="select every document whose ocr_text is empty (the repair sweep)",
+    )
+    d_reocr.add_argument(
+        "--person", help="scope --where-empty to one owner slug"
+    )
+    d_reocr.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="report the character count that would be stored; write nothing",
+    )
+    d_reocr.add_argument(
+        "--force", action="store_true",
+        help="replace existing ocr_text, and store despite an owner mismatch "
+             "(both refused without this, same as `ingest --force`)",
+    )
+    d_reocr.add_argument("--sources", help="sources blob dir (overrides config)")
+    d_reocr.add_argument("--json", action="store_true", help="machine-readable output")
+    # `parser` rides along for the selector-combination checks in the handler, so the
+    # usage line names `pemr document reocr` (same pattern as `document rm`).
+    d_reocr.set_defaults(func=_cmd_document_reocr, parser=d_reocr)
 
     d_edit = document_sub.add_parser(
         "edit", help="correct a document's date/category/provider (partial)"

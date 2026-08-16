@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from pemr import cli, db, dedup, documents, persons
+from pemr import cli, db, dedup, documents, ingest, persons
 
 RECORDS = {
     "lab_result": [
@@ -1186,3 +1186,356 @@ def test_cli_document_output_is_console_safe(cli_ready, capsys):
         for text in (captured.out, captured.err):
             assert text.isascii(), repr(text)
             text.encode("cp437")
+
+
+# --- re-extraction from the stored blob: `document reocr` (issue #143) -------
+
+
+def _sources(tmp_path):
+    return str(tmp_path / "sources")
+
+
+def _ingest_textless(tmp_path, name, content, person="jane-doe"):
+    """Ingest a blob with no ocr_text - the population `reocr` exists to repair."""
+    src = tmp_path / name
+    src.write_bytes(content)
+    assert _run(tmp_path, "ingest", str(src), "--person", person,
+                "--sources", _sources(tmp_path)) == 0
+
+
+def _ocr_text_of(tmp_path, document_id):
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = ?", (document_id,)
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+
+
+def test_list_documents_without_text_uses_the_invisible_aware_predicate(conn):
+    """The #87 rows are the target population: raw truthiness calls them populated,
+    `normalize_document_text` calls them empty, and only the second one is right."""
+    jane = persons.add_person(conn, "jane-doe", "Jane Doe")
+    john = persons.add_person(conn, "john-doe", "John Doe")
+    populated = _insert_document(conn, jane.person_id, "aa11", ocr_text="real text")
+    empty = _insert_document(conn, jane.person_id, "bb22", ocr_text=None)
+    invisible = _insert_document(conn, jane.person_id, "cc33", ocr_text="​﻿")
+    johns = _insert_document(conn, john.person_id, "dd44", ocr_text="")
+
+    ids = documents.list_documents_without_text(conn)
+
+    assert ids == sorted([empty, invisible, johns])   # ascending, resumable by eye
+    assert populated not in ids
+    assert documents.list_documents_without_text(conn, "jane-doe") == sorted(
+        [empty, invisible]
+    )
+
+
+def test_list_documents_without_text_unknown_slug_raises(seeded):
+    with pytest.raises(persons.PersonNotFoundError):
+        documents.list_documents_without_text(seeded["conn"], "nobody")
+
+
+def test_cli_document_reocr_fills_an_empty_document_and_find_sees_it(
+    cli_ready, capsys
+):
+    _ingest_textless(cli_ready, "scan2.txt", b"acute pericarditis noted on review")
+    capsys.readouterr()
+    assert _run(cli_ready, "find", "--person", "jane-doe", "pericarditis") == 0
+    assert "pericarditis" not in capsys.readouterr().out
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  written" in out
+    assert "34 chars (was empty)" in out
+    assert "route native" in out
+    assert out.isascii(), repr(out)
+
+    # No explicit reindex anywhere: the FTS trigger followed the ocr_text write.
+    assert _run(cli_ready, "find", "--person", "jane-doe", "pericarditis") == 0
+    assert "pericarditis" in capsys.readouterr().out.lower()
+
+
+def test_cli_document_reocr_refuses_a_populated_document_without_force(
+    cli_ready, capsys
+):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "1",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#1  skipped" in out and "--force" in out
+    assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
+
+
+def test_cli_document_reocr_force_replaces_existing_text(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "1", "--force",
+                "--sources", _sources(cli_ready)) == 0
+    assert "was 17 chars" in capsys.readouterr().out
+    # The blob is the same bytes the transcription came from, so this is a no-change
+    # replace - what matters is that force got past the guard at all.
+    assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
+
+
+def test_cli_document_reocr_dry_run_prints_char_count_and_names_truncation(
+    cli_ready, capsys, monkeypatch
+):
+    _ingest_textless(cli_ready, "scan2.txt", b"a long scanned bundle of pages")
+    # The page count is the extractor's business; here the unit under test is whether
+    # the operator is *told* about the cap without having to read the write path.
+    monkeypatch.setattr(ingest, "pdf_page_count", lambda src: 21)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2", "--dry-run",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  would write  30 chars (was empty)" in out
+    assert "[dry run]" in out
+    assert f"pages: 21 (over the {ingest.OCR_MAX_PAGES}-page cap" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) is None
+
+
+def test_cli_document_reocr_where_empty_selects_only_textless_documents(
+    cli_ready, capsys
+):
+    _ingest_textless(cli_ready, "scan2.txt", b"second document text")
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "--where-empty",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  written" in out
+    assert "#1" not in out                 # already populated -> never selected
+    assert "1 document(s): 1 written" in out
+
+
+def test_cli_document_reocr_where_empty_scoped_by_person(cli_ready, capsys):
+    _ingest_textless(cli_ready, "jane2.txt", b"jane's untranscribed scan")
+    _ingest_textless(cli_ready, "john2.txt", b"john's untranscribed scan", "john-doe")
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "--where-empty",
+                "--person", "john-doe", "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#3  written" in out and "#2" not in out
+    assert _ocr_text_of(cli_ready, 2) is None
+    assert _ocr_text_of(cli_ready, 3) == "john's untranscribed scan"
+
+
+def test_cli_document_reocr_where_empty_on_a_clean_archive_is_a_noop(
+    cli_ready, capsys
+):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "--where-empty",
+                "--sources", _sources(cli_ready)) == 0
+    assert "nothing to do" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [
+    ("document", "reocr", "1", "--where-empty"),        # both selectors
+    ("document", "reocr"),                              # neither
+    ("document", "reocr", "1", "--person", "jane-doe"),  # --person without the filter
+])
+def test_cli_document_reocr_rejects_bad_flag_combinations(cli_ready, argv):
+    with pytest.raises(SystemExit) as exc:
+        _run(cli_ready, *argv, "--sources", _sources(cli_ready))
+    assert exc.value.code == 2
+
+
+def test_cli_document_reocr_multi_id_summary_and_exit_code(cli_ready, capsys):
+    _ingest_textless(cli_ready, "scan2.txt", b"recovered from the blob")
+    capsys.readouterr()
+
+    # One written, one refused: the write still lands, and the refusal still sets rc=1.
+    assert _run(cli_ready, "document", "reocr", "1", "2",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#1  skipped" in out and "#2  written" in out
+    assert "2 document(s): 1 has-text, 1 written" in out
+    assert _ocr_text_of(cli_ready, 2) == "recovered from the blob"
+
+
+def test_cli_document_reocr_json_carries_a_stable_key_set(cli_ready, capsys):
+    _ingest_textless(cli_ready, "scan2.txt", b"Patient: Jane  findings here")
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "1", "2", "--json",
+                "--sources", _sources(cli_ready)) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["document_id"] for row in payload] == [1, 2]
+    assert set(payload[0]) == {
+        "document_id", "status", "chars", "previous_chars", "route", "pages",
+        "truncated", "blob_path", "owner_check",
+    }
+    assert payload[0]["status"] == "has-text"
+    assert payload[0]["owner_check"] is None            # refused before any check
+    assert payload[1]["status"] == "written"
+    assert set(payload[1]["owner_check"]) == {"verdict", "matched_slug", "evidence"}
+
+
+def test_cli_document_reocr_missing_blob_is_reported_not_crashed(cli_ready, capsys):
+    _ingest_textless(cli_ready, "scan2.txt", b"about to vanish from sources")
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        source_path = conn.execute(
+            "SELECT source_path FROM document WHERE document_id = 2"
+        ).fetchone()["source_path"]
+    finally:
+        conn.close()
+    (cli_ready / "sources" / source_path).unlink()
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#2  missing blob" in out
+    assert out.isascii(), repr(out)
+
+
+def test_cli_document_reocr_owner_mismatch_refuses_and_names_the_remedy(
+    cli_ready, capsys
+):
+    # A roster person with a usable multi-token name: `name_tokens` deliberately
+    # ignores mononyms, so the fixture's "Jane"/"John" can never produce a verdict.
+    assert _run(cli_ready, "person", "add", "--slug", "bob-roe",
+                "--name", "Robert Alan Roe") == 0
+    _ingest_textless(cli_ready, "scan2.txt", b"Patient: ROE, ROBERT ALAN  summary")
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#2  refused" in out
+    assert "text matches 'bob-roe'" in out
+    assert "pemr document reassign 2 --person bob-roe" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) is None
+
+    # ...and --force is the documented way past it.
+    assert _run(cli_ready, "document", "reocr", "2", "--force",
+                "--sources", _sources(cli_ready)) == 0
+    assert _ocr_text_of(cli_ready, 2) == "Patient: ROE, ROBERT ALAN  summary"
+
+
+def test_cli_document_reocr_unknown_id_is_a_friendly_error(cli_ready, capsys):
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "999",
+                "--sources", _sources(cli_ready)) == 1
+    assert "no document with id" in capsys.readouterr().err
+
+
+def test_cli_document_reocr_without_a_sources_dir_is_a_friendly_error(
+    cli_ready, monkeypatch
+):
+    monkeypatch.delenv("PEMR_SOURCES", raising=False)
+    monkeypatch.delenv("PEMR_CONFIG", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "--db", str(cli_ready / "cli.db"),
+            "--config", str(cli_ready / "absent.toml"),
+            "document", "reocr", "1",
+        ])
+    assert "no sources dir" in str(exc.value.code)
+
+
+def test_cli_document_reocr_leaves_records_and_keys_untouched(cli_ready, capsys):
+    """`reocr` touches one column. Record rows, dedup keys and the blob are not its
+    business, and extraction against a repaired document behaves normally."""
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        before = conn.execute(
+            "SELECT lab_result_id, dedup_key FROM lab_result ORDER BY lab_result_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    _ingest_textless(cli_ready, "scan2.txt", b"repaired document text")
+    blob_bytes = sorted(p.read_bytes() for p in (cli_ready / "sources").rglob("*.txt"))
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+    capsys.readouterr()
+
+    payload = cli_ready / "extract2.json"
+    payload.write_text(json.dumps({"lab_result": [
+        {"test_name": "Sodium", "collected_at": "2026-02-02", "value_num": 140,
+         "unit": "mmol/L"},
+    ]}), encoding="utf-8")
+    assert _run(cli_ready, "commit-extraction", "--document", "2",
+                "--json", str(payload)) == 0
+
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        after = conn.execute(
+            "SELECT lab_result_id, dedup_key FROM lab_result WHERE document_id = 1 "
+            "ORDER BY lab_result_id"
+        ).fetchall()
+        added = conn.execute(
+            "SELECT COUNT(*) AS n FROM lab_result WHERE document_id = 2"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+    assert added == 1
+    # The blob store is read-only to this verb.
+    assert sorted(
+        p.read_bytes() for p in (cli_ready / "sources").rglob("*.txt")
+    ) == blob_bytes
+
+
+def test_cli_document_reocr_names_truncation_on_the_write_path_too(
+    cli_ready, capsys, monkeypatch
+):
+    """The dry-run names an over-cap document; so must the run that writes for real.
+    A sweep is exactly where the operator is *not* looking at the document, so a
+    truncation notice that only appears under `--dry-run` is a notice nobody sees."""
+    _ingest_textless(cli_ready, "bundle.txt", b"a long scanned bundle of pages")
+    monkeypatch.setattr(ingest, "pdf_page_count", lambda src: 21)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  written" in out
+    assert f"pages: 21 (over the {ingest.OCR_MAX_PAGES}-page cap" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) == "a long scanned bundle of pages"
+
+
+def test_cli_document_reocr_stores_what_ingest_would_have_stored(cli_ready, capsys):
+    """The anti-drift claim at the operator's surface: the same bytes ingested with
+    `--ocr auto` today, and ingested textless then repaired with `reocr`, end up with
+    byte-identical `ocr_text`. Two archives, because layer-1 dedup rightly refuses the
+    same sha twice inside one."""
+    content = b"MERIDIAN FAMILY CLINIC\nSodium 140 mmol/L\nrepeat panel in six months\n"
+    blob = cli_ready / "panel.txt"
+    blob.write_bytes(content)
+
+    # Archive A - ingested after the extractor could read it.
+    other = cli_ready / "other"
+    other.mkdir()
+    assert cli.main(["--db", str(other / "cli.db"), "migrate", "--create"]) == 0
+    assert cli.main(["--db", str(other / "cli.db"), "person", "add",
+                     "--slug", "jane-doe", "--name", "Jane"]) == 0
+    assert cli.main(["--db", str(other / "cli.db"), "ingest", str(blob),
+                     "--person", "jane-doe", "--sources", str(other / "sources"),
+                     "--ocr", "auto"]) == 0
+
+    # Archive B - the #143 population: same bytes, ingested before it could.
+    _ingest_textless(cli_ready, "panel-copy.txt", content)
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "2",
+                "--sources", _sources(cli_ready)) == 0
+
+    conn = db.connect(other / "cli.db")
+    try:
+        at_ingest = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    assert at_ingest, "the --ocr auto ingest stored nothing; the comparison is vacuous"
+    assert _ocr_text_of(cli_ready, 2) == at_ingest

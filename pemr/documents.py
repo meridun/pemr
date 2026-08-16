@@ -276,6 +276,43 @@ def list_documents(
     return [_document_view(conn, row) for row in rows]
 
 
+def list_documents_without_text(
+    conn: sqlite3.Connection, person_slug: str | None = None
+) -> list[int]:
+    """Ids of documents whose ``ocr_text`` is empty, ascending (`reocr --where-empty`).
+
+    Ascending rather than :func:`list_documents`' newest-first: this feeds a repair
+    sweep, where the useful property is that it works forward through the backlog and a
+    partially-completed run is resumable by eye.
+
+    Emptiness is :func:`normalize_document_text`'s predicate, applied in Python rather
+    than in SQL: `TRIM()` knows about whitespace and nothing about zero-width or other
+    invisible characters, and the invisible-only rows of issue #87 are part of exactly
+    the population this selector exists to find.
+
+    Raises :class:`pemr.persons.PersonNotFoundError` for an unknown ``person_slug``,
+    matching :func:`list_documents` — an unknown slug is a typo, not an empty result.
+    """
+    db.require_migrated(conn)
+    params: list[object] = []
+    where = ""
+    if person_slug is not None:
+        person = get_person(conn, person_slug)
+        if person is None:
+            raise PersonNotFoundError(f"no person with slug '{person_slug}'")
+        where = " WHERE person_id = ?"
+        params.append(person.person_id)
+    return [
+        row["document_id"]
+        for row in conn.execute(
+            f"SELECT document_id, ocr_text FROM document{where} "
+            "ORDER BY document_id ASC",
+            params,
+        )
+        if not normalize_document_text(row["ocr_text"])
+    ]
+
+
 def _show_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     """The :func:`_document_view` fields plus the two `document show` extras.
 
