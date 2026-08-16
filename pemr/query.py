@@ -25,7 +25,7 @@ import re
 import sqlite3
 from datetime import date, datetime
 
-from . import db
+from . import db, units
 from .dedup import enum_token, key_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
@@ -406,7 +406,8 @@ def trends(
     """Summary stats for one **assay** of one analyte over time.
 
     Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
-    slope_per_day, other_assays, other_assay_count}``. ``count`` is the number of
+    slope_per_day, other_assays, other_assay_count, canonical_unit, converted_count,
+    unconverted_count}``. ``count`` is the number of
     numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two distinct
     collection dates. ``latest`` is the row with the greatest ``collected_at``, ties
     broken by the greatest ``lab_result_id`` (most-recently-ingested wins);
@@ -420,10 +421,26 @@ def trends(
     ``other_assays`` lists their key tokens (each usable verbatim as ``--test``, via
     :func:`_loose` — a canonical value may carry underscores that a re-derivation
     cannot reproduce) and ``other_assay_count`` counts the numeric rows behind them.
+
+    A series stated in two unit systems is the same wrong chart (issue #136), so when
+    the person has recorded a canonical display unit for this key
+    (``person_unit_pref``) every point is converted into it **before** the stats are
+    computed — which is what makes ``min``/``max``/``latest``/``slope_per_day`` and the
+    reported ``unit`` incapable of disagreeing. Nothing is written: the conversion is a
+    read-time transform, exactly like the curation overlay. A point whose stored unit
+    cannot be converted (unknown spelling, wrong dimension) is **kept and disclosed**
+    via ``unconverted_count``, never dropped — the ``other_assays`` rule — and
+    ``result["unit"]`` then falls back rather than labelling the series with a unit some
+    of it is not in.
     """
     person_id = resolve_person_id(conn, slug)
     target = _loose(key_token(test, dictionary))
     family = _loose(norm(test, dictionary))
+    # Compared through `_loose` on both sides, the underscore-insensitive spelling the
+    # rest of this function already matches on.
+    canonical = {_loose(k): v for k, v in units.load_prefs(conn, person_id).items()}.get(
+        target
+    )
     rows = conn.execute(
         "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
         "WHERE person_id = ? AND value_num IS NOT NULL "
@@ -456,25 +473,45 @@ def trends(
         # Same analyte, different assay: reported so the excluded rows stay findable.
         "other_assays": sorted(others),
         "other_assay_count": sum(others.values()),
+        # Display-unit disclosure (issue #136). All three are inert -- `None`/`0` -- for
+        # a person with no preference for this key, which is every caller today.
+        "canonical_unit": canonical,
+        "converted_count": 0,
+        "unconverted_count": 0,
     }
     if not matched:
         return result
 
-    values = [float(r["value_num"]) for r in matched]
-    units = {r["unit"] for r in matched if r["unit"]}
-    result["unit"] = next(iter(units)) if len(units) == 1 else None
+    shown = [units.display(r["value_num"], r["unit"], canonical) for r in matched]
+    values = [float(d.value) for d in shown]
+    if canonical is not None:
+        result["converted_count"] = sum(1 for d in shown if d.converted)
+        # "Not in the canonical unit", not "not converted": a point already stored in it
+        # needs no conversion and is not a caveat.
+        result["unconverted_count"] = sum(
+            1
+            for r, d in zip(matched, shown)
+            if not (d.converted or units.in_target(r["unit"], canonical))
+        )
+    if canonical is not None and result["unconverted_count"] == 0:
+        result["unit"] = canonical
+    else:
+        # Today's rule, over the units actually displayed (identical to the stored ones
+        # whenever no preference applied).
+        seen = {d.unit for d in shown if d.unit}
+        result["unit"] = next(iter(seen)) if len(seen) == 1 else None
     result["min"] = min(values)
     result["max"] = max(values)
     latest = matched[-1]  # rows came back ORDER BY collected_at, lab_result_id
-    result["latest"] = float(latest["value_num"])
+    result["latest"] = values[-1]
     result["latest_at"] = latest["collected_at"]
     result["latest_tie"] = sum(
         1 for r in matched if r["collected_at"] == latest["collected_at"]
     )
 
     points = [
-        (o, float(r["value_num"]))
-        for r in matched
+        (o, value)
+        for r, value in zip(matched, values)
         if (o := _ordinal(r["collected_at"])) is not None
     ]
     result["slope_per_day"] = _slope_per_day(points)

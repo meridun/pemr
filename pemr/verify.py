@@ -31,6 +31,7 @@ COUNTED_TABLES = (
     "document_tombstone",
     "curation",
     "record_edit",
+    "person_unit_pref",
     "lab_result",
     "medication",
     "procedure",

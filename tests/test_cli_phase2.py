@@ -1698,3 +1698,71 @@ def test_functional_observation_cli_roundtrip(ready, capsys):
         assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
     finally:
         conn.close()
+
+
+# --- a display preference must not touch dedup (issues #129 + #136) ----------
+
+def _reingest_after_a_unit_correction(root, *, with_pref):
+    """ingest -> commit -> `record edit` the unit -> (optionally set a canonical display
+    unit) -> re-commit the *same* extraction off the same document.
+
+    Returns everything the second commit did: its exit code, the conflict rows it
+    staged, and the surviving observation rows.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+
+    def run(*argv):
+        return cli.main(["--db", str(root / "cli.db"), *argv])
+
+    assert run("migrate", "--create") == 0
+    assert run("person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
+    scan = root / "scan.txt"
+    scan.write_bytes(b"weight 180 lbs")
+    assert run("ingest", str(scan), "--person", "jane-doe",
+               "--sources", str(root / "sources")) == 0
+    payload = _write_json(root, "extract.json", {"observation": [
+        {"obs_type": "vital", "key": "weight", "observed_at": "2026-01-02",
+         "value_num": 180.0, "unit": "lbs"},
+    ]})
+    assert run("commit-extraction", "--document", "1", "--json", str(payload)) == 0
+    # Issue #129's scalpel: correct the mislabelled unit in place, provenance intact.
+    assert run("record", "edit", "observation", "1", "--set", "unit=lb",
+               "--note", "normalise unit spelling", "--apply") == 0
+    if with_pref:
+        assert run("person", "unit-pref", "set", "jane-doe", "--key", "weight",
+                   "--unit", "lb") == 0
+
+    rc = run("commit-extraction", "--document", "1", "--json", str(payload))
+    conn = db.connect(root / "cli.db")
+    try:
+        conflicts = [dict(r) for r in conn.execute(
+            "SELECT record_type, dedup_key, existing_json, incoming_json, status "
+            "FROM conflict ORDER BY conflict_id"
+        ).fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT key, value_num, unit, dedup_key FROM observation "
+            "ORDER BY observation_id"
+        ).fetchall()]
+    finally:
+        conn.close()
+    return rc, conflicts, rows
+
+
+def test_a_display_unit_preference_cannot_change_re_ingest_dedup(tmp_path):
+    """Issue #136 AC-7. `unit` is in `dedup._COMPARE_FIELDS`, so a row whose unit was
+    corrected by `record edit` diverges from its own source document on re-ingest --
+    deliberately and loudly (#129's "Re-ingest divergence"). #136 must not quietly
+    change that either way: it is a *display* lever, so the property to prove is **no
+    change at all**, with a preference set or not.
+    """
+    plain = _reingest_after_a_unit_correction(tmp_path / "plain", with_pref=False)
+    preferred = _reingest_after_a_unit_correction(tmp_path / "preferred",
+                                                  with_pref=True)
+    assert plain == preferred
+
+    rc, conflicts, rows = preferred
+    # And the outcome is #129's documented one, so this cannot pass by both sides
+    # silently becoming no-ops.
+    assert rc == 0
+    assert [c["record_type"] for c in conflicts] == ["observation"]
+    assert [(r["unit"], r["value_num"]) for r in rows] == [("lb", 180.0)]

@@ -472,3 +472,81 @@ def test_query_meds_active_agrees_with_render_summary(curated, capsys):
     # Active Medications query in the first place, so nothing about it is suppressed.)
     appendix = md.split("## Superseded / corrected", 1)[1]
     assert "Breo Ellipta" in appendix
+
+
+# --- trends: display-unit conversion + its disclosure (issue #136) ------------
+
+def _seed_dry_weights(tmp_path):
+    """Two dry-weight readings, one clinic in kg and one in lb."""
+    conn = db.connect(tmp_path / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    # Not `_doc`: its sha is derived from `conn.total_changes`, which restarts at 0 on
+    # this fresh connection and collides with the fixture's document.
+    doc = conn.execute(
+        "INSERT INTO document (sha256, person_id, doc_date, source_path, ocr_text, "
+        "ingested_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"sha-{uuid.uuid4()}", pid, "2026-02-01", "aa/dw.pdf",
+         "dialysis flowsheets", "2026-01-01T00:00:00"),
+    ).lastrowid
+    conn.commit()
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "Dry Weight", "collected_at": "2026-01-01", "value_num": 90.0,
+         "unit": "kg"},
+        {"test_name": "Dry Weight", "collected_at": "2026-01-31", "value_num": 196.0,
+         "unit": "lb"},
+    ]}, d)
+    conn.close()
+
+
+def test_trends_prints_the_converted_unit_and_its_note(ready, capsys):
+    _seed_dry_weights(ready)
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "198.42 lb" in out                                  # max, converted from kg
+    assert "converted to lb (canonical unit for this key)" in out
+    assert "left in their stored unit" not in out              # nothing was left behind
+    assert out.isascii()
+    out.encode("cp437")
+
+
+def test_trends_discloses_the_points_it_could_not_convert(ready, capsys):
+    _seed_dry_weights(ready)
+    _seed_lab(ready, "jane-doe", test_name="Dry Weight", value_num=195.0,
+              unit="stone-ish", collected_at="2026-02-15")
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "1 point(s) left in their stored unit (not convertible to lb)" in out
+    assert out.isascii()
+
+
+def test_trends_json_carries_the_unit_disclosure_keys(ready, capsys):
+    _seed_dry_weights(ready)
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["canonical_unit"] == "lb"
+    assert t["converted_count"] == 1 and t["unconverted_count"] == 0
+    assert t["unit"] == "lb" and t["max"] == 198.42
+
+
+def test_trends_json_keys_are_inert_without_a_preference(ready, capsys):
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["canonical_unit"] is None
+    assert t["converted_count"] == 0 and t["unconverted_count"] == 0
+    assert "converted to" not in json.dumps(t)
