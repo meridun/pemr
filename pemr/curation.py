@@ -234,6 +234,7 @@ class CurationReport:
     applied: bool = False
     record_id: int = FAMILY_SCOPE      # 0 = family scope; else the annotated row
     scope: str = SCOPE_FAMILY          # SCOPE_FAMILY | SCOPE_ROW (derived from record_id)
+    cross_person: bool = False         # a merge into another person's family, allowed
 
     def as_dict(self) -> dict:
         return {
@@ -253,6 +254,9 @@ class CurationReport:
             # only widen it (Architecture.md's additive-only rule).
             "record_id": self.record_id,
             "scope": self.scope,
+            # Appended, never inserted (#161): True only when --allow-cross-person
+            # actually permitted a merge across two people's families.
+            "cross_person": self.cross_person,
         }
 
 
@@ -587,6 +591,65 @@ def row_label(
     )
 
 
+def _person_slug(conn: sqlite3.Connection, person_id: int | None) -> str:
+    """``person.slug`` for one id, or ``""`` when it names nothing.
+
+    A plain SQL read rather than a :mod:`records`/:mod:`query` import: this module is
+    pinned to :mod:`db` + :mod:`dedup` (module docstring), and reaching for a helper
+    elsewhere would put a cycle in the import graph for one column.
+    """
+    if not person_id:
+        return ""
+    row = conn.execute(
+        "SELECT slug FROM person WHERE person_id = ?", (int(person_id),)
+    ).fetchone()
+    return str(row["slug"]) if row is not None else ""
+
+
+def family_person(
+    conn: sqlite3.Connection, record_type: str, base: str
+) -> tuple[int | None, str]:
+    """``(person_id, slug)`` for one family — read off occurrence 0.
+
+    A family is **single-person by construction**: :func:`dedup._key_parts` folds
+    ``person_id`` into every record type's identity tuple, so two people's same-named
+    facts never share a ``dedup_base``. That is exactly why an accidental cross-person
+    ``--merged-into`` is silent — nothing collides — and why the person has to be looked
+    up explicitly to catch one (issue #161).
+
+    An empty family reports ``(None, "")`` rather than raising, the :func:`family_label`
+    convention: an unknown person is not evidence of a cross-person merge.
+    """
+    _require_type(record_type)
+    family = dedup.load_family(conn, record_type, base)
+    if not family:
+        return None, ""
+    person_id = family[0]["person_id"]
+    if person_id is None:
+        return None, ""
+    return int(person_id), _person_slug(conn, int(person_id))
+
+
+def row_person(
+    conn: sqlite3.Connection, record_type: str, record_id: int
+) -> tuple[int | None, str]:
+    """:func:`family_person`'s row twin — the person off the annotated row itself.
+
+    Row scope rules on one occurrence, so its person comes from that row rather than
+    from occurrence 0 (the :func:`row_label` distinction). A removed row reports
+    ``(None, "")``.
+    """
+    _require_type(record_type)
+    pk = f"{record_type}_id"
+    row = conn.execute(
+        f"SELECT person_id FROM {record_type} WHERE {pk} = ?", (int(record_id),)
+    ).fetchone()
+    if row is None or row["person_id"] is None:
+        return None, ""
+    person_id = int(row["person_id"])
+    return person_id, _person_slug(conn, person_id)
+
+
 def resolve_base(conn: sqlite3.Connection, record_type: str, token: str) -> str:
     """Resolve a ``<base-or-id>`` token to a ``dedup_base`` in ``record_type``.
 
@@ -673,6 +736,7 @@ def annotate_record(
     note: str,
     attributed_to: str | None = None,
     merged_into_base: str | None = None,
+    allow_cross_person: bool = False,
     row: bool = False,
     now: str | None = None,
     apply: bool = False,
@@ -703,9 +767,24 @@ def annotate_record(
     here would make `pemr verify`'s "re-affirm it" notice impossible to follow for the
     one status that most often carries it.
 
-    Raises ``ValueError`` for an unknown ``record_type``/``status``/empty note or a bad
-    merge target, :class:`FamilyNotFoundError` when a family target does not resolve, and
-    :class:`RowNotFoundError` when a ``--row`` target does not.
+    The merge target must also belong to the **same person** as the annotated family or
+    row (issue #161), unless ``allow_cross_person=True``. A ``dedup_base`` is
+    person-scoped (:func:`dedup._key_parts` folds ``person_id`` in), so two people can
+    each hold a family with the same clinical label under different, unrelated bases:
+    nothing collides at dedup time, and a merge across them moves the fact out of one
+    person's chart without it ever appearing on the other's — silently, with `pemr verify`
+    seeing a live target and reporting no orphan. The check is skipped when the target
+    *is* the annotated family (the row-scope narrowing shape above — same person by
+    construction) and when either side's person is unknown (a removed row, an empty
+    family): an unknown person is not evidence of a mismatch, and refusing there would
+    break the orphan-repair paths this module exists to keep runnable.
+    ``allow_cross_person`` is a silent no-op on a same-person merge, and is refused —
+    like ``merged_into_base`` itself — on any other status.
+
+    Raises ``ValueError`` for an unknown ``record_type``/``status``/empty note, a bad
+    merge target or an unpermitted cross-person merge, :class:`FamilyNotFoundError` when
+    a family target does not resolve, and :class:`RowNotFoundError` when a ``--row``
+    target does not.
     """
     db.require_migrated(conn)
     _require_type(record_type)
@@ -726,6 +805,7 @@ def annotate_record(
         record_id, base = FAMILY_SCOPE, resolve_base(conn, record_type, token)
 
     merge_target = (merged_into_base or "").strip() or None
+    cross_person = False
     if status == "merged-into":
         if merge_target is None:
             raise ValueError(
@@ -739,9 +819,37 @@ def annotate_record(
                 "family renders only under its target, so this would hide it "
                 "entirely; nothing was written"
             )
+        # Whose fact is being merged, and whose family absorbs it (issue #161). Skipped
+        # for `merge_target == base` (a row absorbed into its own family, #116) - same
+        # person by construction, and no lookup should be able to disagree.
+        if merge_target != base:
+            if record_id:
+                ruled_id, ruled_slug = row_person(conn, record_type, record_id)
+            else:
+                ruled_id, ruled_slug = family_person(conn, record_type, base)
+            target_id, target_slug = family_person(conn, record_type, merge_target)
+            # Only a *known* mismatch refuses: an unknown person on either side (a
+            # removed row, an empty family) is not evidence of a cross-person merge, and
+            # refusing there would break the orphan-repair paths.
+            if ruled_id is not None and target_id is not None and ruled_id != target_id:
+                if not allow_cross_person:
+                    raise ValueError(
+                        f"cannot merge {record_type} {base[:12]}... ({ruled_slug}) into "
+                        f"{merge_target[:12]}... ({target_slug}) - the target family "
+                        f"belongs to a different person, so the fact would leave "
+                        f"{ruled_slug}'s chart without ever appearing on "
+                        f"{target_slug}'s; pass --allow-cross-person if that is "
+                        "genuinely intended; nothing was written"
+                    )
+                cross_person = True
     elif merge_target is not None:
         raise ValueError(
             f"--merged-into is only meaningful with status 'merged-into', not "
+            f"'{status}'; nothing was written"
+        )
+    elif allow_cross_person:
+        raise ValueError(
+            f"--allow-cross-person is only meaningful with status 'merged-into', not "
             f"'{status}'; nothing was written"
         )
 
@@ -756,6 +864,7 @@ def annotate_record(
         dedup_base=base,
         record_id=record_id,
         scope=SCOPE_ROW if record_id else SCOPE_FAMILY,
+        cross_person=cross_person,
         status=status,
         note=cleaned_note,
         attributed_to=(attributed_to or "").strip() or None,

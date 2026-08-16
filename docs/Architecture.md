@@ -132,7 +132,8 @@ CREATE TABLE curation (
   record_id        INTEGER NOT NULL DEFAULT 0,  -- 0 = family scope; else <record_type>_id
   status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
   note             TEXT NOT NULL,   -- required: the why, and who said so
-  merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY
+  merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY, and of the
+                                    -- SAME person unless --allow-cross-person (issue #161)
   attributed_to    TEXT,
   created_at       TEXT NOT NULL,   -- ISO8601 UTC
   PRIMARY KEY (record_type, dedup_base, record_id)
@@ -172,6 +173,15 @@ CREATE TABLE record_edit (
 );
 CREATE INDEX record_edit_row ON record_edit (record_type, record_id);
 ```
+
+A `merged_into_base` names a family **of the same person**. A `dedup_base` folds
+`person_id` in (§3), so two people's same-named facts never collide — which is exactly why
+an accidental cross-person merge is silent: the target family genuinely exists, so `verify`
+reports no orphan, while the fact leaves the annotated person's chart and never appears on
+the target person's. `record annotate` therefore refuses a cross-person `--merged-into`,
+and `record reaffirm` refuses the same shape at plan time (issue #161).
+`--allow-cross-person` is the explicit escape hatch for the rare deliberate case: never the
+default, and disclosed in the report (`cross_person`) rather than recorded silently.
 
 A correction is **not** a re-attribution. Before `record edit`, a wrong display field
 could only be repaired by re-submitting the row through `commit-extraction` (or deleting
@@ -1024,11 +1034,14 @@ pemr record edit <table> <id> --set NAME=VALUE [--set ...] --note <text>
                                                          # every change ledgered; dry run by default
 pemr record edit --list [<table>] [--json]               # recorded corrections, newest first (field: old -> new)
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
-                     [--merged-into <base-or-id>] [--row] [--apply]
+                     [--merged-into <base-or-id>] [--allow-cross-person] [--row] [--apply]
                                                          # record a human verdict over a record FAMILY (§2 curation):
                                                          # confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
                                                          # distinct: two rows that recompute to one dedup_key are TWO facts
                                                          #        (generic extracted labels); unblocks `rekey`, both stay live
+                                                         # --merged-into must name a family of the SAME person; a cross-person
+                                                         #        merge is refused (the fact would leave one chart without
+                                                         #        appearing on the other) unless --allow-cross-person says so
                                                          # --row: scope it to that ROW only (a keep-both family holds
                                                          #        two live rows; row scope beats family scope there)
                                                          # pure overlay - no record row is mutated; dry run by default

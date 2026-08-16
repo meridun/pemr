@@ -1309,6 +1309,13 @@ def _print_curation_report(report: "curation.CurationReport") -> None:
         print(f"  attributed to: {report.attributed_to}")
     if report.merged_into_base:
         print(f"  merged into: {report.merged_into_base[:12]}")
+    if report.cross_person:
+        # Never silent (issue #161): the escape hatch was taken, so say so where the
+        # verdict itself is read back.
+        print(
+            "  cross-person merge: allowed by --allow-cross-person "
+            "(the target family belongs to a different person)"
+        )
     if report.previous is not None and report.action != "clear":
         print(f"  replaces: {curation.describe(report.previous)}")
 
@@ -1388,6 +1395,7 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
             note=args.note,
             attributed_to=args.attributed_to,
             merged_into_base=args.merged_into,
+            allow_cross_person=args.allow_cross_person,
             row=args.row,
             apply=args.apply,
         )
@@ -1674,6 +1682,31 @@ def _plan_one_reaffirm(
                 f"merge target {str(to_merge_base)[:12]}... is not live - the map is "
                 "stale; re-run `pemr rekey --apply --json`"
             )
+        if to_merge_base != to_base:
+            # The #161 guard, refused in the *plan* rather than at write time: the batch
+            # is fully planned before any write, and a mid-batch `ValueError` out of
+            # `annotate_record` would stop the run after N partial writes. No `--map-file`
+            # key plumbs the override through - `rekey` never rewrites `person_id`, so a
+            # cross-person successor can only come from a hand-edited map, which deserves
+            # a refusal rather than an option.
+            if orphan.record_id:
+                ruled_id, ruled_slug = curation.row_person(
+                    conn, orphan.record_type, orphan.record_id
+                )
+            else:
+                ruled_id, ruled_slug = curation.family_person(
+                    conn, orphan.record_type, to_base
+                )
+            target_id, target_slug = curation.family_person(
+                conn, orphan.record_type, to_merge_base
+            )
+            if ruled_id is not None and target_id is not None and ruled_id != target_id:
+                return skip(
+                    f"the merge target belongs to a different person ({ruled_slug} -> "
+                    f"{target_slug}) - the fact would leave one chart without appearing "
+                    "on the other; re-rule it with `pemr record annotate ... "
+                    "--allow-cross-person` if that is genuinely intended"
+                )
         if to_merge_base == to_base and not orphan.record_id:
             # This rekey fused the ruled family into its own merge target. A family merged
             # into itself renders nowhere at all (`annotate_record` refuses it at family
@@ -3510,6 +3543,12 @@ def build_parser() -> argparse.ArgumentParser:
     r_annotate.add_argument(
         "--merged-into", metavar="BASE-OR-ID",
         help="target family, required with --status merged-into",
+    )
+    r_annotate.add_argument(
+        "--allow-cross-person", action="store_true",
+        help="allow --merged-into to name a family belonging to a DIFFERENT person "
+             "(refused by default: the fact would leave one chart without appearing "
+             "on the other)",
     )
     r_annotate.add_argument(
         "--list", action="store_true", help="list current verdicts and exit"
