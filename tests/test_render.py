@@ -549,6 +549,66 @@ def test_summary_orders_malformed_compound_key_renders(seeded):
     assert "- HbA1c,  (ordered 2026-03-03)" in section
 
 
+# A `,` or `/` is structure in a panel key but *content* in many single analytes' names
+# (`Glucose, fasting`, `Kappa/Lambda Ratio`). Decomposing one of those asks for analytes
+# that were never ordered, so the order stops suppressing -- #128's inversion, re-created
+# for a different class of key. Two guards, tested below: the dictionary is asked whether
+# the whole string is one declared analyte before any split, and the whole-key match of
+# #128 is tried first regardless, so no suppression that worked before can be lost.
+
+def test_summary_orders_declared_comma_bearing_analyte_is_not_decomposed(seeded):
+    """AC3: `data/dictionary.example.toml:37` declares `glucose, fasting` a single
+    analyte, so the order asks for *that* result, not for `glucose` plus `fasting`."""
+    _seed_orders(seeded, [{"key": "Glucose, fasting", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Glucose, fasting", "collected_at": "2026-03-02", "value_num": 92},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "Glucose" not in section
+    assert "cervical collar" in section          # control: unresulted rows untouched
+
+
+def test_summary_orders_declared_analyte_is_not_closed_by_one_component(seeded):
+    """The guard restores a *name*, it does not become a looser match: a bare `Glucose`
+    result answers `glucose`, which is not the `glucose_fasting` that was ordered."""
+    _seed_orders(seeded, [{"key": "Glucose, fasting", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Glucose", "collected_at": "2026-03-02", "value_num": 92},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "- Glucose, fasting  (ordered 2026-03-01)" in section
+
+
+def test_summary_orders_declared_analyte_holds_for_a_slash_and_a_stem(seeded):
+    """The same guard for the `/` spelling (`kappa/lambda ratio`, whose first component
+    would otherwise map to a *different* analyte) and for a declared **stem** carrying a
+    qualifier -- `identity` looks the stem up, so `norm` sees the hit either way."""
+    _seed_orders(seeded, [
+        {"key": "Kappa/Lambda Ratio", "observed_at": "2026-03-01"},
+        {"key": "Cholesterol, Total (Calculated)", "observed_at": "2026-03-01"},
+    ])
+    _seed_results(seeded, [
+        {"test_name": "Kappa/Lambda Ratio", "collected_at": "2026-03-02", "value_num": 1.2},
+        {"test_name": "Cholesterol, Total (Calculated)", "collected_at": "2026-03-02",
+         "value_num": 180},
+    ])
+    section = _orders_section(seeded, dictionary=dedup.load_dictionary(DICT_PATH))
+    assert "Kappa" not in section and "Cholesterol" not in section
+
+
+def test_summary_orders_comma_bearing_name_suppresses_without_a_dictionary(seeded):
+    """AC3 for the case no dictionary can speak for: an undeclared analyte whose name
+    carries a comma, rendered with no dictionary at all. #128's whole-key match is asked
+    first, so an identically-named result still closes it."""
+    _seed_orders(seeded, [{"key": "Ferritin, Serum", "observed_at": "2026-03-01"}])
+    _seed_results(seeded, [
+        {"test_name": "Ferritin, Serum", "collected_at": "2026-03-02", "value_num": 30},
+    ])
+    section = _orders_section(seeded)
+    assert "Ferritin" not in section
+    assert "cervical collar" in section
+
+
 def test_summary_latest_vitals_pick(seeded):
     md = render.render_summary(seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH))
     assert "blood_pressure: 118.0 mmHg" in md   # most recent per key

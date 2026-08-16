@@ -1089,7 +1089,12 @@ default to the same exclusion unless a human explicitly decides otherwise.
   A *compound* order key (one order naming several analytes, `cbc,cmp,ldh`) decomposes on
   `,`/`/` at parenthesis depth 0 into component tokens, each still matched exactly, and
   leaves the section only when **every** component resulted in window (issue #145) — the
-  order side alone decomposes, and a partially resulted panel is still outstanding.
+  order side alone decomposes, and a partially resulted panel is still outstanding. Those
+  separators are content, not structure, inside many single analytes' names (`Glucose,
+  fasting`, `Kappa/Lambda Ratio`), so two guards keep #128's behaviour reachable: a key
+  the dictionary declares as one analyte is never split, and the whole-key match is tried
+  before the per-component one — decomposition can only ever move an order from
+  "renders" toward "suppressed", never take away a suppression that already worked.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.
