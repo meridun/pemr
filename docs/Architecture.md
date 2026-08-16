@@ -895,6 +895,18 @@ knows" case softens to `unverified`. `mismatch` — an affirmative name/DOB matc
 *different* roster person — is the half that actually prevents misfiling, and it blocks on
 every route.
 
+`document reocr` (issue #143) re-runs this same dispatch against a blob already in
+`sources/`, closing the gap for documents ingested before an extractor fix (#70, #138)
+landed — same routing, so the two paths cannot drift. Its `--force` carries two meanings at
+once: it overrides both the has-text refusal (replace a populated `ocr_text`) *and* a
+`mismatch` owner-check refusal on the recovered text, and the exit code stays 0 when the
+latter fires. The verb's own backlog use case, `--where-empty`, needs neither sense of
+`--force` — the population is unpopulated by definition, so a `mismatch` there still
+refuses on its own and names `document reassign` as the remedy. `suspect` (no roster match
+either way) stores and warns rather than refusing, since the recovered text cannot name the
+wrong household member — refusing would only withhold the evidence that the document is
+misfiled at the row level.
+
 ### Study directories (issue #69)
 
 A burned imaging disc is clinically *one* document but physically one folder holding
