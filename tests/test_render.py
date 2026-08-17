@@ -785,6 +785,180 @@ def test_months_before_clamps_a_short_target_month():
     assert render._months_before(date(2026, 1, 15), 13) == date(2024, 12, 15)
 
 
+# --- issue #166: the summary's Procedures section -----------------------------
+#
+# `procedure` rows arrive largely from billing documents, so the table mixes genuine
+# procedural history with routine service lines. The section narrows against a
+# suppress-only pattern list, under one stance throughout: significance is never
+# established by absence from a list, so every ambiguity resolves to *render*.
+
+def _seed_procedures(conn, rows):
+    """Extra `procedure` rows on jane, committed as their own document."""
+    dedup.commit_extraction(conn, _doc(conn, "jane-doe"), {
+        "procedure": list(rows),
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def _procedures_section(conn, routine=None, slug="jane-doe"):
+    md = render.render_summary(conn, slug, routine_procedures=routine)
+    return md.split("## Procedures")[1].split("\n## ")[0]
+
+
+def _procedure_bullets(section):
+    return [ln for ln in section.splitlines() if ln.startswith("- ")]
+
+
+def test_summary_has_a_procedures_section(seeded):
+    """AC1: procedure rows were stored, deduped and journalled but never reached the
+    master summary. The section sits between results and the forward-looking sections --
+    everything above it is standing state, everything below is what happens next."""
+    md = render.render_summary(seeded, "jane-doe")
+    assert "- 2025-03-15  Colonoscopy - normal" in _procedures_section(seeded)
+    assert (md.index("## Abnormal Labs")
+            < md.index("## Procedures")
+            < md.index("## Upcoming / Open Appointments"))
+
+
+def test_summary_procedures_no_patterns_suppress_nothing(seeded):
+    """The default is default-show *and* the fast path: no list, no filtering, no
+    disclosure line -- so every caller that never learns about this arg is unaffected."""
+    _seed_procedures(seeded, [
+        {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+    ])
+    for routine in (None, [], ()):
+        section = _procedures_section(seeded, routine)
+        assert "Office Visit" in section and "Colonoscopy" in section
+        assert "not shown" not in section
+
+
+def test_summary_procedures_routine_pattern_is_suppressed(seeded):
+    """AC3: a configured routine line leaves the summary, and the narrowing is disclosed
+    on the page (issue #93's precedent) -- a summary that silently drops rows is exactly
+    what the default-show rule is defending against."""
+    _seed_procedures(seeded, [
+        {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+    ])
+    section = _procedures_section(seeded, ["office visit"])
+    assert "Office Visit" not in section
+    assert "Colonoscopy" in section                      # control: unmatched row stays
+    assert "_1 routine procedure not shown" in section
+
+
+def test_summary_procedures_default_show_unlisted_name(seeded):
+    """AC2: a procedure nobody anticipated renders in the same pass that hides a listed
+    one. Absence from the list can never establish that a row is insignificant."""
+    _seed_procedures(seeded, [
+        {"name": "Venipuncture", "performed_on": "2026-02-01"},
+        {"name": "Cryoablation of renal tumor", "performed_on": "2026-02-02"},
+    ])
+    section = _procedures_section(seeded, ["venipuncture"])
+    assert "Cryoablation of renal tumor" in section
+    assert "Venipuncture" not in section
+
+
+def test_summary_procedures_match_is_token_bounded(seeded):
+    """Over-suppression is the failure that matters here, so the match lands on a token
+    boundary: `cast` reaches a cast application and never `Castration`."""
+    _seed_procedures(seeded, [
+        {"name": "Cast application, short arm", "performed_on": "2026-02-01"},
+        {"name": "Castration", "performed_on": "2026-02-02"},
+    ])
+    section = _procedures_section(seeded, ["cast"])
+    assert "Castration" in section
+    assert "Cast application" not in section
+    assert "_1 routine procedure not shown" in section
+
+
+def test_summary_procedures_reverse_chronological_undated_last(seeded):
+    """AC4: newest first, and every undated row sorts after every dated one --
+    `performed_on` is nullable *and* unvalidated, so `''` must land with `NULL` rather
+    than in among the dates where SQLite's own DESC ordering would leave it."""
+    _seed_procedures(seeded, [
+        {"name": "Appendectomy", "performed_on": "2015-03-08"},
+        {"name": "Knee arthroscopy", "performed_on": "2026-02-01"},
+        {"name": "Tonsillectomy"},                                    # NULL
+        {"name": "Mole removal", "performed_on": "2019-01-01"},
+    ])
+    seeded.execute("UPDATE procedure SET performed_on = '' WHERE name = 'Mole removal'")
+    seeded.commit()
+    bullets = _procedure_bullets(_procedures_section(seeded))
+    assert [b.split("  ", 1)[1] for b in bullets] == [
+        "Knee arthroscopy", "Colonoscopy - normal", "Appendectomy",
+        "Mole removal", "Tonsillectomy",
+    ]
+    assert bullets[-2:] == ["- (undated)  Mole removal", "- (undated)  Tonsillectomy"]
+
+
+def test_summary_procedures_empty_state(seeded):
+    """AC7: john has no procedures, and an absent section must never read as an
+    overlooked one -- the project's existing explicit empty state applies here too."""
+    md = render.render_summary(seeded, "john-doe")
+    assert "## Procedures" in md
+    assert "_none recorded_" in md.split("## Procedures")[1].split("\n## ")[0]
+
+
+def test_summary_procedures_all_routine_discloses_the_filter(seeded):
+    """The all-filtered case must not render `_none recorded_`: the person *has*
+    procedures, and claiming otherwise would be the one outright false statement this
+    section could make."""
+    section = _procedures_section(seeded, ["colonoscopy"])
+    assert "_none recorded_" not in section
+    assert "_1 routine procedure not shown" in section
+
+
+def test_summary_procedures_plural_disclosure(seeded):
+    _seed_procedures(seeded, [
+        {"name": "Venipuncture", "performed_on": "2026-02-01"},
+        {"name": "Office visit", "performed_on": "2026-02-02"},
+    ])
+    section = _procedures_section(seeded, ["venipuncture", "office visit"])
+    assert "_2 routine procedures not shown" in section
+
+
+def test_summary_procedures_filter_is_render_only(seeded):
+    """AC3: nothing is deleted or mutated, and the journal stays the complete chronology
+    -- the summary is the only view that narrows."""
+    _seed_procedures(seeded, [{"name": "Venipuncture", "performed_on": "2026-02-01"}])
+    before = _row_counts(seeded)
+    assert "Venipuncture" not in _procedures_section(seeded, ["venipuncture"])
+    assert _row_counts(seeded) == before
+    assert "Venipuncture" in render.render_journal(seeded, "jane-doe")
+
+
+def test_brief_procedures_are_unfiltered(seeded):
+    """The brief takes no pattern list at all, so a routine row a clinician might still
+    ask about cannot be hidden from the document handed to them."""
+    _seed_procedures(seeded, [{"name": "Venipuncture", "performed_on": "2026-02-01"}])
+    md = render.render_brief(seeded, _upcoming_appt_id(seeded))
+    assert "Venipuncture" in md.split("## Procedures & Observations")[1]
+
+
+def test_summary_procedures_dispute_and_attest_suffixes(seeded):
+    """AC6: the section is a first-class one -- it carries the same dispute marker and
+    attestation provenance suffix every other summary section does."""
+    _annotate(seeded, "procedure", "name", "Colonoscopy", status="disputed",
+              note="two reports disagree on the date")
+    _attest_all(seeded)
+    section = _procedures_section(seeded)
+    assert "[DISPUTED: two reports disagree on the date]" in section
+    assert any("Wisdom tooth extraction" in ln and _ATTEST_MARKER in ln
+               for ln in section.splitlines())
+
+
+def test_summary_procedures_superseded_row_leaves_for_the_appendix(seeded):
+    """Filter order: curation first, routine list second. An appendix-bound row must be
+    routed by its verdict before the pattern list counts anything, or a superseded row
+    would be reported twice -- once in the appendix, once as a hidden routine one."""
+    _seed_procedures(seeded, [{"name": "Venipuncture", "performed_on": "2026-02-01"}])
+    _annotate(seeded, "procedure", "name", "Colonoscopy", status="superseded",
+              note="duplicated by the later report")
+    md = render.render_summary(seeded, "jane-doe", routine_procedures=["venipuncture"])
+    section = md.split("## Procedures")[1].split("\n## ")[0]
+    assert "Colonoscopy" not in section
+    assert "## Superseded / corrected" in md and "procedure: Colonoscopy" in md
+    assert "_1 routine procedure not shown" in section   # the superseded row is not counted
+
+
 def test_summary_upcoming_and_open_appointments(seeded):
     md = render.render_summary(seeded, "jane-doe")
     section = md.split("## Upcoming / Open Appointments")[1].split("\n## ")[0]
@@ -1339,10 +1513,11 @@ def test_summary_marks_an_attested_row_in_every_section(seeded):
         line.split("  ")[0].lstrip("- ")
         for line in md.splitlines() if _ATTEST_MARKER in line
     }
-    # Meds, active problems, allergies, orders, vitals, abnormal labs, appointments:
-    # every section that can show an attested row does, so none can render it bare.
+    # Meds, active problems, allergies, orders, vitals, abnormal labs, procedures,
+    # appointments: every section that can show an attested row does, so none can render
+    # it bare.
     for token in ("Amlodipine", "Migraine", "Shellfish", "sleep study", "pulse",
-                  "Potassium", "Dr. Attested"):
+                  "Potassium", "Wisdom tooth extraction", "Dr. Attested"):
         assert any(
             token in line and _ATTEST_MARKER in line for line in md.splitlines()
         ), token

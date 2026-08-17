@@ -69,6 +69,12 @@ def _dictionary() -> dict[str, str]:
     return _dedup.load_dictionary(cli._resolve_dictionary_path(_ARGS))
 
 
+def _routine_procedures() -> tuple[str, ...]:
+    """The summary's render-only routine-procedure list (issue #166), from the same file
+    :func:`_dictionary` reads -- so both front doors narrow identically."""
+    return _dedup.load_routine_procedures(cli._resolve_dictionary_path(_ARGS))
+
+
 def _connect() -> sqlite3.Connection:
     """Same missing-database gate the CLI applies, raised as a tool error (issue #55).
 
@@ -472,7 +478,12 @@ def trends(conn: sqlite3.Connection, *, person: str, test: str) -> dict[str, Any
 def render_summary(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
     """[read] Master summary for a person -> Markdown. Mirrors ``pemr render summary``."""
     try:
-        markdown = _render.render_summary(conn, person, dictionary=_dictionary())
+        markdown = _render.render_summary(
+            conn,
+            person,
+            dictionary=_dictionary(),
+            routine_procedures=_routine_procedures(),
+        )
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}

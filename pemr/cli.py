@@ -2963,8 +2963,16 @@ def _render_with_conn(args: argparse.Namespace, work) -> int:
 
 def _cmd_render_summary(args: argparse.Namespace) -> int:
     def work(conn):
-        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
-        markdown = render.render_summary(conn, args.person, dictionary=dictionary)
+        # One resolved path, two overlays read from it: the synonym map and the
+        # render-only routine-procedure list (issue #166). No new flag -- `--dictionary` /
+        # `PEMR_DICTIONARY` / `[paths].dictionary_file` already select the file.
+        path = _resolve_dictionary_path(args)
+        markdown = render.render_summary(
+            conn,
+            args.person,
+            dictionary=dedup.load_dictionary(path),
+            routine_procedures=dedup.load_routine_procedures(path),
+        )
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -3794,7 +3802,11 @@ def build_parser() -> argparse.ArgumentParser:
         "summary", help="master summary for a person -> Markdown on stdout"
     )
     r_summary.add_argument("--person", required=True, help="owner slug")
-    r_summary.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_summary.add_argument(
+        "--dictionary",
+        help="synonym dictionary TOML (overrides default); also supplies the "
+             "[procedures].routine list the Procedures section narrows against",
+    )
     r_summary.add_argument("--out", help="write to file instead of stdout")
     r_summary.set_defaults(func=_cmd_render_summary)
 

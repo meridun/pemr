@@ -302,3 +302,40 @@
 "oxygen saturation" = "spo2"
 "respiratory rate" = "respiratory_rate"
 "resp rate" = "respiratory_rate"
+
+# =============================================================================
+# Routine procedures — the master summary's ## Procedures filter (issue #166).
+#
+# THIS TABLE MUST STAY AT THE END OF THE FILE. `[synonyms]` above runs to EOF, so a
+# table header inserted anywhere above it would silently swallow every synonym key
+# that follows into this table and empty the synonym map.
+#
+# `procedure` rows arrive largely from billing documents, so the table mixes genuine
+# procedural history with routine service lines. `pemr render summary` hides a
+# procedure whose name matches one of these patterns; `pemr render journal` and
+# `pemr render brief` are unaffected and stay the complete record. Nothing is
+# deleted — the filter is render-only, and the summary discloses how many rows it hid.
+#
+# Rules:
+#   * DEFAULT-SHOW. A procedure matching no pattern always renders. Significance is
+#     never established by absence from this list, so a procedure type nobody
+#     anticipated cannot be dropped silently. The list can only SUPPRESS.
+#   * Patterns are name fragments matched on TOKEN BOUNDARIES after the same
+#     lowercase/trim/collapse normalization the keys above use, so "cast" suppresses
+#     "Cast application, short arm" but never "Castration". Boundaries are exact:
+#     "radiograph" does not match "radiographs", so add a plural spelling of its own
+#     when your documents use one.
+#   * RENDER-ONLY. Unlike [synonyms], nothing here touches dedup identity — adding or
+#     removing a pattern changes no stored row and does NOT require `pemr rekey`.
+#   * An absent table or an empty list suppresses nothing.
+[procedures]
+routine = [
+  "office visit",
+  "established patient",
+  "venipuncture",
+  "blood draw",
+  "radiograph",
+  "x-ray",
+  "cast application",
+  "cast removal",
+]

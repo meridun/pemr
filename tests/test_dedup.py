@@ -53,6 +53,49 @@ def test_load_missing_dictionary_is_empty(tmp_path):
     assert dedup.load_dictionary(None) == {}
 
 
+# --- issue #166: the render-only routine-procedure list ------------------------
+
+def test_load_routine_procedures_missing_or_none(tmp_path):
+    """No file, no list: the summary suppresses nothing, which is the default-show rule
+    holding even when the dictionary itself is absent."""
+    assert dedup.load_routine_procedures(None) == ()
+    assert dedup.load_routine_procedures(tmp_path / "nope.toml") == ()
+
+
+def test_load_routine_procedures_absent_table(tmp_path):
+    """A dictionary that predates this feature (only `[synonyms]`) is not an error and
+    not a partial filter -- it suppresses nothing."""
+    p = tmp_path / "d.toml"
+    p.write_text('[synonyms]\n"a1c" = "hba1c"\n', encoding="utf-8")
+    assert dedup.load_routine_procedures(p) == ()
+
+    empty = tmp_path / "e.toml"
+    empty.write_text("[procedures]\nroutine = []\n", encoding="utf-8")
+    assert dedup.load_routine_procedures(empty) == ()
+
+
+def test_load_routine_procedures_normalizes_and_dedupes(tmp_path):
+    """Authoring is lenient the way `[synonyms]` keys are: case, padding and underscores
+    collapse, blanks drop, duplicates drop, and the authored order survives."""
+    p = tmp_path / "d.toml"
+    p.write_text(
+        "[procedures]\n"
+        'routine = ["  Office   Visit ", "office_visit", "", "Venipuncture"]\n',
+        encoding="utf-8",
+    )
+    assert dedup.load_routine_procedures(p) == ("office visit", "venipuncture")
+
+
+def test_example_dictionary_keeps_both_tables():
+    """The shipped example must yield BOTH overlays. `[synonyms]` runs to EOF, so a
+    `[procedures]` header placed above it would silently swallow every following synonym
+    key -- this is the guard on that placement."""
+    assert dedup.load_dictionary(DICT_PATH)          # synonyms survived the new table
+    assert dedup.norm("A1c", dedup.load_dictionary(DICT_PATH)) == "hba1c"
+    routine = dedup.load_routine_procedures(DICT_PATH)
+    assert routine and "office visit" in routine
+
+
 def test_esr_synonyms_map_to_canonical():
     # Issue #41: an ESR result labeled "SED RATE BY MODIFIED WESTERGREN" on a Quest
     # report must share the `esr` identity with every other ESR spelling.

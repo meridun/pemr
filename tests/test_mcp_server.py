@@ -149,7 +149,11 @@ def test_find_household_wide_omits_person(seeded):
 
 
 def test_renderers_return_markdown(seeded):
-    assert mcp_server.render_summary(seeded, person="jane-doe")["markdown"].startswith("#")
+    summary = mcp_server.render_summary(seeded, person="jane-doe")["markdown"]
+    assert summary.startswith("#")
+    # Issue #166: the wrapper passes the routine-procedure list, so the section exists
+    # and the extra kwarg cannot silently drift into a TypeError.
+    assert "## Procedures" in summary
     brief = mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"]
     assert "Medication Interaction Review" in brief  # the placeholder AGENTS.md fills
     assert mcp_server.render_journal(seeded, person="jane-doe")["markdown"].startswith("#")
