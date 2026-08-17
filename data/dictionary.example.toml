@@ -325,6 +325,11 @@
 #     "Cast application, short arm" but never "Castration". Boundaries are exact:
 #     "radiograph" does not match "radiographs", so add a plural spelling of its own
 #     when your documents use one.
+#   * Normalization ALSO STRIPS PARENTHETICALS on both the stored name and the pattern
+#     (same qualifier-stripping norm() applies everywhere else). "cast application"
+#     therefore also suppresses "Cast application (open reduction internal fixation)",
+#     and a pattern written entirely inside parentheses (e.g. "(routine)") normalizes
+#     to an empty string and matches nothing.
 #   * RENDER-ONLY. Unlike [synonyms], nothing here touches dedup identity — adding or
 #     removing a pattern changes no stored row and does NOT require `pemr rekey`.
 #   * An absent table or an empty list suppresses nothing.
