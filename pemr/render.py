@@ -28,6 +28,27 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
     collapse disclosed on the line (issue #93) -- the stored rows keep their dates
     and stay distinct, because an order is an event, not a standing fact.
 
+**Procedures on the summary** (issue #166). ``procedure`` rows arrive largely from billing
+documents, so the table mixes genuine procedural history with routine service lines
+(office visits, serial radiographs, venipuncture). ``render_summary`` therefore narrows
+its ``## Procedures`` section against a **routine-pattern list** authored in
+``dictionary.toml`` (``[procedures].routine``, loaded by
+:func:`dedup.load_routine_procedures`), under three rules that are all one stance --
+significance is never established by *absence* from a list:
+
+  * **default-show** -- a name matching no configured pattern always renders, so a
+    procedure type nobody anticipated cannot be silently dropped;
+  * **suppress-only, summary-only** -- the list can remove a row from this one section and
+    nothing else. ``render_brief`` and ``render_journal`` stay the complete record, and
+    the stored rows are untouched;
+  * **disclosed on the page** -- when anything was filtered the section says how many, the
+    way order grouping discloses its collapse (issue #93). A summary that silently drops
+    rows is the thing default-show is defending against.
+
+Matching is token-boundary on :func:`dedup.norm`-normalized text, both sides, so ``cast``
+cannot suppress ``Castration``: over-suppression is the failure mode here, and
+under-suppression merely leaves a line on the page.
+
 **Curation overlay** (issues #109, #114). Every section is filtered at read time against
 the ``curation`` table, a pure overlay of recorded human verdicts scoped to a whole dedup
 family or to a **single row** (:meth:`curation.VerdictMap.for_row` resolves per row, row
@@ -70,7 +91,9 @@ prints it correctly instead of ``?`` (issue #46). Literal vs. data are orthogona
 from __future__ import annotations
 
 import calendar
+import re
 import sqlite3
+from collections.abc import Sequence
 from datetime import date, datetime
 
 from . import curation, db, query, units
@@ -913,6 +936,75 @@ def _abnormal_labs(
     return out
 
 
+def _routine_matcher(patterns: Sequence[str] | None) -> re.Pattern[str] | None:
+    """One compiled, token-boundary alternation over already-normalized routine-procedure
+    patterns -- or ``None`` when there is nothing to suppress (issue #166).
+
+    ``None`` is both the fast path and the default: no list, no compile, no filtering, so
+    a caller that passes nothing renders every procedure exactly as it would have before
+    the section learned to narrow.
+
+    The boundary is the point. A bare substring test would let ``cast`` suppress
+    ``Castration``, and over-suppression is precisely what the default-show rule exists to
+    prevent -- a procedure nobody anticipated must never vanish silently, while a routine
+    one that slips through merely costs a line. After :func:`norm` the alphabet is
+    ``[a-z0-9]`` plus punctuation, so a lookaround pair on the alphanumerics is a word
+    boundary that still lets a pattern begin or end on punctuation (``x-ray``).
+    """
+    cleaned = [p for p in (patterns or ()) if p]
+    if not cleaned:
+        return None
+    alternation = "|".join(re.escape(p) for p in cleaned)
+    return re.compile(rf"(?<![a-z0-9])(?:{alternation})(?![a-z0-9])")
+
+
+def _is_routine(name: object, matcher: re.Pattern[str] | None) -> bool:
+    """True when a procedure ``name`` matches a configured routine pattern.
+
+    Normalized with **no dictionary** (as the patterns were, on load): ``[synonyms]`` is
+    lab-analyte vocabulary and must never rewrite a procedure name on either side of the
+    match.
+    """
+    return matcher is not None and bool(matcher.search(norm(name)))
+
+
+def _procedures(
+    conn: sqlite3.Connection, person_id: int, cur: "_CurationPass | None" = None
+) -> list[dict]:
+    """Procedure rows, newest first, undated last -- the summary's ``## Procedures``
+    source (issue #166).
+
+    ``performed_on`` is nullable *and* unvalidated free text, so the SQL ordering is not
+    trusted to place undated rows on its own: SQLite's ``DESC`` puts ``NULL`` last but
+    sorts ``''`` in among the dated rows. One extra **stable** pass on
+    :func:`_date_part`'s truthiness moves every undated row -- ``NULL`` and ``''`` alike --
+    behind the dated ones without disturbing their relative order.
+
+    Curation runs first, as everywhere else: an appendix-bound verdict must route the row
+    before the routine filter (applied by the caller) ever sees it, or a superseded row
+    would be reported twice.
+    """
+    rows = conn.execute(
+        "SELECT * FROM procedure WHERE person_id = ? "
+        "ORDER BY performed_on DESC, procedure_id",
+        (person_id,),
+    ).fetchall()
+    kept = _apply_curation([dict(r) for r in rows], "procedure", cur)
+    kept.sort(key=lambda p: not _date_part(p["performed_on"]))
+    return kept
+
+
+def _procedure_line(row: dict) -> str:
+    """One ``## Procedures`` bullet. No ``procedure:`` prefix -- the brief needs one
+    because its section is shared with observations, a dedicated section does not."""
+    outcome = f" - {row['outcome']}" if row["outcome"] else ""
+    who = f"  ({row['provider']})" if row["provider"] else ""
+    return (
+        f"- {_date_part(row['performed_on']) or '(undated)'}  {row['name']}"
+        f"{outcome}{who}{_dispute_suffix(row)}{_attest_suffix(row)}"
+    )
+
+
 def _open_appointments(
     conn: sqlite3.Connection,
     person_id: int,
@@ -996,17 +1088,24 @@ def render_summary(
     slug: str,
     *,
     dictionary: dict[str, str] | None = None,
+    routine_procedures: Sequence[str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """Markdown master summary for a person: active meds, active problems, past medical
     history, family history, allergies, orders, latest vitals, recent abnormal labs,
-    upcoming/open appointments, and any open conflicts --
+    procedures, upcoming/open appointments, and any open conflicts --
     with a self-identifying header (name, DOB, generated-at, source row counts).
     Read-only.
 
     The summary is the document read *between* appointments, so an open conflict has to
     surface here too: without it a staged correction is invisible and the summary prints
     the stale value with no hint that a corrected one is pending (issue #59).
+
+    ``routine_procedures`` is the ``[procedures].routine`` pattern list (issue #166,
+    module docstring). It is **suppress-only** and defaults to ``None``, which suppresses
+    nothing -- so every caller that does not pass one gets default-show behavior for free.
+    A section that filtered anything says so; a section that filtered *everything* says
+    that too, rather than the false ``_none recorded_``.
 
     Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
     person_id = query.resolve_person_id(conn, slug)
@@ -1092,6 +1191,22 @@ def render_summary(
             f"{_dispute_suffix(r)}{_attest_suffix(r)}{_unit_suffix(d)}"
         )
 
+    # Curation first, routine filter second (issue #166): an appendix-bound row has to be
+    # routed by its verdict before the pattern list sees it, or the disclosure count below
+    # would report a superseded row as a hidden routine one.
+    proc_rows = _procedures(conn, person_id, cur)
+    matcher = _routine_matcher(routine_procedures)
+    proc_kept = [p for p in proc_rows if not _is_routine(p["name"], matcher)]
+    proc_lines = [_procedure_line(p) for p in proc_kept]
+    hidden = len(proc_rows) - len(proc_kept)
+    if hidden:
+        note = (
+            f"_{hidden} routine procedure{'' if hidden == 1 else 's'} not shown "
+            "(name matches the dictionary's routine list); "
+            "`pemr render journal` lists them._"
+        )
+        proc_lines.append(f"\n{note}" if proc_lines else note)
+
     appt_lines = [
         f"- {_appt_line(a)}{_dispute_suffix(a)}{_attest_suffix(a)}"
         for a in _open_appointments(conn, person_id, today, cur)
@@ -1111,6 +1226,7 @@ def render_summary(
             lab_lines,
             empty="_none flagged_",
         ),
+        _section("Procedures", proc_lines),
         _section("Upcoming / Open Appointments", appt_lines),
         _section(
             "Open Conflicts", _open_conflict_lines(conn, person_id), empty="_none_"

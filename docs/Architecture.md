@@ -1196,6 +1196,22 @@ default to the same exclusion unless a human explicitly decides otherwise.
   and an empty section reads as "nothing flagged", which is worse than the dump it
   replaces. Like the #128 order constants the window is a named constant, and the heading
   text is built from it, so the stated window and the actual filter cannot desync.
+  `Procedures` (issue #166) lists `procedure` rows reverse-chronologically, undated last,
+  narrowed by a routine-pattern list authored in `dictionary.toml` (`[procedures].routine`)
+  — those rows arrive largely from billing documents, so the table mixes genuine
+  procedural history with routine service lines (office visits, serial radiographs,
+  venipuncture) and rendering all of them recreates the unreadable-section problem #165
+  bounds. The list is **default-show** (a name matching no pattern always renders, so
+  significance is never established by absence from a list), **suppress-only and
+  summary-only** (the brief and the journal stay the complete record and no stored row
+  changes), and **disclosed** — the section states how many rows it hid, on #93's
+  precedent. Matching is token-boundary on normalized text, both sides, so `cast` cannot
+  suppress `Castration`: over-suppression is the failure that matters here, and
+  under-suppression only costs a line. Normalization also strips parenthetical qualifiers
+  on both sides, so `cast application` also suppresses `Cast application (open reduction
+  internal fixation)`, and a pattern written entirely inside parentheses matches nothing.
+  Unlike `[synonyms]` the list never reaches a dedup key, so editing it needs no
+  `pemr rekey`.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command.

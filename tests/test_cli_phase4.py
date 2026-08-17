@@ -131,6 +131,93 @@ def _commit_labs(tmp_path, sha, rows):
                 "--json", str(payload)) == 0
 
 
+def _commit_procedures(tmp_path, sha, rows):
+    """`_commit_orders`'s sibling for `procedure` rows, committed the same way."""
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    cur = conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ingested_at) "
+        "VALUES (?, ?, 'aa/x.pdf', '2026-01-01T00:00:00')", (sha, pid)
+    )
+    conn.commit()
+    doc = cur.lastrowid
+    conn.close()
+    payload = tmp_path / f"extract-{sha}.json"
+    payload.write_text(json.dumps({"procedure": rows}), encoding="utf-8")
+    assert _run(tmp_path, "commit-extraction", "--document", str(doc),
+                "--json", str(payload)) == 0
+
+
+def test_render_summary_routine_procedures_come_from_the_dictionary(ready, capsys):
+    """Issue #166 at the command boundary: `--dictionary` selects one file and the
+    summary reads *both* tables from it -- the synonym map and the render-only
+    `[procedures].routine` list. This pins the wiring, not the filter logic (that lives
+    in `tests/test_render.py`); without it the arg could go unpassed and every summary
+    would silently render unfiltered."""
+    tmp_path, _ = ready
+    _commit_procedures(tmp_path, "sha-proc", [
+        {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+        {"name": "Total knee arthroplasty", "performed_on": "2026-01-15"},
+    ])
+    d = tmp_path / "dict.toml"
+    d.write_text(
+        '[synonyms]\n"a1c" = "hba1c"\n\n'
+        '[procedures]\nroutine = ["office visit"]\n',
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe",
+                "--dictionary", str(d)) == 0
+    out = capsys.readouterr().out
+    section = out.split("## Procedures")[1].split("\n## ")[0]
+    assert "- 2026-01-15  Total knee arthroplasty" in section
+    assert "Office Visit" not in section
+    assert "_1 routine procedure not shown" in section
+    # render-only: the hidden row is untouched in the DB
+    conn = db.connect(tmp_path / "cli.db")
+    assert conn.execute("SELECT COUNT(*) AS n FROM procedure").fetchone()["n"] == 2
+    conn.close()
+    assert out.isascii()          # cp1252/cp437 console contract
+
+
+def test_render_summary_default_dictionary_applies_the_starter_list(ready, capsys):
+    """With no `--dictionary` the CLI falls back to the shipped
+    `data/dictionary.example.toml`, exactly as it already does for `[synonyms]` -- so the
+    starter routine list is live out of the box, and the run that suppresses discloses it
+    while an unlisted procedure still renders (default-show)."""
+    tmp_path, _ = ready
+    _commit_procedures(tmp_path, "sha-proc2", [
+        {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+        {"name": "Total knee arthroplasty", "performed_on": "2026-01-15"},
+    ])
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    section = capsys.readouterr().out.split("## Procedures")[1].split("\n## ")[0]
+    assert "Office Visit" not in section
+    assert "- 2026-01-15  Total knee arthroplasty" in section
+    assert "_1 routine procedure not shown" in section
+
+
+def test_render_summary_empty_routine_list_hides_nothing(ready, capsys):
+    """The default-show rule survives the front door: a dictionary with an empty list
+    suppresses nothing and discloses nothing."""
+    tmp_path, _ = ready
+    _commit_procedures(tmp_path, "sha-proc3", [
+        {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+    ])
+    d = tmp_path / "empty.toml"
+    d.write_text("[procedures]\nroutine = []\n", encoding="utf-8")
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe",
+                "--dictionary", str(d)) == 0
+    section = capsys.readouterr().out.split("## Procedures")[1].split("\n## ")[0]
+    assert "Office Visit, Established Patient" in section
+    assert "not shown" not in section
+
+
 def test_render_summary_groups_repeated_orders_end_to_end(ready, capsys):
     """Issue #93, walked through the real CLI: an order restated by three documents is
     one bullet carrying the latest detail plus the `+N earlier` disclosure; distinct and

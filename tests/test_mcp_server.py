@@ -149,10 +149,41 @@ def test_find_household_wide_omits_person(seeded):
 
 
 def test_renderers_return_markdown(seeded):
-    assert mcp_server.render_summary(seeded, person="jane-doe")["markdown"].startswith("#")
+    summary = mcp_server.render_summary(seeded, person="jane-doe")["markdown"]
+    assert summary.startswith("#")
+    # Issue #166: the wrapper passes the routine-procedure list, so the section exists
+    # and the extra kwarg cannot silently drift into a TypeError.
+    assert "## Procedures" in summary
     brief = mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"]
     assert "Medication Interaction Review" in brief  # the placeholder AGENTS.md fills
     assert mcp_server.render_journal(seeded, person="jane-doe")["markdown"].startswith("#")
+
+
+def test_render_summary_narrows_procedures_like_the_cli(seeded):
+    """Issue #166, verify pass: the MCP front door must *apply* the routine list, not
+    merely accept the kwarg. `test_renderers_return_markdown` asserts only that the
+    section exists, which a `_routine_procedures()` stuck at `()` would also satisfy --
+    so the two front doors could silently disagree. `_ARGS.dictionary` is unset here,
+    exactly as a real server starts, so this resolves the shipped
+    `data/dictionary.example.toml` and its starter patterns: the same file and the same
+    fallback `pemr render summary` uses."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "procedure": [
+            {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+            {"name": "Total knee arthroplasty", "performed_on": "2026-01-15"},
+        ],
+    }, {})
+    section = mcp_server.render_summary(
+        seeded, person="jane-doe"
+    )["markdown"].split("## Procedures")[1].split("\n## ")[0]
+
+    assert "- 2026-01-15  Total knee arthroplasty" in section   # default-show
+    assert "Office Visit" not in section                        # suppressed
+    assert "_1 routine procedure not shown" in section          # and disclosed
+    # Render-only: the suppressed row is still in the journal both front doors serve.
+    journal = mcp_server.render_journal(seeded, person="jane-doe")["markdown"]
+    assert "Office Visit, Established Patient" in journal
 
 
 def test_read_tools_leave_db_byte_stable(seeded, db_path):

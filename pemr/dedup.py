@@ -257,6 +257,45 @@ def load_dictionary(path: str | Path | None) -> dict[str, str]:
     return {_collapse(str(k)): str(v).strip() for k, v in raw.items()}
 
 
+def load_routine_procedures(path: str | Path | None) -> tuple[str, ...]:
+    """Load the routine-procedure pattern list (``[procedures].routine``) from the same
+    TOML file :func:`load_dictionary` reads (issue #166).
+
+    Returns the patterns :func:`norm`-normalized (no dictionary -- see below), blanks
+    dropped, duplicates dropped, authoring order preserved. ``None``, a missing file, an
+    absent ``[procedures]`` table and an absent/empty ``routine`` key all give ``()`` --
+    the empty list suppresses nothing, which is the whole point of the default-show rule
+    the render side implements.
+
+    **Render-only.** These patterns narrow the master summary's ``## Procedures`` section
+    and nothing else: they never reach :func:`dedup_key`/:func:`key_token`, no stored row
+    depends on them, and `pemr rekey` must ignore this table entirely. It lives in
+    ``dictionary.toml`` because that is the project's one human-curated naming file, not
+    because it participates in identity.
+
+    Normalization runs **without** the synonym dictionary on purpose: ``[synonyms]`` is
+    lab-analyte vocabulary and must never rewrite a procedure name on either side of the
+    match.
+    """
+    if path is None:
+        return ()
+    p = Path(path)
+    if not p.is_file():
+        return ()
+    with p.open("rb") as fh:
+        data = tomllib.load(fh)
+    table = data.get("procedures", {})
+    entries = table.get("routine", []) if isinstance(table, dict) else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        token = norm(entry)
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return tuple(out)
+
+
 def _collapse(value: str) -> str:
     """Case/whitespace-normalized spelling of a free-text name.
 
