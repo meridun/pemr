@@ -2067,15 +2067,22 @@ def test_reocr_refuses_a_populated_document_without_force(
 
 
 def test_reocr_force_replaces_existing_text(conn, tmp_path, sources):
+    # The blob is deliberately longer than the transcription: this test is about the
+    # has-text guard, and a shrinking replacement would be refused by the #174 guard
+    # before it ever got there (passing allow_shrink=True would stop it proving what it
+    # names).
     doc = _file_document(
-        conn, tmp_path, sources, content=b"machine text", ocr_text="old transcription"
+        conn, tmp_path, sources, content=b"machine text, and then some more of it",
+        ocr_text="old transcription",
     )
 
     (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
 
     assert result.status == "written"
     assert result.previous_chars == len("old transcription")
-    assert _stored_text(conn, doc.document_id) == "machine text"
+    assert _stored_text(conn, doc.document_id) == (
+        "machine text, and then some more of it"
+    )
 
 
 def test_reocr_dry_run_reports_chars_and_writes_nothing(conn, tmp_path, sources):
@@ -2217,6 +2224,159 @@ def test_reocr_native_route_does_not_trust_anchors(conn, tmp_path, sources):
     assert result.route == "native"
     assert result.status == "written"
     assert result.owner_check.verdict == "unverified"
+
+
+# --- the shrinkage guard (issue #174) -----------------------------------------
+#
+# `truncated` only ever caught one *cause* of a shorter replacement (the page cap).
+# These cover the condition itself: text shorter than what is stored refuses by default,
+# and `--force` is not the way past it - a populated corpus needs `--force` just to
+# reach the write, so it cannot also mean "and discard most of it".
+
+_LONG_STORED = "a long stored transcription that took somebody real effort"
+
+
+def test_reocr_refuses_text_shorter_than_what_is_stored(conn, tmp_path, sources):
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "shorter-text"
+    assert result.refused is True
+    assert result.shrunk is True
+    assert result.chars == len("short")
+    assert result.previous_chars == len(_LONG_STORED)
+    assert _stored_text(conn, doc.document_id) == _LONG_STORED
+
+
+def test_reocr_allow_shrink_stores_the_shorter_text(conn, tmp_path, sources):
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+
+    (result,) = ingest.reocr_documents(
+        conn, [doc.document_id], sources, force=True, allow_shrink=True
+    )
+
+    assert result.status == "written"
+    assert result.refused is False
+    assert result.shrunk is True          # permitted, still reported
+    assert _stored_text(conn, doc.document_id) == "short"
+
+
+def test_reocr_allow_shrink_does_not_bypass_the_other_guards(
+    conn, tmp_path, sources, monkeypatch
+):
+    """It is an override for one refusal, not a second `--force`."""
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+    _forbid_extraction(monkeypatch)
+
+    (result,) = ingest.reocr_documents(
+        conn, [doc.document_id], sources, allow_shrink=True
+    )
+
+    assert result.status == "has-text"
+    assert _stored_text(conn, doc.document_id) == _LONG_STORED
+
+
+def test_reocr_dry_run_refuses_a_shrinking_document_too(conn, tmp_path, sources):
+    """The guard sits before the dry-run branch, so an audit sweep reports the refusal
+    it would hit for real rather than an unqualified `would write`."""
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+
+    (result,) = ingest.reocr_documents(
+        conn, [doc.document_id], sources, force=True, dry_run=True
+    )
+
+    assert result.status == "shorter-text"
+    assert _stored_text(conn, doc.document_id) == _LONG_STORED
+
+
+def test_reocr_equal_length_replacement_is_not_shrinkage(conn, tmp_path, sources):
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"machine text", ocr_text="human typing"
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "written"
+    assert result.chars == result.previous_chars == 12
+    assert result.shrunk is False
+    assert _stored_text(conn, doc.document_id) == "machine text"
+
+
+def test_reocr_shrinkage_records_the_owner_check(conn, tmp_path, sources):
+    """The refusal keeps `owner_check` populated, so the `--force --dry-run` owner audit
+    this guard is wrapped around still verifies owners on the documents it refuses."""
+    _seed_roster(conn)
+    doc = _file_document(
+        conn, tmp_path, sources, name="labs.csv",
+        content=b"Patient ID,Test\n1,HbA1c\n", ocr_text=_LONG_STORED,
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "shorter-text"
+    assert result.owner_check is not None
+    assert result.owner_check.verdict == "unverified"
+    assert result.route == "native"
+
+
+def test_reocr_force_waives_the_mismatch_but_not_the_shrinkage(conn, tmp_path, sources):
+    """The two refusals cannot both be live on one document, and the ordering is what
+    decides which one you see. `owner-mismatch` only fires without `force`; shrinkage is
+    only reachable *with* it (the has-text skip returns first otherwise). So a forced
+    re-derivation that both names another person and shrinks is exactly where `--force`
+    stops being enough - and the waived mismatch is still on the result to be audited.
+    """
+    _seed_roster(conn)
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"Patient: ROE, ROBERT ALAN",
+        ocr_text=_LONG_STORED,
+    )
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "shorter-text"
+    assert result.owner_check.verdict == "mismatch"
+    assert result.owner_check.matched_slug == "bob-roe"
+    assert _stored_text(conn, doc.document_id) == _LONG_STORED
+
+
+def test_reocr_shrunk_is_false_on_a_has_text_skip(conn, tmp_path, sources, monkeypatch):
+    """`chars` is 0 on a skip because nothing was extracted, not because the text
+    shrank - an ungated comparison would flag every skip on a populated corpus."""
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+    _forbid_extraction(monkeypatch)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "has-text"
+    assert result.chars == 0 and result.previous_chars == len(_LONG_STORED)
+    assert result.shrunk is False
+
+
+def test_reocr_truncated_and_shrunk_reports_both(
+    conn, tmp_path, sources, monkeypatch
+):
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"short", ocr_text=_LONG_STORED
+    )
+    monkeypatch.setattr(ingest, "pdf_page_count", lambda src: ingest.OCR_MAX_PAGES + 1)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "shorter-text"
+    assert result.truncated is True
+    assert result.shrunk is True
 
 
 def test_reocr_html_reports_the_prose_route(conn, tmp_path, sources):

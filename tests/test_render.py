@@ -1996,3 +1996,252 @@ def test_curation_record_never_resolves_a_cross_person_merge_target(seeded):
     assert f"## merged into {johns[:12]}..." in md
     assert johns not in md                      # truncated, never printed in full
     assert "LDL" not in md                      # the target's label never resolved
+
+
+# --- self-reported symptoms (issue #167) --------------------------------------
+#
+# The lane's whole point is the *collapse*: a recurring complaint is reported over and
+# over, and a chronological dump ("achy on the 16th / fine on the 18th") is worse than
+# nothing. So the assertions here are about one line per key carrying the state of the
+# complaint, and about everything the section is deliberately NOT.
+
+_SYMPTOM_NOW = datetime(2026, 8, 18, 9, 0)
+_SYMPTOM_HEADER = "## Self-Reported Symptoms"
+
+
+def _seed_symptoms(conn, rows, slug="jane-doe"):
+    """Attest a batch of self-reported rows the way `pemr record assert` does."""
+    from pemr import attestations
+
+    d = dedup.load_dictionary(DICT_PATH)
+    for row in rows:
+        attestations.assert_record(
+            conn, "observation", slug, dict(row), attributed_to="Jane Doe",
+            attested_on="2026-08-18", dictionary=d, apply=True,
+        )
+
+
+def _symptom_row(observed_at, key="right foot ache", value_num=3,
+                 value_text="achy after the walk", obs_type="symptom"):
+    return {"obs_type": obs_type, "key": key, "observed_at": observed_at,
+            "value_num": value_num, "value_text": value_text}
+
+
+def _symptom_summary(conn, slug="jane-doe", now=_SYMPTOM_NOW):
+    return render.render_summary(
+        conn, slug, dictionary=dedup.load_dictionary(DICT_PATH), now=now
+    )
+
+
+def test_summary_collapses_repeat_symptom_reports_into_one_line(seeded):
+    """T5: four in-window reports fold to one line carrying the count, the latest date
+    and the latest severity -- and an older report outside the window is not counted."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-06-01T09:00", value_num=7),   # outside the 30d window
+        _symptom_row("2026-07-25T09:00", value_num=5),
+        _symptom_row("2026-08-02T09:00", value_num=4),
+        _symptom_row("2026-08-10T09:00", value_num=4),
+        _symptom_row("2026-08-16T09:00", value_num=3),
+    ])
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert line.startswith(
+        "- right foot ache - 4 reports in 30d, latest 2026-08-16 (severity 3/10)"
+    )
+
+
+def test_summary_symptom_line_pluralizes_and_drops_a_missing_severity(seeded):
+    """A lone report says 'report', and a value_num-less row is a present report of
+    unknown severity -- not a resolution, and not a fabricated 0."""
+    _seed_symptoms(seeded, [_symptom_row("2026-08-17T08:00", key="jaw click",
+                                         value_num=None)])
+    line = _line(_symptom_summary(seeded), "jaw click")
+    assert line.startswith("- jaw click - 1 report in 30d, latest 2026-08-17")
+    assert "severity" not in line
+
+
+def test_summary_keeps_a_qualified_symptom_on_its_own_line(seeded):
+    """Grouped on `key_token`, matching the dedup key: a meaningful qualifier is its own
+    complaint, not an overwrite of the plain one (the `_latest_vitals` rule)."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00", key="right foot ache", value_num=3),
+        _symptom_row("2026-08-17T09:00", key="right foot ache (morning)", value_num=6),
+    ])
+    md = _symptom_summary(seeded)
+    assert "- right foot ache - 1 report in 30d" in md
+    assert "- right foot ache (morning) - 1 report in 30d" in md
+
+
+def test_summary_reports_a_resolution_as_the_last_word(seeded):
+    """T6: value_num == 0 is 'reported resolved' -- the 0-10 scale's natural bottom, no
+    sentinel and no second obs_type."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00", value_num=3),
+        _symptom_row("2026-08-18T08:00", value_num=0, value_text="fine today"),
+    ])
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert line.startswith(
+        "- right foot ache - 2 reports in 30d, latest 2026-08-16 (severity 3/10)"
+        "; last reported resolved 2026-08-18"
+    )
+
+
+def test_summary_drops_a_resolution_older_than_the_latest_report(seeded):
+    """A resolution the complaint has since outlived is not news."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-10T09:00", value_num=0),
+        _symptom_row("2026-08-16T09:00", value_num=3),
+    ])
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert "latest 2026-08-16 (severity 3/10)" in line
+    assert "resolved" not in line
+
+
+def test_summary_renders_a_key_whose_only_reports_are_resolutions(seeded):
+    """Head + resolved clause, no `latest` clause: nothing is asserted to be present."""
+    _seed_symptoms(seeded, [_symptom_row("2026-08-18T08:00", value_num=0)])
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert line.startswith(
+        "- right foot ache - 1 report in 30d; last reported resolved 2026-08-18"
+    )
+    assert "severity" not in line and "latest 2026" not in line
+
+
+def test_summary_sorts_symptoms_by_most_recent_report(seeded):
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-02T09:00", key="jaw click"),
+        _symptom_row("2026-08-17T09:00", key="right foot ache"),
+    ])
+    md = _symptom_summary(seeded)
+    assert md.index("right foot ache") < md.index("jaw click")
+
+
+def test_summary_omits_the_symptom_section_entirely_when_empty(seeded):
+    """T7, the additive-only guarantee. `_none recorded_` would read as "the patient
+    reports no symptoms" -- an assertion the record cannot make -- and it would change
+    the rendered output of every person who never uses the lane."""
+    assert _SYMPTOM_HEADER not in _symptom_summary(seeded)
+
+
+def test_summary_omits_the_symptom_section_when_every_report_is_stale(seeded):
+    _seed_symptoms(seeded, [_symptom_row("2026-01-05T09:00")])
+    assert _SYMPTOM_HEADER not in _symptom_summary(seeded)
+
+
+def test_a_record_without_self_reports_renders_byte_identically(seeded):
+    """The strongest form of the additive-only rule: seeding *jane's* symptoms cannot
+    move a byte of *john's* summary or journal."""
+    d = dedup.load_dictionary(DICT_PATH)
+    before = (
+        render.render_summary(seeded, "john-doe", dictionary=d, now=_SYMPTOM_NOW),
+        render.render_journal(seeded, "john-doe", now=_SYMPTOM_NOW),
+    )
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    after = (
+        render.render_summary(seeded, "john-doe", dictionary=d, now=_SYMPTOM_NOW),
+        render.render_journal(seeded, "john-doe", now=_SYMPTOM_NOW),
+    )
+    assert before == after
+
+
+def test_activity_renders_in_no_summary_section(seeded):
+    """Activity is the higher-volume, lower-signal lane: it stays reachable through
+    `query`, `trends` and the journal's opt-in flag, and renders on no summary page."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity",
+                     value_num=40, value_text="two miles, easy"),
+    ])
+    md = _symptom_summary(seeded)
+    assert "morning walk" not in md
+    assert _SYMPTOM_HEADER not in md            # activity alone opens no section
+
+
+def test_self_reports_never_reach_the_problem_list(seeded):
+    """The load-bearing invariant: neither lane may reach `condition` or Active
+    Problems, in either clinical document."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00"),
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity"),
+    ])
+    md = _symptom_summary(seeded)
+    active = md.split("## Active Problems")[1].split("\n## ")[0]
+    assert "right foot ache" not in active and "morning walk" not in active
+    assert seeded.execute(
+        "SELECT COUNT(*) AS n FROM condition WHERE name LIKE '%foot%'"
+    ).fetchone()["n"] == 0
+    brief = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), dictionary=dedup.load_dictionary(DICT_PATH),
+        now=_SYMPTOM_NOW,
+    )
+    brief_active = brief.split("## Active Problems")[1].split("\n## ")[0]
+    assert "right foot ache" not in brief_active and "morning walk" not in brief_active
+    # The brief is otherwise deliberately untouched: its generic recent-observations list
+    # still shows the raw rows, tagged as attested. Only the *problem list* is off-limits
+    # to these lanes, and only the summary gains a collapsed section.
+    assert _SYMPTOM_HEADER not in brief
+
+
+def test_a_symptom_line_says_it_is_attested(seeded):
+    """T8: `record assert` is the only entry path, so the line must never read as a
+    document-sourced fact."""
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert line.endswith("(attested by Jane Doe 2026-08-18; no source document)")
+
+
+def test_a_superseded_report_is_neither_counted_nor_latest(seeded):
+    """Curation runs before the fold, as in `_latest_vitals`: a superseded report can
+    neither win 'latest' nor inflate the count."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-10T09:00", value_num=4),
+        _symptom_row("2026-08-16T09:00", value_num=9, value_text="mis-typed severity"),
+    ])
+    base = seeded.execute(
+        "SELECT dedup_base FROM observation WHERE observed_at = '2026-08-16T09:00'"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "observation", base, status="superseded",
+                             note="severity mis-typed", apply=True)
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert line.startswith(
+        "- right foot ache - 1 report in 30d, latest 2026-08-10 (severity 4/10)"
+    )
+
+
+def test_symptom_section_is_console_safe(seeded):
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    md = _symptom_summary(seeded)
+    assert md.isascii(), f"non-ASCII would crash a cp437 console: {md!r}"
+    md.encode("cp437")
+
+
+def test_rendering_symptoms_changes_no_rows(seeded):
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    before = _row_counts(seeded)
+    _symptom_summary(seeded)
+    render.render_journal(seeded, "jane-doe", include_self_reported=True)
+    assert _row_counts(seeded) == before
+
+
+# --- journal filtering (issue #167) -------------------------------------------
+
+def test_journal_excludes_self_reports_by_default(seeded):
+    """T9: a few hundred attestations a year would swamp a chronology spanning decades,
+    so the journal is the one reader that filters them out."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00"),
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity"),
+    ])
+    md = render.render_journal(seeded, "jane-doe", now=_SYMPTOM_NOW)
+    assert "right foot ache" not in md and "morning walk" not in md
+    assert "blood_pressure" in md          # control: other observations still there
+
+
+def test_journal_includes_self_reports_on_request(seeded):
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00"),
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity"),
+    ])
+    md = render.render_journal(
+        seeded, "jane-doe", now=_SYMPTOM_NOW, include_self_reported=True
+    )
+    assert "symptom right foot ache" in md
+    assert "activity morning walk" in md

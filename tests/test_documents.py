@@ -1368,7 +1368,7 @@ def test_cli_document_reocr_json_carries_a_stable_key_set(cli_ready, capsys):
     assert [row["document_id"] for row in payload] == [1, 2]
     assert set(payload[0]) == {
         "document_id", "status", "chars", "previous_chars", "route", "pages",
-        "truncated", "blob_path", "owner_check",
+        "truncated", "shrunk", "blob_path", "owner_check",
     }
     assert payload[0]["status"] == "has-text"
     assert payload[0]["owner_check"] is None            # refused before any check
@@ -1418,6 +1418,124 @@ def test_cli_document_reocr_owner_mismatch_refuses_and_names_the_remedy(
     assert _run(cli_ready, "document", "reocr", "2", "--force",
                 "--sources", _sources(cli_ready)) == 0
     assert _ocr_text_of(cli_ready, 2) == "Patient: ROE, ROBERT ALAN  summary"
+
+
+# --- the shrinkage guard at the operator's surface (issue #174) --------------
+
+
+def _set_long_text(tmp_path, document_id, text):
+    """`document set-text --force` a long transcription onto a document - the issue's
+    own verification setup, and the shape that makes the blob's text a shrinkage."""
+    path = tmp_path / f"long-{document_id}.txt"
+    path.write_text(text, encoding="utf-8")
+    assert _run(tmp_path, "document", "set-text", str(document_id),
+                "--ocr-text-file", str(path), "--force") == 0
+
+
+_LONG = "a long stored transcription that took somebody real effort to type out"
+
+
+def test_cli_document_reocr_refuses_a_shrinking_replacement(cli_ready, capsys):
+    """The issue's verification case verbatim: ingest, set-text a long text, then
+    `reocr --force --dry-run` against a blob that extracts to something shorter."""
+    _ingest_textless(cli_ready, "scan2.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2", "--force", "--dry-run",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#2  refused" in out
+    assert "shorter than stored" in out
+    assert f"16 chars (was {len(_LONG)} chars)" in out
+    assert "--allow-shrink" in out
+    assert "would write" not in out
+    assert "1 document(s): 1 shorter-text" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) == _LONG
+
+
+def test_cli_document_reocr_allow_shrink_stores_and_warns(cli_ready, capsys):
+    _ingest_textless(cli_ready, "scan2.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2", "--force", "--allow-shrink",
+                "--sources", _sources(cli_ready)) == 0
+    out = capsys.readouterr().out
+    assert "#2  written" in out
+    assert f"shrink: 16 chars replaces {len(_LONG)}" in out
+    assert "the difference is discarded" in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 2) == "three words only"
+
+
+def test_cli_document_reocr_json_reports_shrinkage(cli_ready, capsys):
+    _ingest_textless(cli_ready, "scan2.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2", "--force", "--json",
+                "--sources", _sources(cli_ready)) == 1
+    (row,) = json.loads(capsys.readouterr().out)
+    assert row["status"] == "shorter-text"
+    assert row["shrunk"] is True
+    assert row["chars"] == 16 and row["previous_chars"] == len(_LONG)
+    # The owner audit the guard sits behind still gets its verdict.
+    assert row["owner_check"]["verdict"] == "unverified"
+    assert _ocr_text_of(cli_ready, 2) == _LONG
+
+
+def test_cli_document_reocr_truncated_and_shrunk_prints_both_notices(
+    cli_ready, capsys, monkeypatch
+):
+    """Two independent conditions on one document, so neither notice may swallow the
+    other - the page cap is one cause of a shorter replacement, not the condition."""
+    _ingest_textless(cli_ready, "bundle.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    monkeypatch.setattr(ingest, "pdf_page_count", lambda src: 21)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "2", "--force",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#2  refused" in out and "shorter than stored" in out
+    assert f"pages: 21 (over the {ingest.OCR_MAX_PAGES}-page cap" in out
+    assert out.isascii(), repr(out)
+
+
+def test_cli_document_reocr_allow_shrink_alone_does_not_replace_text(
+    cli_ready, capsys
+):
+    """It overrides one refusal, not the has-text guard - `--force` still means what it
+    meant, and neither flag implies the other."""
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "reocr", "1", "--allow-shrink",
+                "--sources", _sources(cli_ready)) == 1
+    assert "#1  skipped" in capsys.readouterr().out
+    assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
+
+
+def test_cli_document_reocr_mixed_sweep_summarises_both_outcomes(cli_ready, capsys):
+    """The shape a real sweep takes: one document re-derives to the same text and is
+    written, another shrinks and is refused. The summary must name both, and one
+    refusal must carry the whole run to rc=1 - a sweep that exits 0 because most of it
+    succeeded is how the silent loss this issue reports goes unnoticed."""
+    _ingest_textless(cli_ready, "scan2.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "1", "2", "--force",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#1  written" in out
+    assert "#2  refused" in out and "shorter than stored" in out
+    assert "2 document(s): 1 shorter-text, 1 written" in out
+    # The written one did not shrink, so it draws no shrink notice.
+    assert "shrink:" not in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
+    assert _ocr_text_of(cli_ready, 2) == _LONG
 
 
 def test_cli_document_reocr_unknown_id_is_a_friendly_error(cli_ready, capsys):

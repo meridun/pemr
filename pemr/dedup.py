@@ -152,15 +152,47 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 
+# The self-attested lanes (issue #167): what the *patient* reports about themselves on a
+# given day, as opposed to what a clinician or a document asserted. Deliberately two
+# obs_types, not one — `activity` is the higher-volume, lower-signal of the pair, and
+# sharing a lane would bury the symptom signal underneath it. Both stay inside the
+# `observation` catch-all and never reach `condition`/`Active Problems`, which is what
+# keeps unfiltered self-attested rows out of the verdict-curated problem list.
+#
+# They live here rather than beside render's `OBS_VITAL`/`OBS_ORDER` because `query` needs
+# them too and it already imports from this module while `render` imports `query` —
+# defining them in `render` would invert that edge.
+OBS_SYMPTOM = "symptom"
+OBS_ACTIVITY = "activity"
+SELF_REPORTED_OBS_TYPES: frozenset[str] = frozenset({OBS_SYMPTOM, OBS_ACTIVITY})
+
 # Per-`obs_type` required fields, enforced by validate_row after the per-field loop.
 # `observation`'s FIELD_SPECS entry marks `observed_at` optional because vitals and orders
 # legitimately arrive undated, but a `functional` row's whole value is being dated (issue
 # #132: "the running-balance column stops in July") — an undated one is exactly the
-# unqueryable prose that record type exists to eliminate. Scoped to `functional` alone:
-# widening it to the other families would reject already-valid extractions.
+# unqueryable prose that record type exists to eliminate. Scoped to `functional` and the
+# two self-attested lanes: widening it to the other families would reject already-valid
+# extractions. The self-attested pair needs a date because a fluctuating complaint with no
+# date answers no frequency question, and a `key` because a keyless symptom is exactly the
+# untyped blob the lane exists to prevent (issue #167).
 OBS_TYPE_REQUIRED: dict[str, frozenset[str]] = {
     "functional": frozenset({"observed_at"}),
+    OBS_SYMPTOM: frozenset({"observed_at", "key"}),
+    OBS_ACTIVITY: frozenset({"observed_at", "key"}),
 }
+
+# Obs_types whose `observed_at` must additionally carry a **time of day**, enforced right
+# after the OBS_TYPE_REQUIRED loop (issue #167). Kept a separate name from
+# :data:`OBS_TYPE_REQUIRED` so the presence rule and the precision rule stay separately
+# readable and separately testable.
+#
+# Why a precision rule rather than a new dedup discriminator: `_norm_ts` already keeps
+# `observation.observed_at` at full precision, so two same-day reports at *different times*
+# already get distinct keys (Architecture.md §3). The collision a same-day repeat hits is
+# therefore not a key defect — it is what a date-only `observed_at` means. Mandating the
+# time on these two lanes fixes it without forking observation identity, and it preserves
+# the property that a correction at the *same* timestamp still collides as a CONFLICT.
+OBS_TYPE_REQUIRES_TIME: frozenset[str] = SELF_REPORTED_OBS_TYPES
 
 _WS = re.compile(r"\s+")
 # Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
@@ -233,6 +265,18 @@ def _is_iso_date(value: str) -> bool:
             return False
         return True
     return False
+
+
+def _has_time_component(value: str) -> bool:
+    """True when an ISO date value also carries a time of day (issue #167).
+
+    Correct **only** on a value :func:`_is_iso_date` has already accepted: at that point a
+    string longer than ``YYYY-MM-DD`` can only be a full date followed by the ``T``/space
+    separator and a valid time (month- and year-precision forms permit no time component
+    at all). The caller in :func:`validate_row` guarantees that ordering; the
+    ``len(value) > 10`` guard keeps a shorter value from ever indexing out of range.
+    """
+    return len(value) > 10 and value[10] in ("T", " ")
 
 
 # --------------------------------------------------------------------------- #
@@ -638,6 +682,18 @@ def validate_row(record_type: str, row: object) -> None:
                     f"observation: missing required field '{field}' "
                     f"for obs_type={row['obs_type']!r}"
                 )
+        # Ordering is load-bearing (issue #167): the per-field loop above has already
+        # proven `observed_at` is an ISO value, and the OBS_TYPE_REQUIRED loop has just
+        # proven it is present, so `_has_time_component` may index into it. Moving either
+        # block after this one would turn a ValidationError into an IndexError.
+        if row["obs_type"] in OBS_TYPE_REQUIRES_TIME and not _has_time_component(
+            row["observed_at"]
+        ):
+            raise ValidationError(
+                f"observation.observed_at: obs_type={row['obs_type']!r} requires a time "
+                f"of day (YYYY-MM-DDTHH:MM), got {row['observed_at']!r} - two reports of "
+                "one key on the same day would otherwise dedup into a single row"
+            )
 
 
 def _type_names(types: object) -> str:

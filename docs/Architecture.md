@@ -332,8 +332,11 @@ CREATE TABLE observation (
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
                                            -- 'blood_pressure'/'weight'), 'order',
-                                           -- 'screening', 'immunization', 'functional'
-                                           -- ('functional' alone requires observed_at;
+                                           -- 'screening', 'immunization', 'functional',
+                                           -- 'symptom'/'activity' (self-reported, #167)
+                                           -- ('functional' requires observed_at;
+                                           -- symptom/activity require a `key` and an
+                                           -- observed_at carrying a time of day;
                                            -- condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
@@ -741,7 +744,10 @@ two rows preserved; a correction or OCR re-read of the *same* reading carries th
 timestamp → collides → surfaces as a conflict (below). When only a date is available,
 same-day differing values collide → conflict; that safety bias is intentional (a spurious
 conflict on a genuine repeat is human-recoverable, a silent duplicate of a correction
-poisons `trends`/brief/`query` irrecoverably).
+poisons `trends`/brief/`query` irrecoverably). The self-reported lanes
+(`obs_type='symptom'`/`'activity'`, issue #167) therefore *mandate* the time component in
+`validate_row`, so a same-day repeat is a second row rather than a conflict — a
+fluctuating complaint is reported several times a day by design.
 
 `lab_result.collected_at` is **truncated to the date** for key purposes (issue #117); the
 column itself still stores the most precise prefix the source gave, and the read layer
@@ -975,6 +981,20 @@ either way) stores and warns rather than refusing, since the recovered text cann
 wrong household member — refusing would only withhold the evidence that the document is
 misfiled at the row level.
 
+Both of `--force`'s meanings stop at the **shrinkage guard** (issue #174): re-derived text
+shorter than the `ocr_text` already stored is refused (`shorter-text`, a `refused` status,
+so rc=1), and `--allow-shrink` is the separate override. Separate deliberately — a
+populated corpus needs `--force` just to reach the write at all, so it cannot also mean
+"and discard most of it", and the only read-only owner audit there is (`reocr --force
+--dry-run`, since `check_owner`'s three call sites are all write paths) would otherwise be
+one missing flag away from losing text. The threshold is any shrinkage rather than a
+percentage: it is unreachable without `--force` — the has-text skip returns first — so
+`--where-empty` never trips it, and one predicate drives the refusal, the human line and
+the `--json` `shrunk` key alike. `shrunk` also rides the writes that *are* permitted, so a
+shorter replacement warns on its own line instead of reading as an ordinary success.
+Truncation against `OCR_MAX_PAGES` is one *cause* of a shorter replacement, not the
+condition — a document that is both reports both.
+
 ### Study directories (issue #69)
 
 A burned imaging disc is clinically *one* document but physically one folder holding
@@ -1087,8 +1107,9 @@ pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--n
                                                          # pre-emptive exclusion; ingests and copies nothing
 pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
-pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force]
+pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force] [--allow-shrink]
                                                          # re-derive ocr_text from the stored blob using the ingest dispatch
+                                                         # --allow-shrink: store text shorter than what is there (refused otherwise)
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
 pemr query meds --person jane --active [--raw]           # --active = query.med_is_current per row:
                                                          # a past ended_on or a terminal status ends
