@@ -43,6 +43,9 @@ Read-only tools (never mutate the DB; safe to call freely):
 - `render_summary` — master summary Markdown for a person.
 - `render_brief` — walk-in brief Markdown for one appointment.
 - `render_journal` — narrative chronology Markdown for a person.
+- `render_curation` — curation audit trail Markdown for a person: every recorded verdict that
+  removed a row from the three documents above, grouped by ruling. Empty Markdown means the
+  person has no verdicts, not a failure.
 
 Write tools (mutate the DB; the only tools that do):
 

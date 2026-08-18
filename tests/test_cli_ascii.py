@@ -201,7 +201,13 @@ def test_record_annotate_output_is_console_safe(ready, capsys):
     capsys.readouterr()
     assert _run(ready, "render", "summary", "--person", "jane-doe") == 0
     out = capsys.readouterr().out
-    assert "## Superseded / corrected" in out
+    assert "Glucose" not in out              # curated out of the summary (#168)
+    _assert_console_safe(out)
+
+    # The audit trail is its own target now, and it is console-safe too (#168).
+    assert _run(ready, "render", "curation", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "## superseded" in out and "lab_result: Glucose" in out
     _assert_console_safe(out)
 
     assert _run(ready, "record", "rm", "lab_result", "1", "--apply") == 0

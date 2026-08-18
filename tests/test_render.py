@@ -945,17 +945,18 @@ def test_summary_procedures_dispute_and_attest_suffixes(seeded):
                for ln in section.splitlines())
 
 
-def test_summary_procedures_superseded_row_leaves_for_the_appendix(seeded):
-    """Filter order: curation first, routine list second. An appendix-bound row must be
+def test_summary_procedures_superseded_row_leaves_for_the_curation_record(seeded):
+    """Filter order: curation first, routine list second. A curated-away row must be
     routed by its verdict before the pattern list counts anything, or a superseded row
-    would be reported twice -- once in the appendix, once as a hidden routine one."""
+    would be reported twice -- once as curated, once as a hidden routine one."""
     _seed_procedures(seeded, [{"name": "Venipuncture", "performed_on": "2026-02-01"}])
     _annotate(seeded, "procedure", "name", "Colonoscopy", status="superseded",
               note="duplicated by the later report")
     md = render.render_summary(seeded, "jane-doe", routine_procedures=["venipuncture"])
     section = md.split("## Procedures")[1].split("\n## ")[0]
     assert "Colonoscopy" not in section
-    assert "## Superseded / corrected" in md and "procedure: Colonoscopy" in md
+    assert "Colonoscopy" not in md                        # not anywhere in the summary
+    assert "procedure: Colonoscopy" in render.render_curation(seeded, "jane-doe")
     assert "_1 routine procedure not shown" in section   # the superseded row is not counted
 
 
@@ -967,31 +968,43 @@ def test_summary_upcoming_and_open_appointments(seeded):
     assert "Dr. Past" not in section  # past + documented -> closed
 
 
-def test_summary_open_conflicts_section(seeded):
+def test_summary_open_conflicts_warning_line(seeded):
     """The summary is the doc read between appointments, so a staged correction must be
     visible there and not only in `review-conflicts` / a per-appointment brief: without
-    it the summary prints the stale value with no hint a correction is pending (#59)."""
-    cid = _stage_conflict(seeded, "jane-doe")
+    it the summary prints the stale value with no hint a correction is pending (#59).
+
+    Issue #168 kept that guarantee and dropped the section: one `> [!WARNING]` block,
+    directly under the header, because the wording says "some values *below*"."""
+    _stage_conflict(seeded, "jane-doe")
     md = render.render_summary(seeded, "jane-doe")
-    section = md.split("## Open Conflicts")[1].split("\n## ")[0]
-    assert f"conflict #{cid} (lab_result)" in section
-    assert "`pemr review-conflicts`" in section       # tells the reader how to clear it
+    assert "## Open Conflicts" not in md              # the section is gone, not moved
+    warning = md.split("\n## ")[0]                    # everything above the first section
+    assert "> [!WARNING]" in warning
+    assert "> 1 open conflict - some values below may be superseded." in warning
+    assert "curation.md" in warning
+    assert "`pemr review-conflicts`" in warning       # tells the reader how to clear it
+
+
+def test_summary_open_conflicts_warning_pluralizes(seeded):
+    _stage_conflict(seeded, "jane-doe")
+    _stage_conflict(seeded, "jane-doe")
+    md = render.render_summary(seeded, "jane-doe")
+    assert "> 2 open conflicts - some values below may be superseded." in md
 
 
 def test_summary_open_conflicts_empty_state_and_scoping(seeded):
-    """Empty state is explicit (`_none_`, matching the brief), resolved conflicts drop
-    out of the section, and another person's conflict never leaks in."""
+    """Zero open conflicts means *nothing* -- no header, no `_none_` line (the noise
+    issue #168 was raised over). Resolved conflicts and another person's never count."""
     md = render.render_summary(seeded, "jane-doe")
-    assert "_none_" in md.split("## Open Conflicts")[1].split("\n## ")[0]
+    assert "## Open Conflicts" not in md
+    assert "_none_" not in md
+    assert "[!WARNING]" not in md
 
-    resolved = _stage_conflict(seeded, "jane-doe", status="resolved")
-    johns = _stage_conflict(seeded, "john-doe")
-    section = render.render_summary(
-        seeded, "jane-doe"
-    ).split("## Open Conflicts")[1].split("\n## ")[0]
-    assert f"conflict #{resolved}" not in section     # resolved -> not open
-    assert f"conflict #{johns}" not in section        # other person's conflict
-    assert "_none_" in section
+    _stage_conflict(seeded, "jane-doe", status="resolved")
+    _stage_conflict(seeded, "john-doe")
+    md = render.render_summary(seeded, "jane-doe")
+    assert "[!WARNING]" not in md                    # resolved / other person -> not open
+    assert "## Open Conflicts" not in md
 
 
 def test_summary_empty_sections_are_explicit(seeded):
@@ -1215,8 +1228,9 @@ def _renders(conn):
 
 
 def test_no_verdicts_renders_byte_identically(seeded):
-    """The load-bearing guarantee: the appendix and questions sections are *omitted*,
-    not rendered empty, so unannotated output is unchanged to the byte."""
+    """The load-bearing guarantee: the questions section is *omitted*, not rendered
+    empty, so unannotated output is unchanged to the byte. Since issue #168 the same rule
+    binds the curation record itself: no verdicts means no document at all."""
     before = _renders(seeded)
     # An empty `curation` table is the state every existing database is in.
     assert seeded.execute("SELECT COUNT(*) AS n FROM curation").fetchone()["n"] == 0
@@ -1226,22 +1240,24 @@ def test_no_verdicts_renders_byte_identically(seeded):
         assert "Superseded / corrected" not in md
         assert "Questions for the Clinician" not in md
         assert "DISPUTED" not in md
+    assert render.render_curation(seeded, "jane-doe") == ""
 
 
 @pytest.mark.parametrize("status", ["superseded", "erroneous-in-source"])
-def test_superseded_family_leaves_its_section_for_the_appendix(seeded, status):
+def test_superseded_family_leaves_its_section_for_the_curation_record(seeded, status):
     _annotate(seeded, "condition", "name", "Appendicitis", status=status,
               note="never actually confirmed")
     out = _renders(seeded)
     for name, md in out.items():
-        if name == "brief":
-            continue  # the brief has no past-medical-history section
-        assert "## Superseded / corrected" in md, name
-        assert "condition: Appendicitis" in md, name
-        assert "never actually confirmed" in md, name
-    # Gone from Past Medical History, but the row itself is untouched.
-    body = out["summary"].split("## Superseded / corrected")[0]
-    assert "Appendicitis" not in body
+        # Gone from every clinical document, appendix and all (issue #168).
+        assert "Superseded / corrected" not in md, name
+        assert "Appendicitis" not in md, name
+    # ... and the trail is the curation record, which is where it now lives alone.
+    record = render.render_curation(seeded, "jane-doe")
+    assert "condition: Appendicitis" in record
+    assert "never actually confirmed" in record
+    assert f"## {status}" in record          # grouped under its ruling
+    # The row itself is untouched: a verdict is an overlay, never a delete.
     assert seeded.execute(
         "SELECT COUNT(*) AS n FROM condition WHERE name = 'Appendicitis'"
     ).fetchone()["n"] == 1
@@ -1275,13 +1291,16 @@ def test_merged_into_renders_only_the_target(seeded):
     _annotate(seeded, "lab_result", "test_name", "Glucose, fasting",
               status="merged-into", merged_into_base=target,
               note="same analyte, two spellings")
-    md = render.render_summary(seeded, "jane-doe",
-                               dictionary=dedup.load_dictionary(DICT_PATH))
-    body, appendix = md.split("## Superseded / corrected")
+    body = render.render_summary(seeded, "jane-doe",
+                                 dictionary=dedup.load_dictionary(DICT_PATH))
     assert "Glucose, fasting" not in body
     assert "LDL" in body                                     # the target still renders
-    assert "lab_result: Glucose, fasting" in appendix
-    assert f"merged into {target[:12]}..." in appendix
+    record = render.render_curation(seeded, "jane-doe")
+    assert "lab_result: Glucose, fasting" in record
+    assert f"## merged into {target[:12]}..." in record
+    # The target base is truncated and never resolved to a label: it may name another
+    # person's family (issue #161), which must not leak into this person's document.
+    assert target not in record
 
 
 def test_confirmed_changes_nothing_but_the_row_still_renders(seeded):
@@ -1368,14 +1387,15 @@ def test_a_row_scoped_verdict_hides_one_occurrence_and_spares_its_sibling(seeded
     curation.annotate_record(seeded, "lab_result", str(occ1), status="superseded",
                              note="loser of an earlier keep-both", row=True, apply=True)
 
-    md = render.render_summary(seeded, "jane-doe",
-                               dictionary=dedup.load_dictionary(DICT_PATH))
-    body, appendix = md.split("## Superseded / corrected")
+    body = render.render_summary(seeded, "jane-doe",
+                                 dictionary=dedup.load_dictionary(DICT_PATH))
     assert "200.0" in body                  # the sibling renders normally
     assert "205.0" not in body              # the annotated occurrence does not
+    record = render.render_curation(seeded, "jane-doe")
     # Listed once, not once per row of the family.
-    assert appendix.count("lab_result: Glucose, fasting") == 1
-    assert "loser of an earlier keep-both" in appendix
+    assert record.count("lab_result: Glucose, fasting") == 1
+    assert "loser of an earlier keep-both" in record
+    assert "(row)" in record                # row scope, so it covers exactly one row
 
     # The contrast: the same verdict at family scope takes both rows with it.
     curation.clear_curation(seeded, "lab_result", str(occ1), row=True, apply=True)
@@ -1383,13 +1403,14 @@ def test_a_row_scoped_verdict_hides_one_occurrence_and_spares_its_sibling(seeded
                              note="the whole family", apply=True)
     body = render.render_summary(
         seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH)
-    ).split("## Superseded / corrected")[0]
+    )
     assert "200.0" not in body and "205.0" not in body
+    assert "(family, 2 rows)" in render.render_curation(seeded, "jane-doe")
 
 
 def test_a_row_verdict_overrides_its_family_verdict_at_render_time(seeded):
     """Precedence, end to end: the family is disputed, one occurrence is superseded.
-    The superseded row leaves for the appendix; its sibling renders in place, marked."""
+    The superseded row leaves the summary; its sibling renders in place, marked."""
     base, _occ0, occ1 = _keep_both_sibling(seeded)
     curation.annotate_record(seeded, "lab_result", base, status="disputed",
                              note="two sources disagree", apply=True)
@@ -1397,15 +1418,17 @@ def test_a_row_verdict_overrides_its_family_verdict_at_render_time(seeded):
                              note="this one is the transcription error", row=True,
                              apply=True)
 
-    md = render.render_summary(seeded, "jane-doe",
-                               dictionary=dedup.load_dictionary(DICT_PATH))
-    body, appendix = md.split("## Superseded / corrected")
+    body = render.render_summary(seeded, "jane-doe",
+                                 dictionary=dedup.load_dictionary(DICT_PATH))
     assert "200.0" in body
     assert "[DISPUTED: two sources disagree]" in body
     assert "205.0" not in body
-    assert "this one is the transcription error" in appendix
-    # One appendix line: the row verdict's, not one per row of the family.
-    assert appendix.count("lab_result: Glucose, fasting") == 1
+    record = render.render_curation(seeded, "jane-doe")
+    assert "this one is the transcription error" in record
+    # One line: the row verdict's, not one per row of the family. And the `disputed`
+    # family verdict is not in the curation record at all -- it never left its section.
+    assert record.count("lab_result: Glucose, fasting") == 1
+    assert "two sources disagree" not in record
 
 
 def test_a_distinct_verdict_keeps_both_siblings_live(seeded):
@@ -1758,3 +1781,218 @@ def test_brief_and_journal_are_deliberately_not_converted(seeded):
     journal = render.render_journal(seeded, "jane-doe", now=_NOW)
     assert "80.0 kg" in brief and "converted from" not in brief
     assert "80.0 kg" in journal and "converted from" not in journal
+
+
+# --- the curation record: the audit trail as its own target (issue #168) -------
+
+
+def _record(conn, slug="jane-doe"):
+    return render.render_curation(conn, slug, now=datetime(2026, 6, 1))
+
+
+def test_curation_record_header_is_self_identifying_and_counts_its_scope(seeded):
+    _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+              note="never actually confirmed", attributed_to="mkd")
+    md = _record(seeded)
+    assert md.startswith("# Curation Record: Jane Doe\n")
+    assert "- Person: jane-doe" in md
+    assert "- Generated: 2026-06-01T00:00:00 (read-only view of DB state)" in md
+    assert "- Verdicts: 1 covering 1 row" in md
+    assert "## superseded (mkd)" in md
+    assert "_1 verdict, 1 row_" in md
+    assert "> never actually confirmed" in md
+    assert "- condition: Appendicitis  (family, 1 row)" in md
+
+
+def test_curation_record_groups_verdicts_that_share_a_ruling(seeded):
+    """The observed complaint: one merge session's note recorded against many families
+    rendered as one near-identical bullet per family. Same ruling -> one block."""
+    for rtype, column, value in (("condition", "name", "Appendicitis"),
+                                 ("condition", "name", "Chickenpox"),
+                                 ("allergy", "substance", "Sulfa")):
+        _annotate(seeded, rtype, column, value, status="superseded",
+                  note="duplicate portal import", attributed_to="mkd")
+    md = _record(seeded)
+    assert md.count("## superseded (mkd)") == 1
+    assert md.count("> duplicate portal import") == 1
+    assert "_3 verdicts, 3 rows_" in md
+    assert "- Verdicts: 3 covering 3 rows" in md
+    for target in ("condition: Appendicitis", "condition: Chickenpox", "allergy: Sulfa"):
+        assert target in md
+
+
+@pytest.mark.parametrize("differing", ["status", "note", "attributed_to"])
+def test_curation_record_splits_rulings_that_differ_in_any_key(seeded, differing):
+    """The group key is the ruling itself. Differ anywhere in it and they are two
+    rulings, however similar they read."""
+    base = dict(status="superseded", note="duplicate portal import",
+                attributed_to="mkd")
+    other = dict(base, **{differing: {"status": "erroneous-in-source",
+                                      "note": "wrong patient",
+                                      "attributed_to": "dr-who"}[differing]})
+    _annotate(seeded, "condition", "name", "Appendicitis", **base)
+    _annotate(seeded, "condition", "name", "Chickenpox", **other)
+    md = _record(seeded)
+    assert md.count("\n## ") == 2
+    assert "- Verdicts: 2 covering 2 rows" in md
+
+
+def test_curation_record_row_arithmetic_counts_the_family(seeded):
+    """A family-scoped verdict covers every occurrence; a row-scoped one covers one.
+    The counts are what make the grouping auditable rather than an assertion."""
+    base, _occ0, occ1 = _keep_both_sibling(seeded)
+    curation.annotate_record(seeded, "lab_result", base, status="superseded",
+                             note="the whole family", apply=True)
+    md = _record(seeded)
+    assert "_1 verdict, 2 rows_" in md
+    assert "- lab_result: Glucose, fasting  (family, 2 rows)" in md
+    assert "- Verdicts: 1 covering 2 rows" in md
+
+    curation.clear_curation(seeded, "lab_result", base, apply=True)
+    curation.annotate_record(seeded, "lab_result", str(occ1), status="superseded",
+                             note="just this occurrence", row=True, apply=True)
+    md = _record(seeded)
+    assert "_1 verdict, 1 row_" in md
+    assert "- lab_result: Glucose, fasting  (row)" in md
+
+
+def test_curation_record_puts_a_multi_line_note_in_a_blockquote(seeded):
+    """The heading must stay one line whatever the operator typed -- a multi-line `##`
+    is broken Markdown, and multi-line merge notes are exactly what prompted the move."""
+    _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+              note="first line\nsecond line", attributed_to="mkd")
+    md = _record(seeded)
+    assert "## superseded (mkd)\n" in md
+    assert "> first line\n> second line\n" in md
+
+
+def test_curation_group_block_omits_the_blockquote_for_an_empty_note():
+    """A block-level unit test on purpose: `record annotate` demands a note and the
+    `curation` table CHECKs it non-blank + NOT NULL, so no fixture can reach this state
+    through the DB. The guard still has to exist -- a bare `>` is broken Markdown -- so
+    it is exercised where it lives."""
+    block = render._curation_group_block(
+        {"heading": "superseded", "note": "", "verdicts": 1, "rows": 1,
+         "targets": ["- condition: Appendicitis  (family, 1 row)"]}
+    )
+    assert ">" not in block
+    assert block == (
+        "## superseded\n\n_1 verdict, 1 row_\n\n"
+        "- condition: Appendicitis  (family, 1 row)\n"
+    )
+
+
+def test_curation_record_carries_only_appendix_status_verdicts(seeded):
+    """`disputed`/`confirmed`/`distinct` never left their section, so they have no audit
+    trail to carry -- they are still on the page where the reader can see them."""
+    _annotate(seeded, "allergy", "substance", "Sulfa", status="disputed",
+              note="two notes disagree")
+    _annotate(seeded, "allergy", "substance", "Penicillin", status="confirmed",
+              note="clinician agreed")
+    assert _record(seeded) == ""
+
+    target = seeded.execute(
+        "SELECT dedup_base FROM condition WHERE name = 'Chickenpox'"
+    ).fetchone()["dedup_base"]
+    _annotate(seeded, "condition", "name", "Appendicitis", status="merged-into",
+              merged_into_base=target, note="one episode, two notes")
+    md = _record(seeded)
+    assert "condition: Appendicitis" in md
+    assert "two notes disagree" not in md and "clinician agreed" not in md
+
+
+def test_curation_record_is_scoped_to_one_person(seeded):
+    """John's verdict is John's business. A family is single-person by construction
+    (`dedup._key_parts` folds `person_id` in), so scoping is a lookup, not a guess."""
+    _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+              note="jane's ruling")
+    johns = seeded.execute(
+        "SELECT dedup_base FROM lab_result WHERE person_id = "
+        "(SELECT person_id FROM person WHERE slug='john-doe')"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "lab_result", johns, status="superseded",
+                             note="john's ruling", apply=True)
+
+    jane = _record(seeded)
+    assert "jane's ruling" in jane and "john's ruling" not in jane
+    john = _record(seeded, "john-doe")
+    assert "john's ruling" in john and "jane's ruling" not in john
+
+
+def test_curation_record_excludes_an_orphan_verdict(seeded):
+    """A verdict whose target is gone has no person to scope it to, so it cannot appear
+    here -- unchanged from the block this replaced. `pemr verify` / `record reaffirm`
+    are its surfaces."""
+    base = _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+                     note="never actually confirmed")
+    assert "Appendicitis" in _record(seeded)
+    seeded.execute("DELETE FROM condition WHERE dedup_base = ?", (base,))
+    seeded.commit()
+    assert curation.get_verdict(seeded, "condition", base) is not None
+    assert _record(seeded) == ""
+
+
+def test_curation_record_skips_an_unknown_record_type_without_raising(seeded):
+    """A hand-edited `curation` row can name anything, and `row_person`/`family_person`
+    interpolate the type into a table name. The membership guard runs first."""
+    _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+              note="the good one")
+    seeded.execute(
+        "INSERT INTO curation (record_type, dedup_base, record_id, status, note, "
+        "created_at) VALUES ('not_a_table', 'deadbeef', 0, 'superseded', 'hand-edited', "
+        "'2026-01-01T00:00:00')"
+    )
+    seeded.commit()
+    md = _record(seeded)
+    assert "the good one" in md
+    assert "hand-edited" not in md and "not_a_table" not in md
+
+
+def test_curation_record_is_empty_for_a_person_with_no_verdicts(seeded):
+    assert _record(seeded, "john-doe") == ""
+
+
+def test_curation_record_unknown_slug_raises(seeded):
+    with pytest.raises(query.PersonNotFoundError):
+        render.render_curation(seeded, "nobody")
+
+
+def test_curation_record_degrades_on_a_pre_008_snapshot(tmp_path):
+    """A snapshot without the `curation` table renders the empty document rather than
+    raising `no such table` (the `has_table` degradation convention)."""
+    conn = db.connect(tmp_path / "old.db")
+    db.migrate(conn)
+    persons.add_person(conn, "jane-doe", "Jane Doe")
+    conn.execute("DROP TABLE curation")
+    conn.commit()
+    try:
+        assert render.render_curation(conn, "jane-doe") == ""
+    finally:
+        conn.close()
+
+
+def test_curation_record_stays_ascii_and_read_only(seeded):
+    before = _row_counts(seeded)
+    _annotate(seeded, "condition", "name", "Appendicitis", status="superseded",
+              note="duplicate portal import", attributed_to="mkd")
+    md = _record(seeded)
+    assert md.isascii(), f"non-ASCII would crash a cp437 console: {md!r}"
+    md.encode("cp437")
+    assert _row_counts(seeded) == before      # still a pure read
+
+
+def test_curation_record_never_resolves_a_cross_person_merge_target(seeded):
+    """Issue #161: the merge target may name another person's family. The heading prints
+    the truncated base and never a resolved label, so nothing of John's leaks into
+    Jane's document."""
+    johns = seeded.execute(
+        "SELECT dedup_base FROM lab_result WHERE person_id = "
+        "(SELECT person_id FROM person WHERE slug='john-doe')"
+    ).fetchone()["dedup_base"]
+    _annotate(seeded, "lab_result", "test_name", "Glucose, fasting",
+              status="merged-into", merged_into_base=johns,
+              note="same draw, filed twice", allow_cross_person=True)
+    md = _record(seeded)
+    assert f"## merged into {johns[:12]}..." in md
+    assert johns not in md                      # truncated, never printed in full
+    assert "LDL" not in md                      # the target's label never resolved

@@ -113,8 +113,8 @@ STATUSES: tuple[str, ...] = (
     "distinct",
 )
 
-#: The statuses that move a family **out** of its normal rendered section and into the
-#: "Superseded / corrected" appendix. ``confirmed`` renders exactly as today (it records
+#: The statuses that move a family **out** of its normal rendered section, leaving their
+#: audit trail to `pemr render curation` (issue #168). ``confirmed`` renders as today (it records
 #: agreement, it does not change the document); ``disputed`` renders in place, marked —
 #: a disputed fact that vanished from the summary would be worse than an unmarked one.
 APPENDIX_STATUSES: tuple[str, ...] = (
@@ -404,8 +404,9 @@ def load_verdicts(conn: sqlite3.Connection) -> VerdictMap:
 # The *stamping* rule (which verdict applies to which carrier) lives here, beside
 # :meth:`VerdictMap.for_row` and :data:`APPENDIX_STATUSES`; the *policy* rule (what to do
 # with a carrier bound for the appendix) stays with each front door, because they
-# legitimately differ: `render` collects the carrier into its "Superseded / corrected"
-# section, `pemr query` hides it behind a count, and the MCP payload hides nothing at all.
+# legitimately differ: `render` drops the carrier from its clinical documents (the audit
+# trail is `pemr render curation`, issue #168), `pemr query` hides it behind a count, and
+# the MCP payload hides nothing at all.
 #
 # Before #131 the stamping half lived only inside `render`, and `pemr query` had no
 # overlay at all — the two verbs disagreed about which medications a person is on.
