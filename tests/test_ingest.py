@@ -1509,16 +1509,38 @@ def test_malformed_html_does_not_raise(tmp_path):
     assert "alpha" in text and "beta" in text and "gamma" in text
 
 
-def test_html_marked_section_does_not_raise(tmp_path, capsys):
-    """`_markupbase.parse_marked_section` ends in a plain `raise AssertionError`, which
-    input as ordinary as `<![foo[ x ]]>` reaches. `AssertionError` is not in
-    `_EXTRACT_ERRORS`, so without `_extract_html`'s guard it escapes the "never raises"
-    contract and costs the document — the #138 audit's `RecursionError` defect again."""
+def test_html_marked_section_does_not_raise(tmp_path):
+    """`<![foo[ x ]]>` crashed `html.parser` with a bare `AssertionError` from
+    `_markupbase.parse_marked_section` up to mid-3.12 (gh-81928); the HTML5-conformance
+    rework (gh-135661, ~3.12.12) now skips it as a bogus comment. The contract is the
+    same on both sides — extraction must not raise — but which side the interpreter is
+    on decides whether the document is refused (old: guard translates the crash) or
+    survives (new: parser copes, text extracted). Assert only the shared contract; the
+    guard's translation is pinned deterministically in the next test."""
     src = _make_file(
         tmp_path, "marked.html", b"<p>Ferritin 201</p><![foo[ x ]]><p>tail</p>",
     )
     text, route = ingest.extract_text_routed(src)      # must not raise
     assert route == "native-prose"                     # ...and reports its own route
+    assert text is None or "Ferritin 201" in text
+
+
+def test_html_parser_assertion_is_translated_to_a_refusal(
+    tmp_path, capsys, monkeypatch
+):
+    """The `_extract_html` guard itself, version-independent: interpreters up to
+    mid-3.12 still raise `AssertionError` on ordinary saved pages (previous test), and
+    `AssertionError` is deliberately not in `_EXTRACT_ERRORS` (widening it would
+    swallow our own asserts). Simulate the raise at the `feed` seam the guard wraps
+    and pin the translation: no escape, stderr note, document refused not crashed —
+    the #138 audit's `RecursionError` defect class."""
+    def _raise(self, data):
+        raise AssertionError("unknown status keyword 'foo' in marked section")
+
+    monkeypatch.setattr(ingest._HtmlText, "feed", _raise)
+    src = _make_file(tmp_path, "marked.html", b"<p>Ferritin 201</p>")
+    text, route = ingest.extract_text_routed(src)      # must not raise
+    assert route == "native-prose"
     assert text is None
     assert "malformed HTML markup" in capsys.readouterr().err
 
