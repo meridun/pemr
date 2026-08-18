@@ -214,6 +214,7 @@ def query_timeline(
     since: str | None = None,
     *,
     with_identity: bool = False,
+    exclude_obs_types: frozenset[str] | None = None,
 ) -> list[dict]:
     """Merged chronological event stream across the typed tables + observations.
 
@@ -239,6 +240,16 @@ def query_timeline(
     into both contracts. Since issue #131 the `pemr query timeline` CLI handler and the
     MCP ``query`` tool turn it on too — the same overlay `render_journal` applies — and
     both strip the three keys again before emitting anything.
+
+    ``exclude_obs_types`` drops ``observation`` rows whose ``obs_type`` is in the set,
+    before the event is built (issue #167). Keyword-only and **default-off**: ``None``
+    filters nothing, so every existing caller's output is byte-identical. It filters on
+    the *row* rather than on the built event deliberately — an event carries no
+    ``obs_type`` key (it is folded into ``summary``), string-prefix matching a rendered
+    sentence is exactly the fragile thing to avoid, and widening the event dict is the
+    same public-contract problem ``with_identity`` exists to sidestep. `render_journal`
+    is the one caller that passes a set, to keep a few hundred self-reported attestations
+    a year out of a decades-long chronology.
     """
     person_id = resolve_person_id(conn, slug)
     events: list[dict] = []
@@ -308,6 +319,8 @@ def query_timeline(
     for r in conn.execute(
         "SELECT * FROM observation WHERE person_id = ?", (person_id,)
     ).fetchall():
+        if exclude_obs_types and r["obs_type"] in exclude_obs_types:
+            continue
         value = r["value_num"] if r["value_num"] is not None else r["value_text"]
         unit = f" {r['unit']}" if r["unit"] else ""
         parts = [r["obs_type"]]

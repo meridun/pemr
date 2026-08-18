@@ -504,11 +504,22 @@ def render_brief(conn: sqlite3.Connection, *, appointment: int) -> dict[str, str
 
 
 def render_journal(
-    conn: sqlite3.Connection, *, person: str, since: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    person: str,
+    since: str | None = None,
+    include_self_reported: bool = False,
 ) -> dict[str, str]:
-    """[read] Narrative chronology for a person -> Markdown. Mirrors ``pemr render journal``."""
+    """[read] Narrative chronology for a person -> Markdown. Mirrors ``pemr render journal``.
+
+    ``include_self_reported`` mirrors the CLI's ``--include-self-reported`` (issue #167),
+    a pass-through with no logic of its own: the two verbs must not drift about what the
+    journal contains.
+    """
     try:
-        markdown = _render.render_journal(conn, person, since=since)
+        markdown = _render.render_journal(
+            conn, person, since=since, include_self_reported=include_self_reported
+        )
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}
@@ -615,8 +626,15 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         return _run(render_brief, appointment=appointment)
 
     @server.tool(name="render_journal", annotations=ro)
-    def render_journal_tool(person: str, since: str | None = None) -> dict:
-        return _run(render_journal, person=person, since=since)
+    def render_journal_tool(
+        person: str, since: str | None = None, include_self_reported: bool = False
+    ) -> dict:
+        return _run(
+            render_journal,
+            person=person,
+            since=since,
+            include_self_reported=include_self_reported,
+        )
 
     @server.tool(name="render_curation", annotations=ro)
     def render_curation_tool(person: str) -> dict:

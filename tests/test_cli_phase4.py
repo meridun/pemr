@@ -545,3 +545,90 @@ def test_render_summary_open_conflicts_warning_end_to_end(ready, capsys):
     assert "> 1 open conflict - some values below may be superseded." in out
     assert "`pemr review-conflicts`" in out
     assert out.isascii()
+
+
+# --- self-reported symptom / activity lanes (issue #167) ----------------------
+#
+# End-to-end through the real argv surface: `record assert` in, `render summary` and
+# `render journal` out. The summary's window is relative to the real clock (the CLI
+# passes no `now`), so the dates here are computed from today rather than pinned.
+
+def _assert_symptom(tmp_path, observed_at, key="right foot ache", severity="3",
+                    obs_type="symptom"):
+    return _run(
+        tmp_path, "record", "assert", "observation", "--person", "jane-doe",
+        "--attributed-to", "Jane Doe", "--date", "2026-08-18",
+        "--field", f"obs_type={obs_type}", "--field", f"key={key}",
+        "--field", f"observed_at={observed_at}",
+        "--field", f"value_num={severity}", "--apply",
+    )
+
+
+def test_two_same_day_symptom_asserts_collapse_into_one_summary_line(ready, capsys):
+    """T10: the whole lane, through argv. Two reports on one calendar day survive as two
+    rows (the time-of-day rule) and render as one collapsed line (the section's point)."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=2)
+    assert _assert_symptom(tmp_path, f"{day}T09:00", severity="5") == 0
+    assert _assert_symptom(tmp_path, f"{day}T21:00", severity="3") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "## Self-Reported Symptoms" in out
+    line = next(ln for ln in out.splitlines() if "right foot ache" in ln)
+    assert line.startswith(
+        f"- right foot ache - 2 reports in 30d, latest {day} (severity 3/10)"
+    )
+    assert "(attested by Jane Doe 2026-08-18; no source document)" in line
+
+
+def test_a_date_only_symptom_assert_exits_non_zero(ready, capsys):
+    """The precision rule is a refusal with a message that names the fix, not a crash."""
+    tmp_path, _ = ready
+    assert _assert_symptom(tmp_path, str(date.today())) == 1
+    err = capsys.readouterr().err
+    assert "requires a time of day (YYYY-MM-DDTHH:MM)" in err
+    assert err.isascii()
+
+
+def test_journal_hides_self_reports_until_asked(ready, capsys):
+    """The flag, end to end: a chronology spanning decades must not be swamped by a few
+    hundred attestations a year, but the events stay one flag away."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T09:00") == 0
+    assert _assert_symptom(tmp_path, f"{day}T07:30", key="morning walk",
+                           obs_type="activity", severity="40") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "journal", "--person", "jane-doe") == 0
+    default = capsys.readouterr().out
+    assert "right foot ache" not in default and "morning walk" not in default
+    assert "Metformin" in default            # control: the chronology is otherwise whole
+
+    assert _run(tmp_path, "render", "journal", "--person", "jane-doe",
+                "--include-self-reported") == 0
+    opted_in = capsys.readouterr().out
+    assert "symptom right foot ache" in opted_in
+    assert "activity morning walk" in opted_in
+
+
+def test_query_timeline_still_shows_every_self_report(ready, capsys):
+    """`activity` stays reachable: only the journal filters, and `query timeline` is the
+    complete record it filters *from*."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T07:30", key="morning walk",
+                           obs_type="activity", severity="40") == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    events = json.loads(capsys.readouterr().out)
+    assert any("morning walk" in e["summary"] for e in events)
+
+
+def test_a_person_with_no_self_reports_gets_no_symptom_section(ready, capsys):
+    """The additive-only rule at the CLI: no header implying the patient reports nothing."""
+    tmp_path, _ = ready
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    assert "Self-Reported Symptoms" not in capsys.readouterr().out

@@ -869,6 +869,139 @@ def test_functional_commit_without_observed_at_is_rejected(conn):
     assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
 
 
+# --- self-reported symptom / activity lanes (issue #167) ----------------------
+
+def _symptom(observed_at="2026-08-16T09:00", key="right foot ache",
+             value_num=3, value_text="achy after the walk"):
+    return {"obs_type": "symptom", "key": key, "observed_at": observed_at,
+            "value_num": value_num, "value_text": value_text}
+
+
+def test_validate_accepts_a_self_reported_symptom_row():
+    # T1: the shape the lane is built for -- key = the complaint, value_num = a 0-10
+    # severity, value_text = the patient's verbatim wording.
+    dedup.validate_row("observation", _symptom())
+
+
+def test_validate_accepts_a_self_reported_activity_row():
+    dedup.validate_row(
+        "observation",
+        {"obs_type": "activity", "key": "walk", "observed_at": "2026-08-16T07:30",
+         "value_num": 40, "unit": "min"},
+    )
+
+
+@pytest.mark.parametrize("obs_type", ["symptom", "activity"])
+def test_validate_rejects_a_self_reported_row_without_a_key(obs_type):
+    # T2a: a keyless self-report is exactly the untyped blob the lane exists to prevent.
+    with pytest.raises(dedup.ValidationError,
+                       match=rf"missing required field 'key'.*{obs_type}"):
+        dedup.validate_row(
+            "observation",
+            {"obs_type": obs_type, "observed_at": "2026-08-16T09:00",
+             "value_text": "sore"},
+        )
+
+
+@pytest.mark.parametrize("obs_type", ["symptom", "activity"])
+def test_validate_rejects_a_self_reported_row_without_an_observed_at(obs_type):
+    # T2c: undated, a fluctuating complaint answers no frequency question at all.
+    with pytest.raises(dedup.ValidationError,
+                       match=rf"missing required field 'observed_at'.*{obs_type}"):
+        dedup.validate_row(
+            "observation", {"obs_type": obs_type, "key": "right foot ache"}
+        )
+
+
+@pytest.mark.parametrize("observed_at", ["2026-08-16", "2026-08", "2026"])
+def test_validate_rejects_a_self_report_dated_without_a_time(observed_at):
+    # T2b/T2b2: the precision rule, and the validation-order hazard with it. A
+    # year-precision value is 4 characters long, so a helper that indexed blindly would
+    # raise IndexError instead of a ValidationError -- the guard is what keeps the
+    # message honest at every precision.
+    with pytest.raises(dedup.ValidationError) as exc:
+        dedup.validate_row("observation", _symptom(observed_at=observed_at))
+    message = str(exc.value)
+    assert "requires a time of day (YYYY-MM-DDTHH:MM)" in message   # names the fix
+    assert observed_at in message                                   # names what it saw
+    assert message.isascii()                                        # cp1252 (issue #23)
+
+
+def test_self_report_precision_rule_does_not_shadow_the_iso_check():
+    # A present-but-junk observed_at still reports as an ISO-date error: the DATE_FIELDS
+    # loop is what proves the value parseable before the precision branch indexes it.
+    with pytest.raises(dedup.ValidationError, match=r"observed_at.*ISO date"):
+        dedup.validate_row("observation", _symptom(observed_at="yesterday morning"))
+
+
+@pytest.mark.parametrize("obs_type", ["vital", "order", "screening", "immunization",
+                                      "functional"])
+def test_the_time_of_day_rule_is_scoped_to_the_self_reported_lanes(obs_type):
+    # Scoping regression: mandating a time on the older families would reject every
+    # already-valid extraction, which state dates and not clock times.
+    dedup.validate_row(
+        "observation",
+        {"obs_type": obs_type, "key": "anything", "observed_at": "2026-07-14"},
+    )
+
+
+def test_same_day_symptom_reports_at_different_times_are_distinct_rows(conn):
+    # T3, the point of the whole precision rule: two reports of one complaint on one
+    # calendar day must survive as two rows.
+    doc = _make_document(conn)
+    summary = dedup.commit_extraction(conn, doc, {"observation": [
+        _symptom(observed_at="2026-08-16T09:00", value_num=3),
+        _symptom(observed_at="2026-08-16T21:00", value_num=6),
+    ]})
+    assert summary.counts["new"] == 2
+    keys = {r["dedup_key"] for r in conn.execute(
+        "SELECT dedup_key FROM observation WHERE obs_type='symptom'"
+    ).fetchall()}
+    assert len(keys) == 2
+
+
+def test_a_symptom_restated_at_the_same_timestamp_still_collides(conn):
+    # The other half of T3: the correction-collides property is preserved, not traded
+    # away. A re-read of the *same* report carries the same timestamp, so it dedups --
+    # a differing value stages a conflict rather than becoming a phantom second report.
+    doc1, doc2 = _make_document(conn), _make_document(conn)
+    dedup.commit_extraction(conn, doc1, {"observation": [_symptom()]})
+    same = dedup.commit_extraction(conn, doc2, {"observation": [_symptom()]})
+    assert same.counts["duplicate"] == 1
+    differing = dedup.commit_extraction(
+        conn, doc2, {"observation": [_symptom(value_num=8)]}
+    )
+    assert differing.counts["conflict"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM observation WHERE obs_type='symptom'"
+    ).fetchone()["n"] == 1
+
+
+def test_a_self_reported_row_never_creates_a_condition(conn):
+    # The load-bearing invariant (issue #167): these lanes stay inside the `observation`
+    # catch-all. The problem list is clinician-sourced and heavily verdict-suppressed;
+    # routing unfiltered self-attestations into it would undo that curation.
+    doc = _make_document(conn)
+    dedup.commit_extraction(conn, doc, {"observation": [
+        _symptom(),
+        {"obs_type": "activity", "key": "walk", "observed_at": "2026-08-16T07:30"},
+    ]})
+    assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 0
+
+
+def test_observation_identity_is_not_forked_by_obs_type():
+    # `_key_parts`/`KEY_FIELDS` are untouched: the fix is a validation-time precision
+    # rule, not a second key shape. So no stored row's dedup_key moves (no `pemr rekey`
+    # implied), and a symptom row keys on exactly the four parts every observation does.
+    assert dedup.KEY_FIELDS["observation"] == frozenset({"obs_type", "observed_at", "key"})
+    parts = dedup._key_parts("observation", _symptom(), 1)
+    assert parts == [1, "symptom", "2026-08-16 09:00", "right foot ache"]
+    # The severity is payload, never identity -- an edited value must keep colliding as a
+    # correction instead of silently becoming a second report.
+    assert dedup._key_parts("observation", _symptom(value_num=9), 1) == parts
+
+
 # --- intra-payload collisions (issue #58) -------------------------------------
 
 def test_intra_payload_collision_with_differing_values_is_rejected(conn):
