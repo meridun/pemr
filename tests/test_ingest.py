@@ -1414,6 +1414,220 @@ def test_extract_text_has_no_route_for_msg(conn, tmp_path, sources, capsys, monk
     assert "--ocr-text-file" in capsys.readouterr().err
 
 
+# --- HTML (issue #173) ---------------------------------------------------------
+# A saved portal page used to reach tesseract, which cannot decode HTML, so it stored
+# nothing. It is the first format that is natively extracted *and* prose, which is why
+# the route vocabulary grew a third word (`native-prose`) rather than reusing `native`:
+# `trust_anchors` reads "not native ⇒ prose", and a printed `Patient:` header on a
+# portal page **is** an identity claim, unlike a spreadsheet's `Patient ID` column.
+
+
+def _make_html(
+    tmp_path, name="portal.html", patient="Jane Doe", dob="03/14/1962", body=None,
+):
+    """A saved visit-summary page: `<style>`/`<script>` in the head, an identity header
+    split by a `<br>`, a results table, and both entity forms."""
+    if body is None:
+        body = (
+            '<div class="banner"><p>Mercy Clinic &amp; Labs</p></div>\n'
+            f"<p>Patient: {patient}<br>DOB: {dob}</p>\n"
+            "<table>"
+            "<thead><tr><th>Test</th><th>Value</th></tr></thead>"
+            "<tbody><tr><td><div>Ferritin</div></td><td>201&#160;ng/mL</td></tr></tbody>"
+            "</table>"
+        )
+    page = (
+        "<!DOCTYPE html>\n<html><head><title>Visit Summary</title>\n"
+        "<style>.banner { color: #003366; }</style>\n"
+        "<script>var portalPatientId = 1043;</script>\n"
+        f"</head><body>\n{body}\n</body></html>\n"
+    )
+    p = tmp_path / name
+    p.write_text(page, encoding="utf-8")
+    return p
+
+
+@pytest.mark.parametrize("name", ["portal.html", "portal.htm"])
+def test_extract_text_reads_saved_portal_html(tmp_path, name):
+    text, route = ingest.extract_text_routed(_make_html(tmp_path, name=name))
+    assert route == "native-prose"
+    lines = text.splitlines()
+    assert "Patient: Jane Doe" in lines          # `<br>` ended the line...
+    assert "DOB: 03/14/1962" in lines            # ...so the DOB is its own
+    assert "Mercy Clinic & Labs" in lines        # `&amp;` decoded
+    # the row's header cell stays beside its value, `&#160;` folded to a space
+    assert "Ferritin\t201 ng/mL" in lines
+    assert "Test\tValue" in lines
+    assert "<" not in text                       # every tag stripped
+
+
+def test_html_script_and_style_contents_are_dropped(tmp_path):
+    """`ocr_text` is mirrored into the FTS index, so JS and CSS must never reach it."""
+    text, _ = ingest.extract_text_routed(_make_html(tmp_path))
+    assert "portalPatientId" not in text
+    assert "#003366" not in text
+    assert ".banner" not in text
+
+
+def test_nested_skip_tags_do_not_leak_their_contents(tmp_path):
+    """The skip state is a depth counter, not a boolean, which a boolean would get wrong
+    in both directions. `<script>`/`<style>` are the easy case — the stdlib reads them in
+    CDATA mode, so their bodies arrive as one `handle_data` — but `<noscript>` and
+    `<template>` are parsed normally and *do* nest, and a boolean flips back on the
+    innermost close, leaking markup-ish text into `ocr_text` and thence the FTS index."""
+    text, route = ingest.extract_text_routed(
+        _make_html(
+            tmp_path, name="nested.html",
+            body="<template><template>inner</template>outer</template>"
+                 "<p>Ferritin 201</p>",
+        )
+    )
+    assert route == "native-prose"
+    assert text.splitlines() == ["Visit Summary", "Ferritin 201"]
+
+
+def test_stray_end_tag_does_not_drop_the_rest_of_the_page(tmp_path):
+    """The other direction: an unmatched `</script>` must floor the depth at 0 rather
+    than go negative, or every later `</...>` would keep it "inside" a skip and the real
+    content would vanish."""
+    text, _ = ingest.extract_text_routed(
+        _make_html(
+            tmp_path, name="stray.html",
+            body="</script></template><p>Ferritin 201</p>",
+        )
+    )
+    assert "Ferritin 201" in text.splitlines()
+
+
+def test_malformed_html_does_not_raise(tmp_path):
+    """Crossed and unclosed tags are what a saved page actually looks like."""
+    src = _make_file(
+        tmp_path, "broken.html", b"<p>alpha<div><span>beta</p></div></span><td>gamma",
+    )
+    text, route = ingest.extract_text_routed(src)
+    assert route == "native-prose"
+    assert "alpha" in text and "beta" in text and "gamma" in text
+
+
+def test_html_marked_section_does_not_raise(tmp_path):
+    """`<![foo[ x ]]>` crashed `html.parser` with a bare `AssertionError` from
+    `_markupbase.parse_marked_section` up to mid-3.12 (gh-81928); the HTML5-conformance
+    rework (gh-135661, ~3.12.12) now skips it as a bogus comment. The contract is the
+    same on both sides — extraction must not raise — but which side the interpreter is
+    on decides whether the document is refused (old: guard translates the crash) or
+    survives (new: parser copes, text extracted). Assert only the shared contract; the
+    guard's translation is pinned deterministically in the next test."""
+    src = _make_file(
+        tmp_path, "marked.html", b"<p>Ferritin 201</p><![foo[ x ]]><p>tail</p>",
+    )
+    text, route = ingest.extract_text_routed(src)      # must not raise
+    assert route == "native-prose"                     # ...and reports its own route
+    assert text is None or "Ferritin 201" in text
+
+
+def test_html_parser_assertion_is_translated_to_a_refusal(
+    tmp_path, capsys, monkeypatch
+):
+    """The `_extract_html` guard itself, version-independent: interpreters up to
+    mid-3.12 still raise `AssertionError` on ordinary saved pages (previous test), and
+    `AssertionError` is deliberately not in `_EXTRACT_ERRORS` (widening it would
+    swallow our own asserts). Simulate the raise at the `feed` seam the guard wraps
+    and pin the translation: no escape, stderr note, document refused not crashed —
+    the #138 audit's `RecursionError` defect class."""
+    def _raise(self, data):
+        raise AssertionError("unknown status keyword 'foo' in marked section")
+
+    monkeypatch.setattr(ingest._HtmlText, "feed", _raise)
+    src = _make_file(tmp_path, "marked.html", b"<p>Ferritin 201</p>")
+    text, route = ingest.extract_text_routed(src)      # must not raise
+    assert route == "native-prose"
+    assert text is None
+    assert "malformed HTML markup" in capsys.readouterr().err
+
+
+def test_html_is_not_read_as_plaintext(tmp_path):
+    """Adding the suffixes to `_PLAINTEXT_SUFFIXES` would be the tempting simplification:
+    it stores the markup verbatim *and* routes the page `"native"`, losing the anchor."""
+    assert ".html" not in ingest._PLAINTEXT_SUFFIXES
+    assert ".htm" not in ingest._PLAINTEXT_SUFFIXES
+    text, _ = ingest.extract_text_routed(_make_html(tmp_path))
+    assert "<p>" not in text and "<table" not in text
+
+
+def test_html_never_shells_out(conn, tmp_path, sources, monkeypatch):
+    def boom(path):  # pragma: no cover - the assertion is that this never runs
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", boom)
+    src = _make_html(tmp_path)
+    assert ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).ocr_text_populated
+
+
+@pytest.mark.parametrize(
+    "route, trusts",
+    [("ocr", True), ("native", False), ("native-prose", True)],
+)
+def test_trusts_anchors_route_table(route, trusts):
+    """The one place the route vocabulary is asserted: `native` is structured, the other
+    two are prose."""
+    assert ingest._trusts_anchors(route) is trusts
+
+
+def test_html_route_keeps_the_identity_anchor_check(conn, tmp_path, sources):
+    """AC bullet 3, and the whole point of the third route value: a page headed with a
+    stranger's name is `suspect`, where the `.csv` equivalent is `unverified`."""
+    _seed_roster(conn)
+    src = _make_html(
+        tmp_path, name="stranger.html", patient="SMITH, KAREN", dob="09/09/1971",
+    )
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "suspect"
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_html_mismatch_still_blocks(conn, tmp_path, sources):
+    """The protective half of #61 fires on the new route too."""
+    _seed_roster(conn)
+    src = _make_html(
+        tmp_path, name="other.html", patient="ROE, ROBERT ALAN", dob="11/02/1955",
+    )
+    with pytest.raises(ingest.OwnerMismatchError) as excinfo:
+        ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert excinfo.value.check.verdict == "mismatch"
+    assert excinfo.value.check.matched_slug == "bob-roe"
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+
+
+def test_html_ingest_stores_normalized_text(conn, tmp_path, sources):
+    """AC bullet 2 — the branch falls through to the shared tail, so `--ocr auto` and
+    `--ocr-text-file` keep agreeing on what "empty" means (issue #87)."""
+    result = ingest.ingest_document(
+        conn, _make_html(tmp_path), "jane-doe", sources, ocr=True
+    )
+    assert result.ocr_text_populated
+    stored = result.document.ocr_text
+    assert stored == ingest.normalize_document_text(stored)
+
+
+def test_empty_html_degrades_like_any_other_textless_file(
+    conn, tmp_path, sources, capsys, monkeypatch
+):
+    """Nothing extractable is `None`, not an empty string — and it degrades natively
+    rather than falling through to tesseract."""
+    def never(path):  # pragma: no cover - the degrade is native, not a fallback
+        raise AssertionError(f"run_ocr must not be called for {path}")
+
+    monkeypatch.setattr(ingest, "run_ocr", never)
+    src = _make_file(tmp_path, "blank.html", b"<html><body><div> </div></body></html>")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.status == "new"                # the document still lands
+    assert result.document.ocr_text is None
+    assert "--ocr-text-file" not in capsys.readouterr().err   # no OCR advice: it parsed
+
+
 # --- routing boundary (issue #66 verify bounce) --------------------------------
 # `ocr=True` used to hand *every* file to tesseract. An image-suffix allowlist silently
 # dropped `.jfif`/`.jpe`/extension-less scans out of `find`, so anything without a native
@@ -1717,7 +1931,11 @@ def test_plaintext_suffixes_are_route_scoped_too(conn, tmp_path, sources, name):
     identity header in a natively-read `.txt`/`.md`/`.tsv`/`.log` yields `unverified`,
     not `suspect`. Not a regression — before native extraction these went to tesseract,
     which declined, so there was no text and no check either — but it is the behavior
-    `AGENTS.md` §3 documents, so pin it rather than let it drift silently."""
+    `AGENTS.md` §3 documents, so pin it rather than let it drift silently.
+
+    HTML (issue #173) is deliberately the exception, not a precedent to extend here: it
+    rides `"native-prose"` and *does* keep the anchor. Re-classifying these four suffixes
+    would change owner-check behaviour for already-ingested formats — a separate issue."""
     _seed_roster(conn)
     src = _make_file(
         tmp_path, name, b"MERCY LABS\nPatient: SMITH, KAREN\nDOB: 09/09/1971\n"
@@ -1763,7 +1981,7 @@ def test_ocr_route_still_produces_suspect(conn, tmp_path, sources, monkeypatch):
 # `word/document.xml`). Over the cap degrades like any other extraction failure.
 
 
-@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt", "ccda"])
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "txt", "ccda", "html"])
 def test_oversized_extraction_degrades_instead_of_reading_it(
     conn, tmp_path, sources, capsys, monkeypatch, kind
 ):
@@ -1776,6 +1994,8 @@ def test_oversized_extraction_degrades_instead_of_reading_it(
         # over the cap degrades *native* with the cap note, rather than falling
         # through to a tesseract failure that says nothing useful
         src = _make_ccda(tmp_path)
+    elif kind == "html":
+        src = _make_html(tmp_path)
     else:
         src = _make_file(tmp_path, "big.txt", b"x" * 500)
     result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
@@ -2179,6 +2399,23 @@ def test_reocr_truncated_and_shrunk_reports_both(
     assert result.status == "shorter-text"
     assert result.truncated is True
     assert result.shrunk is True
+
+
+def test_reocr_html_reports_the_prose_route(conn, tmp_path, sources):
+    """The second `trust_anchors` call site reaches the same route value ingest does —
+    which is also what `pemr document reocr` prints (issue #143 backfills `.html` for
+    free once this branch exists)."""
+    _seed_roster(conn)
+    page = _make_html(tmp_path, name="reocr-src.html").read_bytes()
+    doc = _file_document(conn, tmp_path, sources, name="portal.html", content=page)
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.route == "native-prose"
+    assert result.status == "written"
+    # anchors trusted on this route, and the header names the owner
+    assert result.owner_check.verdict == "match"
+    assert "Ferritin\t201 ng/mL" in _stored_text(conn, doc.document_id)
 
 
 def test_reocr_reports_a_missing_blob_without_writing(conn, tmp_path, sources):

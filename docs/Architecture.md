@@ -886,7 +886,9 @@ Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text 
 from instead of re-reading the source every time. It extracts by whatever route the file
 type allows (issue #66), with only the image and PDF routes reaching outside the stdlib:
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
-parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
+parsed, `.html`/`.htm` parsed with `html.parser` (issue #173 — tags stripped,
+`<script>`/`<style>` dropped, tables as tab-delimited rows), **everything else** through
+`tesseract` (a soft dependency) — no image-suffix
 allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Every
 OOXML member goes through one guarded parse helper that applies the same encoding-agnostic
 `<!DOCTYPE` refusal described for CCDA below before `ElementTree` sees the bytes (issue
@@ -944,12 +946,18 @@ capped at 32 MiB per file — `ocr_text` is mirrored into the FTS index, so an u
 both a database-size problem and a decompression-bomb surface (a small `.docx` can declare a
 gigabyte of `word/document.xml`).
 
-Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
-only to an agent transcription or a tesseract pass, never to natively-extracted text —
-the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set, CCDA `.xml` included. In a
+Extraction route feeds the owner check, and the route vocabulary has **three** words for
+it: `native` (natively extracted, *structured*), `native-prose` (natively extracted,
+*prose* — HTML, issue #173) and `ocr` (a tesseract pass or an agent transcription, prose
+by definition). The identity-anchor (`suspect`) verdict is applied on the two prose
+routes and withheld on `native` — the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx`
+set, CCDA `.xml` included. In a
 structured export
 `Patient`/`DOB`/`MRN` are column labels and field keys, and counting them as an identity
-header refuses ordinary lab exports as belonging to a stranger. The line is the *route*
+header refuses ordinary lab exports as belonging to a stranger. A saved portal page is
+the other case: tags aside it is a printed page, so its `Patient:` header **is** a claim
+and the anchor stays armed — which is the whole reason the boolean `route != "native"`
+grew into `_trusts_anchors()`, one predicate both call sites share. The line is the *route*
 rather than how prose-like the format is, because the route is what the extractor actually
 knows; the cost is that a prose transcript saved as `.txt` and ingested with `--ocr auto`
 loses the anchor check too. That is no worse than before native extraction existed (such a
