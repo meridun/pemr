@@ -182,7 +182,12 @@ reports no orphan, while the fact leaves the annotated person's chart and never 
 the target person's. `record annotate` therefore refuses a cross-person `--merged-into`,
 and `record reaffirm` refuses the same shape at plan time (issue #161).
 `--allow-cross-person` is the explicit escape hatch for the rare deliberate case: never the
-default, and disclosed in the report (`cross_person`) rather than recorded silently.
+default, and disclosed in the report (`cross_person`) rather than recorded silently. That
+guard is forward-only, so `pemr verify` also **flags** a stored `merged_into_base` that
+resolves to another person's live family (issue #169) — the shape a verdict written before
+#161 can still carry. `cross_person` is not persisted on the row, so a deliberate
+`--allow-cross-person` merge shows up in that warning too; the message says as much, and
+warning on both beats staying silent on the accidental one.
 
 A correction is **not** a re-attribution. Before `record edit`, a wrong display field
 could only be repaired by re-submitting the row through `commit-extraction` (or deleting
@@ -638,7 +643,10 @@ the warning it answers would re-annotate the wrong rows. It owns exactly two cla
 `dangling-merge-target` (either scope, `merged_into_base` names no live family). The
 row-scoped **stale breadcrumb** is deliberately not one of them — that verdict still
 resolves by row id, so nothing may re-point it — nor is the removed-row case, whose remedy
-is `--clear --row` and which the removal write paths already retire.
+is `--clear --row` and which the removal write paths already retire. Nor is the
+cross-person merge target (#169): its family is *live*, just the wrong person's, and
+neither `record reaffirm` nor `rekey --apply` has a remedy for that — making it a kind
+would have them offer to re-point a verdict only a human re-ruling can fix.
 
 The two halves compose **by file**, and have to: a `dedup_base` is a content hash
 overwritten in place, so once the run is over nothing in the database records that `F_old`
