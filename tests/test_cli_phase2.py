@@ -1217,6 +1217,118 @@ def test_lab_export_with_a_patient_column_is_not_refused(ready, capsys):
 
     assert _run(tmp_path, "find", "--person", "jane-doe", "glucose") == 0
     assert "#1" in capsys.readouterr().out
+
+
+# --- saved HTML portal pages at the CLI (issue #173) ---------------------------
+# `tests/test_ingest.py` covers the extractor and both `trust_anchors` call sites at
+# the library level; these two walk the same behaviour through `pemr ingest`/`find`/
+# `document reocr` — the verify-stage real run, kept as a repeatable spec.
+
+_PORTAL_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>MyChart &mdash; Visit Summary</title>
+<style>.banner { color: #003366; font-family: "Helvetica Neue", sans-serif; }</style>
+<script>var portalSessionToken = "abc123"; analytics.send("visit-summary");</script>
+</head><body onload="trackPageView()">
+<div class="banner">Mercy Clinic &amp; Labs</div>
+<p>Patient: Jane Doe<br>DOB: 01/01/1980</p>
+<table><thead><tr><th>Test</th><th>Result</th></tr></thead><tbody>
+<tr><td><div>Ferritin</div></td><td>201&#160;ng/mL</td></tr>
+<tr><td></td><td></td></tr>
+</tbody></table>
+<noscript><p>Enable JavaScript for the interactive chart.</p></noscript>
+</body></html>
+"""
+
+# The same lab table twice, in the two formats whose owner-check verdicts now differ.
+_LAB_TABLE_CSV = "Patient ID,Test,Result\n00998877,Ferritin,201 ng/mL\n"
+_LAB_TABLE_HTML = (
+    "<html><body><table>"
+    "<tr><th>Patient ID</th><th>Test</th></tr>"
+    "<tr><td>00998877</td><td>Ferritin 201 ng/mL</td></tr>"
+    "</table></body></html>"
+)
+
+
+def test_ocr_auto_reads_a_saved_portal_page_end_to_end(ready, capsys):
+    """Issue #173 through the CLI: a saved portal page used to reach tesseract, which
+    cannot decode HTML, so it stored nothing and never entered `find`. Now it is read
+    natively on the `native-prose` route — tags stripped, `<script>`/`<style>` out of
+    the FTS index, the identity header live, and the route named in `reocr` output."""
+    from pemr import ingest as ingest_mod
+
+    tmp_path = ready
+    page = tmp_path / "portal.html"
+    page.write_text(_PORTAL_PAGE, encoding="utf-8")
+    sources = tmp_path / "sources"
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out
+    # the anchor is armed on this route, and the header names the owner
+    assert "owner verified: matched 'jane-doe' in document text" in out.out
+    assert "no ocr_text stored" not in out.err
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        text = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    lines = text.splitlines()
+    assert "Patient: Jane Doe" in lines             # `<br>` ended the line...
+    assert "DOB: 01/01/1980" in lines               # ...so the DOB is its own
+    assert "Mercy Clinic & Labs" in lines           # `&amp;` decoded
+    assert "Ferritin\t201 ng/mL" in lines           # `<div>` did not split the cell
+    assert "\t\t" not in text and "\t" in text      # the all-empty row contributed none
+    assert "<" not in text                          # every tag stripped
+    assert text == ingest_mod.normalize_document_text(text)   # stored normalized
+
+    # `ocr_text` is mirrored into FTS, so the page's code must be unfindable...
+    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
+    assert "#1" in capsys.readouterr().out
+    for junk in ("portalSessionToken", "Helvetica", "JavaScript"):
+        assert _run(tmp_path, "find", "--person", "jane-doe", junk) == 0
+        assert "no matches" in capsys.readouterr().out, junk
+
+    # ...and `document reocr` reports the third route value on its own line (#143)
+    assert _run(tmp_path, "document", "reocr", "1", "--sources", str(sources),
+                "--dry-run", "--force") == 0
+    assert "route native-prose" in capsys.readouterr().out
+
+
+def test_html_lab_table_is_refused_where_the_csv_equivalent_is_not(ready, capsys):
+    """The intended, bounded cost of arming the anchor on HTML: the *same* lab table
+    files as `.csv` (structured — `Patient ID` is a column label, issue #66) and is
+    refused as `suspect` when it arrives as a saved `.html` page. `--force` is the
+    one-flag recovery. Pin it, so the divergence stays a decision rather than drift."""
+    tmp_path = ready
+    sources = tmp_path / "sources"
+    csv = tmp_path / "labs.csv"
+    csv.write_text(_LAB_TABLE_CSV, encoding="utf-8")
+    page = tmp_path / "labs.html"
+    page.write_text(_LAB_TABLE_HTML, encoding="utf-8")
+
+    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 0
+    assert "ingested document #1" in capsys.readouterr().out
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 1
+    err = capsys.readouterr().err
+    assert "owner verification failed" in err
+    assert "re-run with --force" in err
+    assert len(_document_id(tmp_path)) == 1          # pre-write refusal: nothing landed
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto", "--force") == 0
+    out = capsys.readouterr()
+    assert "ingested document #2" in out.out
+    assert "verdict: suspect" in out.err
+
+
 def _stage_pre_006(tmp_path):
     """Copy every migration below 006 into a staging dir (leaving 006 pending)."""
     import shutil
