@@ -751,3 +751,66 @@ def test_trends_preference_is_person_scoped(mixed_weights):
     units.set_pref(mixed_weights, "jane-doe", "hba1c", "%", dictionary=d)
     john = query.trends(mixed_weights, "john-doe", "hba1c", dictionary=d)
     assert john["canonical_unit"] is None and john["latest"] == 9.0
+
+
+def _seed_self_reports(conn, slug="jane-doe"):
+    """Two self-reported rows (issue #167), entered the way `record assert` does."""
+    from pemr import attestations
+
+    for row in (
+        {"obs_type": "symptom", "key": "right foot ache",
+         "observed_at": "2026-08-16T09:00", "value_num": 3},
+        {"obs_type": "activity", "key": "morning walk",
+         "observed_at": "2026-08-16T07:30", "value_num": 40, "unit": "min"},
+    ):
+        attestations.assert_record(
+            conn, "observation", slug, row, attributed_to="Jane Doe",
+            attested_on="2026-08-18", apply=True,
+        )
+
+
+def test_timeline_returns_self_reports_by_default(seeded):
+    """Issue #167: `pemr query timeline` and the MCP `query` tool stay the complete
+    record. Only `render_journal` filters, and it does so by asking."""
+    _seed_self_reports(seeded)
+    summaries = [e["summary"] for e in query.query_timeline(seeded, "jane-doe")]
+    assert "symptom right foot ache = 3.0" in summaries
+    assert "activity morning walk = 40.0 min" in summaries
+
+
+def test_timeline_can_exclude_obs_types(seeded):
+    _seed_self_reports(seeded)
+    events = query.query_timeline(
+        seeded, "jane-doe", exclude_obs_types=dedup.SELF_REPORTED_OBS_TYPES
+    )
+    assert not any("right foot ache" in e["summary"] for e in events)
+    assert not any("morning walk" in e["summary"] for e in events)
+    # Control: another obs_type on the same table is untouched by the filter.
+    assert any("blood_pressure systolic" in e["summary"] for e in events)
+
+
+def test_excluding_obs_types_leaves_the_event_shape_alone(seeded):
+    """The filter drops rows before the event is built, so it can neither add nor remove
+    a key: an excluded-set call is the unfiltered call minus whole events."""
+    _seed_self_reports(seeded)
+    full = query.query_timeline(seeded, "jane-doe")
+    filtered = query.query_timeline(
+        seeded, "jane-doe", exclude_obs_types=dedup.SELF_REPORTED_OBS_TYPES
+    )
+    assert len(filtered) == len(full) - 2
+    assert all(set(e) == {"date", "type", "summary", "document_id"} for e in filtered)
+    assert filtered == [
+        e for e in full
+        if "right foot ache" not in e["summary"] and "morning walk" not in e["summary"]
+    ]
+
+
+def test_an_empty_exclusion_set_filters_nothing(seeded):
+    """Default-off, and `frozenset()` is treated as no filter too -- so no caller can
+    accidentally hand it an empty set and get a different-shaped result."""
+    _seed_self_reports(seeded)
+    full = query.query_timeline(seeded, "jane-doe")
+    assert query.query_timeline(seeded, "jane-doe", exclude_obs_types=None) == full
+    assert query.query_timeline(
+        seeded, "jane-doe", exclude_obs_types=frozenset()
+    ) == full

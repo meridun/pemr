@@ -28,6 +28,18 @@ canonical *vital* vocabulary in ``data/dictionary.example.toml``):
     **grouped at render time** by normalized ``key``, newest first, with the
     collapse disclosed on the line (issue #93) -- the stored rows keep their dates
     and stay distinct, because an order is an event, not a standing fact.
+  * **self-reported** -> ``obs_type='symptom'`` (``key`` = the complaint, ``value_num`` =
+    a 0-10 severity where **0 means reported resolved**, ``value_text`` = the verbatim
+    wording) and ``obs_type='activity'`` (exercise and general activity), both entered
+    through `pemr record assert` (issue #167). Two lanes on purpose: activity is the
+    higher-volume, lower-signal of the pair and would bury the symptom signal. Symptoms
+    render as one **collapsed** ``## Self-Reported Symptoms`` line per ``key``
+    (:func:`_self_reported_symptoms`) -- a chronological dump of "achy on the 16th / fine
+    on the 18th" is worse than nothing. Activity renders in **no** summary section at
+    all; it stays reachable through `query`, `trends` and the journal's opt-in flag.
+    Neither lane may ever reach `condition` or the problem-list sections: those are
+    clinician-sourced and heavily verdict-suppressed, and routing unfiltered
+    self-attestations into them would undo that curation.
 
 **Procedures on the summary** (issue #166). ``procedure`` rows arrive largely from billing
 documents, so the table mixes genuine procedural history with routine service lines
@@ -114,10 +126,17 @@ import calendar
 import re
 import sqlite3
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from . import curation, db, dedup, query, units
-from .dedup import enum_token, is_attested, key_token, norm
+from .dedup import (
+    OBS_SYMPTOM,
+    SELF_REPORTED_OBS_TYPES,
+    enum_token,
+    is_attested,
+    key_token,
+    norm,
+)
 
 # Observation obs_type conventions this layer reads (see module docstring).
 OBS_VITAL = "vital"
@@ -163,6 +182,14 @@ _BRIEF_RECENT_LABS = 10
 #: miss than the dump it bounds. The window controls volume; the keep-latest guard in
 #: `_abnormal_labs` controls that false-empty, which recurs at *any* fixed window.
 _ABNORMAL_LABS_WINDOW_MONTHS = 12
+
+#: Trailing window for the summary's self-reported symptom section (issue #167). Days,
+#: not months like `_ABNORMAL_LABS_WINDOW_MONTHS` above: a fluctuating complaint's
+#: decision-relevant span is weeks, and a report count is only meaningful against a span
+#: short enough to read as "lately". 30 is the window the issue's worked example states.
+#: There is deliberately no keep-latest guard here (unlike `_abnormal_labs`): a lab marker
+#: abnormal 14 months ago is still live, a complaint last mentioned 14 months ago is not.
+_SYMPTOM_WINDOW_DAYS = 30
 
 
 class AppointmentNotFoundError(ValueError):
@@ -566,6 +593,130 @@ def _latest_vitals(
     for r in kept:
         latest[key_token(r["key"], dictionary)] = r  # ascending -> last wins
     return [latest[k] for k in sorted(latest)]
+
+
+def _self_reported_symptoms(
+    conn: sqlite3.Connection,
+    person_id: int,
+    today: str,
+    dictionary: dict[str, str] | None,
+    cur: "_CurationPass | None" = None,
+) -> list[dict]:
+    """One collapsed entry per self-reported symptom ``key`` (issue #167).
+
+    A recurring, fluctuating complaint is reported over and over; rendering the reports
+    chronologically ("achy on the 16th / fine on the 18th") is worse than not rendering
+    them at all. So each ``key`` folds to **one** entry carrying how often it was
+    reported in the trailing ``_SYMPTOM_WINDOW_DAYS``, the latest present report, and the
+    latest report that it had *resolved*.
+
+    Selection rules, in the :func:`_abnormal_labs` spirit:
+
+    * curation runs **before** the fold, as in :func:`_latest_vitals`, so a superseded
+      report can neither win "latest" nor inflate the count;
+    * grouped on :func:`key_token`, matching the dedup key, so ``right foot ache
+      (morning)`` keeps its own entry rather than overwriting the plain one;
+    * a row whose ``observed_at`` will not parse counts as in-window, and an unparseable
+      ``today`` skips the bound entirely -- a bad date must never silently empty a medical
+      section;
+    * future-dated rows are untouched; only the old side is bounded.
+
+    ``value_num`` is the 0-10 severity, and **0 means reported resolved** -- the scale
+    already has a natural bottom, so absence needs no sentinel and no second obs_type. A
+    ``NULL`` ``value_num`` is a present report of unknown severity.
+    """
+    rows = conn.execute(
+        "SELECT * FROM observation WHERE person_id = ? AND obs_type = ? "
+        "ORDER BY observed_at, observation_id",
+        (person_id, OBS_SYMPTOM),
+    ).fetchall()
+    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
+
+    anchor = _as_date(today)
+    start = None if anchor is None else anchor - timedelta(days=_SYMPTOM_WINDOW_DAYS)
+
+    entries: dict[str, dict] = {}
+    for r in kept:  # ascending -> the last row seen for a key is its newest
+        when = _as_date(r["observed_at"])
+        if start is not None and when is not None and when < start:
+            continue
+        entry = entries.setdefault(
+            key_token(r["key"], dictionary),
+            {"label": "", "count": 0, "latest": None, "resolved": None, "sort": ""},
+        )
+        entry["label"] = r["key"]
+        entry["count"] += 1
+        entry["sort"] = r["observed_at"] or ""
+        if r["value_num"] == 0:
+            entry["resolved"] = r
+        else:
+            entry["latest"] = r
+    # Newest activity first -- the live complaint belongs at the top -- with the label as
+    # a deterministic A-Z tiebreaker. Two stable passes rather than one composite key,
+    # because the two fields sort in opposite directions and `sorted` has no per-field
+    # reverse; an undated row (empty `sort`) lands last, not first.
+    out = sorted(entries.values(), key=lambda e: str(e["label"] or ""))
+    out.sort(key=lambda e: (bool(e["sort"]), e["sort"]), reverse=True)
+    return out
+
+
+def _severity(value: object) -> str:
+    """A 0-10 severity for display: ``3.0`` prints as ``3`` (issue #167's worked example).
+
+    Scoped to this one line builder rather than folded into :func:`_fmt`: every other
+    numeric section prints the stored REAL verbatim (``weight: 80.0 kg``) and changing
+    that would rewrite output this issue has no business touching.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return _fmt(value)
+
+
+def _symptom_line(entry: dict) -> str:
+    """One ``## Self-Reported Symptoms`` bullet: the collapsed state of one complaint.
+
+    The provenance suffixes annotate the ``anchor`` row -- the one that supplied the
+    line's headline datum -- because :func:`_attest_suffix`'s contract is per row and a
+    suffix stays truthful only about the row it annotates. The rows folded into ``count``
+    contribute no suffix: a count is not a provenance claim, and the section title is
+    itself the standing statement that everything under it is self-reported.
+    """
+    count = entry["count"]
+    plural = "" if count == 1 else "s"
+    head = f"- {entry['label']} - {count} report{plural} in {_SYMPTOM_WINDOW_DAYS}d"
+
+    latest = entry["latest"]
+    resolved = entry["resolved"]
+    if latest is not None:
+        head += f", latest {_date_part(latest['observed_at'])}"
+        if latest["value_num"] is not None:
+            head += f" (severity {_severity(latest['value_num'])}/10)"
+    # A resolution older than the newest present report is not news; only a resolution
+    # that is the last word on the complaint earns the clause.
+    if resolved is not None and (
+        latest is None or str(resolved["observed_at"]) > str(latest["observed_at"])
+    ):
+        head += f"; last reported resolved {_date_part(resolved['observed_at'])}"
+
+    anchor = latest if latest is not None else resolved
+    if anchor is None:
+        return head
+    return f"{head}{_dispute_suffix(anchor)}{_attest_suffix(anchor)}"
+
+
+def _symptom_section(entries: list[dict]) -> str | None:
+    """The ``## Self-Reported Symptoms`` section, or ``None`` when there is nothing.
+
+    Built like :func:`_questions_section`, not like a plain :func:`_section` call.
+    ``_section``'s always-present ``_none recorded_`` header is right where emptiness is
+    *information* -- a clinician reviewed and found none -- but here it would read as "the
+    patient reports no symptoms", an assertion the record cannot make. Omitting the
+    section also keeps summary output byte-identical for every person who never uses the
+    lane, which is the additive-only rule issue #168 recorded for the appendix.
+    """
+    if not entries:
+        return None
+    return _section("Self-Reported Symptoms", [_symptom_line(e) for e in entries])
 
 
 def _order_display(row: dict) -> str:
@@ -1121,7 +1272,8 @@ def render_summary(
     now: datetime | None = None,
 ) -> str:
     """Markdown master summary for a person: active meds, active problems, past medical
-    history, family history, allergies, orders, latest vitals, recent abnormal labs,
+    history, family history, allergies, orders, latest vitals, self-reported symptoms
+    (omitted when there are none), recent abnormal labs,
     procedures and upcoming/open appointments --
     with a self-identifying header (name, DOB, generated-at, source row counts).
     Read-only.
@@ -1210,6 +1362,10 @@ def render_summary(
             f"{_dispute_suffix(v)}{_attest_suffix(v)}{_unit_suffix(d)}"
         )
 
+    symptom_section = _symptom_section(
+        _self_reported_symptoms(conn, person_id, today, dictionary, cur)
+    )
+
     lab_lines = []
     for r in _abnormal_labs(conn, person_id, today, cur):
         d = units.display(
@@ -1256,6 +1412,12 @@ def render_summary(
         _section("Allergies", allergy_lines),
         _section("Orders & Referrals", order_lines),
         _section("Latest Vitals", vital_lines),
+        # Between the vitals and the labs: both are "current state of the body", and it
+        # keeps the self-attested block well away from the clinician-sourced problem
+        # list at the top. Spliced the `_open_conflicts_warning` way because the section
+        # is omitted entirely when empty (issue #167) -- a header here would assert the
+        # patient reports nothing, which is not a thing the record knows.
+        *(s for s in (symptom_section,) if s is not None),
         _section(
             f"Abnormal Labs (last {_ABNORMAL_LABS_WINDOW_MONTHS} months)",
             lab_lines,
@@ -1447,12 +1609,19 @@ def render_journal(
     *,
     since: str | None = None,
     now: datetime | None = None,
+    include_self_reported: bool = False,
 ) -> str:
     """The phase-3 timeline event stream rendered as a narrative Markdown chronology,
     grouped by date, with document-provenance footnotes. Read-only.
 
     Curated-away events simply do not appear; their audit trail is
     :func:`render_curation` (issue #168), not a tail section here.
+
+    ``include_self_reported`` opts the ``symptom``/``activity`` lanes back in (issue
+    #167). **Off by default**: the journal is a chronology that already spans decades, and
+    a few hundred self-attestations a year swamps it -- while the summary's collapsed
+    ``## Self-Reported Symptoms`` section is the reading of them that is actually useful.
+    The rows stay reachable in full through `pemr query timeline`, which is unfiltered.
 
     Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
     person_id = query.resolve_person_id(conn, slug)
@@ -1463,7 +1632,11 @@ def render_journal(
     # `with_identity` is what makes the overlay reachable from here: a timeline event
     # is a rendered sentence, not a row, so it carries no family identity by default.
     events = query.query_timeline(
-        conn, slug, since=since, with_identity=bool(cur.verdicts)
+        conn,
+        slug,
+        since=since,
+        with_identity=bool(cur.verdicts),
+        exclude_obs_types=None if include_self_reported else SELF_REPORTED_OBS_TYPES,
     )
     events = _apply_curation_events(events, cur)
 

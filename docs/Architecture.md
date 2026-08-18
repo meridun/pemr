@@ -332,8 +332,11 @@ CREATE TABLE observation (
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
                                            -- 'blood_pressure'/'weight'), 'order',
-                                           -- 'screening', 'immunization', 'functional'
-                                           -- ('functional' alone requires observed_at;
+                                           -- 'screening', 'immunization', 'functional',
+                                           -- 'symptom'/'activity' (self-reported, #167)
+                                           -- ('functional' requires observed_at;
+                                           -- symptom/activity require a `key` and an
+                                           -- observed_at carrying a time of day;
                                            -- condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
@@ -741,7 +744,10 @@ two rows preserved; a correction or OCR re-read of the *same* reading carries th
 timestamp → collides → surfaces as a conflict (below). When only a date is available,
 same-day differing values collide → conflict; that safety bias is intentional (a spurious
 conflict on a genuine repeat is human-recoverable, a silent duplicate of a correction
-poisons `trends`/brief/`query` irrecoverably).
+poisons `trends`/brief/`query` irrecoverably). The self-reported lanes
+(`obs_type='symptom'`/`'activity'`, issue #167) therefore *mandate* the time component in
+`validate_row`, so a same-day repeat is a second row rather than a conflict — a
+fluctuating complaint is reported several times a day by design.
 
 `lab_result.collected_at` is **truncated to the date** for key purposes (issue #117); the
 column itself still stores the most precise prefix the source gave, and the read layer

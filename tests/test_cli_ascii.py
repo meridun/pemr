@@ -304,3 +304,14 @@ def test_record_assert_output_is_console_safe(ready, capsys):
     err = capsys.readouterr().err
     assert "already holds this identity" in err
     _assert_console_safe(err)
+
+
+def test_render_journal_help_is_console_safe(ready, capsys):
+    """Issue #167's one new flag: its help text joins the corpus the cp437 sweep
+    covers, since `render journal --help` was not previously exercised here."""
+    with pytest.raises(SystemExit):
+        _run(ready, "render", "journal", "--help")
+    out = capsys.readouterr().out
+    assert "--include-self-reported" in out
+    assert "excluded by default" in out
+    _assert_console_safe(out)

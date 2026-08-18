@@ -679,3 +679,58 @@ def test_record_edit_is_not_on_the_mcp_surface():
     for spelling in ("record_edit", "edit_record", "record_edits"):
         assert spelling not in surface, spelling
     assert "record_edit" not in mcp_server.WRITE_TOOLS
+
+
+# --------------------------------------------------------------------------- #
+# self-reported lanes: CLI/MCP verb parity (issue #167)
+# --------------------------------------------------------------------------- #
+
+def _attest_self_reports(conn, slug="jane-doe"):
+    from pemr import attestations
+
+    for row in (
+        {"obs_type": "symptom", "key": "right foot ache",
+         "observed_at": "2026-08-16T09:00", "value_num": 3},
+        {"obs_type": "activity", "key": "morning walk",
+         "observed_at": "2026-08-16T07:30", "value_num": 40, "unit": "min"},
+    ):
+        attestations.assert_record(
+            conn, "observation", slug, row, attributed_to="Jane Doe",
+            attested_on="2026-08-18", apply=True,
+        )
+
+
+def test_render_journal_tool_mirrors_the_cli_default(seeded):
+    """The MCP front door applies the same default-off filter the CLI does -- the two
+    verbs must not disagree about what the journal contains."""
+    _attest_self_reports(seeded)
+    md = mcp_server.render_journal(seeded, person="jane-doe")["markdown"]
+    assert "right foot ache" not in md and "morning walk" not in md
+
+
+def test_render_journal_tool_forwards_the_opt_in(seeded):
+    _attest_self_reports(seeded)
+    md = mcp_server.render_journal(
+        seeded, person="jane-doe", include_self_reported=True
+    )["markdown"]
+    assert "symptom right foot ache" in md
+    assert "activity morning walk" in md
+
+
+def test_the_self_reported_lanes_add_no_tool(seeded):
+    """`record assert` is CLI-only and stays that way: the lanes are entered through an
+    existing verb, and the MCP surface gains a parameter, never a name."""
+    assert "record_assert" not in mcp_server.TOOL_NAMES
+    assert set(mcp_server.TOOL_NAMES) == set(
+        mcp_server.READ_ONLY_TOOLS + mcp_server.WRITE_TOOLS
+    )
+    assert "render_journal" in mcp_server.READ_ONLY_TOOLS
+
+
+def test_the_query_tool_still_returns_self_reports(seeded):
+    """Only the journal filters. `query timeline` -- CLI and MCP alike -- is the
+    complete record it filters from."""
+    _attest_self_reports(seeded)
+    events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
+    assert any("morning walk" in e["summary"] for e in events)
+    assert any("right foot ache" in e["summary"] for e in events)

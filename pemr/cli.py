@@ -2997,7 +2997,12 @@ def _cmd_render_brief(args: argparse.Namespace) -> int:
 
 def _cmd_render_journal(args: argparse.Namespace) -> int:
     def work(conn):
-        markdown = render.render_journal(conn, args.person, since=args.since)
+        markdown = render.render_journal(
+            conn,
+            args.person,
+            since=args.since,
+            include_self_reported=args.include_self_reported,
+        )
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -3841,6 +3846,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_journal.add_argument("--person", required=True, help="owner slug")
     r_journal.add_argument("--since", help="ISO date; keep events on/after this date")
+    r_journal.add_argument(
+        "--include-self-reported", dest="include_self_reported", action="store_true",
+        help="include self-reported symptom and activity events (excluded by default)",
+    )
     r_journal.add_argument("--out", help="write to file instead of stdout")
     r_journal.set_defaults(func=_cmd_render_journal)
 
