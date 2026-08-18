@@ -1377,6 +1377,152 @@ def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
     assert _curation_count(conn) == 0
 
 
+# --- verify catches the pre-#161 cross-person merge target (issue #169) -------
+#
+# #161's guard is forward-only: a `merged_into_base` written before it can still point at
+# another person's family, and neither orphan check notices, because that family genuinely
+# exists. `allow_cross_person=True` is how these tests reach that stored shape - the row
+# it writes is byte-identical to a pre-#161 one, since `cross_person` lives on the report
+# and is never persisted.
+
+CROSS_PERSON = "belongs to a different person"
+
+
+def _merged_cross_person(two_people, *, row=False):
+    """Rule one of jane's Type 2 Diabetes facts merged into john's family."""
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    token = jane_base
+    if row:
+        token = str(_person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                                   two_people["jane"].person_id))
+    curation.annotate_record(
+        conn, "condition", token, status="merged-into",
+        note="same condition, two charts", merged_into_base=john_base,
+        allow_cross_person=True, row=row, apply=True,
+    )
+    return conn, jane_base, john_base
+
+
+def test_verify_warns_about_a_live_cross_person_merge_target(two_people):
+    """AC 1: the target family resolves and is live, so no orphan check sees anything -
+    only the person comparison does."""
+    conn, jane_base, john_base = _merged_cross_person(two_people)
+
+    report = verify.verify_report(conn)
+
+    assert report.ok is True and report.problems == []
+    flagged = [w for w in report.warnings if CROSS_PERSON in w]
+    assert len(flagged) == 1
+    assert jane_base[:12] in flagged[0] and john_base[:12] in flagged[0]
+    assert "john-doe" in flagged[0] and "jane-doe" in flagged[0]
+    # Both families are live, so neither orphan warning may fire alongside it.
+    assert not any("has no live family" in w for w in report.warnings)
+
+
+def test_verify_warns_about_a_row_scoped_cross_person_merge_target(two_people):
+    """AC 5: the merge target is a family in either scope, so the check is too - but the
+    ruling side's person comes off the row, not occurrence 0."""
+    conn = two_people["conn"]
+    row_id = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                            two_people["jane"].person_id)
+    _merged_cross_person(two_people, row=True)
+
+    report = verify.verify_report(conn)
+
+    flagged = [w for w in report.warnings if CROSS_PERSON in w]
+    assert len(flagged) == 1 and f"row #{row_id}" in flagged[0]
+
+
+def test_verify_is_silent_on_a_same_person_merge(seeded):
+    """AC 2: the ordinary merge - two of jane's own families - stays quiet."""
+    conn = seeded["conn"]
+    base = _base(conn, "condition", "name", "Prediabetes")
+    target = _base(conn, "condition", "name", "Type 2 Diabetes")
+    curation.annotate_record(
+        conn, "condition", base, status="merged-into",
+        note="one condition, two labels", merged_into_base=target, apply=True,
+    )
+
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_verify_does_not_flag_a_merge_whose_ruling_family_has_no_person(two_people):
+    """AC 3, family scope: an unknown person is not evidence of a cross-person merge -
+    `annotate_record`'s own convention. Emptying the ruling family is the reachable way
+    there, since `person_id` is NOT NULL on every record table."""
+    conn, jane_base, _john_base = _merged_cross_person(two_people)
+    records.remove_record(
+        conn, "condition",
+        _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                       two_people["jane"].person_id),
+        apply=True,
+    )
+    assert not dedup.load_family(conn, "condition", jane_base)
+
+    report = verify.verify_report(conn)
+
+    assert not any(CROSS_PERSON in w for w in report.warnings)
+    # The family orphan warning still fires - it is the one this state is about.
+    assert any("has no live family" in w for w in report.warnings)
+
+
+def test_verify_does_not_flag_a_merge_whose_ruling_row_is_gone(two_people):
+    """AC 3, row scope: `row_person` reports ``(None, "")`` for a removed row, and an
+    unknown ruling person must not warn either."""
+    conn = two_people["conn"]
+    row_id = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                            two_people["jane"].person_id)
+    _merged_cross_person(two_people, row=True)
+    # Straight to the table: the write paths retire a row verdict with its row.
+    conn.execute("DELETE FROM condition WHERE condition_id = ?", (row_id,))
+    conn.commit()
+
+    report = verify.verify_report(conn)
+
+    assert not any(CROSS_PERSON in w for w in report.warnings)
+    assert any("names no live row" in w for w in report.warnings)
+
+
+def test_verify_does_not_flag_a_merge_whose_target_family_has_no_person(
+    two_people, monkeypatch
+):
+    """AC 3, target side. Unreachable through the write paths - `person_id` is NOT NULL,
+    so a live target family always has one, and an *empty* target is the dangling-merge
+    orphan below rather than this branch. The guard is defensive parity with
+    `annotate_record`, so it is pinned defensively."""
+    conn, _jane_base, john_base = _merged_cross_person(two_people)
+    real_family_person = curation.family_person
+
+    def unknown_target(conn_, record_type, base):
+        if base == john_base:
+            return None, ""
+        return real_family_person(conn_, record_type, base)
+
+    monkeypatch.setattr(curation, "family_person", unknown_target)
+
+    assert not any(CROSS_PERSON in w for w in verify.verify_report(conn).warnings)
+
+
+def test_verify_does_not_double_report_a_dangling_cross_person_target(two_people):
+    """AC 4: a dead target is the existing orphan warning's case, and only its case - the
+    `elif` placement is what guarantees that, not a second lookup."""
+    conn, _jane_base, john_base = _merged_cross_person(two_people)
+    records.remove_record(
+        conn, "condition",
+        _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                       two_people["john"].person_id),
+        apply=True,
+    )
+    assert not dedup.load_family(conn, "condition", john_base)
+
+    report = verify.verify_report(conn)
+
+    merge_warnings = [w for w in report.warnings if "merges into" in w]
+    assert len(merge_warnings) == 1
+    assert "has no live family" in merge_warnings[0]
+    assert CROSS_PERSON not in merge_warnings[0]
+
+
 # --- row ids are reusable, so removing the row retires its verdict (issue #114) ---
 
 
@@ -2110,7 +2256,6 @@ def test_cli_a_reused_row_id_is_not_filed_under_the_superseded_appendix(
     assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
     summary = capsys.readouterr().out
     assert "Anaphylaxis - epinephrine plan" in summary
-    assert "## Superseded / corrected" not in summary
     assert "loser of a keep-both" not in summary
 
     capsys.readouterr()
@@ -2124,8 +2269,9 @@ def test_cli_a_reused_row_id_is_not_filed_under_the_superseded_appendix(
 
 
 def test_cli_annotate_render_remove_verify_drill(cli_ready, capsys):
-    """annotate --apply -> render summary shows the appendix -> record rm the whole
-    family -> verify warns about the orphan and still exits ok."""
+    """annotate --apply -> the row leaves the summary and lands in `render curation`
+    (issue #168) -> record rm the whole family -> verify warns about the orphan and
+    still exits ok."""
     target = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
     assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
                 "--status", "superseded", "--note", "repeat draw supersedes it",
@@ -2134,11 +2280,22 @@ def test_cli_annotate_render_remove_verify_drill(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
     summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
-    assert "lab_result: Glucose" in summary
-    assert "repeat draw supersedes it" in summary
+    assert "Glucose" not in summary
+    assert "repeat draw supersedes it" not in summary
+
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
+    assert "## superseded" in record
+    assert "lab_result: Glucose" in record
+    assert "repeat draw supersedes it" in record
 
     assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--apply") == 0
+
+    # An orphan verdict has no person to scope it to, so it leaves the record too --
+    # `verify` / `record reaffirm` are its surfaces, exactly as before the move.
+    capsys.readouterr()
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    assert capsys.readouterr().out == ""
 
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
@@ -2255,10 +2412,10 @@ def test_cli_reaffirm_drill_moves_the_verdict_and_quiets_verify(cli_ready, capsy
 
     # And the ruling is doing its job again on the new identity.
     capsys.readouterr()
-    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
-    summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
-    assert "one assay, two labels" in summary
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
+    assert "## superseded (Dr Who)" in record
+    assert "one assay, two labels" in record
 
 
 def test_cli_reaffirm_rerunning_the_same_map_file_is_a_clean_no_op(cli_ready, capsys):
@@ -2596,11 +2753,10 @@ def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
     assert "but the row now sits in" in out
 
     capsys.readouterr()
-    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
-    summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
     for note in ("same draw as the a1c", "progressed, one condition"):
-        assert note in summary
+        assert note in record
 
 
 def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(
@@ -2684,8 +2840,9 @@ def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys)
     `annotate` that points one at the other, and a `render` showing what the
     accident costs. The last two steps are the load-bearing ones: with
     `--allow-cross-person` the fact really does leave jane's chart without ever
-    appearing on john's, and `pemr verify` really is clean while it happens, so the
-    refusal is the only thing standing between an operator and a silent loss.
+    appearing on john's, and `pemr verify` only *warns* about it after the fact
+    (issue #169) - nothing is corrupt, so the exit code never moves - which is why
+    the write-time refusal is what stands between an operator and a silent loss.
     """
     jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
                             "jane-doe")
@@ -2746,13 +2903,93 @@ def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys)
     assert "Type 2 Diabetes" not in jane_problems
     assert john_problems.count("Type 2 Diabetes") == 1   # john's own row, not jane's
 
-    # ...and `verify` stays clean throughout, because the target family genuinely
-    # exists. Nothing in the database is broken; a fact simply stopped rendering.
+    # ...and `verify` does not *fail* over it - the target family genuinely exists, so
+    # nothing in the database is broken; a fact simply stopped rendering. Since #169 it
+    # is at least reported, as a warning that leaves the exit code alone.
     capsys.readouterr()
     assert _run(cli_two_people, "verify") == 0
+    assert "belongs to a different person" in capsys.readouterr().out
 
     # 5. And it is reversible: lifting the verdict restores jane's chart.
     assert _run(cli_two_people, "record", "annotate", "condition", jane,
                 "--clear", "--apply") == 0
     assert "Type 2 Diabetes" in _summary_section(
         cli_two_people, "jane-doe", "Active Problems", capsys)
+
+
+def test_cli_smoke_verify_reports_the_live_cross_person_merge(cli_two_people, capsys):
+    """The read-time half of the same story, through the CLI (issue #169).
+
+    The unit tests above drive `verify_report` directly; this walks the operator's
+    view - real `record annotate` writes, then the real console block and the real
+    `--json` payload. The rows it leaves behind are byte-identical to pre-#161 ones,
+    since `cross_person` is disclosed in the annotate report and never persisted, so
+    what `verify` reads here is exactly the shape the guard cannot retroactively fix.
+    """
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    jane_pre = _cli_person_base(cli_two_people, "condition", "name", "Prediabetes",
+                                "jane-doe")
+    john_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "john-doe")
+
+    # The control: jane's own two families merge without a murmur - an ordinary
+    # same-person `merged-into` must stay as quiet as it was before this check.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane_pre,
+                "--status", "merged-into", "--merged-into", jane,
+                "--note", "progressed to the same dx", "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    assert "warnings" not in capsys.readouterr().out
+
+    # The pre-#161 accident, family scope. Both families are live, so no orphan check
+    # sees anything; only the person comparison does, and it is a warning, not a
+    # problem - `pemr verify` still exits 0.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "deliberate, for the smoke", "--allow-cross-person",
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    assert out.isascii()                       # ASCII-only console output (issue #23)
+    flagged = [ln for ln in out.splitlines() if "belongs to a different person" in ln]
+    assert len(flagged) == 1
+    assert jane[:12] in flagged[0] and john[:12] in flagged[0]
+    assert "jane-doe" in flagged[0] and "john-doe" in flagged[0]
+    # The escape hatch is named, so a deliberate merge reads as expected, not corrupt.
+    assert "--allow-cross-person" in flagged[0]
+
+    # The same string reaches an agent through `--json`, and `ok` stays true.
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["problems"] == []
+    assert len(payload["warnings"]) == 1
+    assert payload["warnings"][0] in flagged[0]
+
+    # Row scope, where the ruled person comes off the row rather than the family.
+    assert _run(cli_two_people, "record", "annotate", "condition", str(john_row),
+                "--row", "--status", "merged-into", "--merged-into", jane_pre,
+                "--note", "the same accident, row-scoped", "--allow-cross-person",
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    assert out.count("belongs to a different person") == 2
+    assert f"row #{john_row}" in out
+
+    # And no double-reporting: removing john's row kills the family the first verdict
+    # points at (and retires the row-scoped one with the row), leaving exactly one
+    # merge warning - the existing dangling-target orphan, not this check as well.
+    assert _run(cli_two_people, "record", "rm", "condition", str(john_row),
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    merge_lines = [ln for ln in out.splitlines() if "merges into" in ln]
+    assert len(merge_lines) == 1
+    assert "has no live family" in merge_lines[0]
+    assert "belongs to a different person" not in out

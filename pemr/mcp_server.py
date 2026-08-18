@@ -516,11 +516,25 @@ def render_journal(
     return {"markdown": markdown}
 
 
+def render_curation(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
+    """[read] Curation audit trail for a person -> Markdown. Mirrors ``pemr render curation``.
+
+    The verdict record that issue #168 moved out of the three clinical documents. Without
+    it here the content would vanish from every MCP-visible surface with no replacement;
+    an empty ``markdown`` means the person has no curation verdicts, not an error.
+    """
+    try:
+        markdown = _render.render_curation(conn, person)
+    except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
+        raise _friendly(exc) from exc
+    return {"markdown": markdown}
+
+
 # The exposed tool surface, in one place. AGENTS.md's contract-lint asserts it
 # references every name here; build_server registers exactly these.
 READ_ONLY_TOOLS = (
     "person_list", "person_show", "query", "find", "trends",
-    "render_summary", "render_brief", "render_journal",
+    "render_summary", "render_brief", "render_journal", "render_curation",
 )
 WRITE_TOOLS = (
     "person_add", "person_edit", "ingest", "commit_extraction", "document_set_text",
@@ -605,6 +619,10 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     @server.tool(name="render_journal", annotations=ro)
     def render_journal_tool(person: str, since: str | None = None) -> dict:
         return _run(render_journal, person=person, since=since)
+
+    @server.tool(name="render_curation", annotations=ro)
+    def render_curation_tool(person: str) -> dict:
+        return _run(render_curation, person=person)
 
     # -- write --
     @server.tool(name="person_add", annotations=rw)
