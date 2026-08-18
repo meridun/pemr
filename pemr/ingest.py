@@ -59,6 +59,7 @@ import zipfile
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
@@ -418,6 +419,20 @@ def run_ocr(path: str | Path) -> str | None:
 # --------------------------------------------------------------------------- #
 
 _PLAINTEXT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".json", ".log"})
+
+# HTML (issue #173) — a saved portal page. Deliberately **not** in
+# `_PLAINTEXT_SUFFIXES`: reading the markup verbatim would store tags and inline
+# scripts as document text (and route it `"native"`, see `_trusts_anchors`).
+_HTML_SUFFIXES = frozenset({".html", ".htm"})
+# Element content that is code/markup, never document text.
+_HTML_SKIP_TAGS = frozenset({"script", "style", "noscript", "template"})
+# Tags that end a line — the ones that render as a block or a line break.
+_HTML_BLOCK_TAGS = frozenset({
+    "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "section", "article", "header", "footer",
+    "blockquote", "hr", "pre", "dt", "dd", "ul", "ol", "title",
+})
+_HTML_CELL_TAGS = frozenset({"td", "th"})
 
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -810,6 +825,169 @@ def _extract_ccda(path: Path) -> str | None:
     return "\n".join(lines)
 
 
+class _HtmlText(HTMLParser):
+    """Readable text out of an HTML page: tags stripped, `<script>`/`<style>` dropped.
+
+    Rendering mirrors :func:`_ccda_narrative` / :func:`_ccda_table_rows` (issue #138) so
+    both native routes produce the same *shaped* text — one line per block element,
+    one tab-delimited line per `<tr>` — which is what keeps a lab table's header cell
+    on the same line as its value.
+
+    Unlike the CCDA walk this is event-driven, so there is **no recursion here at all**
+    and no `RecursionError` surface, however deeply the page nests.
+    """
+
+    def __init__(self) -> None:
+        # `convert_charrefs` (the default) must stay on: with it off, every `&amp;` /
+        # `&#160;` would need `handle_entityref`/`handle_charref` or be silently lost.
+        super().__init__(convert_charrefs=True)
+        self.lines: list[str] = []
+        self._parts: list[str] = []          # the line being built
+        self._cells: list[str] | None = None  # non-None while a `<tr>` is open
+        # A *depth counter*, not a boolean. `<script>`/`<style>` are the easy half —
+        # the stdlib reads them in CDATA mode, so their bodies never re-enter the tag
+        # machinery — but `<noscript>`/`<template>` are parsed normally and do nest, and
+        # a boolean flips back on the innermost close, leaking their contents into
+        # `ocr_text` and thence the FTS index. The counter also has to floor at 0, or a
+        # stray `</script>` (ordinary in a saved page) would swallow the rest of it.
+        self._skip = 0
+
+    # -- line/cell plumbing --------------------------------------------------- #
+
+    def _take(self) -> str:
+        """The pending text, whitespace-collapsed as `_ccda_flat` does — `str.split()`
+        also folds the `\\xa0` that `&nbsp;` decodes to."""
+        chunk = " ".join("".join(self._parts).split())
+        self._parts.clear()
+        return chunk
+
+    def _break(self) -> None:
+        """A block boundary. Ends the current line — except **inside a `<tr>`**, where it
+        is only a word separator: a `<div>` wrapping a cell's value must not split the
+        cell, which is what keeps a lab row's header cell beside its value."""
+        if self._cells is not None:
+            self._parts.append(" ")
+            return
+        chunk = self._take()
+        if chunk:
+            self.lines.append(chunk)
+
+    def _close_cell(self) -> None:
+        """`</td>`/`</th>`: the pending text becomes one cell — empty ones included, so
+        columns stay aligned."""
+        chunk = self._take()
+        if self._cells is None:      # a stray `</td>` outside any row: keep its text
+            if chunk:
+                self.lines.append(chunk)
+        else:
+            self._cells.append(chunk)
+
+    def _end_row(self) -> None:
+        trailing = self._take()      # text after the last `</td>`, if any
+        cells, self._cells = self._cells or [], None
+        if trailing:
+            cells.append(trailing)
+        # `any(cells)` is `_ccda_table_rows`'s rule (line 609): an all-empty row
+        # contributes nothing.
+        if any(cells):
+            self.lines.append("\t".join(cells))
+
+    # -- HTMLParser hooks ----------------------------------------------------- #
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _HTML_SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag == "tr":
+            self._break()
+            self._cells = []
+        elif tag in _HTML_CELL_TAGS:
+            self._parts.append(" ")   # separator only; the cell closes on `</td>`
+        elif tag in _HTML_BLOCK_TAGS:
+            self._break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _HTML_SKIP_TAGS:
+            # Floored: an unmatched `</script>` must not push the depth negative, or
+            # every later close would keep us "inside" a skip and drop the real page.
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip:
+            return
+        if tag == "tr":
+            self._end_row()
+        elif tag in _HTML_CELL_TAGS:
+            self._close_cell()
+        elif tag in _HTML_BLOCK_TAGS:
+            self._break()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip:
+            return
+        self._parts.append(data)
+
+    def text(self) -> str:
+        """The page as lines. Flushes whatever an unclosed final tag left open."""
+        if self._cells is not None:
+            self._end_row()
+        else:
+            self._break()
+        return "\n".join(self.lines)
+
+
+def _extract_html(path: Path) -> str:
+    """Readable text from a saved HTML page (`.html`/`.htm`, issue #173).
+
+    Same shape and contract as :func:`_extract_ccda`, except it never returns ``None``:
+    dispatch is on the suffix, not on sniffed content, so there is no "not actually
+    HTML, fall through to OCR" case — a `.html` that is really something else extracts
+    to little or nothing and takes the usual stderr note. Tesseract could not read it
+    either.
+    """
+    size = path.stat().st_size
+    if size > _MAX_EXTRACT_BYTES:
+        raise ValueError(
+            f"{size} bytes, past the {_MAX_EXTRACT_BYTES}-byte extraction cap"
+        )
+    # Same trade as the plaintext branch: utf-8-sig eats a BOM, errors="replace" keeps a
+    # legacy-encoded page usable rather than losing it. No `<meta charset>` sniffing.
+    data = path.read_text(encoding="utf-8-sig", errors="replace")
+    parser = _HtmlText()
+    try:
+        parser.feed(data)
+        parser.close()
+    except AssertionError as exc:
+        # `_markupbase.ParserBase.parse_marked_section` ends in a plain
+        # `raise AssertionError(...)` (so `python -O` does not remove it), which input as
+        # ordinary as `<![foo[ x ]]>` reaches. `AssertionError` is not in
+        # `_EXTRACT_ERRORS` and would escape the "never raises" contract and cost the
+        # document — the defect class the #138 audit caught with `RecursionError`.
+        # Translated here rather than by widening `_EXTRACT_ERRORS`, which would swallow
+        # our own asserts, including the ones tests use as tripwires.
+        raise ValueError(f"malformed HTML markup: {exc}") from exc
+    return parser.text()
+
+
+def _trusts_anchors(route: str) -> bool:
+    """Whether :func:`check_owner` may read `Patient`/`DOB`/`MRN` as an identity claim.
+
+    The route vocabulary, and the reason it has three words rather than two:
+
+    - ``"native"`` — natively extracted **structured** data (plaintext-ish suffixes,
+      `.docx`/`.xlsx`, CCDA). A `Patient ID` there is a column label, not a claim, so
+      anchors are **not** trusted (issue #66 audit).
+    - ``"native-prose"`` — natively extracted **prose** (HTML, issue #173). Tags aside,
+      a saved portal page is a printed page: its `Patient:` header is a claim.
+    - ``"ocr"`` — tesseract output or an agent transcription; prose by definition.
+
+    One definition for both call sites (:func:`ingest_document`,
+    :func:`reocr_documents`), so a fourth route can never disagree with itself.
+    """
+    return route != "native"
+
+
 def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     """:func:`extract_text` plus the **route** that produced the text.
 
@@ -818,7 +996,10 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     `.xml` (issue #138) is rendered natively too — sections' narrative plus a
     `recordTarget` identity header — but on the parsed **root element**, not the
     suffix: a non-CCDA or malformed `.xml` falls through to the OCR route exactly as
-    it did before that branch existed.
+    it did before that branch existed. A saved `.html`/`.htm` portal page (issue #173)
+    is rendered natively as well, but on the third route ``"native-prose"``: it is
+    natively extracted *and* prose, which the two-word vocabulary could not express —
+    see :func:`_trusts_anchors`.
     **Everything else falls through to :func:`run_ocr`** (route ``"ocr"``) — the same
     thing `ocr=True` did before this dispatcher existed. Deliberately not a suffix
     allowlist: image extensions vary far too widely (`.jfif`, `.jpe`, extension-less
@@ -838,6 +1019,10 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     """
     src = Path(path)
     suffix = src.suffix.lower()
+    # Hoisted so the failure path reports the branch's own route: a `.html` that fails
+    # extraction reads `route native-prose` in `pemr document reocr` output, not a fixed
+    # word. Every existing format keeps `"native"`.
+    route = "native"
     try:
         if suffix in _PLAINTEXT_SUFFIXES:
             size = src.stat().st_size
@@ -852,6 +1037,9 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             text = _extract_docx(src)
         elif suffix == ".xlsx":
             text = _extract_xlsx(src)
+        elif suffix in _HTML_SUFFIXES:
+            route = "native-prose"     # set *before* the call, so `except` sees it
+            text = _extract_html(src)
         # `.xml` deliberately stays out of `_PLAINTEXT_SUFFIXES`: only a file whose
         # root element is `{urn:hl7-org:v3}ClinicalDocument` is read natively, and
         # every other `.xml` falls through to the `run_ocr` branch below unchanged.
@@ -874,11 +1062,11 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             "storing without ocr_text",
             file=sys.stderr,
         )
-        return None, "native"
+        return None, route
     # Same predicate as the supplied-text route below - one emptiness notion per
     # column, so `--ocr auto` cannot store what `--ocr-text-file` rejects (issue #87).
     text = normalize_document_text(text)
-    return (text or None), "native"
+    return (text or None), route
 
 
 def extract_text(path: str | Path) -> str | None:
@@ -1370,11 +1558,10 @@ def ingest_document(
         ocr_text, route = None, "ocr"  # no text at all; the route is moot
 
     roster = _roster(conn)
-    # Natively-extracted text (CSV/OOXML/JSON) is structured, so a `Patient ID` column
-    # header is not an identity claim — trusting anchors there refuses ordinary lab
-    # exports as belonging to a stranger. `mismatch` still blocks on every route.
+    # Structured vs prose per route — see `_trusts_anchors`. `mismatch` still blocks on
+    # every route.
     owner_check = check_owner(
-        ocr_text, person, roster, trust_anchors=(route != "native")
+        ocr_text, person, roster, trust_anchors=_trusts_anchors(route)
     )
     if owner_check.blocks and not force:
         raise OwnerMismatchError(
@@ -1728,8 +1915,8 @@ def reocr_documents(
         person = _person_for_id(conn, row.person_id)
         owner_check = None
         if person is not None:
-            owner_check = check_owner(
-                text, person, roster, trust_anchors=(route != "native")
+            owner_check = check_owner(     # structured vs prose — see `_trusts_anchors`
+                text, person, roster, trust_anchors=_trusts_anchors(route)
             )
         common["owner_check"] = owner_check
         # Only `mismatch` refuses here, unlike ingest where `suspect` blocks too: this

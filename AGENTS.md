@@ -219,7 +219,9 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
   It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
   `.docx`/`.xlsx` parsed from their OOXML, a CCDA `.xml` (a portal "download my record"
-  export) rendered from its section narrative, everything else (images, unknown suffixes)
+  export) rendered from its section narrative, a saved `.html`/`.htm` page parsed with the
+  stdlib HTML parser (tags stripped, scripts and styles dropped), everything else (images,
+  unknown suffixes)
   through tesseract. A `.pdf` is read page by page — embedded text layer where there is one, a
   300-dpi render OCR'd where there isn't (first 20 pages, joined by `\f`); that route needs the
   optional `pip install pemr[ocr]` extra, and without it a PDF stores no text and says so on
@@ -250,10 +252,12 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 *different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
 `unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
-**refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
-the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
-— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set, CCDA `.xml`
-included — because in a
+**refuse the ingest** before anything is written. `suspect` is scoped by **route**, and the split
+is *structured vs prose*, not native vs OCR: it applies to the text you supply, to a tesseract
+pass, and to a natively-extracted `.html`/`.htm` page (route `native-prose` — a saved portal page
+is a printed page, so its `Patient:` header is a real claim). It never applies to the
+**structured** native routes — the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx`
+set, CCDA `.xml` included — because in a
 structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
 route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
 with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /
