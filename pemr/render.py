@@ -1,8 +1,9 @@
 """Phase 4 render layer: generated Markdown documents as pure functions of DB state.
 
 Architecture.md §6/§9. ``render.py`` produces the project's current deliverables --
-master summary, appointment brief, journal -- as pure, **read-only** functions of DB
-state, so they never drift from truth (old exports are disposable). Every function is
+master summary, appointment brief, journal, curation record -- as pure, **read-only**
+functions of DB state, so they never drift from truth (old exports are disposable). Every
+function is
 callable as plain Python with structured args (a person slug or appointment id, plus an
 optional synonym ``dictionary`` and a ``now`` for a deterministic generated-at stamp) so
 phase 5's MCP wrapper stays thin. The CLI owns argument parsing and the §5
@@ -53,15 +54,34 @@ under-suppression merely leaves a line on the page.
 the ``curation`` table, a pure overlay of recorded human verdicts scoped to a whole dedup
 family or to a **single row** (:meth:`curation.VerdictMap.for_row` resolves per row, row
 scope winning over family scope): ``superseded`` / ``erroneous-in-source`` /
-``merged-into`` leave their section for a ``## Superseded / corrected``
-appendix, ``disputed`` renders in place with a ``[DISPUTED: ...]`` marker (and
-reach the brief's ``## Questions for the Clinician``), and ``confirmed`` — like
-``distinct``, the collision ruling that says both rows are real facts (issue #122) —
-renders exactly
-as before. Both new sections are **omitted entirely** when empty, so a record with no
+``merged-into`` leave their section entirely, ``disputed`` renders in place with a
+``[DISPUTED: ...]`` marker (and reaches the brief's ``## Questions for the Clinician``),
+and ``confirmed`` — like ``distinct``, the collision ruling that says both rows are real
+facts (issue #122) — renders exactly
+as before. The questions section is **omitted entirely** when empty, so a record with no
 verdicts renders byte-identically to what it did before the overlay existed. This is
 still a pure function of DB state -- the filter is a read, and output changes after a
 verdict because the database changed.
+
+**The audit trail is its own target** (issue #168). Where the three clinical documents
+once each carried a ``## Superseded / corrected`` appendix at their foot, the verdicts
+now render as :func:`render_curation` -- ``pemr render curation``, redirected to a
+``curation.md`` of the operator's choosing. That block was merge bookkeeping addressed to
+a future curation session, not chart content, and on a curated dataset it dominated the
+summary. Two consequences are deliberate:
+
+  * the curation record is a **superset** of the block it replaced -- it enumerates
+    :func:`curation.list_curation` scoped to the person, rather than the verdicts whichever
+    sections happened to select, because a standalone audit trail must not depend on which
+    render pass produced it;
+  * it groups **by ruling**, not by row: one merge session's note recorded against forty
+    families renders once with a count.
+
+Nothing replaces the appendix inline. An ``APPENDIX_STATUSES`` verdict *removes* its row,
+so no reader is shown a stale value -- the hazard :func:`_open_conflicts_warning` answers
+(issue #59: the summary printing a value a staged correction disputes) has no analogue
+here. The empty-state rule the appendix documented survives the move: a subject with no
+verdicts gets ``""``, never a header implying a review happened.
 
 **Attested rows** (issue #110). A row whose provenance is a named human rather than a
 document (`pemr record assert`) is tagged wherever it renders, by :func:`_attest_suffix` at
@@ -96,7 +116,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import date, datetime
 
-from . import curation, db, query, units
+from . import curation, db, dedup, query, units
 from .dedup import enum_token, is_attested, key_token, norm
 
 # Observation obs_type conventions this layer reads (see module docstring).
@@ -237,18 +257,24 @@ def _ref_range(row: sqlite3.Row | dict) -> str:
 # --------------------------------------------------------------------------- #
 
 class _CurationPass:
-    """One render's view of the `curation` overlay: the verdict map plus the two
-    out-of-band collections a render builds while filtering its sections.
+    """One render's view of the `curation` overlay: the verdict map plus the
+    out-of-band collection a render builds while filtering its sections.
 
-    One object rather than threading ``verdicts``/``appendix``/``disputed`` through
-    every read helper: a render touches ten sections and the three always travel
-    together. It is created once per render and is read-only with respect to the DB --
-    ``render`` never writes, and the overlay does not change that.
+    One object rather than threading ``verdicts``/``disputed`` through every read
+    helper: a render touches ten sections and the two always travel together. It is
+    created once per render and is read-only with respect to the DB -- ``render`` never
+    writes, and the overlay does not change that.
 
     ``verdicts`` empty (the overwhelmingly common case, and every pre-008 snapshot) is
     the fast path: :func:`_apply_curation` returns its rows untouched, no row is given a
-    ``_curation`` key, and both new sections are omitted -- which is what keeps output
+    ``_curation`` key, and the questions section is omitted -- which is what keeps output
     byte-identical for unannotated data.
+
+    There is no ``appendix`` bucket since issue #168: the audit trail moved to
+    :func:`render_curation`, which reads the stored verdict table directly, and keeping a
+    write-only bucket here would cost a ``row_label``/``family_label`` query per verdict
+    on every curated render for nothing. The :data:`curation.APPENDIX_STATUSES` *filter*
+    is unaffected -- it keys off :func:`curation.is_appendix`, not off this bucket.
     """
 
     def __init__(self, conn: sqlite3.Connection):
@@ -258,7 +284,6 @@ class _CurationPass:
         # listed once however many of its rows a section selected -- while two rows of
         # one family carrying *different* row-scoped verdicts (issue #114) are two
         # entries rather than one swallowing the other. Insertion-ordered.
-        self.appendix: dict[tuple[str, str, int], dict] = {}
         self.disputed: dict[tuple[str, str, int], dict] = {}
 
     def _entry(self, verdict: dict) -> dict:
@@ -274,25 +299,24 @@ class _CurationPass:
         return dict(verdict, label=label, family_size=family_size)
 
     def record(self, verdict: dict) -> None:
-        """File a verdict under the section its status sends it to, once.
+        """File a ``disputed`` verdict for the questions section, once.
 
         Identity comes off the verdict itself rather than off the row that matched it:
         the key must be the verdict's *scope* (family or this one row), and passing the
         matching row's id alongside a family-scoped verdict would split one family into
-        an appendix line per occurrence.
+        a question line per occurrence.
 
-        ``confirmed`` is filed nowhere on purpose: it records agreement, so it neither
-        leaves its section nor raises a question.
+        Every other status is filed nowhere. ``confirmed`` records agreement, so it
+        neither leaves its section nor raises a question; the
+        :data:`curation.APPENDIX_STATUSES` verdicts do leave their section, but their
+        audit trail is :func:`render_curation`'s job (issue #168), read from the stored
+        table rather than accumulated here.
         """
-        if verdict["status"] in curation.APPENDIX_STATUSES:
-            bucket = self.appendix
-        elif verdict["status"] == "disputed":
-            bucket = self.disputed
-        else:
+        if verdict["status"] != "disputed":
             return
         key = (verdict["record_type"], verdict["dedup_base"], verdict["record_id"])
-        if key not in bucket:
-            bucket[key] = self._entry(verdict)
+        if key not in self.disputed:
+            self.disputed[key] = self._entry(verdict)
 
 
 def _apply_curation(
@@ -302,8 +326,8 @@ def _apply_curation(
 
     Returns the rows that still render, stamping each annotated survivor with its
     verdict under ``_curation``; rows whose verdict is in
-    :data:`curation.APPENDIX_STATUSES` are dropped from the section and collected for the
-    appendix instead.
+    :data:`curation.APPENDIX_STATUSES` are dropped from the section, their audit trail
+    left to :func:`render_curation` (issue #168).
 
     Resolution is **per row**, not per family (issue #114): a row-scoped verdict applies
     to its own occurrence and a family-scoped one to every row that has no verdict of its
@@ -316,10 +340,9 @@ def _apply_curation(
 
     The stamping itself is :func:`curation.annotate_rows` (issue #131) — shared with
     `pemr query`, so the two verbs cannot drift apart about which rows carry which
-    verdict. What stays here is the *policy*: collect into the appendix, then drop. An
-    appendix-bound row is now stamped a moment before it is dropped, which is invisible
-    (the row is discarded) but is why this is a filter over stamped rows rather than a
-    stamp-only-survivors loop.
+    verdict. What stays here is the *policy*: drop the appendix-bound rows. Such a row is
+    stamped a moment before it is dropped, which is invisible (the row is discarded) but
+    is why this is a filter over stamped rows rather than a stamp-only-survivors loop.
     """
     if cur is None or not cur.verdicts:
         return rows
@@ -344,7 +367,7 @@ def _apply_curation_events(
     journal never asks for the extra keys in the first place.
 
     Stamping is :func:`curation.annotate_events`, shared with `pemr query timeline`
-    (issue #131); the appendix policy stays here, as in :func:`_apply_curation`.
+    (issue #131); the drop policy stays here, as in :func:`_apply_curation`.
     """
     if cur is None or not cur.verdicts:
         return events
@@ -438,24 +461,6 @@ def _converted_lab(row: dict, d: units.Displayed) -> dict:
         moved = None if raw is None else units.convert(raw, d.source_unit, d.unit)
         bounds[name] = raw if moved is None else units.round_display(moved)
     return dict(row, value_num=d.value, unit=d.unit, **bounds)
-
-
-def _appendix_section(entries: dict[tuple[str, str, int], dict]) -> str | None:
-    """The ``## Superseded / corrected`` section, or ``None`` when there is nothing
-    to say.
-
-    Deliberately **not** built with :func:`_section`: that helper's always-present
-    header is right for a clinical section whose emptiness is itself information, and
-    exactly wrong here -- an empty appendix on every unannotated record would break the
-    additive-only guarantee for output that has no verdicts at all.
-    """
-    if not entries:
-        return None
-    lines = []
-    for (record_type, _base, _record_id), entry in entries.items():
-        label = entry["label"] or "(no live rows)"
-        lines.append(f"- {record_type}: {label}  [{curation.describe(entry)}]")
-    return _section("Superseded / corrected", lines)
 
 
 def _questions_section(entries: dict[tuple[str, str, int], dict]) -> str | None:
@@ -585,11 +590,10 @@ def _result_index(
     Scoped to ``person_id``: one person's results can never close another's order.
 
     Verdicts are read **directly** rather than through :func:`_apply_curation`, on
-    purpose. A result in :data:`curation.APPENDIX_STATUSES` must not close an order, but
-    this helper runs *before* ``_abnormal_labs``, and filing appendix entries from here
-    would re-order ``## Superseded / corrected`` for existing records. Reading without
-    recording keeps the overlay additive. ``disputed``/``confirmed``/``distinct``
-    results still count: they are live rows.
+    purpose: a result in :data:`curation.APPENDIX_STATUSES` must not close an order, and
+    this helper only needs to *ask*, not to file anything. Reading without recording keeps
+    the overlay additive. ``disputed``/``confirmed``/``distinct`` results still count:
+    they are live rows.
     """
     index: dict[str, list[date]] = {}
     rows = conn.execute(
@@ -1056,6 +1060,31 @@ def _open_conflict_lines(conn: sqlite3.Connection, person_id: int) -> list[str]:
     ]
 
 
+def _open_conflicts_warning(conn: sqlite3.Connection, person_id: int) -> str | None:
+    """The summary's one-line open-conflicts warning, or ``None`` at zero (issue #168).
+
+    #59's safety property, at a section's worth less page: an open conflict means the
+    summary is *currently displaying* a value a staged correction disputes, so the
+    document has to say so -- but it does not need a per-conflict list to say it, and an
+    always-present ``## Open Conflicts`` / ``_none_`` header on the common case was
+    exactly the noise this issue is about. The per-conflict lines survive in the brief
+    (:func:`_open_conflict_lines`, unchanged) and in `pemr review-conflicts`.
+
+    Not built with :func:`_section` for :func:`_questions_section`'s reason: emptiness
+    here is not information, it is the normal case.
+    """
+    count = len(_open_conflict_lines(conn, person_id))
+    if not count:
+        return None
+    plural = "" if count == 1 else "s"
+    return (
+        "> [!WARNING]\n"
+        f"> {count} open conflict{plural} - some values below may be superseded. See "
+        "curation.md, or run\n"
+        "> `pemr review-conflicts`.\n"
+    )
+
+
 def _appt_who(row: sqlite3.Row | dict) -> str:
     return " ".join(p for p in (row["provider"], row["specialty"]) if p)
 
@@ -1093,13 +1122,16 @@ def render_summary(
 ) -> str:
     """Markdown master summary for a person: active meds, active problems, past medical
     history, family history, allergies, orders, latest vitals, recent abnormal labs,
-    procedures, upcoming/open appointments, and any open conflicts --
+    procedures and upcoming/open appointments --
     with a self-identifying header (name, DOB, generated-at, source row counts).
     Read-only.
 
     The summary is the document read *between* appointments, so an open conflict has to
     surface here too: without it a staged correction is invisible and the summary prints
-    the stale value with no hint that a corrected one is pending (issue #59).
+    the stale value with no hint that a corrected one is pending (issue #59). Since issue
+    #168 it says so in one :func:`_open_conflicts_warning` line under the header, emitted
+    only when the count is non-zero, rather than an always-present section. The curation
+    audit trail is no longer inlined here either -- it is :func:`render_curation`.
 
     ``routine_procedures`` is the ``[procedures].routine`` pattern list (issue #166,
     module docstring). It is **suppress-only** and defaults to ``None``, which suppresses
@@ -1212,8 +1244,11 @@ def render_summary(
         for a in _open_appointments(conn, person_id, today, cur)
     ]
 
+    # Immediately after the header, not at the foot: the wording says "some values
+    # *below* may be superseded", and a warning at the end of the document warns nobody.
     parts = [
         header,
+        *(w for w in (_open_conflicts_warning(conn, person_id),) if w is not None),
         _section("Active Medications", med_lines),
         _section("Active Problems", active_lines),
         _section("Past Medical History", past_lines),
@@ -1228,12 +1263,7 @@ def render_summary(
         ),
         _section("Procedures", proc_lines),
         _section("Upcoming / Open Appointments", appt_lines),
-        _section(
-            "Open Conflicts", _open_conflict_lines(conn, person_id), empty="_none_"
-        ),
     ]
-    # Omitted entirely when there are no verdicts -- see _appendix_section.
-    parts += [p for p in (_appendix_section(cur.appendix),) if p is not None]
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -1397,13 +1427,12 @@ def render_brief(
         _section("Procedures & Observations", ctx_lines),
         _section("Open Conflicts", conflict_lines, empty="_none_"),
     ]
-    # Both omitted entirely when empty, so an unannotated brief is byte-identical to
-    # what it was before the overlay existed. The clinician questions sit immediately
-    # before the interaction block: the last thing read is what to ask about.
-    parts += [
-        p for p in (_appendix_section(cur.appendix), _questions_section(cur.disputed))
-        if p is not None
-    ]
+    # Omitted entirely when empty, so an unannotated brief is byte-identical to what it
+    # was before the overlay existed. The clinician questions sit immediately before the
+    # interaction block: the last thing read is what to ask about. The superseded/
+    # corrected appendix used to sit here too; issue #168 dropped it -- what belongs in
+    # front of a clinician is the questions, and the audit trail is `render curation`.
+    parts += [p for p in (_questions_section(cur.disputed),) if p is not None]
     parts.append(interaction)
     return "\n".join(parts).rstrip() + "\n"
 
@@ -1421,6 +1450,9 @@ def render_journal(
 ) -> str:
     """The phase-3 timeline event stream rendered as a narrative Markdown chronology,
     grouped by date, with document-provenance footnotes. Read-only.
+
+    Curated-away events simply do not appear; their audit trail is
+    :func:`render_curation` (issue #168), not a tail section here.
 
     Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
     person_id = query.resolve_person_id(conn, slug)
@@ -1440,11 +1472,7 @@ def render_journal(
         f"- Generated: {_generated_at(now)} (read-only view of DB state)\n"
     )
     if not events:
-        # An appendix can outlive the events: a journal whose every dated event was
-        # superseded still has to say where they went.
-        tail = _appendix_section(cur.appendix)
-        empty = header + "\n_No dated events on record._\n"
-        return empty if tail is None else empty + "\n" + tail
+        return header + "\n_No dated events on record._\n"
 
     # Provenance footnotes: assign a stable [^n] marker per referenced document, in
     # first-appearance order, and resolve each to a one-line source description.
@@ -1471,12 +1499,6 @@ def render_journal(
             f"{_dispute_suffix(e)}{_attest_suffix(e)}"
         )
 
-    # Before the footnote block: footnotes are reference apparatus for the events
-    # above them and stay last.
-    appendix = _appendix_section(cur.appendix)
-    if appendix is not None:
-        lines.append("\n" + appendix.rstrip())
-
     if footnote_order:
         lines.append("\n---\n")
         for doc_id in footnote_order:
@@ -1501,3 +1523,161 @@ def _document_citation(doc: sqlite3.Row | None, doc_id: int) -> str:
     if doc["source_path"]:
         bits.append(f"sources/{doc['source_path']}")
     return ", ".join(bits)
+
+
+# --------------------------------------------------------------------------- #
+# Curation record -- the audit trail as its own target (Architecture.md §6)
+# --------------------------------------------------------------------------- #
+
+def _verdict_heading(verdict: dict) -> str:
+    """One ruling's ``##`` heading: :func:`curation.describe` **minus the note**.
+
+    Deliberately not ``describe()`` itself. An operator note is free-form text that may
+    run to several lines -- the merge-bookkeeping notes issue #168 was raised over do
+    exactly that -- and a multi-line ``##`` heading is broken Markdown, so the note goes
+    in a blockquote under the heading instead.
+
+    ``merged_into_base`` keeps ``describe()``'s 12-character truncation and carries **no**
+    resolved label: a merge target may be another person's family (issue #161), which must
+    never leak into this person's document.
+    """
+    status = verdict.get("status") or ""
+    if status == "merged-into" and verdict.get("merged_into_base"):
+        status = f"merged into {str(verdict['merged_into_base'])[:12]}..."
+    who = verdict.get("attributed_to")
+    return f"{status} ({who})" if who else status
+
+
+def _curation_target_line(verdict: dict) -> str:
+    """One ``- <record_type>: <label>  (<scope>)`` bullet under a ruling.
+
+    The scope note carries the row count a family-scoped verdict covers, which is what
+    makes the group counts auditable rather than assertions: ``(family, 4 rows)`` against
+    ``(row)``.
+    """
+    label = verdict["label"] or "(no live rows)"
+    if verdict["record_id"]:
+        scope = "row"
+    else:
+        size = verdict["family_size"]
+        scope = f"family, {size} row{'' if size == 1 else 's'}"
+    return f"- {verdict['record_type']}: {label}  ({scope})"
+
+
+def _curation_groups(conn: sqlite3.Connection, person_id: int) -> list[dict]:
+    """This person's :data:`curation.APPENDIX_STATUSES` verdicts, grouped by ruling.
+
+    Read from :func:`curation.list_curation` -- the stored table -- rather than from a
+    render pass's collected verdicts, and that is the point of the target: the block this
+    replaced listed only whatever verdicts some section's ``SELECT`` happened to hit, so
+    "the appendix" was a different set per document (the summary's missed a superseded
+    *inactive* med and a superseded lab older than the abnormal-labs window). A standalone
+    audit trail must not depend on which sections ran, so the curation record is a
+    deliberate **superset** of the block it replaces.
+
+    The group key is the ruling itself -- ``(status, merged_into_base, note,
+    attributed_to)`` -- so one merge session's note recorded against forty families is one
+    block with a count instead of forty near-identical bullets.
+
+    Orphan verdicts (the target is gone, so there is no person to scope them to) are
+    excluded exactly as they were before, and keep their own surfaces: `pemr verify`,
+    `pemr record reaffirm`, `pemr record --list`.
+
+    Order is :func:`curation.list_curation`'s (``created_at DESC, record_type,
+    dedup_base, record_id``), both across groups and inside one; it is already
+    deterministic, so nothing re-sorts.
+    """
+    groups: dict[tuple, dict] = {}
+    for verdict in curation.list_curation(conn):
+        if verdict["status"] not in curation.APPENDIX_STATUSES:
+            continue
+        record_type = verdict["record_type"]
+        if record_type not in dedup.FIELD_SPECS:
+            # A hand-edited row can name anything, and `row_person`/`family_person`
+            # interpolate the type into a table name. Guard before, never after.
+            continue
+        if verdict["record_id"]:
+            owner, _slug = curation.row_person(conn, record_type, verdict["record_id"])
+        else:
+            owner, _slug = curation.family_person(
+                conn, record_type, verdict["dedup_base"]
+            )
+        if owner is None or owner != person_id:
+            continue
+        key = (
+            verdict["status"],
+            verdict["merged_into_base"],
+            verdict["note"],
+            verdict["attributed_to"],
+        )
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "heading": _verdict_heading(verdict),
+                "note": verdict["note"] or "",
+                "verdicts": 0,
+                "rows": 0,
+                "targets": [],
+            }
+        group["verdicts"] += 1
+        group["rows"] += 1 if verdict["record_id"] else verdict["family_size"]
+        group["targets"].append(_curation_target_line(verdict))
+    return list(groups.values())
+
+
+def _curation_group_block(group: dict) -> str:
+    """One ruling rendered to Markdown: heading, counts, the note as a blockquote, then
+    the targets it covers.
+
+    Not :func:`_section`, for :func:`_questions_section`'s reason -- and because the body
+    is not a bullet list but three stanzas. An empty note emits no blockquote rather than
+    a bare ``>``.
+    """
+    lines = [f"## {group['heading']}", ""]
+    verdicts, rows = group["verdicts"], group["rows"]
+    lines.append(
+        f"_{verdicts} verdict{'' if verdicts == 1 else 's'}, "
+        f"{rows} row{'' if rows == 1 else 's'}_"
+    )
+    if group["note"]:
+        lines.append("")
+        lines.extend(f"> {line}" for line in group["note"].splitlines())
+    lines.append("")
+    lines.extend(group["targets"])
+    return "\n".join(lines) + "\n"
+
+
+def render_curation(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Markdown curation record for a person -- the audit trail of every recorded verdict
+    that removed a row from the clinical documents, grouped by ruling. Read-only.
+
+    ``""`` when there is nothing to say: no qualifying verdicts, or a pre-008 snapshot
+    with no ``curation`` table at all (:func:`curation.list_curation` returns ``[]``
+    there, the `has_table` degradation convention `render`/`verify` already use). That
+    empty state is a **rule, not an optimisation** -- it is the additive-only guarantee
+    the old ``_appendix_section`` documented, carried across the move: a subject nobody
+    has curated must never be handed a document whose header implies a review happened.
+
+    Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
+    person_id = query.resolve_person_id(conn, slug)
+    groups = _curation_groups(conn, person_id)
+    if not groups:
+        return ""
+    person = conn.execute(
+        "SELECT * FROM person WHERE person_id = ?", (person_id,)
+    ).fetchone()
+    verdicts = sum(g["verdicts"] for g in groups)
+    rows = sum(g["rows"] for g in groups)
+    header = (
+        f"# Curation Record: {person['full_name']}\n\n"
+        f"- Person: {person['slug']}\n"
+        f"- Generated: {_generated_at(now)} (read-only view of DB state)\n"
+        f"- Verdicts: {verdicts} covering {rows} row{'' if rows == 1 else 's'}\n"
+    )
+    parts = [header] + [_curation_group_block(g) for g in groups]
+    return "\n".join(parts).rstrip() + "\n"

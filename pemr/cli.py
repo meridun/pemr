@@ -2924,11 +2924,17 @@ def _cmd_trends(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 4: render (summary / brief / journal)
+# Phase 4: render (summary / brief / journal / curation)
 # --------------------------------------------------------------------------- #
 
 def _emit_markdown(markdown: str, out: str | None) -> int:
-    """Write rendered Markdown to ``--out`` or stdout (the §5 shell-redirect default)."""
+    """Write rendered Markdown to ``--out`` or stdout (the §5 shell-redirect default).
+
+    An **empty** document (``render curation`` for a subject with no verdicts, issue #168)
+    writes a genuinely zero-byte file and prints nothing at all -- the additive-only
+    guarantee reaches the bytes on disk, and a lone newline on stdout would be a document
+    where there is none. Every non-empty target is unaffected.
+    """
     if out:
         try:
             with open(out, "w", encoding="utf-8", newline="\n") as fh:
@@ -2937,6 +2943,8 @@ def _emit_markdown(markdown: str, out: str | None) -> int:
             print(f"error: cannot write {out}: {exc}", file=sys.stderr)
             return 1
         print(f"wrote {out}")
+        return 0
+    if not markdown:
         return 0
     # Default stdout keeps the documented `> exports/...` redirect contract. Output is
     # ASCII-only by construction (render layer), so a cp1252/cp437 console is safe.
@@ -2990,6 +2998,14 @@ def _cmd_render_brief(args: argparse.Namespace) -> int:
 def _cmd_render_journal(args: argparse.Namespace) -> int:
     def work(conn):
         markdown = render.render_journal(conn, args.person, since=args.since)
+        return _emit_markdown(markdown, args.out)
+
+    return _render_with_conn(args, work)
+
+
+def _cmd_render_curation(args: argparse.Namespace) -> int:
+    def work(conn):
+        markdown = render.render_curation(conn, args.person)
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -3792,7 +3808,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_trends.add_argument("--json", action="store_true", help="machine-readable output")
     p_trends.set_defaults(func=_cmd_trends)
 
-    # --- phase 4: render (summary / brief / journal) ----------------------
+    # --- phase 4: render (summary / brief / journal / curation) -----------
     p_render = sub.add_parser(
         "render", help="generate Markdown documents from DB state (read-only)"
     )
@@ -3827,6 +3843,13 @@ def build_parser() -> argparse.ArgumentParser:
     r_journal.add_argument("--since", help="ISO date; keep events on/after this date")
     r_journal.add_argument("--out", help="write to file instead of stdout")
     r_journal.set_defaults(func=_cmd_render_journal)
+
+    r_curation = render_sub.add_parser(
+        "curation", help="curation audit trail for a person -> Markdown on stdout"
+    )
+    r_curation.add_argument("--person", required=True, help="owner slug")
+    r_curation.add_argument("--out", help="write to file instead of stdout")
+    r_curation.set_defaults(func=_cmd_render_curation)
 
     # --- phase 6: backup (VACUUM INTO snapshot + rotation) ----------------
     p_backup = sub.add_parser(

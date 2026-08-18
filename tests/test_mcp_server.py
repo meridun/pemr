@@ -159,6 +159,30 @@ def test_renderers_return_markdown(seeded):
     assert mcp_server.render_journal(seeded, person="jane-doe")["markdown"].startswith("#")
 
 
+def test_render_curation_mirrors_the_cli_target(seeded):
+    """Issue #168: the appendix left the three clinical documents, so without this tool
+    its content would vanish from every MCP-visible surface. Empty Markdown for an
+    uncurated person is the documented state, not a failure."""
+    assert mcp_server.render_curation(seeded, person="jane-doe")["markdown"] == ""
+
+    base = seeded.execute(
+        "SELECT dedup_base FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "medication", base, status="superseded",
+                             note="duplicate portal import", apply=True)
+
+    md = mcp_server.render_curation(seeded, person="jane-doe")["markdown"]
+    assert md.startswith("# Curation Record: Jane Doe")
+    assert "medication: Metformin" in md and "duplicate portal import" in md
+    # ... and it really is the content the summary no longer carries.
+    assert "Metformin" not in mcp_server.render_summary(seeded, person="jane-doe")["markdown"]
+
+
+def test_render_curation_unknown_person_is_a_friendly_tool_error(seeded):
+    with pytest.raises(mcp_server.ToolError):
+        mcp_server.render_curation(seeded, person="ghost")
+
+
 def test_render_summary_narrows_procedures_like_the_cli(seeded):
     """Issue #166, verify pass: the MCP front door must *apply* the routine list, not
     merely accept the kwarg. `test_renderers_return_markdown` asserts only that the
@@ -195,6 +219,7 @@ def test_read_tools_leave_db_byte_stable(seeded, db_path):
     mcp_server.trends(seeded, person="jane-doe", test="a1c")
     mcp_server.render_summary(seeded, person="jane-doe")
     mcp_server.render_journal(seeded, person="jane-doe")
+    mcp_server.render_curation(seeded, person="jane-doe")
     assert _sha(db_path) == before
 
 
@@ -618,10 +643,19 @@ def test_curation_verbs_are_not_on_the_mcp_surface():
     """Trust boundary (issue #109, the `document rm` / `record rm` precedent): a
     human's clinical verdict is CLI-only. AGENTS.md's blessed write set is
     commit_extraction/person_add/person_edit/ingest/document_set_text, and
-    `record annotate` is deliberately not in it - read or write."""
+    `record annotate` is deliberately not in it - read or write.
+
+    `render_curation` (issue #168) is the one tool that may say "curation" at all, and it
+    is a *renderer*: it reads the verdict table the same way `render_summary` reads the
+    clinical tables. Writing a verdict is still unreachable from here, which is the
+    property this test exists for - so the write surface may never say it."""
     surface = " ".join(mcp_server.TOOL_NAMES).lower()
-    for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
+    for spelling in ("annotate", "record_rm", "record_annotate"):
         assert spelling not in surface, spelling
+    writes = " ".join(mcp_server.WRITE_TOOLS).lower()
+    for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
+        assert spelling not in writes, spelling
+    assert [t for t in mcp_server.TOOL_NAMES if "curation" in t] == ["render_curation"]
 
 
 def test_record_assert_is_not_on_the_mcp_surface():

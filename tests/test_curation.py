@@ -2110,7 +2110,6 @@ def test_cli_a_reused_row_id_is_not_filed_under_the_superseded_appendix(
     assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
     summary = capsys.readouterr().out
     assert "Anaphylaxis - epinephrine plan" in summary
-    assert "## Superseded / corrected" not in summary
     assert "loser of a keep-both" not in summary
 
     capsys.readouterr()
@@ -2124,8 +2123,9 @@ def test_cli_a_reused_row_id_is_not_filed_under_the_superseded_appendix(
 
 
 def test_cli_annotate_render_remove_verify_drill(cli_ready, capsys):
-    """annotate --apply -> render summary shows the appendix -> record rm the whole
-    family -> verify warns about the orphan and still exits ok."""
+    """annotate --apply -> the row leaves the summary and lands in `render curation`
+    (issue #168) -> record rm the whole family -> verify warns about the orphan and
+    still exits ok."""
     target = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
     assert _run(cli_ready, "record", "annotate", "lab_result", str(target),
                 "--status", "superseded", "--note", "repeat draw supersedes it",
@@ -2134,11 +2134,22 @@ def test_cli_annotate_render_remove_verify_drill(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
     summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
-    assert "lab_result: Glucose" in summary
-    assert "repeat draw supersedes it" in summary
+    assert "Glucose" not in summary
+    assert "repeat draw supersedes it" not in summary
+
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
+    assert "## superseded" in record
+    assert "lab_result: Glucose" in record
+    assert "repeat draw supersedes it" in record
 
     assert _run(cli_ready, "record", "rm", "lab_result", str(target), "--apply") == 0
+
+    # An orphan verdict has no person to scope it to, so it leaves the record too --
+    # `verify` / `record reaffirm` are its surfaces, exactly as before the move.
+    capsys.readouterr()
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    assert capsys.readouterr().out == ""
 
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
@@ -2255,10 +2266,10 @@ def test_cli_reaffirm_drill_moves_the_verdict_and_quiets_verify(cli_ready, capsy
 
     # And the ruling is doing its job again on the new identity.
     capsys.readouterr()
-    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
-    summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
-    assert "one assay, two labels" in summary
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
+    assert "## superseded (Dr Who)" in record
+    assert "one assay, two labels" in record
 
 
 def test_cli_reaffirm_rerunning_the_same_map_file_is_a_clean_no_op(cli_ready, capsys):
@@ -2596,11 +2607,10 @@ def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
     assert "but the row now sits in" in out
 
     capsys.readouterr()
-    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
-    summary = capsys.readouterr().out
-    assert "## Superseded / corrected" in summary
+    assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
+    record = capsys.readouterr().out
     for note in ("same draw as the a1c", "progressed, one condition"):
-        assert note in summary
+        assert note in record
 
 
 def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(

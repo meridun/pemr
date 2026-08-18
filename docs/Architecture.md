@@ -55,7 +55,8 @@ pemr/
     <sha256[:2]>/<sha256>.pdf  # dedup-friendly, immutable blob store
     .tmp/                      # staging for study archives (§4); exclude from cloud sync
   inbox/                       # drop zone for new un-ingested scans
-  exports/                     # generated docs (disposable): summaries, briefs, journal
+  exports/                     # generated docs (disposable): summaries, briefs, journal,
+                               #   curation records
   backups/                     # local VACUUM INTO snapshots before they sync
   config.toml                  # paths, cloud backup dir, people roster
   AGENTS.md                    # conventions + tool contract for any agent
@@ -478,9 +479,9 @@ recommends `record annotate` when annotating that row could actually change the 
 a row already released is never named. Once every colliding row is released the attestation
 proceeds as an ordinary new occurrence of the identity (the next free `dedup_occurrence`),
 not a replacement of what is stored. One consequence worth knowing: a **family**-scoped
-release covers that new occurrence too, so the freshly attested row itself renders in the
-`## Superseded / corrected` appendix (§6) until the verdict is re-scoped to the rows it
-meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
+release covers that new occurrence too, so the freshly attested row itself leaves the
+clinical documents for the curation record (§6) until the verdict is re-scoped to the rows
+it meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
 
 `norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
 synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
@@ -1101,6 +1102,7 @@ pemr due --person jane                                   # screening/vaccine gap
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
 pemr render journal --person jane        > exports/jane-journal.md
+pemr render curation --person jane       > exports/jane-curation.md  # curation audit trail (empty = no verdicts)
 pemr backup                                              # VACUUM INTO snapshot
 pemr restore latest [--force]                            # install a snapshot back over pemr.db (§8)
 pemr verify                                              # integrity + row counts + source-blob resolution
@@ -1124,7 +1126,8 @@ under a PEP 660 editable install); see issue #22.
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
-`trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
+`trends`, `render_summary`, `render_brief`, `render_journal`, `render_curation`. Write:
+`person_add`, `person_edit`,
 `ingest` (`study="dicom"` + `allow_large` make `file` a study directory, §4), `commit_extraction`,
 `document_set_text` (fills an empty `ocr_text` only — the `--force`
 replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). Each returns the
@@ -1165,10 +1168,13 @@ default to the same exclusion unless a human explicitly decides otherwise.
 `render.py` produces your current deliverables as pure functions of DB state:
 
 - **master summary** — active meds, conditions, allergies, latest vitals, recent
-  abnormal labs, open follow-ups, open conflicts. One query bundle → Markdown. The
-  conflicts section is not decoration: an open conflict means a stored value is disputed
-  and its correction is still staged, so the summary would otherwise print the stale
-  value silently (the brief carries the same section, but it is per-appointment). An
+  abnormal labs, open follow-ups. One query bundle → Markdown. Open conflicts are not
+  decoration: an open conflict means a stored value is disputed and its correction is
+  still staged, so the summary would otherwise print the stale value silently. Since
+  issue #168 the summary says so in a single `> [!WARNING]` line under the header,
+  emitted only when the count is non-zero — the safety property of issue #59 without an
+  always-present `## Open Conflicts` / `_none_` header on the common case. The brief keeps
+  the per-conflict section, since it is per-appointment. An
   order in `Orders & Referrals` leaves the section once a matching `lab_result` lands
   (issue #128) — matching is deliberately narrow (exact `key_token` plus a tight,
   edge-tested date window) and biased toward under-suppression, since age alone is never
@@ -1217,13 +1223,20 @@ default to the same exclusion unless a human explicitly decides otherwise.
   questions. This is your "walk-in readiness" as a repeatable command.
 - **journal** — chronological event stream (documents + appointments + procedures)
   rendered as a narrative timeline.
+- **curation record** (issue #168) — the audit trail: every recorded verdict that removed a
+  row from the three documents above, grouped **by ruling** rather than by row, so one merge
+  session's note against forty families is one block with a count. Read from the stored
+  `curation` table (not from a render pass), so it is person-scoped and complete rather than
+  "whatever sections happened to select" — a deliberate superset of the
+  `## Superseded / corrected` appendix it replaced. Empty output when the person has no
+  verdicts, which is what keeps the additive-only guarantee below true.
 
 Every section is filtered at read time against the `curation` overlay (§2, issues #109 and
-#114): `superseded` / `erroneous-in-source` / `merged-into` leave their section for a
-`## Superseded / corrected` appendix, `disputed` renders in place with a
+#114): `superseded` / `erroneous-in-source` / `merged-into` leave their section entirely
+(their trail is the curation record), `disputed` renders in place with a
 `[DISPUTED: <note>]` marker and reaches the brief's `## Questions for the Clinician`, and
 `confirmed` — and `distinct` (§3, issue #122), whose whole point is that both rows stay
-live — render unchanged. Both new sections are omitted entirely when empty, so a record
+live — render unchanged. The questions section is omitted entirely when empty, so a record
 with no verdicts renders byte-identically to before the overlay existed. This does not weaken
 the purity rule: the filter is a read, and output changes after a verdict because the
 *database* changed. Resolution is **per row**: a row-scoped verdict affects only its own

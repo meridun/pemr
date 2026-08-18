@@ -733,14 +733,14 @@ def test_a_distinct_resolved_pair_still_renders_as_two_live_problems(
 ):
     """AC2 + AC3 as one chain at the CLI, on the real-world trigger (AC6): declare the
     pair distinct, `rekey --apply` writes the table, and the rendered summary still shows
-    *both* conditions with no `## Superseded / corrected` appendix at all.
+    *both* conditions with an empty curation record.
 
     The `superseded` leg is the control that keeps the assertion honest. Both statuses
     resolve the collision and both produce the identical two-occurrence family, so the
     only thing separating them is `distinct`'s absence from
     `curation.APPENDIX_STATUSES` - and on that leg the ruled row *does* leave Active
-    Problems for the appendix. Without the contrast, "no appendix" could equally mean the
-    appendix never fires for conditions."""
+    Problems, for the curation record (issue #168). Without the contrast, "empty record"
+    could equally mean the record never fires for conditions."""
     old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
     new = _dict_file(tmp_path, "fuse.toml", '"diagnosis 2" = "diagnosis"\n')
     _seed_generic_condition_pair(ready, capsys, tmp_path, old)
@@ -771,13 +771,16 @@ def test_a_distinct_resolved_pair_still_renders_as_two_live_problems(
         assert (rows[first_id]["dedup_occurrence"],
                 rows[second_id]["dedup_occurrence"]) == (0, 1)
         summary = render.render_summary(conn, "jane-doe")
+        record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
 
     problems = summary.split("## Active Problems")[1].split("##")[0]
     assert "asthma, per pulmonology" in problems           # never the ruled row
     assert ("hypertension, per cardiology" in problems) is both_live
-    assert ("## Superseded / corrected" not in summary) is both_live
+    assert (record == "") is both_live
+    if not both_live:
+        assert "two diagnoses, numbered labels" in record   # the ruling, with its note
 
 
 def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
@@ -1341,10 +1344,12 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
     conn = db.connect(tmp_path / "cli.db")
     try:
         before = render.render_summary(conn, "jane-doe")
+        before_record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
     assert "- Penicillin - anaphylaxis" in before
-    assert "allergy: PCN" in before.split("## Superseded / corrected")[1]
+    assert "PCN" not in before                        # curated out of the summary (#168)
+    assert "allergy: PCN" in before_record
 
     new = _dict_file(tmp_path, "fuse006.toml",
                      '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
@@ -1369,7 +1374,8 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
         # The verdict still covers PCN and only PCN: Penicillin stays where it was.
         after = render.render_summary(conn, "jane-doe")
         assert "- Penicillin - anaphylaxis" in after
-        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+        assert "PCN" not in after
+        assert "allergy: PCN" in render.render_curation(conn, "jane-doe")
         # Nothing orphaned; the narrowing surfaces as a re-affirm notice instead.
         warnings = verify.verify_report(conn).warnings
         assert not any("no live family" in w for w in warnings)
@@ -1419,10 +1425,11 @@ def test_the_re_affirm_notice_from_a_narrowing_is_runnable(tmp_path, capsys):
         warnings = verify.verify_report(conn).warnings
         assert not any("a rekey moved it" in w or "no live family" in w
                        for w in warnings)
-        # Extension unchanged: PCN in the appendix, Penicillin still live.
+        # Extension unchanged: PCN in the curation record, Penicillin still live.
         after = render.render_summary(conn, "jane-doe")
         assert "- Penicillin - anaphylaxis" in after
-        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+        assert "PCN" not in after
+        assert "allergy: PCN" in render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
 

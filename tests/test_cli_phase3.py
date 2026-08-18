@@ -514,6 +514,7 @@ def test_query_meds_active_agrees_with_render_summary(curated, capsys):
         md = render.render_summary(
             conn, "jane-doe", dictionary=dedup.load_dictionary(DICT_ARG[1])
         )
+        record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
     section = md.split("## Active Medications", 1)[1].split("\n## ", 1)[0]
@@ -526,8 +527,8 @@ def test_query_meds_active_agrees_with_render_summary(curated, capsys):
     # ... and the one the summary *would* have listed is accounted for, not lost.
     # (Prednisone is absent from both sides: an ended 2016 course never reaches the
     # Active Medications query in the first place, so nothing about it is suppressed.)
-    appendix = md.split("## Superseded / corrected", 1)[1]
-    assert "Breo Ellipta" in appendix
+    assert "Breo Ellipta" not in md            # nowhere in the summary at all (#168)
+    assert "Breo Ellipta" in record            # accounted for in the curation record
 
 
 # --- trends: display-unit conversion + its disclosure (issue #136) ------------

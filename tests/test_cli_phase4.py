@@ -1,6 +1,6 @@
-"""End-to-end CLI wiring for phase 4: render summary|brief|journal -- Markdown to
-stdout (the §5 redirect contract), --out file convenience, unknown-slug/appointment
-rc=1, and unmigrated-DB friendliness."""
+"""End-to-end CLI wiring for phase 4: render summary|brief|journal|curation -- Markdown
+to stdout (the §5 redirect contract), --out file convenience, unknown-slug/appointment
+rc=1, the empty-document contract, and unmigrated-DB friendliness."""
 
 import json
 from datetime import date, timedelta
@@ -452,3 +452,96 @@ def test_render_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     rc = _run(tmp_path, "render", "summary", "--person", "jane-doe")
     assert rc == 1
     assert "migrate" in capsys.readouterr().err
+
+
+# --- `render curation`: the audit-trail target (issue #168) -------------------
+
+
+def _annotate_ldl(tmp_path, note="repeat draw supersedes it"):
+    """Rule the fixture's one lab superseded, through the real CLI verb."""
+    lab = None
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        lab = conn.execute(
+            "SELECT lab_result_id FROM lab_result WHERE test_name='LDL'"
+        ).fetchone()["lab_result_id"]
+    finally:
+        conn.close()
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(lab),
+                "--status", "superseded", "--note", note, "--apply") == 0
+
+
+def test_render_curation_to_stdout(ready, capsys):
+    tmp_path, _ = ready
+    _annotate_ldl(tmp_path)
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "curation", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "# Curation Record: Jane Doe" in out
+    assert "## superseded" in out
+    assert "lab_result: LDL" in out
+    assert out.isascii()                       # cp1252/cp437 console contract
+
+
+def test_render_curation_to_out_file(ready, capsys):
+    tmp_path, _ = ready
+    _annotate_ldl(tmp_path)
+    capsys.readouterr()
+    dest = tmp_path / "curation.md"
+    assert _run(tmp_path, "render", "curation", "--person", "jane-doe",
+                "--out", str(dest)) == 0
+    assert f"wrote {dest}" in capsys.readouterr().out
+    assert "# Curation Record: Jane Doe" in dest.read_text(encoding="utf-8")
+
+
+def test_render_curation_with_no_verdicts_writes_nothing(ready, capsys):
+    """The additive-only rule, all the way to the bytes on disk (issue #168): an
+    uncurated subject gets an empty document, not a header implying a review happened --
+    rc=0 on stdout with *no* stray newline, and a genuinely zero-byte `--out` file."""
+    tmp_path, _ = ready
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "curation", "--person", "jane-doe") == 0
+    assert capsys.readouterr().out == ""
+
+    dest = tmp_path / "curation.md"
+    assert _run(tmp_path, "render", "curation", "--person", "jane-doe",
+                "--out", str(dest)) == 0
+    assert f"wrote {dest}" in capsys.readouterr().out
+    assert dest.stat().st_size == 0
+
+
+def test_render_curation_unknown_person_is_friendly_rc1(ready, capsys):
+    tmp_path, _ = ready
+    assert _run(tmp_path, "render", "curation", "--person", "ghost") == 1
+    assert "ghost" in capsys.readouterr().err
+
+
+def test_render_summary_open_conflicts_warning_end_to_end(ready, capsys):
+    """Issue #168 at the command boundary: no conflicts means no section and no `_none_`
+    line at all; a staged one means one warning block under the header. The section this
+    replaced was always present, so only the command boundary proves it is really gone."""
+    tmp_path, _ = ready
+    capsys.readouterr()
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "## Open Conflicts" not in out and "_none_" not in out
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        conn.execute(
+            "INSERT INTO conflict (record_type, dedup_key, person_id, existing_json, "
+            "incoming_json, status, detected_at) VALUES ('lab_result', 'k', "
+            "(SELECT person_id FROM person WHERE slug='jane-doe'), '{}', '{}', 'open', "
+            "'2026-01-01')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "## Open Conflicts" not in out
+    assert "> [!WARNING]" in out
+    assert "> 1 open conflict - some values below may be superseded." in out
+    assert "`pemr review-conflicts`" in out
+    assert out.isascii()
