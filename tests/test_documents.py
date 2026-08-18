@@ -1516,6 +1516,28 @@ def test_cli_document_reocr_allow_shrink_alone_does_not_replace_text(
     assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
 
 
+def test_cli_document_reocr_mixed_sweep_summarises_both_outcomes(cli_ready, capsys):
+    """The shape a real sweep takes: one document re-derives to the same text and is
+    written, another shrinks and is refused. The summary must name both, and one
+    refusal must carry the whole run to rc=1 - a sweep that exits 0 because most of it
+    succeeded is how the silent loss this issue reports goes unnoticed."""
+    _ingest_textless(cli_ready, "scan2.txt", b"three words only")
+    _set_long_text(cli_ready, 2, _LONG)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "document", "reocr", "1", "2", "--force",
+                "--sources", _sources(cli_ready)) == 1
+    out = capsys.readouterr().out
+    assert "#1  written" in out
+    assert "#2  refused" in out and "shorter than stored" in out
+    assert "2 document(s): 1 shorter-text, 1 written" in out
+    # The written one did not shrink, so it draws no shrink notice.
+    assert "shrink:" not in out
+    assert out.isascii(), repr(out)
+    assert _ocr_text_of(cli_ready, 1) == "hba1c 5.7 percent"
+    assert _ocr_text_of(cli_ready, 2) == _LONG
+
+
 def test_cli_document_reocr_unknown_id_is_a_friendly_error(cli_ready, capsys):
     capsys.readouterr()
     assert _run(cli_ready, "document", "reocr", "999",
