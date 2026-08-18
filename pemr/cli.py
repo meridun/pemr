@@ -631,6 +631,7 @@ def _reocr_json(result: "ingest.ReocrResult") -> dict:
         "route": result.route,
         "pages": result.pages,
         "truncated": result.truncated,
+        "shrunk": result.shrunk,
         "blob_path": result.blob_path,
         "owner_check": None if check is None else {
             "verdict": check.verdict,
@@ -641,8 +642,9 @@ def _reocr_json(result: "ingest.ReocrResult") -> dict:
 
 
 def _print_reocr_result(result: "ingest.ReocrResult") -> None:
-    """One human line per document, plus the two things a sweep must not miss:
-    truncation against `OCR_MAX_PAGES`, and any owner verdict that isn't reassuring."""
+    """One human line per document, plus the three things a sweep must not miss:
+    truncation against `OCR_MAX_PAGES`, text that shrank against what is stored
+    (issue #174), and any owner verdict that isn't reassuring."""
     was = (
         f"was {result.previous_chars} chars"
         if result.previous_chars
@@ -662,6 +664,10 @@ def _print_reocr_result(result: "ingest.ReocrResult") -> None:
         line = f"no text      nothing could be extracted from the blob{route}"
     elif result.status == "owner-mismatch":
         line = "refused      owner verification failed - nothing written"
+    elif result.status == "shorter-text":
+        line = (
+            f"refused      shorter than stored  {result.chars} chars ({was}){route}"
+        )
     elif result.status == "missing-blob":
         line = f"missing blob {result.blob_path}"
     else:  # study-blob
@@ -671,10 +677,22 @@ def _print_reocr_result(result: "ingest.ReocrResult") -> None:
         )
     print(f"#{result.document_id}  {line}")
 
+    if result.status == "shorter-text":
+        print(
+            "    store it anyway with --allow-shrink, or leave the stored text as it is"
+        )
     if result.truncated:
         print(
             f"    pages: {result.pages} (over the {ingest.OCR_MAX_PAGES}-page cap - "
             "text is truncated)"
+        )
+    # The issue's floor ask, for the shrinkage that was *permitted*: a written or
+    # would-write line reading `104 chars (was 3221 chars)` says nothing about the 97%
+    # that just went away. A refusal already says it on its own line above.
+    if result.shrunk and result.status != "shorter-text":
+        print(
+            f"    shrink: {result.chars} chars replaces {result.previous_chars} - "
+            "the difference is discarded"
         )
     check = result.owner_check
     if check is not None and check.verdict not in ("match", "unverified"):
@@ -730,6 +748,7 @@ def _cmd_document_reocr(args: argparse.Namespace) -> int:
             results = ingest.reocr_documents(
                 conn, document_ids, sources_dir,
                 force=args.force, dry_run=args.dry_run,
+                allow_shrink=args.allow_shrink,
             )
         except ingest.IngestError as exc:
             # Not in `_with_document_conn`'s catch list (it is an engine-side
@@ -3389,6 +3408,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="replace existing ocr_text, and store despite an owner mismatch "
              "(both refused without this, same as `ingest --force`)",
+    )
+    d_reocr.add_argument(
+        "--allow-shrink", dest="allow_shrink", action="store_true",
+        help="store re-derived text that is shorter than the text already stored "
+             "(refused without this; --force does not imply it)",
     )
     d_reocr.add_argument("--sources", help="sources blob dir (overrides config)")
     d_reocr.add_argument("--json", action="store_true", help="machine-readable output")
