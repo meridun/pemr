@@ -2830,8 +2830,9 @@ def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys)
     `annotate` that points one at the other, and a `render` showing what the
     accident costs. The last two steps are the load-bearing ones: with
     `--allow-cross-person` the fact really does leave jane's chart without ever
-    appearing on john's, and `pemr verify` really is clean while it happens, so the
-    refusal is the only thing standing between an operator and a silent loss.
+    appearing on john's, and `pemr verify` only *warns* about it after the fact
+    (issue #169) - nothing is corrupt, so the exit code never moves - which is why
+    the write-time refusal is what stands between an operator and a silent loss.
     """
     jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
                             "jane-doe")
@@ -2892,13 +2893,93 @@ def test_cli_smoke_walks_the_cross_person_merge_accident(cli_two_people, capsys)
     assert "Type 2 Diabetes" not in jane_problems
     assert john_problems.count("Type 2 Diabetes") == 1   # john's own row, not jane's
 
-    # ...and `verify` stays clean throughout, because the target family genuinely
-    # exists. Nothing in the database is broken; a fact simply stopped rendering.
+    # ...and `verify` does not *fail* over it - the target family genuinely exists, so
+    # nothing in the database is broken; a fact simply stopped rendering. Since #169 it
+    # is at least reported, as a warning that leaves the exit code alone.
     capsys.readouterr()
     assert _run(cli_two_people, "verify") == 0
+    assert "belongs to a different person" in capsys.readouterr().out
 
     # 5. And it is reversible: lifting the verdict restores jane's chart.
     assert _run(cli_two_people, "record", "annotate", "condition", jane,
                 "--clear", "--apply") == 0
     assert "Type 2 Diabetes" in _summary_section(
         cli_two_people, "jane-doe", "Active Problems", capsys)
+
+
+def test_cli_smoke_verify_reports_the_live_cross_person_merge(cli_two_people, capsys):
+    """The read-time half of the same story, through the CLI (issue #169).
+
+    The unit tests above drive `verify_report` directly; this walks the operator's
+    view - real `record annotate` writes, then the real console block and the real
+    `--json` payload. The rows it leaves behind are byte-identical to pre-#161 ones,
+    since `cross_person` is disclosed in the annotate report and never persisted, so
+    what `verify` reads here is exactly the shape the guard cannot retroactively fix.
+    """
+    jane = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "jane-doe")
+    john = _cli_person_base(cli_two_people, "condition", "name", "Type 2 Diabetes",
+                            "john-doe")
+    jane_pre = _cli_person_base(cli_two_people, "condition", "name", "Prediabetes",
+                                "jane-doe")
+    john_row = _cli_person_row_id(cli_two_people, "condition", "name",
+                                  "Type 2 Diabetes", "john-doe")
+
+    # The control: jane's own two families merge without a murmur - an ordinary
+    # same-person `merged-into` must stay as quiet as it was before this check.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane_pre,
+                "--status", "merged-into", "--merged-into", jane,
+                "--note", "progressed to the same dx", "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    assert "warnings" not in capsys.readouterr().out
+
+    # The pre-#161 accident, family scope. Both families are live, so no orphan check
+    # sees anything; only the person comparison does, and it is a warning, not a
+    # problem - `pemr verify` still exits 0.
+    assert _run(cli_two_people, "record", "annotate", "condition", jane,
+                "--status", "merged-into", "--merged-into", john,
+                "--note", "deliberate, for the smoke", "--allow-cross-person",
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    assert out.isascii()                       # ASCII-only console output (issue #23)
+    flagged = [ln for ln in out.splitlines() if "belongs to a different person" in ln]
+    assert len(flagged) == 1
+    assert jane[:12] in flagged[0] and john[:12] in flagged[0]
+    assert "jane-doe" in flagged[0] and "john-doe" in flagged[0]
+    # The escape hatch is named, so a deliberate merge reads as expected, not corrupt.
+    assert "--allow-cross-person" in flagged[0]
+
+    # The same string reaches an agent through `--json`, and `ok` stays true.
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["problems"] == []
+    assert len(payload["warnings"]) == 1
+    assert payload["warnings"][0] in flagged[0]
+
+    # Row scope, where the ruled person comes off the row rather than the family.
+    assert _run(cli_two_people, "record", "annotate", "condition", str(john_row),
+                "--row", "--status", "merged-into", "--merged-into", jane_pre,
+                "--note", "the same accident, row-scoped", "--allow-cross-person",
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    assert out.count("belongs to a different person") == 2
+    assert f"row #{john_row}" in out
+
+    # And no double-reporting: removing john's row kills the family the first verdict
+    # points at (and retires the row-scoped one with the row), leaving exactly one
+    # merge warning - the existing dangling-target orphan, not this check as well.
+    assert _run(cli_two_people, "record", "rm", "condition", str(john_row),
+                "--apply") == 0
+    capsys.readouterr()
+    assert _run(cli_two_people, "verify") == 0
+    out = capsys.readouterr().out
+    merge_lines = [ln for ln in out.splitlines() if "merges into" in ln]
+    assert len(merge_lines) == 1
+    assert "has no live family" in merge_lines[0]
+    assert "belongs to a different person" not in out
