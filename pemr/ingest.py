@@ -1617,6 +1617,9 @@ class ReocrResult:
     * ``no-text`` — extraction ran and recovered nothing. A warning, not an error.
     * ``owner-mismatch`` — the recovered text affirmatively names a *different* roster
       person (issue #61's check, re-run against text that did not exist at ingest).
+    * ``shorter-text`` — the re-derived text is shorter than the text already stored,
+      and ``allow_shrink`` was off (issue #174). Nothing written: a replacement that
+      drops characters is a loss unless the operator says otherwise.
     * ``missing-blob`` — ``source_path`` does not resolve under ``sources_dir``.
     * ``study-blob`` — a packed DICOM study, whose ``ocr_text`` is a derived header
       summary rather than extracted text (see :func:`ingest_study_dir`).
@@ -1637,6 +1640,21 @@ class ReocrResult:
         return self.status == "written"
 
     @property
+    def shrunk(self) -> bool:
+        """Whether the re-derived text is shorter than what is already stored (#174).
+
+        Gated on the statuses whose ``chars`` is a real would-be-stored length. The
+        skips (``has-text``, ``missing-blob``, ``study-blob``) and ``no-text`` carry
+        ``chars == 0`` beside a populated ``previous_chars``, so a bare comparison would
+        call every one of them shrunk — including the has-text skip, which by definition
+        never got as far as extracting anything to compare.
+        """
+        return (
+            self.status in ("written", "would-write", "shorter-text")
+            and self.chars < self.previous_chars
+        )
+
+    @property
     def refused(self) -> bool:
         """Whether the caller asked for work that was declined (drives the exit code).
 
@@ -1645,8 +1663,8 @@ class ReocrResult:
         expected outcomes trains `|| true` — the same reasoning as
         :attr:`IngestResult.is_tombstoned`.
         """
-        return self.status in ("has-text", "owner-mismatch", "missing-blob",
-                               "study-blob")
+        return self.status in ("has-text", "owner-mismatch", "shorter-text",
+                               "missing-blob", "study-blob")
 
 
 def reocr_documents(
@@ -1656,6 +1674,7 @@ def reocr_documents(
     *,
     force: bool = False,
     dry_run: bool = False,
+    allow_shrink: bool = False,
 ) -> list[ReocrResult]:
     """Re-derive ``ocr_text`` for each document from its stored blob (`document reocr`).
 
@@ -1668,6 +1687,11 @@ def reocr_documents(
     ``force`` means both "replace existing ``ocr_text``" and "store despite an owner
     mismatch", matching what ``--force`` already means on `ingest`. ``dry_run`` reports
     what would be stored and writes nothing.
+
+    ``allow_shrink`` is the separate override for storing text *shorter* than what is
+    already there (issue #174) — deliberately not ``force``, which a populated corpus
+    already needs just to reach the write, so reusing it would conflate "replace the
+    stored text" with "and discard most of it".
 
     Raises :class:`IngestError` for an unknown document id.
     """
@@ -1739,6 +1763,22 @@ def reocr_documents(
         # affirmative evidence of a cross-owner leak, so it still earns the refusal.
         if owner_check is not None and owner_check.verdict == "mismatch" and not force:
             results.append(ReocrResult(status="owner-mismatch", **common))
+            continue
+
+        # Issue #174: a replacement shorter than what is stored is a loss, and only the
+        # page-cap case (`truncated`) was ever loud about it. Any shrinkage refuses —
+        # no percentage floor, because this is only reachable under `force` at all (the
+        # has-text skip above returns first whenever `previous` is non-empty), so the
+        # `--where-empty` backlog sweep cannot trip it and one predicate can drive the
+        # refusal, the human line and the JSON key alike. Placed *after* the owner check
+        # so `owner_check` is still populated on the refusal — a `--force --dry-run`
+        # owner audit over a populated corpus is the only read-only owner verification
+        # there is — and *before* `dry_run`, so a dry run and a real run report the same
+        # refusal; nothing was going to be written either way.
+        if len(text) < len(previous) and not allow_shrink:
+            results.append(
+                ReocrResult(status="shorter-text", chars=len(text), **common)
+            )
             continue
 
         if dry_run:

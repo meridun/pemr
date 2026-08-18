@@ -967,6 +967,20 @@ either way) stores and warns rather than refusing, since the recovered text cann
 wrong household member — refusing would only withhold the evidence that the document is
 misfiled at the row level.
 
+Both of `--force`'s meanings stop at the **shrinkage guard** (issue #174): re-derived text
+shorter than the `ocr_text` already stored is refused (`shorter-text`, a `refused` status,
+so rc=1), and `--allow-shrink` is the separate override. Separate deliberately — a
+populated corpus needs `--force` just to reach the write at all, so it cannot also mean
+"and discard most of it", and the only read-only owner audit there is (`reocr --force
+--dry-run`, since `check_owner`'s three call sites are all write paths) would otherwise be
+one missing flag away from losing text. The threshold is any shrinkage rather than a
+percentage: it is unreachable without `--force` — the has-text skip returns first — so
+`--where-empty` never trips it, and one predicate drives the refusal, the human line and
+the `--json` `shrunk` key alike. `shrunk` also rides the writes that *are* permitted, so a
+shorter replacement warns on its own line instead of reading as an ordinary success.
+Truncation against `OCR_MAX_PAGES` is one *cause* of a shorter replacement, not the
+condition — a document that is both reports both.
+
 ### Study directories (issue #69)
 
 A burned imaging disc is clinically *one* document but physically one folder holding
@@ -1079,8 +1093,9 @@ pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--n
                                                          # pre-emptive exclusion; ingests and copies nothing
 pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
-pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force]
+pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force] [--allow-shrink]
                                                          # re-derive ocr_text from the stored blob using the ingest dispatch
+                                                         # --allow-shrink: store text shorter than what is there (refused otherwise)
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
 pemr query meds --person jane --active [--raw]           # --active = query.med_is_current per row:
                                                          # a past ended_on or a terminal status ends
