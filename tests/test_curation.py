@@ -1377,6 +1377,152 @@ def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
     assert _curation_count(conn) == 0
 
 
+# --- verify catches the pre-#161 cross-person merge target (issue #169) -------
+#
+# #161's guard is forward-only: a `merged_into_base` written before it can still point at
+# another person's family, and neither orphan check notices, because that family genuinely
+# exists. `allow_cross_person=True` is how these tests reach that stored shape - the row
+# it writes is byte-identical to a pre-#161 one, since `cross_person` lives on the report
+# and is never persisted.
+
+CROSS_PERSON = "belongs to a different person"
+
+
+def _merged_cross_person(two_people, *, row=False):
+    """Rule one of jane's Type 2 Diabetes facts merged into john's family."""
+    conn, jane_base, john_base = _cross_person_bases(two_people)
+    token = jane_base
+    if row:
+        token = str(_person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                                   two_people["jane"].person_id))
+    curation.annotate_record(
+        conn, "condition", token, status="merged-into",
+        note="same condition, two charts", merged_into_base=john_base,
+        allow_cross_person=True, row=row, apply=True,
+    )
+    return conn, jane_base, john_base
+
+
+def test_verify_warns_about_a_live_cross_person_merge_target(two_people):
+    """AC 1: the target family resolves and is live, so no orphan check sees anything -
+    only the person comparison does."""
+    conn, jane_base, john_base = _merged_cross_person(two_people)
+
+    report = verify.verify_report(conn)
+
+    assert report.ok is True and report.problems == []
+    flagged = [w for w in report.warnings if CROSS_PERSON in w]
+    assert len(flagged) == 1
+    assert jane_base[:12] in flagged[0] and john_base[:12] in flagged[0]
+    assert "john-doe" in flagged[0] and "jane-doe" in flagged[0]
+    # Both families are live, so neither orphan warning may fire alongside it.
+    assert not any("has no live family" in w for w in report.warnings)
+
+
+def test_verify_warns_about_a_row_scoped_cross_person_merge_target(two_people):
+    """AC 5: the merge target is a family in either scope, so the check is too - but the
+    ruling side's person comes off the row, not occurrence 0."""
+    conn = two_people["conn"]
+    row_id = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                            two_people["jane"].person_id)
+    _merged_cross_person(two_people, row=True)
+
+    report = verify.verify_report(conn)
+
+    flagged = [w for w in report.warnings if CROSS_PERSON in w]
+    assert len(flagged) == 1 and f"row #{row_id}" in flagged[0]
+
+
+def test_verify_is_silent_on_a_same_person_merge(seeded):
+    """AC 2: the ordinary merge - two of jane's own families - stays quiet."""
+    conn = seeded["conn"]
+    base = _base(conn, "condition", "name", "Prediabetes")
+    target = _base(conn, "condition", "name", "Type 2 Diabetes")
+    curation.annotate_record(
+        conn, "condition", base, status="merged-into",
+        note="one condition, two labels", merged_into_base=target, apply=True,
+    )
+
+    assert verify.verify_report(conn).warnings == []
+
+
+def test_verify_does_not_flag_a_merge_whose_ruling_family_has_no_person(two_people):
+    """AC 3, family scope: an unknown person is not evidence of a cross-person merge -
+    `annotate_record`'s own convention. Emptying the ruling family is the reachable way
+    there, since `person_id` is NOT NULL on every record table."""
+    conn, jane_base, _john_base = _merged_cross_person(two_people)
+    records.remove_record(
+        conn, "condition",
+        _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                       two_people["jane"].person_id),
+        apply=True,
+    )
+    assert not dedup.load_family(conn, "condition", jane_base)
+
+    report = verify.verify_report(conn)
+
+    assert not any(CROSS_PERSON in w for w in report.warnings)
+    # The family orphan warning still fires - it is the one this state is about.
+    assert any("has no live family" in w for w in report.warnings)
+
+
+def test_verify_does_not_flag_a_merge_whose_ruling_row_is_gone(two_people):
+    """AC 3, row scope: `row_person` reports ``(None, "")`` for a removed row, and an
+    unknown ruling person must not warn either."""
+    conn = two_people["conn"]
+    row_id = _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                            two_people["jane"].person_id)
+    _merged_cross_person(two_people, row=True)
+    # Straight to the table: the write paths retire a row verdict with its row.
+    conn.execute("DELETE FROM condition WHERE condition_id = ?", (row_id,))
+    conn.commit()
+
+    report = verify.verify_report(conn)
+
+    assert not any(CROSS_PERSON in w for w in report.warnings)
+    assert any("names no live row" in w for w in report.warnings)
+
+
+def test_verify_does_not_flag_a_merge_whose_target_family_has_no_person(
+    two_people, monkeypatch
+):
+    """AC 3, target side. Unreachable through the write paths - `person_id` is NOT NULL,
+    so a live target family always has one, and an *empty* target is the dangling-merge
+    orphan below rather than this branch. The guard is defensive parity with
+    `annotate_record`, so it is pinned defensively."""
+    conn, _jane_base, john_base = _merged_cross_person(two_people)
+    real_family_person = curation.family_person
+
+    def unknown_target(conn_, record_type, base):
+        if base == john_base:
+            return None, ""
+        return real_family_person(conn_, record_type, base)
+
+    monkeypatch.setattr(curation, "family_person", unknown_target)
+
+    assert not any(CROSS_PERSON in w for w in verify.verify_report(conn).warnings)
+
+
+def test_verify_does_not_double_report_a_dangling_cross_person_target(two_people):
+    """AC 4: a dead target is the existing orphan warning's case, and only its case - the
+    `elif` placement is what guarantees that, not a second lookup."""
+    conn, _jane_base, john_base = _merged_cross_person(two_people)
+    records.remove_record(
+        conn, "condition",
+        _person_row_id(conn, "condition", "name", "Type 2 Diabetes",
+                       two_people["john"].person_id),
+        apply=True,
+    )
+    assert not dedup.load_family(conn, "condition", john_base)
+
+    report = verify.verify_report(conn)
+
+    merge_warnings = [w for w in report.warnings if "merges into" in w]
+    assert len(merge_warnings) == 1
+    assert "has no live family" in merge_warnings[0]
+    assert CROSS_PERSON not in merge_warnings[0]
+
+
 # --- row ids are reusable, so removing the row retires its verdict (issue #114) ---
 
 
