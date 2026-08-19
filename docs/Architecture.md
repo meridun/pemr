@@ -1138,6 +1138,8 @@ pemr trends --person jane --test hba1c                   # min/max/latest/slope
 pemr due --person jane                                   # screening/vaccine gaps — NOT IMPLEMENTED (phase 7)
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
+                                                         # --include-self-reported: also show symptom/activity
+                                                         # rows in Procedures & Observations (default: hidden, #180)
 pemr render journal --person jane        > exports/jane-journal.md
 pemr render curation --person jane       > exports/jane-curation.md  # curation audit trail (empty = no verdicts)
 pemr backup                                              # VACUUM INTO snapshot
@@ -1257,7 +1259,17 @@ default to the same exclusion unless a human explicitly decides otherwise.
   `pemr rekey`.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
-  questions. This is your "walk-in readiness" as a repeatable command.
+  questions. This is your "walk-in readiness" as a repeatable command. Since issue #180,
+  `## Procedures & Observations` hides self-attested `symptom`/`activity` rows by
+  default (`include_self_reported: bool = False`, `--include-self-reported` /
+  `include_self_reported` on the CLI and MCP surfaces, mirroring `render_journal`'s
+  identical #167 flag) — a record with none renders byte-identically to before the
+  flag existed. Unlike the routine-procedures list (above) and order grouping's `+N
+  earlier` (#93), this suppression is **not disclosed on the page**: no `+N hidden`
+  line and no collapsed summary section catch the hidden rows in the brief itself
+  (they remain fully visible via `pemr query timeline`). This is a deliberate,
+  human-approved exception to the disclosed-suppression convention this section
+  otherwise follows — flagged at audit for the merge reviewer, not a bug.
 - **journal** — chronological event stream (documents + appointments + procedures)
   rendered as a narrative timeline.
 - **curation record** (issue #168) — the audit trail: every recorded verdict that removed a
