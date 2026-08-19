@@ -2700,8 +2700,9 @@ def _fmt(value: object) -> str:
 
 
 def _with_conn_person(args: argparse.Namespace, work):
-    """Open the DB, run ``work(conn)``, translating the two friendly failure modes
-    (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
+    """Open the DB, run ``work(conn)``, translating the friendly failure modes
+    (un-migrated DB, unknown person slug, a ``--test`` token that collides across two
+    record types) into an rc=1 stderr message."""
     conn = _connect_db(args)
     try:
         try:
@@ -2709,7 +2710,7 @@ def _with_conn_person(args: argparse.Namespace, work):
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except query.PersonNotFoundError as exc:
+        except (query.PersonNotFoundError, query.AmbiguousTestError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
@@ -3832,10 +3833,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.set_defaults(func=_cmd_find)
 
     p_trends = sub.add_parser(
-        "trends", help="min/max/latest/slope for one analyte over time"
+        "trends", help="min/max/latest/slope for one lab analyte or vital sign over time"
     )
     p_trends.add_argument("--person", required=True, help="owner slug")
-    p_trends.add_argument("--test", required=True, help="analyte name (dictionary-normalized)")
+    p_trends.add_argument(
+        "--test",
+        required=True,
+        help="analyte or vital key (dictionary-normalized); refused, not merged, if it "
+        "matches both a lab result and a vital observation",
+    )
     p_trends.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     p_trends.add_argument("--json", action="store_true", help="machine-readable output")
     p_trends.set_defaults(func=_cmd_trends)

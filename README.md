@@ -49,7 +49,8 @@ layout, `migrations/001_init.sql`, `pemr migrate --create` (bootstrap a new arch
 (`pemr ingest`), semantic dedup keys with conflict staging (`migrations/002_conflict.sql`,
 `pemr review-conflicts`), starter analyte/name dictionary. **Phase 3 (query layer) is done**:
 structured reads (`pemr query labs|meds|timeline`), full-text search over OCR text + record
-fields (`migrations/003_fts.sql`, `pemr find`), and lab `pemr trends` — all with `--json`.
+fields (`migrations/003_fts.sql`, `pemr find`), and `pemr trends` over lab analytes and vital
+signs alike (a key present in both is refused, not merged) — all with `--json`.
 
 ## Data / privacy posture
 

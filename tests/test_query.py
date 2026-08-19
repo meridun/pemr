@@ -814,3 +814,192 @@ def test_an_empty_exclusion_set_filters_nothing(seeded):
     assert query.query_timeline(
         seeded, "jane-doe", exclude_obs_types=frozenset()
     ) == full
+
+
+# --- trends: vitals series (issue #176) ---------------------------------------
+#
+# `trends` charts a measurement *key*, not a table: an `obs_type='vital'` observation
+# reaches the same statistics and the same #136 conversion a lab analyte does. A key that
+# matches numeric rows in both tables is refused rather than merged -- the #71 rule.
+
+@pytest.fixture()
+def vital_temps(seeded):
+    """One person's temperature recorded in degF by one clinic and degC by another, with
+    no `lab_result` counterpart anywhere."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="clinic vitals flowsheets")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Temperature",
+         "value_num": 98.6, "unit": "degF"},
+        {"obs_type": "vital", "observed_at": "2026-01-15", "key": "Temperature",
+         "value_num": 37.5, "unit": "degC"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Temperature",
+         "value_num": 100.4, "unit": "degF"},
+    ]}, d)
+    return seeded
+
+
+def test_trends_charts_a_vitals_series(vital_temps):
+    """The whole point of the issue: a key with zero lab rows still gets a series, dated
+    off `observed_at`."""
+    d = dedup.load_dictionary(DICT_PATH)
+    assert vital_temps.execute(
+        "SELECT COUNT(*) c FROM lab_result WHERE test_name LIKE '%emperature%'"
+    ).fetchone()["c"] == 0
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["test"] == "temperature"
+    assert t["count"] == 3
+    assert t["latest"] == 100.4 and t["latest_at"] == "2026-02-01"
+    assert t["latest_tie"] == 1
+    assert t["slope_per_day"] is not None
+    # No preference set, so the mixed spellings are reported honestly (the pre-#136 rule).
+    assert t["unit"] is None and t["min"] == 37.5 and t["max"] == 100.4
+
+
+def test_trends_converts_a_vitals_series_to_the_canonical_unit(vital_temps):
+    """#136's guarantee, now reachable by the population the registry's temperature
+    dimension exists for: stats and reported unit cannot disagree."""
+    d = dedup.load_dictionary(DICT_PATH)
+    units.set_pref(vital_temps, "jane-doe", "Temperature", "degC", dictionary=d)
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["canonical_unit"] == "degC"
+    assert t["converted_count"] == 2        # the two degF rows
+    assert t["unconverted_count"] == 0
+    assert t["unit"] == "degC"
+    # 98.6 degF is 37.0 degC and 100.4 degF is 38.0 -- not the degF magnitudes.
+    assert t["min"] == 37.0 and t["max"] == 38.0
+    assert t["latest"] == 38.0 and t["latest_at"] == "2026-02-01"
+
+
+def test_trends_keeps_and_discloses_an_unconvertible_vital_point(vital_temps):
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(vital_temps, "jane-doe", ocr="thermometer with no scale printed")
+    dedup.commit_extraction(vital_temps, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-02-15", "key": "Temperature",
+         "value_num": 99.0, "unit": "balmy"},
+    ]}, d)
+    units.set_pref(vital_temps, "jane-doe", "Temperature", "degC", dictionary=d)
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["count"] == 4                   # kept in the series, never dropped
+    assert t["converted_count"] == 2 and t["unconverted_count"] == 1
+    assert t["unit"] is None                 # falls back rather than mislabelling
+
+
+def test_trends_vitals_stored_rows_are_untouched(vital_temps):
+    """The conversion is a read-time transform on `observation` exactly as it is on
+    `lab_result`."""
+    d = dedup.load_dictionary(DICT_PATH)
+    before = [dict(r) for r in vital_temps.execute(
+        "SELECT * FROM observation ORDER BY observation_id"
+    ).fetchall()]
+    units.set_pref(vital_temps, "jane-doe", "Temperature", "degC", dictionary=d)
+    query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert [dict(r) for r in vital_temps.execute(
+        "SELECT * FROM observation ORDER BY observation_id"
+    ).fetchall()] == before
+
+
+def test_trends_lab_only_series_is_unchanged(albumin_assays):
+    """Regression-free for every existing caller: a key with no vitals rows behaves
+    exactly as it did before the second source existed."""
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(albumin_assays, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["unit"] == "%"
+    assert t["min"] == 5.5 and t["max"] == 6.5
+    assert t["latest"] == 6.5 and t["latest_at"] == "2026-01-01"
+    assert t["other_assays"] == [] and t["other_assay_count"] == 0
+
+    alb = query.trends(albumin_assays, "jane-doe", "albumin", dictionary=d)
+    assert alb["count"] == 2
+    assert alb["other_assays"] == ["albumin (spep)"] and alb["other_assay_count"] == 1
+
+
+def test_trends_refuses_a_key_present_in_both_tables(vital_temps):
+    """A lab `Temperature` and a vital `Temperature` are two different measurements that
+    happen to share a token; interleaving them is the wrong chart #71 splits assays to
+    avoid, so the collision is refused, not resolved."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(vital_temps, "jane-doe", ocr="specimen temperature")
+    dedup.commit_extraction(vital_temps, doc, {"lab_result": [
+        {"test_name": "Temperature", "collected_at": "2026-03-01", "value_num": 4.0,
+         "unit": "degC"},
+    ]}, d)
+
+    with pytest.raises(query.AmbiguousTestError) as excinfo:
+        query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    message = str(excinfo.value)
+    assert "lab results" in message and "vital observations" in message
+    assert "1 numeric rows" in message and "(3)" in message
+    assert message.isascii()                 # reaches a cp1252/cp437 console
+
+
+def test_trends_refusal_ignores_a_non_numeric_collision(seeded):
+    """A `120/80` blood pressure lives in `value_text` and can never join a numeric
+    series, so it must neither trigger the refusal nor block a legitimate lab series."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="vitals with a text-only reading")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-04-01", "key": "HbA1c",
+         "value_text": "not run"},
+    ]}, d)
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["latest"] == 6.5
+
+
+def test_trends_discloses_a_vitals_family_sibling_as_another_assay(seeded):
+    """One disclosure rule across both sources: the excluded row is named wherever it
+    lives, and its token pastes back as `--test` and finds it."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="clinic scale + dialysis flowsheet")
+    dedup.commit_extraction(seeded, doc, {
+        "observation": [
+            {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Weight",
+             "value_num": 88.0, "unit": "kg"},
+        ],
+        "lab_result": [
+            {"test_name": "Weight (Post-dialysis)", "collected_at": "2026-01-02",
+             "value_num": 86.0, "unit": "kg"},
+        ],
+    }, d)
+
+    t = query.trends(seeded, "jane-doe", "weight", dictionary=d)
+    assert t["count"] == 1 and t["latest"] == 88.0
+    assert t["other_assays"] == ["weight (post-dialysis)"]
+    assert t["other_assay_count"] == 1
+    # The disclosed token pastes back and reaches the lab row it named.
+    back = query.trends(seeded, "jane-doe", t["other_assays"][0], dictionary=d)
+    assert back["count"] == 1 and back["latest"] == 86.0
+    assert back["other_assays"] == ["weight"]
+
+
+def test_trends_undated_vital_counts_but_never_wins_latest(vital_temps):
+    """`observed_at` is nullable by design for vitals. The point is disclosed in the
+    stats, dropped only from the slope -- the same treatment an undated lab row gets."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(vital_temps, "jane-doe", ocr="undated flowsheet")
+    dedup.commit_extraction(vital_temps, doc, {"observation": [
+        {"obs_type": "vital", "key": "Temperature", "value_num": 101.0, "unit": "degF"},
+    ]}, d)
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["count"] == 4 and t["max"] == 101.0     # counted
+    assert t["latest"] == 100.4 and t["latest_at"] == "2026-02-01"   # never latest
+    assert t["slope_per_day"] is not None            # dropped from the fit, not fatal
+
+
+def test_trends_vitals_are_person_scoped(vital_temps):
+    """Both SELECTs are person-scoped, so the isolation invariant still holds."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(vital_temps, "john-doe", ocr="john vitals")
+    dedup.commit_extraction(vital_temps, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-05-01", "key": "Temperature",
+         "value_num": 36.0, "unit": "degC"},
+    ]}, d)
+
+    jane = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    john = query.trends(vital_temps, "john-doe", "Temperature", dictionary=d)
+    assert jane["count"] == 3 and john["count"] == 1
+    assert john["latest"] == 36.0

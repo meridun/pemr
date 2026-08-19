@@ -39,7 +39,8 @@ Read-only tools (never mutate the DB; safe to call freely):
 - `person_show` — one person by slug.
 - `query` — structured reads; `kind` = `labs` | `meds` | `timeline`.
 - `find` — full-text search over `ocr_text` + record fields.
-- `trends` — min/max/latest/slope for one analyte.
+- `trends` — min/max/latest/slope for one lab analyte or vital sign; a key matching both is
+  refused, not merged.
 - `render_summary` — master summary Markdown for a person.
 - `render_brief` — walk-in brief Markdown for one appointment.
 - `render_journal` — narrative chronology Markdown for a person.
