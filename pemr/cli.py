@@ -3830,10 +3830,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.set_defaults(func=_cmd_find)
 
     p_trends = sub.add_parser(
-        "trends", help="min/max/latest/slope for one analyte over time"
+        "trends", help="min/max/latest/slope for one lab analyte or vital sign over time"
     )
     p_trends.add_argument("--person", required=True, help="owner slug")
-    p_trends.add_argument("--test", required=True, help="analyte name (dictionary-normalized)")
+    p_trends.add_argument(
+        "--test",
+        required=True,
+        help="analyte or vital key (dictionary-normalized); refused, not merged, if it "
+        "matches both a lab result and a vital observation",
+    )
     p_trends.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     p_trends.add_argument("--json", action="store_true", help="machine-readable output")
     p_trends.set_defaults(func=_cmd_trends)
