@@ -964,6 +964,58 @@ def test_cli_document_show_renders_unknown_provenance_rather_than_a_blank(
     assert json.loads(capsys.readouterr().out)["text_source"] is None
 
 
+def test_cli_provenance_lifecycle_ingest_set_text_reocr(cli_ready, capsys):
+    """The whole provenance chain through the CLI, one document, in order (issue #175).
+
+    The per-step assertions exist elsewhere in this file at the API level; what this pins
+    is the *sequence* a real operator walks - extraction at ingest, a hand-attach over it,
+    then a re-OCR that takes it back - together with the FTS resync that rides on the
+    same two-column UPDATE. `record_fts` is asserted at each step because the trigger
+    firing once (not zero or twice) is what keeps `find` honest after a replace.
+    """
+    scan = cli_ready / "engine-scan.txt"
+    scan.write_bytes(b"jane engine token enginetoken alpha")
+    assert _run(cli_ready, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources"), "--ocr", "auto") == 0
+
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        def fts_rows():
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM record_fts "
+                "WHERE source_table = 'document' AND document_id = 2"
+            ).fetchone()["n"]
+
+        # 1. pemr extracted it -> engine.
+        assert _text_source(conn, 2) == "engine"
+        assert fts_rows() == 1
+
+        # 2. a human replaces it -> attached, and `find` follows the new text.
+        hand = cli_ready / "hand.txt"
+        hand.write_text("jane corrected by hand handtoken bravo", encoding="utf-8")
+        assert _run(cli_ready, "document", "set-text", "2", "--force",
+                    "--ocr-text-file", str(hand)) == 0
+        assert _text_source(conn, 2) == "attached"
+        assert fts_rows() == 1
+        capsys.readouterr()
+        assert _run(cli_ready, "find", "handtoken") == 0
+        assert "document#2" in capsys.readouterr().out
+        assert _run(cli_ready, "find", "enginetoken") == 0
+        assert "no matches" in capsys.readouterr().out
+
+        # 3. re-OCR re-derives from the stored blob -> back to engine. Same
+        # `set_document_text` call as step 2, distinguished only by `source`.
+        assert _run(cli_ready, "document", "reocr", "2", "--force", "--allow-shrink",
+                    "--sources", str(cli_ready / "sources")) == 0
+        assert _text_source(conn, 2) == "engine"
+        assert fts_rows() == 1
+        capsys.readouterr()
+        assert _run(cli_ready, "find", "enginetoken") == 0
+        assert "document#2" in capsys.readouterr().out
+    finally:
+        conn.close()
+
+
 def test_cli_document_show_reports_open_conflicts(cli_ready, capsys):
     scan2 = cli_ready / "scan2.txt"
     scan2.write_bytes(b"hba1c 7.4 percent")
