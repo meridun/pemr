@@ -780,3 +780,31 @@ def test_the_query_tool_still_returns_self_reports(seeded):
     events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
     assert any("morning walk" in e["summary"] for e in events)
     assert any("right foot ache" in e["summary"] for e in events)
+
+
+# --- brief opt-in parity (issue #180) -----------------------------------------
+
+def test_render_brief_tool_mirrors_the_cli_default(seeded):
+    """The brief gains the journal's flag on both surfaces in one pass, or the two
+    verbs drift about what a brief contains."""
+    _attest_self_reports(seeded)
+    md = mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"]
+    assert "right foot ache" not in md and "morning walk" not in md
+    assert "# Appointment Brief" in md          # control: the doc is otherwise whole
+
+
+def test_render_brief_tool_forwards_the_opt_in(seeded):
+    _attest_self_reports(seeded)
+    md = mcp_server.render_brief(
+        seeded, appointment=_appt_id(seeded), include_self_reported=True
+    )["markdown"]
+    assert "symptom right foot ache" in md
+    assert "activity morning walk" in md
+
+
+def test_the_brief_opt_in_registers_no_new_tool(seeded):
+    """A parameter, never a name -- the wire surface is unchanged."""
+    assert "render_brief" in mcp_server.READ_ONLY_TOOLS
+    assert set(mcp_server.TOOL_NAMES) == set(
+        mcp_server.READ_ONLY_TOOLS + mcp_server.WRITE_TOOLS
+    )

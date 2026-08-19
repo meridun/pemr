@@ -632,3 +632,58 @@ def test_a_person_with_no_self_reports_gets_no_symptom_section(ready, capsys):
     tmp_path, _ = ready
     assert _run(tmp_path, "render", "summary", "--person", "jane-doe") == 0
     assert "Self-Reported Symptoms" not in capsys.readouterr().out
+
+
+# --- brief filtering + severity range, through argv (issue #180) ---------------
+
+def test_brief_hides_self_reports_until_asked(ready, capsys):
+    """The same flag the journal already had, on the brief -- one vocabulary across the
+    render verbs, and both spellings exit 0."""
+    tmp_path, aid = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T09:00") == 0
+    assert _assert_symptom(tmp_path, f"{day}T07:30", key="morning walk",
+                           obs_type="activity", severity="40") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "render", "brief", "--appointment", str(aid)) == 0
+    default = capsys.readouterr().out
+    assert "right foot ache" not in default and "morning walk" not in default
+    assert "# Appointment Brief: Jane Doe" in default   # control: the doc is otherwise whole
+
+    assert _run(tmp_path, "render", "brief", "--appointment", str(aid),
+                "--include-self-reported") == 0
+    opted_in = capsys.readouterr().out
+    assert "symptom right foot ache" in opted_in
+    assert "activity morning walk" in opted_in
+
+
+def test_an_out_of_range_severity_assert_exits_non_zero(ready, capsys):
+    """The range rule is a refusal with a message that names the bound, not a crash --
+    and the ValidationError -> rc=1 mapping is intact."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T09:00", severity="50") == 1
+    err = capsys.readouterr().err
+    assert "expects a severity in 0-10" in err
+    assert err.isascii()
+
+
+def test_an_out_of_range_activity_value_is_still_accepted(ready, capsys):
+    """The rule is obs_type-conditional: `activity` stores minutes, and 240 of them is a
+    long hike, not a data-entry error."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T07:30", key="morning walk",
+                          obs_type="activity", severity="240") == 0
+
+
+def test_a_blank_key_assert_exits_non_zero(ready, capsys):
+    """The other spelling of keyless: `key=` is the untyped blob the lane exists to
+    prevent, and now reads as missing rather than rendering a blank-labelled line."""
+    tmp_path, _ = ready
+    day = date.today() - timedelta(days=1)
+    assert _assert_symptom(tmp_path, f"{day}T09:00", key="") == 1
+    err = capsys.readouterr().err
+    assert "missing required field 'key'" in err
+    assert err.isascii()

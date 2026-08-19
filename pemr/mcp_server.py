@@ -499,15 +499,29 @@ def render_summary(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
     return {"markdown": markdown}
 
 
-def render_brief(conn: sqlite3.Connection, *, appointment: int) -> dict[str, str]:
+def render_brief(
+    conn: sqlite3.Connection,
+    *,
+    appointment: int,
+    include_self_reported: bool = False,
+) -> dict[str, str]:
     """[read] Walk-in brief for one appointment -> Markdown. Mirrors ``pemr render brief``.
 
     The Markdown carries a placeholder "Medication Interaction Review" section; per
     ``AGENTS.md`` the agent fills it from general knowledge under the mandated
     verify-with-a-pharmacist framing, and must never claim safety or give dosing advice.
+
+    ``include_self_reported`` mirrors the CLI's ``--include-self-reported`` (issue #180),
+    a pass-through with no logic of its own: the two surfaces must not drift about what
+    the brief contains.
     """
     try:
-        markdown = _render.render_brief(conn, appointment, dictionary=_dictionary())
+        markdown = _render.render_brief(
+            conn,
+            appointment,
+            dictionary=_dictionary(),
+            include_self_reported=include_self_reported,
+        )
     except (db.NotMigratedError, _render.AppointmentNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}
@@ -632,8 +646,14 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         return _run(render_summary, person=person)
 
     @server.tool(name="render_brief", annotations=ro)
-    def render_brief_tool(appointment: int) -> dict:
-        return _run(render_brief, appointment=appointment)
+    def render_brief_tool(
+        appointment: int, include_self_reported: bool = False
+    ) -> dict:
+        return _run(
+            render_brief,
+            appointment=appointment,
+            include_self_reported=include_self_reported,
+        )
 
     @server.tool(name="render_journal", annotations=ro)
     def render_journal_tool(

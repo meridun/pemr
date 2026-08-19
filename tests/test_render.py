@@ -2174,9 +2174,9 @@ def test_self_reports_never_reach_the_problem_list(seeded):
     )
     brief_active = brief.split("## Active Problems")[1].split("\n## ")[0]
     assert "right foot ache" not in brief_active and "morning walk" not in brief_active
-    # The brief is otherwise deliberately untouched: its generic recent-observations list
-    # still shows the raw rows, tagged as attested. Only the *problem list* is off-limits
-    # to these lanes, and only the summary gains a collapsed section.
+    # The brief gains no collapsed section either -- that one stays the summary's. Its
+    # generic recent-observations list is opt-in for these lanes as of issue #180; the
+    # pair of tests below covers both sides of that flag.
     assert _SYMPTOM_HEADER not in brief
 
 
@@ -2245,3 +2245,97 @@ def test_journal_includes_self_reports_on_request(seeded):
     )
     assert "symptom right foot ache" in md
     assert "activity morning walk" in md
+
+
+# --- brief filtering + mixed-separator ordering (issue #180) -------------------
+
+_BRIEF_OBS_HEADER = "## Procedures & Observations"
+
+
+def _brief(conn, **kwargs):
+    return render.render_brief(
+        conn, _upcoming_appt_id(conn), dictionary=dedup.load_dictionary(DICT_PATH),
+        now=_SYMPTOM_NOW, **kwargs
+    )
+
+
+def _brief_observations(md):
+    return md.split(_BRIEF_OBS_HEADER)[1].split("\n## ")[0]
+
+
+def test_brief_hides_self_reports_by_default(seeded):
+    """The drowning failure mode #167 fixed for the journal, left open on the brief: the
+    section is uncapped, so a few hundred attestations a year push the clinician-sourced
+    observations the document exists to carry off the top of it."""
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00"),
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity",
+                     value_num=40),
+    ])
+    section = _brief_observations(_brief(seeded))
+    assert "right foot ache" not in section and "morning walk" not in section
+
+
+def test_brief_includes_self_reports_on_request(seeded):
+    _seed_symptoms(seeded, [
+        _symptom_row("2026-08-16T09:00"),
+        _symptom_row("2026-08-16T07:30", key="morning walk", obs_type="activity",
+                     value_num=40),
+    ])
+    section = _brief_observations(_brief(seeded, include_self_reported=True))
+    assert "symptom right foot ache" in section
+    assert "activity morning walk" in section
+
+
+def test_brief_still_shows_clinician_sourced_observations(seeded):
+    """The exclusion is scoped to the two self-attested lanes -- it drops no `vital`,
+    `order` or other clinician-sourced row."""
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    default = _brief_observations(_brief(seeded))
+    opted_in = _brief_observations(_brief(seeded, include_self_reported=True))
+    for row in seeded.execute(
+        "SELECT DISTINCT key FROM observation WHERE obs_type NOT IN ('symptom','activity')"
+        " AND key IS NOT NULL"
+    ).fetchall():
+        assert row["key"] in default, row["key"]
+        assert row["key"] in opted_in, row["key"]
+
+
+def test_a_record_without_self_reports_renders_a_byte_identical_brief(seeded):
+    """AC bullet 1's backward-compatibility half: the default output moves for records
+    that use the lanes, and for nobody else."""
+    before = _brief(seeded)
+    _seed_symptoms(seeded, [_symptom_row("2026-08-16T09:00")])
+    # john-doe's brief is a different appointment; jane's own brief is the one that
+    # changes. Seeding jane cannot move a byte of the sections that carry neither.
+    assert _brief_observations(_brief(seeded)) == _brief_observations(before)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_symptom_latest_survives_a_mixed_separator_timestamp(seeded, reverse):
+    """The AC's named regression test. `T` (0x54) sorts after a space (0x20), so raw
+    lexicographic ordering made the 09:00 report outrank the 20:00 resolution and the
+    `; last reported resolved` clause silently vanished."""
+    rows = [
+        _symptom_row("2026-08-18T09:00", value_num=3),
+        _symptom_row("2026-08-18 20:00", value_num=0, value_text="fine now"),
+    ]
+    _seed_symptoms(seeded, list(reversed(rows)) if reverse else rows)
+    line = _line(_symptom_summary(seeded), "right foot ache")
+    assert "; last reported resolved 2026-08-18" in line
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_latest_vitals_picks_the_newest_across_mixed_separators(seeded, reverse):
+    """The same hazard on the `_latest_vitals` fold, which the symptom test does not
+    exercise: it shares the `ORDER BY observed_at` idiom and the ascending-last-wins
+    fold, so a mis-ordered pair silently renders the older reading."""
+    rows = [
+        {"obs_type": "vital", "key": "heart_rate", "observed_at": "2026-08-18T09:00",
+         "value_num": 61, "unit": "bpm"},
+        {"obs_type": "vital", "key": "heart_rate", "observed_at": "2026-08-18 20:00",
+         "value_num": 88, "unit": "bpm"},
+    ]
+    _seed_symptoms(seeded, list(reversed(rows)) if reverse else rows)
+    line = _line(_symptom_summary(seeded), "heart_rate")
+    assert "88" in line and "61" not in line
