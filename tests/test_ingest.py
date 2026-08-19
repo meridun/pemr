@@ -1806,6 +1806,67 @@ def test_zero_width_only_ocr_text_is_no_text_at_all(conn, tmp_path, sources):
     assert not result.ocr_text_populated
 
 
+# --- text provenance (issue #175) -------------------------------------------
+
+
+def _text_source(conn, document_id):
+    return conn.execute(
+        "SELECT text_source FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()["text_source"]
+
+
+def test_extracted_text_records_engine_provenance(conn, tmp_path, sources):
+    """`--ocr auto` text came off the page through pemr, so it carries OCR-typical noise
+    a consumer may want to weigh differently."""
+    src = _make_file(tmp_path, "notes.txt", b"Sodium 140 mmol/L")
+    result = ingest.ingest_document(conn, src, "jane-doe", sources, ocr=True)
+    assert result.document.ocr_text == "Sodium 140 mmol/L"
+    assert _text_source(conn, result.document.document_id) == "engine"
+
+
+def test_supplied_text_records_attached_provenance(conn, tmp_path, sources):
+    """Provenance follows the text's *origin*, not the verb that wrote it:
+    `--ocr-text-file` is the agent's own transcription (the `AGENTS.md` default path),
+    so recording it as engine output would misclassify exactly the rows this column
+    exists to tell apart."""
+    src = _make_file(tmp_path, "scan.png", b"not really an image")
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr_text="Sodium 140 mmol/L"
+    )
+    assert _text_source(conn, result.document.document_id) == "attached"
+
+
+def test_supplied_text_beats_extraction_for_provenance_too(conn, tmp_path, sources):
+    """When both are available the supplied text wins the column, so it must win the
+    provenance with it."""
+    src = _make_docx(tmp_path, paragraphs=("extracted body",))
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True, ocr_text="agent transcription"
+    )
+    assert result.document.ocr_text == "agent transcription"
+    assert _text_source(conn, result.document.document_id) == "attached"
+
+
+def test_ingest_without_text_records_no_provenance(conn, tmp_path, sources):
+    """No text means nothing to attribute - both columns stay NULL, which is what makes
+    NULL's other reading ("written before 015") derivable from `ocr_text` alone."""
+    src = _make_file(tmp_path)
+    result = ingest.ingest_document(conn, src, "jane-doe", sources)
+    assert result.document.ocr_text is None
+    assert _text_source(conn, result.document.document_id) is None
+
+
+def test_zero_width_only_supplied_text_records_no_provenance(conn, tmp_path, sources):
+    """The emptiness predicate is shared, so a zero-width-only transcription is neither
+    stored nor attributed (#87 + #175)."""
+    src = _make_file(tmp_path, "scan.txt", b"a scan with no text")
+    result = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr_text=chr(0x200B)
+    )
+    assert result.document.ocr_text is None
+    assert _text_source(conn, result.document.document_id) is None
+
+
 def test_supplied_ocr_text_is_stored_without_invisible_padding(conn, tmp_path, sources):
     """Normalise what is *stored*, not just what is rejected (#87)."""
     src = _make_file(tmp_path, "scan2.txt", b"another scan")
@@ -2107,6 +2168,38 @@ def test_reocr_force_replaces_existing_text(conn, tmp_path, sources):
     )
 
 
+def test_reocr_records_engine_provenance(conn, tmp_path, sources):
+    """Re-OCR text is `extract_text_routed` output. It reaches the column through the
+    same `set_document_text(force=True)` call a hand-attach uses, so `source` is the only
+    thing that tells the two apart (issue #175)."""
+    doc = _file_document(conn, tmp_path, sources, content=b"acute pericarditis noted")
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources)
+
+    assert result.status == "written"
+    assert _text_source(conn, doc.document_id) == "engine"
+
+
+def test_reocr_flips_attached_provenance_to_engine_on_a_forced_replace(
+    conn, tmp_path, sources
+):
+    """The replace path: a hand-attached transcription overwritten by re-derived text is
+    no longer hand-attached, and `force=True` must not be read as "leave provenance be"."""
+    doc = _file_document(
+        conn, tmp_path, sources, content=b"machine text, and then some more of it",
+        ocr_text="old transcription",
+    )
+    assert _text_source(conn, doc.document_id) == "attached"
+
+    (result,) = ingest.reocr_documents(conn, [doc.document_id], sources, force=True)
+
+    assert result.status == "written"
+    assert _stored_text(conn, doc.document_id) == (
+        "machine text, and then some more of it"
+    )
+    assert _text_source(conn, doc.document_id) == "engine"
+
+
 def test_reocr_dry_run_reports_chars_and_writes_nothing(conn, tmp_path, sources):
     doc = _file_document(conn, tmp_path, sources, content=b"twenty four characters!!")
 
@@ -2115,6 +2208,7 @@ def test_reocr_dry_run_reports_chars_and_writes_nothing(conn, tmp_path, sources)
     assert result.status == "would-write"
     assert result.chars == 24
     assert _stored_text(conn, doc.document_id) is None
+    assert _text_source(conn, doc.document_id) is None   # neither column written
 
 
 def test_reocr_dry_run_names_a_pdf_over_the_page_cap(

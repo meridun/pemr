@@ -546,6 +546,9 @@ def _print_document_show(doc: dict) -> None:
         ("source_path", _fmt(doc["source_path"])),
         ("ingested_at", _fmt(doc["ingested_at"])),
         ("has_ocr_text", f"yes ({chars} chars)" if doc["has_ocr_text"] else "no"),
+        # Not `_fmt`: it renders None as an empty string, which would make "provenance
+        # unknown" (a pre-015 row, or no text at all) look like a rendering bug (#175).
+        ("text_source", doc["text_source"] or "unknown"),
         ("records", records),
         ("conflicts", conflicts),
     ]

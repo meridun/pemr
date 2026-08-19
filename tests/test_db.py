@@ -51,6 +51,7 @@ ALL_MIGRATIONS = [
     "012_record_edit.sql",
     "013_person_unit_pref.sql",
     "014_medication_status_reason.sql",
+    "015_document_text_source.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -96,6 +97,56 @@ def test_medication_has_status_reason_column(conn):
     assert conn.execute(
         "SELECT status_reason FROM medication"
     ).fetchone()["status_reason"] is None   # nullable, no backfill
+
+
+def _migrate_through_014(conn, tmp_path):
+    """Apply every migration up to 014, leaving 015 pending (a 014-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre015"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "015":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def test_document_has_text_source_column(conn):
+    """Migration 015 (issue #175): which write path produced the current `ocr_text`."""
+    db.migrate(conn)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(document)").fetchall()}
+    assert "text_source" in cols
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ocr_text, ingested_at) "
+        "VALUES ('aa11', 1, 'aa/aa11.pdf', 'scan text', '2026-03-16T00:00:00')"
+    )
+    assert conn.execute(
+        "SELECT text_source FROM document"
+    ).fetchone()["text_source"] is None   # nullable, no backfill
+
+
+def test_migration_015_applies_on_a_014_era_database_without_backfilling(
+    conn, tmp_path
+):
+    """The upgrade path: one additive nullable column, so an existing document keeps its
+    text and gains `text_source IS NULL` — deliberately *not* backfilled to 'engine',
+    which would misclassify the hand-attached rows `document set-text` has been writing
+    since #62."""
+    _migrate_through_014(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ocr_text, ingested_at) "
+        "VALUES ('aa11', 1, 'aa/aa11.pdf', 'hand typed', '2026-03-16T00:00:00')"
+    )
+    conn.commit()
+
+    assert db.migrate(conn) == ["015_document_text_source.sql"]
+
+    row = conn.execute("SELECT * FROM document").fetchone()
+    assert row["ocr_text"] == "hand typed"
+    assert row["text_source"] is None
 
 
 def test_person_has_deactivated_at_column(conn):
@@ -157,7 +208,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
-        "014_medication_status_reason.sql",
+        "014_medication_status_reason.sql", "015_document_text_source.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -292,7 +343,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
         "008_curation.sql", "009_record_attestation.sql",
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
-        "014_medication_status_reason.sql",
+        "014_medication_status_reason.sql", "015_document_text_source.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -346,6 +397,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
         "009_record_attestation.sql", "010_curation_row_scope.sql",
         "011_curation_distinct_status.sql", "012_record_edit.sql",
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
+        "015_document_text_source.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -397,7 +449,7 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
     assert db.migrate(conn) == [
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
-        "014_medication_status_reason.sql",
+        "014_medication_status_reason.sql", "015_document_text_source.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
@@ -483,6 +535,7 @@ def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
     assert db.migrate(conn) == [
         "011_curation_distinct_status.sql", "012_record_edit.sql",
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
+        "015_document_text_source.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
