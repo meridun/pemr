@@ -607,3 +607,63 @@ def test_trends_json_keys_are_inert_without_a_preference(ready, capsys):
     assert t["canonical_unit"] is None
     assert t["converted_count"] == 0 and t["unconverted_count"] == 0
     assert "converted to" not in json.dumps(t)
+
+
+# --- trends over vitals, through the real CLI (issue #176) --------------------
+
+def _seed_vitals(tmp_path, slug="jane-doe", rows=None):
+    """Commit `obs_type='vital'` observation rows for one person."""
+    conn = db.connect(tmp_path / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug=?", (slug,)
+    ).fetchone()["person_id"]
+    doc = conn.execute(
+        "INSERT INTO document (sha256, person_id, doc_date, source_path, ocr_text, "
+        "ingested_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"sha-{uuid.uuid4()}", pid, "2026-01-01", "aa/vitals.pdf", "clinic vitals",
+         "2026-01-01T00:00:00"),
+    ).lastrowid
+    conn.commit()
+    dedup.commit_extraction(conn, doc, {"observation": rows or []}, d)
+    conn.close()
+
+
+def test_trends_charts_a_vital_key(ready, capsys):
+    """A vitals series prints through the existing formatter and carries the same
+    `--json` key set a lab series does -- no new keys, no vitals branch."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Temperature",
+         "value_num": 37.0, "unit": "degC"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Temperature",
+         "value_num": 38.0, "unit": "degC"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "temperature  (2 point(s))" in out
+    assert "latest 38.0 degC  @ 2026-02-01" in out
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    vital = json.loads(capsys.readouterr().out)
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    lab = json.loads(capsys.readouterr().out)
+    assert set(vital) == set(lab)
+    assert vital["count"] == 2 and vital["latest_at"] == "2026-02-01"
+
+
+def test_trends_ambiguous_test_is_a_friendly_error(ready, capsys):
+    """The one non-additive behaviour change must reach the user as rc=1 with an
+    `error:` line, never a traceback."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "HbA1c",
+         "value_num": 6.1, "unit": "%"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "lab results" in err and "vital observations" in err
+    assert "Traceback" not in err

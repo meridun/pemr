@@ -2697,8 +2697,9 @@ def _fmt(value: object) -> str:
 
 
 def _with_conn_person(args: argparse.Namespace, work):
-    """Open the DB, run ``work(conn)``, translating the two friendly failure modes
-    (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
+    """Open the DB, run ``work(conn)``, translating the friendly failure modes
+    (un-migrated DB, unknown person slug, a ``--test`` token that collides across two
+    record types) into an rc=1 stderr message."""
     conn = _connect_db(args)
     try:
         try:
@@ -2706,7 +2707,7 @@ def _with_conn_person(args: argparse.Namespace, work):
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except query.PersonNotFoundError as exc:
+        except (query.PersonNotFoundError, query.AmbiguousTestError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:

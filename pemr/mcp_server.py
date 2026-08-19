@@ -468,10 +468,18 @@ def find(
 
 
 def trends(conn: sqlite3.Connection, *, person: str, test: str) -> dict[str, Any]:
-    """[read] min/max/latest/slope for one analyte over time. Mirrors ``pemr trends``."""
+    """[read] min/max/latest/slope for one lab analyte or vital sign over time. Mirrors
+    ``pemr trends``.
+
+    A ``test`` matching both a lab result and a vital is refused, not merged.
+    """
     try:
         return _query.trends(conn, person, test, dictionary=_dictionary())
-    except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
+    except (
+        db.NotMigratedError,
+        _query.PersonNotFoundError,
+        _query.AmbiguousTestError,
+    ) as exc:
         raise _friendly(exc) from exc
 
 

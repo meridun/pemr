@@ -513,6 +513,16 @@ albumin` matches on `norm()` and lists the whole analyte family, while `pemr tre
 matches on `key_token()` so a numeric series never interleaves two assays — and reports
 the rows it excluded on that basis (`other_assays`) instead of dropping them silently.
 
+`trends` charts a measurement **key**, not a table (issue #176): it reads `lab_result`
+rows *and* `obs_type='vital'` `observation` rows through one aliased row shape
+(`observed_at` standing in for `collected_at`, `key` for `test_name`), so weight,
+temperature and blood pressure reach the same statistics and the same per-person
+canonical-unit conversion an analyte does — the four vitals dimensions the units registry
+carries exist for exactly this population. A `--test` token matching numeric rows in
+*both* tables is **refused**, not merged: the same reasoning as the assay split, since a
+silently interleaved lab-and-vital series is a wrong chart even when the tokens coincide.
+`pemr labs` remains lab-only.
+
 **A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
 in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` re-derives
@@ -1135,6 +1145,9 @@ pemr trends --person jane --test hba1c                   # min/max/latest/slope
                                                          # numbers and the printed unit cannot disagree;
                                                          # a point that cannot be converted is kept and
                                                          # disclosed, never dropped
+pemr trends --person jane --test weight                  # a vital key charts too (labs + obs_type='vital');
+                                                         # a token present in BOTH tables is refused, not
+                                                         # merged - rc=1 naming both sources
 pemr due --person jane                                   # screening/vaccine gaps — NOT IMPLEMENTED (phase 7)
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md

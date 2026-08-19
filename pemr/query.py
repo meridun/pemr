@@ -1,4 +1,4 @@
-"""Phase 3 read layer: structured queries, full-text `find`, and lab `trends`.
+"""Phase 3 read layer: structured queries, full-text `find`, and `trends`.
 
 All functions are pure reads over the tables phases 1–2 populate (Architecture.md §5).
 They return plain Python data (dicts / lists of dicts) with stable field names; the CLI
@@ -16,6 +16,11 @@ The two readers match at deliberately **different granularities** (issue #71):
 ``key_token()`` so a numeric series never interleaves two different assays of one
 analyte (a CMP ``Albumin`` and an SPEP ``Albumin (SPEP)``) — and discloses the rows it
 excluded on that basis rather than dropping them silently.
+
+``trends`` charts a *measurement key*, not a table: it reads lab results and vitals
+``observation`` rows through one aliased row shape (issue #176), so weight, temperature
+and blood pressure reach the same statistics and the same per-person canonical-unit
+conversion an analyte does. ``query_labs`` remains lab-only.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import sqlite3
 from datetime import date, datetime
 
 from . import db, units
-from .dedup import enum_token, key_token, norm
+from .dedup import OBS_VITAL, enum_token, key_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
 # can never be mis-parsed as FTS syntax (each token is quoted as a phrase, AND-ed).
@@ -128,6 +133,14 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
 
 class PersonNotFoundError(ValueError):
     """Raised when a slug does not resolve to a person (friendly rc=1 at the CLI)."""
+
+
+class AmbiguousTestError(ValueError):
+    """Raised when a ``--test`` token matches numeric rows in **both** ``lab_result`` and
+    vitals ``observation`` (issue #176). :func:`trends` charts one series at a time — an
+    interleaved lab-and-vital series is the wrong chart #71 splits assays to avoid — so
+    the collision is refused rather than resolved by a silent preference. A friendly rc=1
+    at the CLI, like its sibling above."""
 
 
 def resolve_person_id(conn: sqlite3.Connection, slug: str) -> int:
@@ -426,6 +439,64 @@ def _ordinal(value: object) -> int | None:
         return None
 
 
+def _series_candidates(
+    conn: sqlite3.Connection, person_id: int
+) -> list[tuple[str, list[sqlite3.Row]]]:
+    """Every numeric measurement of one person, per source, in one row shape.
+
+    Returns ``[("lab_result", rows), ("observation", rows)]``. Both SELECTs alias their
+    table into ``(row_id, value_num, unit, at, label)`` — ``observed_at`` standing in for
+    ``collected_at`` and ``key`` for ``test_name`` — so the matching, the ``other_assays``
+    disclosure and every statistic below read a vital exactly like a lab result, with no
+    per-source branch (issue #176).
+
+    Ordering is load-bearing: ``matched[-1]`` is the latest point and ties break on the
+    greatest row id (most-recently-ingested wins), which holds for vitals only because
+    the vitals SELECT sorts the same way.
+    """
+    labs = conn.execute(
+        "SELECT lab_result_id AS row_id, value_num, unit, collected_at AS at, "
+        "test_name AS label FROM lab_result "
+        "WHERE person_id = ? AND value_num IS NOT NULL "
+        "ORDER BY collected_at, lab_result_id",
+        (person_id,),
+    ).fetchall()
+    vitals = conn.execute(
+        "SELECT observation_id AS row_id, value_num, unit, observed_at AS at, "
+        "key AS label FROM observation "
+        "WHERE person_id = ? AND obs_type = ? AND value_num IS NOT NULL "
+        "ORDER BY observed_at, observation_id",
+        (person_id, OBS_VITAL),
+    ).fetchall()
+    return [("lab_result", labs), ("observation", vitals)]
+
+
+def _match_series(
+    rows: list[sqlite3.Row],
+    target: str,
+    family: str,
+    dictionary: dict[str, str] | None,
+) -> tuple[list[sqlite3.Row], str, dict[str, int]]:
+    """Split one source's candidate rows into ``(matched, matched_token, others)``.
+
+    ``matched`` is the key-token series; ``others`` counts the same-family rows a
+    differing qualifier excluded, which are disclosed rather than dropped (issue #71).
+    """
+    matched: list[sqlite3.Row] = []
+    others: dict[str, int] = {}
+    matched_token = ""
+    for r in rows:
+        token = key_token(r["label"], dictionary)
+        if _loose(token) == target:
+            matched.append(r)
+            # Echo the stored spelling rather than whatever the caller typed, so a
+            # pasted `other_assays` token comes back labelled the way it was disclosed.
+            matched_token = matched_token or token
+        elif _loose(norm(r["label"], dictionary)) == family:
+            others[token] = others.get(token, 0) + 1
+    return matched, matched_token, others
+
+
 def _slope_per_day(points: list[tuple[int, float]]) -> float | None:
     """Least-squares slope (value units per day) of y vs x=ordinal-day. ``None`` when
     fewer than two points or all points share one date (zero x-variance)."""
@@ -447,16 +518,22 @@ def trends(
     test: str,
     dictionary: dict[str, str] | None = None,
 ) -> dict:
-    """Summary stats for one **assay** of one analyte over time.
+    """Summary stats for one **measurement key** over time — a lab analyte's assay or a
+    vital sign (issue #176), whichever the key matches.
 
     Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
     slope_per_day, other_assays, other_assay_count, canonical_unit, converted_count,
-    unconverted_count}``. ``count`` is the number of
+    unconverted_count}`` — one contract, no source field and no vitals branch, so a
+    vitals series is shape-identical to a lab one. ``count`` is the number of
     numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two distinct
-    collection dates. ``latest`` is the row with the greatest ``collected_at``, ties
-    broken by the greatest ``lab_result_id`` (most-recently-ingested wins);
-    ``latest_tie`` counts how many matched rows share that exact ``collected_at``
-    timestamp.
+    dates. ``latest`` is the row with the greatest timestamp (``collected_at`` for a lab,
+    ``observed_at`` for a vital, which is nullable by design and sorts first), ties broken
+    by the greatest row id (most-recently-ingested wins); ``latest_tie`` counts how many
+    matched rows share that exact timestamp.
+
+    A key token matching numeric rows in **both** tables raises
+    :class:`AmbiguousTestError` rather than merging them: same #71 reasoning as the assay
+    split — a silently interleaved series is a wrong chart even when the tokens coincide.
 
     Matching is on ``key_token()``, not ``norm()`` (issue #71): a series that silently
     interleaves a CMP albumin with an SPEP albumin is a wrong chart, the same class of
@@ -485,24 +562,30 @@ def trends(
     canonical = {_loose(k): v for k, v in units.load_prefs(conn, person_id).items()}.get(
         target
     )
-    rows = conn.execute(
-        "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
-        "WHERE person_id = ? AND value_num IS NOT NULL "
-        "ORDER BY collected_at, lab_result_id",
-        (person_id,),
-    ).fetchall()
-    matched = []
+    matched: list[sqlite3.Row] = []
     others: dict[str, int] = {}
     matched_token = ""
-    for r in rows:
-        token = key_token(r["test_name"], dictionary)
-        if _loose(token) == target:
-            matched.append(r)
-            # Echo the stored spelling rather than whatever the caller typed, so a
-            # pasted `other_assays` token comes back labelled the way it was disclosed.
-            matched_token = matched_token or token
-        elif _loose(norm(r["test_name"], dictionary)) == family:
-            others[token] = others.get(token, 0) + 1
+    hits: dict[str, int] = {}
+    for source, rows in _series_candidates(conn, person_id):
+        source_matched, source_token, source_others = _match_series(
+            rows, target, family, dictionary
+        )
+        # One disclosure rule, not a per-source branch: a same-family sibling is reported
+        # wherever it lives, and its token pastes back as `--test` and finds it.
+        for token, count in source_others.items():
+            others[token] = others.get(token, 0) + count
+        if source_matched:
+            hits[source] = len(source_matched)
+            matched = source_matched
+            matched_token = matched_token or source_token
+    if len(hits) > 1:
+        # ASCII only: this reaches a cp1252/cp437 console (see `units` on the same rule).
+        raise AmbiguousTestError(
+            f"'{matched_token or target}' matches both lab results "
+            f"({hits['lab_result']} numeric rows) and vital observations "
+            f"({hits['observation']}) - trends charts one series at a time and will "
+            "not merge them"
+        )
 
     result: dict = {
         "test": matched_token or target,
@@ -546,17 +629,15 @@ def trends(
         result["unit"] = next(iter(seen)) if len(seen) == 1 else None
     result["min"] = min(values)
     result["max"] = max(values)
-    latest = matched[-1]  # rows came back ORDER BY collected_at, lab_result_id
+    latest = matched[-1]  # rows came back ORDER BY <timestamp>, <row id>
     result["latest"] = values[-1]
-    result["latest_at"] = latest["collected_at"]
-    result["latest_tie"] = sum(
-        1 for r in matched if r["collected_at"] == latest["collected_at"]
-    )
+    result["latest_at"] = latest["at"]
+    result["latest_tie"] = sum(1 for r in matched if r["at"] == latest["at"])
 
     points = [
         (o, value)
         for r, value in zip(matched, values)
-        if (o := _ordinal(r["collected_at"])) is not None
+        if (o := _ordinal(r["at"])) is not None
     ]
     result["slope_per_day"] = _slope_per_day(points)
     return result

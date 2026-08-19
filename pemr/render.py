@@ -131,6 +131,7 @@ from datetime import date, datetime, timedelta
 from . import curation, db, dedup, query, units
 from .dedup import (
     OBS_SYMPTOM,
+    OBS_VITAL,
     SELF_REPORTED_OBS_TYPES,
     enum_token,
     is_attested,
@@ -138,8 +139,9 @@ from .dedup import (
     norm,
 )
 
-# Observation obs_type conventions this layer reads (see module docstring).
-OBS_VITAL = "vital"
+# Observation obs_type conventions this layer reads (see module docstring). `OBS_VITAL`
+# lives in `dedup` now that `query.trends` reads it too (issue #176); `order` is still
+# render's alone.
 OBS_ORDER = "order"
 
 # How an order is matched to the `lab_result` that answered it (issue #128). No FK links

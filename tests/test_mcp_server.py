@@ -141,6 +141,37 @@ def test_find_and_trends(seeded):
     assert tr["latest"] == 6.5
 
 
+def test_trends_charts_a_vital_key(seeded):
+    """Issue #176: the tool signature and payload shape are unchanged -- a vitals series
+    is shape-identical to a lab one."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="clinic vitals", doc_date="2026-03-01")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Weight",
+         "value_num": 88.0, "unit": "kg"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Weight",
+         "value_num": 86.0, "unit": "kg"},
+    ]}, d)
+    vital = mcp_server.trends(seeded, person="jane-doe", test="weight")
+    lab = mcp_server.trends(seeded, person="jane-doe", test="a1c")
+    assert set(vital) == set(lab)
+    assert vital["count"] == 2 and vital["latest"] == 86.0
+    assert vital["latest_at"] == "2026-02-01" and vital["unit"] == "kg"
+
+
+def test_trends_collision_is_a_tool_error_not_a_raw_exception(seeded):
+    """A `test` matching both tables is refused, and the refusal reaches the agent as a
+    `ToolError` like every other friendly failure in this wrapper."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="a1c measured twice over", doc_date="2026-04-01")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "HbA1c",
+         "value_num": 6.1, "unit": "%"},
+    ]}, d)
+    with pytest.raises(mcp_server.ToolError, match="vital observations"):
+        mcp_server.trends(seeded, person="jane-doe", test="a1c")
+
+
 def test_find_household_wide_omits_person(seeded):
     # person omitted -> whole-household search; each hit attributes its owner
     hits = mcp_server.find(seeded, query_text="glucose")

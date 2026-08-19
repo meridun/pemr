@@ -152,6 +152,13 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 
+# The vitals lane: the `observation` rows render's `Latest Vitals` shows one at a time and
+# `query.trends` charts as a series (issue #176). It lives here rather than beside render's
+# `OBS_ORDER` because `query` became its second consumer and `render` imports `query` —
+# defining it in `render` would invert that edge, the same reasoning the self-attested
+# lanes below already follow.
+OBS_VITAL = "vital"
+
 # The self-attested lanes (issue #167): what the *patient* reports about themselves on a
 # given day, as opposed to what a clinician or a document asserted. Deliberately two
 # obs_types, not one — `activity` is the higher-volume, lower-signal of the pair, and
@@ -159,7 +166,7 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
 # `observation` catch-all and never reach `condition`/`Active Problems`, which is what
 # keeps unfiltered self-attested rows out of the verdict-curated problem list.
 #
-# They live here rather than beside render's `OBS_VITAL`/`OBS_ORDER` because `query` needs
+# They live here rather than beside render's `OBS_ORDER` because `query` needs
 # them too and it already imports from this module while `render` imports `query` —
 # defining them in `render` would invert that edge.
 OBS_SYMPTOM = "symptom"
