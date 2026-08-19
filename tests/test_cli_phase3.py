@@ -667,3 +667,46 @@ def test_trends_ambiguous_test_is_a_friendly_error(ready, capsys):
     assert err.startswith("error: ")
     assert "lab results" in err and "vital observations" in err
     assert "Traceback" not in err
+
+
+def test_trends_converts_a_vitals_series_through_the_cli(ready, capsys):
+    """The point of #176: #136's canonical-unit machinery, which lives inside
+    `trends`, now reaches the vitals dimensions the units registry carries for it --
+    end to end through the real CLI, not just the query layer."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Temperature",
+         "value_num": 98.6, "unit": "degF"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Temperature",
+         "value_num": 37.8, "unit": "degC"},
+        {"obs_type": "vital", "observed_at": "2026-03-01", "key": "Temperature",
+         "value_num": 100.4, "unit": "degF"},
+    ])
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key",
+                "Temperature", "--unit", "degC", *DICT_ARG) == 0
+    capsys.readouterr()
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "38.0 degC" in out                      # max, converted from 100.4 degF
+    assert "converted to degC (canonical unit for this key)" in out
+    assert "left in their stored unit" not in out  # nothing was left behind
+    assert out.isascii()
+    out.encode("cp437")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["unit"] == "degC" and t["canonical_unit"] == "degC"
+    assert t["converted_count"] == 2 and t["unconverted_count"] == 0
+    assert t["count"] == 3 and t["min"] == 37.0 and t["max"] == 38.0
+
+    # A point in a spelling `units` cannot convert is kept and disclosed, never dropped.
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-04-01", "key": "Temperature",
+         "value_num": 37.2, "unit": "quatloos"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["count"] == 4 and t["unconverted_count"] == 1
