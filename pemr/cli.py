@@ -3008,7 +3008,12 @@ def _cmd_render_summary(args: argparse.Namespace) -> int:
 def _cmd_render_brief(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
-        markdown = render.render_brief(conn, args.appointment, dictionary=dictionary)
+        markdown = render.render_brief(
+            conn,
+            args.appointment,
+            dictionary=dictionary,
+            include_self_reported=args.include_self_reported,
+        )
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -3862,6 +3867,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--appointment", type=int, required=True, help="appointment id"
     )
     r_brief.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_brief.add_argument(
+        "--include-self-reported", dest="include_self_reported", action="store_true",
+        help="include self-reported symptom and activity observations (excluded by default)",
+    )
     r_brief.add_argument("--out", help="write to file instead of stdout")
     r_brief.set_defaults(func=_cmd_render_brief)
 

@@ -1839,7 +1839,7 @@ def test_same_day_distinct_draw_is_staged_and_keep_both_admits_it(ready, capsys)
 
 
 def test_observation_keeps_its_full_precision_key_at_the_cli(ready, capsys):
-    """The scope boundary: `observation` was deliberately left on `_norm_ts`, so the
+    """The scope boundary: `observation` was deliberately left on `norm_ts`, so the
     same mixed-precision pair still forks there -- two rows, no conflict."""
     tmp_path = ready
     for name, observed_at in (("obs1.txt", "2026-04-02"), ("obs2.txt", "2026-04-02T07:30")):

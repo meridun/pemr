@@ -136,6 +136,7 @@ from .dedup import (
     is_attested,
     key_token,
     norm,
+    norm_ts,
 )
 
 # Observation obs_type conventions this layer reads (see module docstring).
@@ -569,6 +570,23 @@ def _allergy_line(row: dict) -> str:
     )
 
 
+def _obs_sort_key(row: dict) -> tuple[str, int]:
+    """Chronological sort key for an ``observation`` row: newest-wins, in Python.
+
+    Why not a second SQL sort key: SQLite cannot call :func:`dedup.norm_ts`, and the raw
+    string is exactly the defect (issue #180). ``observed_at`` is stored verbatim and both
+    ``2026-08-18T09:00`` and ``2026-08-18 20:00`` validate, but ``T`` (0x54) sorts *after*
+    a space (0x20) -- so the 09:00 row lexicographically outranks the 20:00 one and wins
+    "latest" on a section that folds ascending-last-wins. Normalizing the separator makes
+    the two spellings of one timestamp order as one.
+
+    The SQL ``ORDER BY observed_at, observation_id`` stays as the deterministic base
+    fetch; this is the authority applied on top of it. ``observation_id`` keeps the
+    same tiebreak the SQL had, so equal timestamps still resolve by insertion order.
+    """
+    return (norm_ts(row["observed_at"]), row["observation_id"])
+
+
 def _latest_vitals(
     conn: sqlite3.Connection,
     person_id: int,
@@ -587,8 +605,10 @@ def _latest_vitals(
         (person_id, OBS_VITAL),
     ).fetchall()
     # Curation runs before the latest-wins fold, so a superseded reading cannot win
-    # "latest" and hide the good one behind it.
-    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
+    # "latest" and hide the good one behind it. The re-sort runs first of all: the fold
+    # below is ascending-last-wins, so a mis-ordered row wins "latest" silently.
+    obs = sorted((dict(r) for r in rows), key=_obs_sort_key)
+    kept = _apply_curation(obs, "observation", cur)
     latest: dict[str, dict] = {}
     for r in kept:
         latest[key_token(r["key"], dictionary)] = r  # ascending -> last wins
@@ -630,7 +650,9 @@ def _self_reported_symptoms(
         "ORDER BY observed_at, observation_id",
         (person_id, OBS_SYMPTOM),
     ).fetchall()
-    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
+    kept = _apply_curation(
+        sorted((dict(r) for r in rows), key=_obs_sort_key), "observation", cur
+    )
 
     anchor = _as_date(today)
     start = None if anchor is None else anchor - timedelta(days=_SYMPTOM_WINDOW_DAYS)
@@ -646,7 +668,7 @@ def _self_reported_symptoms(
         )
         entry["label"] = r["key"]
         entry["count"] += 1
-        entry["sort"] = r["observed_at"] or ""
+        entry["sort"] = norm_ts(r["observed_at"])
         if r["value_num"] == 0:
             entry["resolved"] = r
         else:
@@ -693,8 +715,11 @@ def _symptom_line(entry: dict) -> str:
             head += f" (severity {_severity(latest['value_num'])}/10)"
     # A resolution older than the newest present report is not news; only a resolution
     # that is the last word on the complaint earns the clause.
+    # Compared through `norm_ts`, not raw strings: the two rows can spell the same
+    # timestamp with a `T` or a space, and `T` sorts after the space (issue #180).
     if resolved is not None and (
-        latest is None or str(resolved["observed_at"]) > str(latest["observed_at"])
+        latest is None
+        or norm_ts(resolved["observed_at"]) > norm_ts(latest["observed_at"])
     ):
         head += f"; last reported resolved {_date_part(resolved['observed_at'])}"
 
@@ -977,8 +1002,11 @@ def _grouped_orders(
         (person_id, OBS_ORDER),
     ).fetchall()
     # Before the grouping fold: a superseded order must not become the group's
-    # "latest" row and speak for the ones behind it.
-    kept = _apply_curation([dict(r) for r in rows], "observation", cur)
+    # "latest" row and speak for the ones behind it. Sorted first, for the same reason
+    # -- `members[-1]` below is the group's latest only if the sequence is chronological.
+    kept = _apply_curation(
+        sorted((dict(r) for r in rows), key=_obs_sort_key), "observation", cur
+    )
     groups: dict[object, list[dict]] = {}
     for r in kept:
         token = key_token(r["key"], dictionary) or key_token(r["value_text"], dictionary)
@@ -1439,6 +1467,7 @@ def render_brief(
     *,
     dictionary: dict[str, str] | None = None,
     recent_labs: int = _BRIEF_RECENT_LABS,
+    include_self_reported: bool = False,
     now: datetime | None = None,
 ) -> str:
     """Markdown walk-in brief for one appointment: the appointment header, current meds,
@@ -1452,8 +1481,19 @@ def render_brief(
 
     Med-interaction flags and suggested questions require external drug knowledge and are
     NOT deterministic engine work (Architecture.md §Open questions); a placeholder section
-    is rendered here for the phase-5 agent layer to fill. Raises
-    :class:`AppointmentNotFoundError` for an unknown id (friendly rc=1)."""
+    is rendered here for the phase-5 agent layer to fill.
+
+    ``include_self_reported`` opts the ``symptom``/``activity`` lanes back into
+    ``## Procedures & Observations``, mirroring :func:`render_journal`'s identical flag
+    (issue #180). **Off by default** and for the same reason: that section is uncapped, so
+    a few hundred self-attestations a year push the clinician-sourced observations this
+    document exists to carry off the top of it. An opt-in rather than a row cap because a
+    cap would silently drop the clinician rows instead once the tail is long -- a worse
+    failure than the one being fixed. The rows stay reachable unfiltered through
+    ``pemr query timeline``, and the summary's collapsed ``## Self-Reported Symptoms``
+    section remains the useful reading of them.
+
+    Raises :class:`AppointmentNotFoundError` for an unknown id (friendly rc=1)."""
     db.require_migrated(conn)
     appt = conn.execute(
         "SELECT * FROM appointment WHERE appointment_id = ?", (appointment_id,)
@@ -1535,17 +1575,26 @@ def render_brief(
         "procedure",
         cur,
     )
-    obs_rows = _apply_curation(
-        [
-            dict(r) for r in conn.execute(
-                "SELECT * FROM observation WHERE person_id = ? "
-                "ORDER BY observed_at DESC, observation_id",
-                (person_id,),
-            ).fetchall()
-        ],
-        "observation",
-        cur,
+    # Placeholders generated from the frozenset rather than interpolated, so the lane
+    # names stay parameters and the query stays one statement whichever way the flag goes.
+    excluded = () if include_self_reported else tuple(sorted(SELF_REPORTED_OBS_TYPES))
+    obs_filter = (
+        f" AND obs_type NOT IN ({', '.join('?' * len(excluded))})" if excluded else ""
     )
+    obs_fetched = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM observation WHERE person_id = ?" + obs_filter
+            + " ORDER BY observed_at DESC, observation_id",
+            (person_id, *excluded),
+        ).fetchall()
+    ]
+    # Re-sorted through `norm_ts` for the same reason as `_obs_sort_key`'s docstring gives
+    # (issue #180). Two stable passes rather than one `reverse=True` composite: the two
+    # fields sort in *opposite* directions here (newest date first, lowest id first within
+    # a date), which is the order the SQL `observed_at DESC, observation_id` expressed.
+    obs_fetched.sort(key=lambda r: r["observation_id"])
+    obs_fetched.sort(key=lambda r: norm_ts(r["observed_at"]), reverse=True)
+    obs_rows = _apply_curation(obs_fetched, "observation", cur)
     ctx_lines = []
     for p in proc_rows:
         outcome = f" - {p['outcome']}" if p["outcome"] else ""

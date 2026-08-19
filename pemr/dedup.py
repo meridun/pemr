@@ -186,13 +186,26 @@ OBS_TYPE_REQUIRED: dict[str, frozenset[str]] = {
 # :data:`OBS_TYPE_REQUIRED` so the presence rule and the precision rule stay separately
 # readable and separately testable.
 #
-# Why a precision rule rather than a new dedup discriminator: `_norm_ts` already keeps
+# Why a precision rule rather than a new dedup discriminator: `norm_ts` already keeps
 # `observation.observed_at` at full precision, so two same-day reports at *different times*
 # already get distinct keys (Architecture.md §3). The collision a same-day repeat hits is
 # therefore not a key defect — it is what a date-only `observed_at` means. Mandating the
 # time on these two lanes fixes it without forking observation identity, and it preserves
 # the property that a correction at the *same* timestamp still collides as a CONFLICT.
 OBS_TYPE_REQUIRES_TIME: frozenset[str] = SELF_REPORTED_OBS_TYPES
+
+# Obs_types whose `value_num` carries a bounded scale, checked at write time right after
+# the precision rule (issue #180). Inclusive bounds. Kept a separate name from its two
+# neighbours above for the same reason they are separate from each other: one rule, one
+# name, one test.
+#
+# `symptom` alone: its `value_num` is the 0-10 severity issue #167 defined and renders as
+# `severity N/10`, so `50` is a data-entry error the document would otherwise repeat back
+# as fact. `OBS_ACTIVITY` is deliberately absent -- it shares the column but stores
+# *minutes*, which has no defensible upper bound, so a column-wide rule would be wrong.
+# The lower bound is inclusive because `value_num == 0` is the "reported resolved"
+# sentinel (see `render._self_reported_symptoms`), not an out-of-range value.
+OBS_TYPE_VALUE_RANGE: dict[str, tuple[float, float]] = {OBS_SYMPTOM: (0.0, 10.0)}
 
 _WS = re.compile(r"\s+")
 # Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
@@ -277,6 +290,18 @@ def _has_time_component(value: str) -> bool:
     ``len(value) > 10`` guard keeps a shorter value from ever indexing out of range.
     """
     return len(value) > 10 and value[10] in ("T", " ")
+
+
+def _is_blank(value: object) -> bool:
+    """True for a value that is *missing* in the sense a required-field rule means.
+
+    ``None`` and a whitespace-only string are the two spellings of the same absence
+    (issue #180): a presence-only ``is None`` test accepts ``key=""`` and renders a
+    blank-labelled symptom line -- precisely the untyped blob the self-attested lanes
+    exist to prevent. Non-strings (a REAL ``0.0``, say) are never blank: only text can
+    be present-but-empty.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -469,18 +494,24 @@ def _date_only(value: object) -> str:
     return text.replace("T", " ").split(" ")[0]
 
 
-def _norm_ts(value: object) -> str:
-    """Normalize an ISO date/datetime for use as a dedup-key identity part, keeping
-    *full precision* (unlike :func:`_date_only`, which truncates to the date).
+def norm_ts(value: object) -> str:
+    """Normalize an ISO date/datetime for use as a sortable/comparable identity part,
+    keeping *full precision* (unlike :func:`_date_only`, which truncates to the date).
 
-    Its one remaining consumer is ``observation.observed_at``: a timestamped
+    Its dedup consumer is ``observation.observed_at``: a timestamped
     observation (``2026-01-02T09:00``) and a bare-date one (``2026-01-02``) stay
     distinct, and two observations on the same day at different times keep distinct
     keys, so serial same-day repeats survive as separate rows. A re-read/correction of
     the *same* observation carries the same timestamp, collides, and surfaces as a
     CONFLICT via :data:`_COMPARE_FIELDS`. Only the ``T``/space separator and
     surrounding/collapsed whitespace are normalized, so trivial formatting differences
-    don't fork the key."""
+    don't fork the key.
+
+    Public (issue #180) because the render layer needs the same normalization for its
+    newest-wins ordering: the raw string sorts ``T`` (0x54) *after* a space (0x20), so a
+    space-separated 20:00 row loses "latest" to a ``T``-separated 09:00 one on the same
+    date. Ordering and comparing through this function is what makes the two spellings
+    of one timestamp sort as one."""
     if value is None:
         return ""
     return _WS.sub(" ", str(value).strip().replace("T", " "))
@@ -522,7 +553,7 @@ def _key_parts(
     if record_type == "appointment":
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
-        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), kt("key")]
+        return [person_id, n("obs_type"), norm_ts(row.get("observed_at")), kt("key")]
     # allergy/condition are DATE-FREE by design: they are standing facts restated on
     # every document with inconsistent or absent dates, so a date in the key would fork
     # one allergy into one row per document. The dates are payload, and a disagreement
@@ -676,8 +707,11 @@ def validate_row(record_type: str, row: object) -> None:
         # Matched verbatim (not via enum_token): `obs_type` is stored as written and every
         # reader selects on it with `=`, so a rule keyed to a normalized spelling would
         # bind a value that then renders nowhere.
+        # `_is_blank`, not `is None` (issue #180): `key=""` is missing in exactly the
+        # sense this rule means, and the message text is unchanged so the two spellings
+        # of keyless read identically to a human and to the CLI's error assertions.
         for field in sorted(OBS_TYPE_REQUIRED.get(row["obs_type"], frozenset())):
-            if row.get(field) is None:
+            if _is_blank(row.get(field)):
                 raise ValidationError(
                     f"observation: missing required field '{field}' "
                     f"for obs_type={row['obs_type']!r}"
@@ -694,6 +728,19 @@ def validate_row(record_type: str, row: object) -> None:
                 f"of day (YYYY-MM-DDTHH:MM), got {row['observed_at']!r} - two reports of "
                 "one key on the same day would otherwise dedup into a single row"
             )
+        # Last of the three, for the same ordering reason: the per-field loop has already
+        # proven `value_num` is a number (`_NUM`), so the comparison below is safe here
+        # and only here. Write-time only -- rows already stored out of range keep
+        # rendering as stored; clamping at render time would make the document disagree
+        # with the row it claims to display (issue #180).
+        bounds = OBS_TYPE_VALUE_RANGE.get(row["obs_type"])
+        if bounds is not None and row.get("value_num") is not None:
+            lo, hi = bounds
+            if not lo <= float(row["value_num"]) <= hi:
+                raise ValidationError(
+                    f"observation.value_num: obs_type={row['obs_type']!r} expects a "
+                    f"severity in {lo:g}-{hi:g}, got {row['value_num']!r}"
+                )
 
 
 def _type_names(types: object) -> str:

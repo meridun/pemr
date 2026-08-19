@@ -1002,6 +1002,91 @@ def test_observation_identity_is_not_forked_by_obs_type():
     assert dedup._key_parts("observation", _symptom(value_num=9), 1) == parts
 
 
+# --- self-report write-time hardening (issue #180) ----------------------------
+
+@pytest.mark.parametrize("value_num", [-1, -0.5, 10.5, 11, 50])
+def test_validate_rejects_a_symptom_severity_out_of_range(value_num):
+    # `value_num=50` used to validate and render as `(severity 50/10)` -- the document
+    # repeating a data-entry error back as fact.
+    with pytest.raises(dedup.ValidationError) as exc:
+        dedup.validate_row("observation", _symptom(value_num=value_num))
+    message = str(exc.value)
+    assert "expects a severity in 0-10" in message   # names the rule
+    assert repr(value_num) in message                # names what it saw
+    assert message.isascii()                         # cp1252 console (issue #23)
+
+
+@pytest.mark.parametrize("value_num", [0, 0.0, 10, 10.0, 3.5, None])
+def test_validate_accepts_a_symptom_severity_at_the_bounds(value_num):
+    # Both bounds are inclusive, and `0` is load-bearing: it is the "reported resolved"
+    # sentinel the summary's symptom line reads. A NULL severity is a present report of
+    # unknown intensity and stays legal too.
+    dedup.validate_row("observation", _symptom(value_num=value_num))
+
+
+def test_activity_value_num_is_not_range_checked():
+    # The rule is obs_type-conditional, not column-wide: `activity` shares `value_num`
+    # but stores minutes, which has no defensible upper bound.
+    dedup.validate_row(
+        "observation",
+        {"obs_type": "activity", "key": "walk", "observed_at": "2026-08-16T07:30",
+         "value_num": 240, "unit": "min"},
+    )
+
+
+@pytest.mark.parametrize("obs_type", ["symptom", "activity"])
+@pytest.mark.parametrize("key", ["", " ", "\t", "  \n "])
+def test_validate_rejects_a_blank_key_self_report(obs_type, key):
+    # The second spelling of keyless: presence-only validation stopped `None` and let
+    # `""` through, rendering a blank-labelled symptom line. Same message as the `None`
+    # case above -- both are "missing" in the sense the rule means.
+    with pytest.raises(dedup.ValidationError,
+                       match=rf"missing required field 'key'.*{obs_type}"):
+        dedup.validate_row(
+            "observation",
+            {"obs_type": obs_type, "key": key, "observed_at": "2026-08-16T09:00",
+             "value_text": "sore"},
+        )
+
+
+def test_a_blank_observed_at_is_rejected_by_the_iso_check_first():
+    # Scoping note for the widened check: `observed_at` is a DATE_FIELD, so the per-field
+    # ISO loop rejects a whitespace-only value before the presence rule ever sees it --
+    # with the more specific message, which is the right one to keep. The widening
+    # therefore closes exactly one real hole (`key`), and blank dates stay rejected.
+    for obs_type in ("functional", "symptom", "activity"):
+        with pytest.raises(dedup.ValidationError, match=r"observed_at.*ISO date"):
+            dedup.validate_row(
+                "observation",
+                {"obs_type": obs_type, "key": "meal_regularity", "observed_at": "   ",
+                 "value_text": "skipping meals"},
+            )
+
+
+def test_the_blank_key_rule_holds_through_the_commit_path(conn):
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError, match="missing required field 'key'"):
+        dedup.commit_extraction(conn, doc, {"observation": [_symptom(key="")]})
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
+
+
+def test_the_severity_range_rule_holds_through_the_commit_path(conn):
+    doc = _make_document(conn)
+    with pytest.raises(dedup.ValidationError, match="expects a severity in 0-10"):
+        dedup.commit_extraction(conn, doc, {"observation": [_symptom(value_num=50)]})
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
+
+
+def test_norm_ts_collapses_the_separator_spellings():
+    # The rename to a public name is what lets `render` share this (issue #180); the
+    # normalization itself is unchanged, and is why the two spellings sort as one.
+    assert dedup.norm_ts("2026-08-18T20:00") == dedup.norm_ts("2026-08-18 20:00")
+    assert dedup.norm_ts(None) == ""
+    # And the hazard it exists to fix: raw, the 09:00 row outranks the 20:00 one.
+    assert "2026-08-18 20:00" < "2026-08-18T09:00"
+    assert dedup.norm_ts("2026-08-18 20:00") > dedup.norm_ts("2026-08-18T09:00")
+
+
 # --- intra-payload collisions (issue #58) -------------------------------------
 
 def test_intra_payload_collision_with_differing_values_is_rejected(conn):
