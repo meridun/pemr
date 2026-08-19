@@ -98,6 +98,7 @@ CREATE TABLE document (
   provider      TEXT,
   source_path   TEXT NOT NULL,            -- sources/<hash>.<ext>
   ocr_text      TEXT,                     -- extracted full text (agent or tesseract)
+  text_source   TEXT,                     -- 'engine'|'attached'; NULL = none/pre-015 (#175)
   ingested_at   TEXT NOT NULL
 );
 
@@ -945,6 +946,17 @@ For those you get a stderr note telling you to transcribe it yourself and pass
 capped at 32 MiB per file — `ocr_text` is mirrored into the FTS index, so an unbounded read is
 both a database-size problem and a decompression-bomb surface (a small `.docx` can declare a
 gigabyte of `word/document.xml`).
+
+Whichever route produced it, the *provenance* of the stored text is recorded alongside it in
+`document.text_source` (issue #175, migration 015): text pemr extracted itself — any of the
+routes above, a `document reocr` re-derivation, or a study's DICOM-header summary — is
+`engine`; text the caller handed over verbatim (`--ocr-text-file`, `pemr document set-text`,
+the `document_set_text` MCP tool) is `attached`. It follows the text's *origin*, not the verb
+that wrote it, because engine text carries OCR-typical noise that a downstream consumer may
+want to weigh differently, and the distinction is unrecoverable afterwards — a transcription
+can be byte-identical to what OCR would have produced. `NULL` means no text, or text written
+before 015; pre-015 rows are deliberately **not** backfilled, since hand-attached rows already
+exist and a blanket `engine` would misclassify exactly the rows the column exists to find.
 
 Extraction route feeds the owner check, and the route vocabulary has **three** words for
 it: `native` (natively extracted, *structured*), `native-prose` (natively extracted,

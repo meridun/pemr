@@ -328,6 +328,112 @@ def test_set_text_leaves_records_and_keys_untouched(seeded):
     assert documents.get_document_view(conn, seeded["doc"])["record_count"] == _SEEDED_ROWS
 
 
+# --- text_source provenance (issue #175) ------------------------------------
+
+
+def _text_source(conn, document_id):
+    return conn.execute(
+        "SELECT text_source FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()["text_source"]
+
+
+def test_set_text_defaults_to_attached_provenance(conn):
+    """The function's own contract is a hand-attach - `pemr document set-text` and the
+    `document_set_text` MCP tool - so `attached` is what an unqualified call records."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    view = documents.set_document_text(conn, doc, "cholesterol panel")
+    assert view["text_source"] == documents.TEXT_SOURCE_ATTACHED == "attached"
+    assert _text_source(conn, doc) == "attached"
+
+
+def test_set_text_records_engine_provenance_when_asked(conn):
+    """The one engine caller (`reocr_documents`) overrides the default explicitly - the
+    whole point of the parameter, since both callers pass `force=True`."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    view = documents.set_document_text(
+        conn, doc, "extracted page", source=documents.TEXT_SOURCE_ENGINE
+    )
+    assert view["text_source"] == "engine"
+    assert _text_source(conn, doc) == "engine"
+
+
+def test_set_text_flips_provenance_on_a_forced_replace(conn):
+    """Provenance describes the text that is *there now*, so a replace overwrites it."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    documents.set_document_text(conn, doc, "typed by hand")
+    documents.set_document_text(
+        conn, doc, "re-extracted", force=True, source=documents.TEXT_SOURCE_ENGINE
+    )
+    assert documents.get_document_text(conn, doc) == "re-extracted"
+    assert _text_source(conn, doc) == "engine"
+
+
+def test_set_text_rejects_an_unknown_source_and_writes_nothing(seeded):
+    """The closed vocabulary is enforced in Python rather than by a DDL `CHECK` (013's
+    precedent), so the guard has to be here - and has to fire before any write."""
+    conn = seeded["conn"]
+    with pytest.raises(ValueError, match="unknown text source"):
+        documents.set_document_text(
+            conn, seeded["doc"], "replacement", force=True, source="guessed"
+        )
+    assert documents.get_document_text(conn, seeded["doc"]) == "scan text"
+    assert _text_source(conn, seeded["doc"]) is None
+
+
+def test_set_text_keeps_the_fts_row_single_despite_the_two_column_update(conn):
+    """`text_source` rides in the *same* UPDATE as `ocr_text`, so migration 003's
+    AFTER UPDATE trigger still fires exactly once - a second statement would double-fire
+    it for no benefit."""
+    person = persons.add_person(conn, "jane-doe", "Jane Doe")
+    doc = _insert_document(conn, person.person_id, "ff00", ocr_text=None)
+    documents.set_document_text(conn, doc, "cholesterol panel")
+    documents.set_document_text(conn, doc, "lipid panel", force=True)
+    rows = conn.execute(
+        "SELECT text FROM record_fts WHERE source_table = 'document' AND source_id = ?",
+        (doc,),
+    ).fetchall()
+    assert [r["text"] for r in rows] == ["lipid panel"]   # replaced, not accumulated
+
+
+def test_views_report_no_provenance_for_a_pre_015_row(seeded):
+    """A row written before 015 (here: the fixture's direct INSERT) reports `None` rather
+    than guessing - `has_ocr_text` is what tells "unknown" apart from "no text"."""
+    conn = seeded["conn"]
+    listed = documents.list_documents(conn)[0]
+    shown = documents.get_document_view(conn, seeded["doc"])
+    assert listed["has_ocr_text"] is True and listed["text_source"] is None
+    assert shown["text_source"] is None
+
+
+def test_views_tolerate_a_database_with_no_text_source_column(tmp_path):
+    """A snapshot restored from a pre-015 database still passes `db.is_migrated` (it only
+    checks 001's sentinel), so `SELECT *` hands back a row with no `text_source` key. The
+    read has to degrade to `None` rather than raise - the same reason
+    `curation.has_table` exists."""
+    import shutil
+
+    staged = tmp_path / "pre015"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "015":
+            shutil.copy(path, staged / path.name)
+    old = db.connect(tmp_path / "old.db")
+    try:
+        db.migrate(old, staged)
+        person = persons.add_person(old, "jane-doe", "Jane Doe")
+        doc = _insert_document(old, person.person_id, "aa11bb22")
+        assert "text_source" not in {
+            r[1] for r in old.execute("PRAGMA table_info(document)").fetchall()
+        }
+        assert documents.list_documents(old)[0]["text_source"] is None
+        assert documents.get_document_view(old, doc)["text_source"] is None
+    finally:
+        old.close()
+
+
 # --- edit -------------------------------------------------------------------
 
 
@@ -827,6 +933,35 @@ def test_cli_document_show_json_keeps_the_stable_shape(cli_ready, capsys):
     assert payload["has_ocr_text"] is True
     assert payload["ocr_text_chars"] > 0
     assert "ocr_text" not in payload
+
+
+def test_cli_document_show_names_the_text_provenance(cli_ready, capsys):
+    """The fixture ingests with `--ocr-text-file`, i.e. the caller's own transcription -
+    so `attached`, even though `ingest` is the engine's own command (issue #175)."""
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "1") == 0
+    assert "text_source    attached" in capsys.readouterr().out
+
+    assert _run(cli_ready, "document", "show", "1", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["text_source"] == "attached"
+
+
+def test_cli_document_show_renders_unknown_provenance_rather_than_a_blank(
+    cli_ready, capsys
+):
+    """A document ingested with no text at all has no provenance to report. `_fmt` would
+    print an empty string there, which reads as a rendering bug rather than as "unknown"."""
+    blank = cli_ready / "untranscribed.txt"
+    blank.write_bytes(b"nothing extracted from this one")
+    assert _run(cli_ready, "ingest", str(blank), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources")) == 0
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "show", "2") == 0
+    out = capsys.readouterr().out
+    assert "has_ocr_text   no" in out and "text_source    unknown" in out
+
+    assert _run(cli_ready, "document", "show", "2", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["text_source"] is None
 
 
 def test_cli_document_show_reports_open_conflicts(cli_ready, capsys):

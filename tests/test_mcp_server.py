@@ -381,6 +381,21 @@ def test_document_set_text_fills_an_empty_ocr_text(seeded):
     assert mcp_server.find(seeded, query_text="thyroid", person="jane-doe")
 
 
+def test_document_set_text_records_attached_provenance(seeded):
+    """The MCP front door is the human/agent write path, so its text is `attached`
+    (issue #175). Proven behaviourally rather than by a line of code in `mcp_server`:
+    the tool passes no `source`, and `set_document_text`'s default is what makes that
+    correct - so this test is what would fail if the default ever flipped."""
+    doc = _doc(seeded, "jane-doe", ocr=None)
+    out = mcp_server.document_set_text(
+        seeded, document_id=doc, text="thyroid panel within range"
+    )
+    assert out["text_source"] == "attached"
+    assert seeded.execute(
+        "SELECT text_source FROM document WHERE document_id = ?", (doc,)
+    ).fetchone()["text_source"] == "attached"
+
+
 def test_document_set_text_refuses_a_populated_document(seeded):
     doc = _doc(seeded, "jane-doe", ocr="the original transcription")
     with pytest.raises(mcp_server.ToolError, match="already has ocr_text"):

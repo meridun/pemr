@@ -398,6 +398,33 @@ def test_ingest_study_dir_caller_values_win(conn, tmp_path, sources):
     assert doc.ocr_text == "IMPRESSION: no acute findings."
 
 
+def _text_source(conn, document_id):
+    return conn.execute(
+        "SELECT text_source FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()["text_source"]
+
+
+def test_ingest_study_dir_summary_records_engine_provenance(conn, tmp_path, sources):
+    """The derived modality/date/series summary is engine output like any extraction
+    (issue #175) - it is generated from the DICOM headers, not handed over by a human."""
+    root = make_study(tmp_path / "disc")
+    result = ingest.ingest_study_dir(conn, root, "jane-doe", sources)
+    assert "DICOM study: disc" in result.document.ocr_text
+    assert _text_source(conn, result.document.document_id) == "engine"
+
+
+def test_ingest_study_dir_supplied_text_records_attached_provenance(
+    conn, tmp_path, sources
+):
+    """A transcribed radiology report supplied by the caller beats the summary, and the
+    provenance goes with it."""
+    root = make_study(tmp_path / "disc")
+    result = ingest.ingest_study_dir(
+        conn, root, "jane-doe", sources, ocr_text="IMPRESSION: no acute findings.",
+    )
+    assert _text_source(conn, result.document.document_id) == "attached"
+
+
 def test_ingest_study_dir_zero_width_ocr_text_falls_back_to_the_summary(
     conn, tmp_path, sources
 ):

@@ -65,7 +65,12 @@ from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study, tombstones as _tombstones
-from .documents import normalize_document_text, set_document_text
+from .documents import (
+    TEXT_SOURCE_ATTACHED,
+    TEXT_SOURCE_ENGINE,
+    normalize_document_text,
+    set_document_text,
+)
 from .models import Document, Person
 
 
@@ -1426,8 +1431,13 @@ def _insert_document(
     category: str | None,
     provider: str | None,
     ocr_text: str | None,
+    text_source: str | None,
 ) -> Document:
     """Insert the `document` row and read it back. Shared by both ingest paths.
+
+    ``text_source`` is the provenance of ``ocr_text`` (issue #175) — ``None`` when there
+    is no text at all. This helper deliberately does not *infer* it: only the caller knows
+    whether the text came off the page through pemr or arrived from the caller verbatim.
 
     Blob cleanup on failure stays with the caller: the file path copies its blob in
     and the study path renames one in, so only they know what to undo.
@@ -1437,8 +1447,8 @@ def _insert_document(
             """
             INSERT INTO document
               (sha256, person_id, doc_date, category, provider, source_path,
-               ocr_text, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ocr_text, text_source, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sha,
@@ -1448,6 +1458,7 @@ def _insert_document(
                 provider,
                 _relative_source_path(sha, ext),
                 ocr_text,
+                text_source,
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
         )
@@ -1557,6 +1568,15 @@ def ingest_document(
     else:
         ocr_text, route = None, "ocr"  # no text at all; the route is moot
 
+    # Provenance follows the text's origin, not the verb (issue #175): `--ocr-text-file`
+    # supplies the *caller's* transcription (the `AGENTS.md` default path), so recording
+    # it as engine output would misclassify exactly the rows this column exists to tell
+    # apart. No text at all leaves both columns NULL.
+    text_source = (
+        None if not ocr_text
+        else (TEXT_SOURCE_ATTACHED if supplied else TEXT_SOURCE_ENGINE)
+    )
+
     roster = _roster(conn)
     # Structured vs prose per route — see `_trusts_anchors`. `mismatch` still blocks on
     # every route.
@@ -1588,6 +1608,7 @@ def ingest_document(
             category=category,
             provider=provider,
             ocr_text=ocr_text,
+            text_source=text_source,
         )
     except Exception:
         if blob_created:
@@ -1709,6 +1730,9 @@ def ingest_study_dir(
     # study summary wins rather than an invisible character (issue #87).
     supplied = normalize_document_text(ocr_text) or None
     text = supplied or _study.summary_text(scan, metadata)
+    # The derived modality/date/series summary is engine output; caller-supplied text (a
+    # transcribed radiology report) is not (issue #175).
+    text_source = TEXT_SOURCE_ATTACHED if supplied else TEXT_SOURCE_ENGINE
 
     roster = _roster(conn)
     owner_check = _strongest_check([
@@ -1758,6 +1782,7 @@ def ingest_study_dir(
                 category=category or _STUDY_CATEGORY,
                 provider=provider,
                 ocr_text=text,
+                text_source=text_source,
             )
         except Exception:
             if blob_created:
@@ -1977,6 +2002,11 @@ def reocr_documents(
         # `force=True` unconditionally: this call is only reached once the `has-text`
         # guard above has already applied the caller's own force policy, and re-testing
         # it here would refuse the invisible-only rows that guard deliberately admits.
-        set_document_text(conn, row.document_id, text, force=True)
+        # `source` is the one thing that distinguishes this engine caller from the
+        # hand-attach `set_document_text` otherwise assumes (issue #175): re-OCR text is
+        # `extract_text_routed` output, so it stamps `engine` over whatever was there.
+        set_document_text(
+            conn, row.document_id, text, force=True, source=TEXT_SOURCE_ENGINE
+        )
         results.append(ReocrResult(status="written", chars=len(text), **common))
     return results

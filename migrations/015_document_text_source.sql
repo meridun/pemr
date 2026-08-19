@@ -1,0 +1,54 @@
+-- 015_document_text_source: record which write path produced the current `ocr_text`
+-- (issue #175).
+--
+-- `document.ocr_text` has two writers that the schema could not tell apart after the
+-- fact:
+--
+--   * pemr's own extraction - `extract_text_routed` / `run_ocr` at ingest, the DICOM
+--     header summary a study gets, and `document reocr` re-deriving either;
+--   * the caller, verbatim - `pemr document set-text`, the `document_set_text` MCP tool,
+--     and `pemr ingest --ocr-text-file` (an agent's own transcription, which `AGENTS.md`
+--     makes the default path precisely because it beats tesseract on messy scans).
+--
+-- Both landed in the same column with no marker, and the distinction is NOT recoverable
+-- afterwards: a hand-attached transcription can be byte-identical to what OCR would have
+-- produced. Engine text carries OCR-typical noise (misreads, layout artifacts) that a
+-- downstream consumer - search ranking, a curation review queue, any future
+-- confidence-weighting - may reasonably want to treat differently, so the fact has to be
+-- stored at write time or it is lost.
+--
+--   'engine'   - pemr extracted the text itself
+--   'attached' - the caller supplied it verbatim
+--   NULL       - no provenance recorded
+--
+-- Provenance follows the text's ORIGIN, not the verb that wrote it: `ingest
+-- --ocr-text-file` records `attached` even though `ingest` is the engine's own command,
+-- because the bytes are the caller's.
+--
+-- Deliberately NOT constrained, and deliberately NOT backfilled:
+--
+--   * TEXT, not a `hand_attached` BOOLEAN. A boolean cannot express "no text at all" or
+--     "written before 015, provenance unknown" without overloading NULL against a third
+--     meaning, and a two-value TEXT column leaves room for a future third writer (a
+--     curation-time correction, say) without another migration.
+--   * No `CHECK`. Following 013's precedent, the closed vocabulary is validated in Python
+--     (`documents.TEXT_SOURCES`, the single definition both `documents` and `ingest`
+--     import) rather than in DDL - which also sidesteps SQLite's `ADD COLUMN` constraint
+--     restrictions entirely.
+--   * No backfill. Hand-attached rows already exist (`document set-text` has shipped),
+--     so blanket-setting every pre-015 row to 'engine' would silently misclassify the
+--     exact rows this issue exists to identify - worse than admitting ignorance. NULL's
+--     two readings are derivable from `ocr_text` itself: empty `ocr_text` means "no text,
+--     so no provenance", populated `ocr_text` means "written before 015, provenance
+--     unknown". No third literal is needed.
+--   * Not part of identity. `document` identity is layer-1 `sha256` only; `text_source`
+--     is in no dedup key, so no family is re-keyed and no curation verdict is orphaned.
+--
+-- Purely additive: one nullable ALTER, no rebuild, no backfill, safe under
+-- foreign_keys=ON. An `ALTER` fires no trigger, so migration 003's
+-- `record_fts_document_au` does not run here and there is no FTS churn at migrate time. A
+-- pre-015 database just needs `pemr migrate`; readers use `documents._text_source`, which
+-- tolerates the missing column (a restored pre-015 snapshot still passes
+-- `db.is_migrated`).
+
+ALTER TABLE document ADD COLUMN text_source TEXT;   -- 'engine' | 'attached'; NULL = none/pre-015
