@@ -52,6 +52,7 @@ ALL_MIGRATIONS = [
     "013_person_unit_pref.sql",
     "014_medication_status_reason.sql",
     "015_document_text_source.sql",
+    "016_record_correction_mark.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -142,11 +143,112 @@ def test_migration_015_applies_on_a_014_era_database_without_backfilling(
     )
     conn.commit()
 
-    assert db.migrate(conn) == ["015_document_text_source.sql"]
+    assert db.migrate(conn) == [
+        "015_document_text_source.sql", "016_record_correction_mark.sql",
+    ]
 
     row = conn.execute("SELECT * FROM document").fetchone()
     assert row["ocr_text"] == "hand typed"
     assert row["text_source"] is None
+
+
+def _migrate_through_015(conn, tmp_path):
+    """Apply every migration up to 015, leaving 016 pending (a 015-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre016"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "016":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def _seed_pre016_lab(conn, row_id, base, key):
+    conn.execute(
+        "INSERT INTO lab_result (lab_result_id, person_id, test_name, collected_at, "
+        "unit, dedup_key, dedup_base) VALUES (?, 1, 'HbA1c', '2024-01-01', ?, ?, ?)",
+        (row_id, "percent", key, base),
+    )
+
+
+def _seed_ledger(conn, row_id, base, field, edited_at, attributed_to):
+    conn.execute(
+        "INSERT INTO record_edit (record_type, record_id, dedup_base, field, "
+        "old_value, new_value, note, attributed_to, edited_at) VALUES "
+        "('lab_result', ?, ?, ?, '%', 'percent', 'normalise', ?, ?)",
+        (row_id, base, field, attributed_to, edited_at),
+    )
+
+
+def test_record_tables_have_correction_mark_columns(conn):
+    """Migration 016 (issue #134): a corrected row says so on the row, so `render` and
+    `query` can disclose it without joining the ledger."""
+    db.migrate(conn)
+    for table in RECORD_TABLES:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        assert {"edited_at", "edited_by"} <= cols, table
+
+
+def test_migration_016_backfills_the_newest_ledger_entry_per_row(conn, tmp_path):
+    """The upgrade path: rows corrected before the columns existed are reconstructed from
+    the ledger, newest entry wins, and an unattributed correction backfills a NULL
+    `edited_by` rather than being skipped."""
+    _migrate_through_015(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    _seed_pre016_lab(conn, 1, "base-a", "base-a")
+    _seed_pre016_lab(conn, 2, "base-b", "base-b")
+    _seed_pre016_lab(conn, 3, "base-c", "base-c")     # never corrected
+    _seed_ledger(conn, 1, "base-a", "unit", "2026-01-01T00:00:00+00:00", "Jane")
+    _seed_ledger(conn, 1, "base-a", "flag", "2026-02-01T00:00:00+00:00", "Sam")
+    _seed_ledger(conn, 2, "base-b", "unit", "2026-01-15T00:00:00+00:00", None)
+    conn.commit()
+
+    assert db.migrate(conn) == ["016_record_correction_mark.sql"]
+
+    marks = {
+        row["lab_result_id"]: (row["edited_at"], row["edited_by"])
+        for row in conn.execute("SELECT * FROM lab_result").fetchall()
+    }
+    assert marks[1] == ("2026-02-01T00:00:00+00:00", "Sam")   # newest wins
+    assert marks[2] == ("2026-01-15T00:00:00+00:00", None)    # unattributed, still marked
+    assert marks[3] == (None, None)
+
+
+def test_migration_016_leaves_a_recycled_row_id_unmarked(conn, tmp_path):
+    """The row-id-reuse hazard (issue #114), answered at backfill time by the ledger's
+    `dedup_base` breadcrumb: a stale entry naming a *different* family must not stamp a
+    correction caveat onto whichever row later inherited the id."""
+    _migrate_through_015(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    _seed_pre016_lab(conn, 1, "base-new", "base-new")
+    _seed_ledger(conn, 1, "base-gone", "unit", "2026-01-01T00:00:00+00:00", "Jane")
+    conn.commit()
+
+    db.migrate(conn)
+
+    row = conn.execute("SELECT * FROM lab_result").fetchone()
+    assert (row["edited_at"], row["edited_by"]) == (None, None)
+    # The ledger entry is kept regardless: nothing resolves through it (migration 012).
+    assert conn.execute("SELECT COUNT(*) AS n FROM record_edit").fetchone()["n"] == 1
+
+
+def test_a_pre016_snapshot_renders_and_queries_without_the_columns(conn, tmp_path):
+    """`restore` can bring back a database predating 016. Every reader goes through
+    `.get()`/`_row_get` on a mapping, so a missing column reads as "not corrected"
+    rather than raising `no such column`."""
+    from pemr import query, render
+
+    _migrate_through_015(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    _seed_pre016_lab(conn, 1, "base-a", "base-a")
+    conn.commit()
+
+    md = render.render_summary(conn, "jane")
+    assert "corrected" not in md
+    events = query.query_timeline(conn, "jane")
+    assert all("edited_at" not in e for e in events)
 
 
 def test_person_has_deactivated_at_column(conn):
@@ -209,6 +311,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
+        "016_record_correction_mark.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -344,6 +447,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
+        "016_record_correction_mark.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -398,6 +502,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
         "011_curation_distinct_status.sql", "012_record_edit.sql",
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
         "015_document_text_source.sql",
+        "016_record_correction_mark.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -450,6 +555,7 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
         "010_curation_row_scope.sql", "011_curation_distinct_status.sql",
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
+        "016_record_correction_mark.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
@@ -536,6 +642,7 @@ def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
         "011_curation_distinct_status.sql", "012_record_edit.sql",
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
         "015_document_text_source.sql",
+        "016_record_correction_mark.sql",
     ]
 
     after = [dict(r) for r in conn.execute(

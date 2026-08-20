@@ -724,9 +724,12 @@ def test_editable_fields_excludes_identity_and_never_names_provenance():
             set(dedup.FIELD_SPECS[record_type]) - dedup.KEY_FIELDS[record_type]
         )
         # Provenance is out for free: it was never in FIELD_SPECS to begin with.
+        # The correction mark (issue #134) joins that set: an edit must not be able to
+        # forge, clear or backdate its own disclosure.
         for column in ("document_id", "person_id", *dedup.INTERNAL_COLUMNS,
-                       *dedup.ATTESTATION_COLUMNS):
+                       *dedup.ATTESTATION_COLUMNS, *dedup.EDIT_MARK_COLUMNS):
             assert column not in editable
+            assert column not in dedup.FIELD_SPECS[record_type]
 
 
 def test_editable_fields_rejects_an_unknown_type():
@@ -897,6 +900,121 @@ def test_clearing_a_field_nulls_it_and_ledgers_the_old_value(seeded):
     assert _row(conn, "lab_result", target)["unit"] is None
     entry = _ledger(conn)[0]
     assert (entry["old_value"], entry["new_value"]) == ("%", None)
+
+
+# --- the correction mark (issue #134) ----------------------------------------
+
+
+def _mark(conn, record_type, row_id):
+    row = _row(conn, record_type, row_id)
+    return (row["edited_at"], row["edited_by"])
+
+
+def test_apply_stamps_the_correction_mark_and_it_matches_the_ledger(seeded):
+    """The disclosure and the audit trail agree, because they are written in one
+    transaction off one stamp."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    assert _mark(conn, "lab_result", target) == (None, None)
+
+    report = records.edit_record(
+        conn, "lab_result", target, {"unit": "percent"},
+        note="normalise the unit", attributed_to="Jane", apply=True,
+    )
+
+    after = _row(conn, "lab_result", target)
+    assert (after["edited_at"], after["edited_by"]) == (report.edited_at, "Jane")
+    entry = _ledger(conn)[0]
+    assert (entry["edited_at"], entry["attributed_to"]) == (report.edited_at, "Jane")
+    # The mark is disclosure, never identity: the key machinery is untouched.
+    for column in (*dedup.INTERNAL_COLUMNS, "document_id", "person_id"):
+        assert after[column] == before[column], column
+
+
+def test_an_unattributed_correction_marks_the_date_only(seeded):
+    """`--attributed-to` is optional in the ledger, so the row's mark is nullable too."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    report = records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                                 note="normalise", apply=True)
+    assert _mark(conn, "lab_result", target) == (report.edited_at, None)
+
+
+def test_a_dry_run_stamps_no_mark(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", attributed_to="Jane")
+    assert _mark(conn, "lab_result", target) == (None, None)
+
+
+def test_an_all_unchanged_edit_stamps_no_mark(seeded):
+    """Nothing diverged from the source, so nothing is disclosed - the `if apply and
+    changes` guard covers the mark exactly as it covers the ledger."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "Glucose")
+    report = records.edit_record(conn, "lab_result", target, {"value_num": 95},
+                                 note="restate", apply=True)
+    assert report.changes == []
+    assert _mark(conn, "lab_result", target) == (None, None)
+    assert _ledger(conn) == []
+
+
+def test_a_second_correction_overwrites_the_mark_and_the_ledger_keeps_both(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    first = records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                                note="normalise", attributed_to="Jane", apply=True)
+    second = records.edit_record(conn, "lab_result", target, {"unit": "%"},
+                                 note="revert", attributed_to="Sam", apply=True)
+
+    assert first.edited_at is not None
+    assert _mark(conn, "lab_result", target) == (second.edited_at, "Sam")
+    entries = _ledger(conn)
+    assert len(entries) == 2                       # last correction wins on the row only
+    assert [e["attributed_to"] for e in entries] == ["Jane", "Sam"]
+
+
+@pytest.mark.parametrize("column", dedup.EDIT_MARK_COLUMNS)
+def test_the_mark_columns_cannot_be_edited_by_name(seeded, column):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    with pytest.raises(records.FieldNotEditableError, match="unknown lab_result field"):
+        records.edit_record(conn, "lab_result", target, {column: "2026-01-01"},
+                            note="forge a mark", apply=True)
+    _assert_untouched(conn, "lab_result", target, before)
+    assert _ledger(conn) == []
+
+
+def test_a_corrected_rows_dedup_key_is_unchanged(seeded):
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    before = _row(conn, "lab_result", target)
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", apply=True)
+    after = _row(conn, "lab_result", target)
+    payload = {name: after[name] for name in dedup.FIELD_SPECS["lab_result"]}
+    assert after["dedup_key"] == before["dedup_key"]
+    assert dedup.dedup_key("lab_result", payload, after["person_id"]) == \
+        before["dedup_key"]
+
+
+def test_public_row_hides_the_mark_until_there_is_one(seeded):
+    """The additive-only read contract: an uncorrected row's payload key set is exactly
+    what it was before migration 016."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    keys_before = set(dedup.public_row(_row(conn, "lab_result", target)))
+    assert keys_before.isdisjoint(dedup.EDIT_MARK_COLUMNS)
+
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", attributed_to="Jane", apply=True)
+
+    payload = dedup.public_row(_row(conn, "lab_result", target))
+    assert set(payload) == keys_before | set(dedup.EDIT_MARK_COLUMNS)
+    assert payload["edited_by"] == "Jane"
 
 
 def test_every_known_type_can_be_edited(conn):
@@ -1072,6 +1190,29 @@ def test_curation_verdicts_in_both_scopes_survive_an_edit(seeded):
     assert verdicts.rows[("lab_result", target)]["status"] == "disputed"
     # Neither is orphaned: both still resolve to a live target.
     assert all(entry["family_size"] for entry in curation.list_curation(conn))
+
+
+def test_a_correction_and_a_verdict_are_independent_overlays(seeded):
+    """AC 5, both directions. A verdict is a ruling on the *fact*; a correction is a note
+    on the value's fidelity to its source. Neither writes the other's storage."""
+    conn = seeded["conn"]
+    target = _row_id(conn, "lab_result", "test_name", "HbA1c")
+
+    records.edit_record(conn, "lab_result", target, {"unit": "percent"},
+                        note="normalise", attributed_to="Jane", apply=True)
+    mark = _mark(conn, "lab_result", target)
+    assert mark[0] is not None
+
+    # Annotating afterwards leaves the mark exactly as the correction left it...
+    curation.annotate_record(conn, "lab_result", str(target), status="disputed",
+                             note="pharmacy has no record", row=True, apply=True)
+    assert _mark(conn, "lab_result", target) == mark
+
+    # ...and correcting again leaves the verdict alone.
+    records.edit_record(conn, "lab_result", target, {"flag": "H"},
+                        note="the flag was dropped", apply=True)
+    verdict = curation.load_verdicts(conn).rows[("lab_result", target)]
+    assert (verdict["status"], verdict["note"]) == ("disputed", "pharmacy has no record")
 
 
 def test_record_rm_discloses_the_ledger_and_keeps_it(seeded):

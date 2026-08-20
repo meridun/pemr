@@ -101,6 +101,15 @@ every line builder: ``(attested by <who> <date>; no source document)``. It must 
 as a document-sourced fact. Once a document backs it the row is promoted and renders
 unmarked, like any other sourced fact.
 
+**Corrected rows** (issue #134). The mirror image: a row whose non-key field was fixed in
+place by `pemr record edit` keeps its original provenance, so without a mark it would read
+as a verbatim quotation of a document that never said that. :func:`_correction_suffix` tags
+it at the same every-line-builder set: ``(corrected by <who> <date>)``, or
+``(corrected <date>)`` when the correction was unattributed. Suffix order on any line
+carrying several is verdict, provenance, correction, display conversion --
+:func:`_dispute_suffix`, :func:`_attest_suffix`, :func:`_correction_suffix`,
+:func:`_unit_suffix`.
+
 **Display units** (issue #136). A person may record one canonical display unit per
 measurement key (``person_unit_pref``, migration 013). ``render_summary`` reads that
 overlay the way it reads ``curation`` -- once, at the top -- and converts Latest Vitals
@@ -443,6 +452,36 @@ def _attest_suffix(row: dict) -> str:
     return f"  (attested by {row['attested_by']}{stamp}; no source document)"
 
 
+def _correction_suffix(row: dict) -> str:
+    """``  (corrected by <who> <date>)`` for a row edited in place, ``""`` otherwise
+    (issue #134).
+
+    The :func:`_attest_suffix` contract, for the mirror-image failure. There, an unsourced
+    fact must never read as a document-sourced one; here, a fact whose stored value has
+    since been *changed* must never read as a verbatim quotation of the document it is
+    still filed under. `record edit` (issue #129) keeps the row's provenance deliberately
+    intact, so without this mark nothing on the page distinguishes the two. Same
+    mitigation shape: one predicate, one suffix builder, appended at **every** line builder
+    that renders a typed-table row.
+
+    Read off :data:`dedup.EDIT_MARK_COLUMNS` on the row (migration 016), never off the
+    ``record_edit`` ledger: ledger entries outlive their row and record ids are reusable,
+    so a read-time join would caveat an unrelated later occupant. ``edited_by`` is NULL
+    when the correction was unattributed, which renders the date-only form; the mapping
+    lacking the key at all (a restored pre-016 snapshot) reads as "not corrected".
+
+    Placed after :func:`_attest_suffix` and before :func:`_unit_suffix`: verdict, then
+    provenance, then the display conversion.
+    """
+    if not isinstance(row, dict):
+        return ""
+    when = _date_part(row.get("edited_at")) or ""
+    if not when:
+        return ""
+    who = str(row.get("edited_by") or "").strip()
+    return f"  (corrected by {who} {when})" if who else f"  (corrected {when})"
+
+
 def _unit_suffix(d: units.Displayed) -> str:
     """``  [converted from 77.6 kg]`` for a display-converted number, ``""`` otherwise
     (issue #136).
@@ -558,7 +597,7 @@ def _condition_line(row: dict, *, past: bool = False) -> str:
     note = f" - {row['note']}" if row["note"] else ""
     return (
         f"- {row['name']}{since}{resolved}{note}"
-        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}{_correction_suffix(row)}"
     )
 
 
@@ -568,7 +607,7 @@ def _allergy_line(row: dict) -> str:
     noted = f"  (noted {row['noted_on']})" if row["noted_on"] else ""
     return (
         f"- {row['substance']}{crit}{reaction}{noted}"
-        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}{_correction_suffix(row)}"
     )
 
 
@@ -728,7 +767,7 @@ def _symptom_line(entry: dict) -> str:
     anchor = latest if latest is not None else resolved
     if anchor is None:
         return head
-    return f"{head}{_dispute_suffix(anchor)}{_attest_suffix(anchor)}"
+    return f"{head}{_dispute_suffix(anchor)}{_attest_suffix(anchor)}{_correction_suffix(anchor)}"
 
 
 def _symptom_section(entries: list[dict]) -> str | None:
@@ -1067,7 +1106,7 @@ def _order_line(row: dict) -> str:
     # displayed row - the same rule `_dispute_suffix` already follows here.
     return (
         f"- {_order_display(row)}{detail}{note}"
-        f"{_dispute_suffix(row)}{_attest_suffix(row)}"
+        f"{_dispute_suffix(row)}{_attest_suffix(row)}{_correction_suffix(row)}"
     )
 
 
@@ -1186,7 +1225,7 @@ def _procedure_line(row: dict) -> str:
     who = f"  ({row['provider']})" if row["provider"] else ""
     return (
         f"- {_date_part(row['performed_on']) or '(undated)'}  {row['name']}"
-        f"{outcome}{who}{_dispute_suffix(row)}{_attest_suffix(row)}"
+        f"{outcome}{who}{_dispute_suffix(row)}{_attest_suffix(row)}{_correction_suffix(row)}"
     )
 
 
@@ -1357,7 +1396,8 @@ def render_summary(
         freq = f" {m['frequency']}" if m["frequency"] else ""
         since = f" (since {m['started_on']})" if m["started_on"] else ""
         med_lines.append(
-            f"- {m['name']}{dose}{freq}{since}{_dispute_suffix(m)}{_attest_suffix(m)}"
+            f"- {m['name']}{dose}{freq}{since}"
+            f"{_dispute_suffix(m)}{_attest_suffix(m)}{_correction_suffix(m)}"
         )
 
     active_lines = [
@@ -1369,7 +1409,7 @@ def render_summary(
     ]
     family_lines = [
         f"- {c['relation'] or 'family'}: {c['name']}"
-        f"{_dispute_suffix(c)}{_attest_suffix(c)}"
+        f"{_dispute_suffix(c)}{_attest_suffix(c)}{_correction_suffix(c)}"
         for c in _conditions(conn, person_id, CONDITION_FAMILY, cur)
     ]
     allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
@@ -1389,7 +1429,7 @@ def render_summary(
         when = f"  ({_date_part(v['observed_at'])})" if v["observed_at"] else ""
         vital_lines.append(
             f"- {v['key']}: {_fmt(value)}{unit}{when}"
-            f"{_dispute_suffix(v)}{_attest_suffix(v)}{_unit_suffix(d)}"
+            f"{_dispute_suffix(v)}{_attest_suffix(v)}{_correction_suffix(v)}{_unit_suffix(d)}"
         )
 
     symptom_section = _symptom_section(
@@ -1406,7 +1446,7 @@ def render_summary(
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
             f"{_lab_value(shown)}{flag}{_ref_range(shown)}"
-            f"{_dispute_suffix(r)}{_attest_suffix(r)}{_unit_suffix(d)}"
+            f"{_dispute_suffix(r)}{_attest_suffix(r)}{_correction_suffix(r)}{_unit_suffix(d)}"
         )
 
     # Curation first, routine filter second (issue #166): an appendix-bound row has to be
@@ -1426,7 +1466,7 @@ def render_summary(
         proc_lines.append(f"\n{note}" if proc_lines else note)
 
     appt_lines = [
-        f"- {_appt_line(a)}{_dispute_suffix(a)}{_attest_suffix(a)}"
+        f"- {_appt_line(a)}{_dispute_suffix(a)}{_attest_suffix(a)}{_correction_suffix(a)}"
         for a in _open_appointments(conn, person_id, today, cur)
     ]
 
@@ -1528,7 +1568,7 @@ def render_brief(
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
         med_lines.append(
-            f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}{_attest_suffix(m)}"
+            f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}{_attest_suffix(m)}{_correction_suffix(m)}"
         )
 
     # Recency stays the primary axis, but a single draw can carry a 50+ analyte panel —
@@ -1563,7 +1603,8 @@ def render_brief(
         abnormal = f"  [!]{_ref_range(r)}" if _is_abnormal(r) else ""
         lab_lines.append(
             f"- {_date_part(r['collected_at'])}  {r['test_name']}  "
-            f"{_lab_value(r)}{flag}{abnormal}{_dispute_suffix(r)}{_attest_suffix(r)}"
+            f"{_lab_value(r)}{flag}{abnormal}"
+            f"{_dispute_suffix(r)}{_attest_suffix(r)}{_correction_suffix(r)}"
         )
 
     proc_rows = _apply_curation(
@@ -1602,7 +1643,7 @@ def render_brief(
         outcome = f" - {p['outcome']}" if p["outcome"] else ""
         ctx_lines.append(
             f"- {_date_part(p['performed_on']) or '(undated)'}  procedure: "
-            f"{p['name']}{outcome}{_dispute_suffix(p)}{_attest_suffix(p)}"
+            f"{p['name']}{outcome}{_dispute_suffix(p)}{_attest_suffix(p)}{_correction_suffix(p)}"
         )
     for o in obs_rows:
         value = o["value_num"] if o["value_num"] is not None else o["value_text"]
@@ -1610,7 +1651,7 @@ def render_brief(
         detail = " ".join(p for p in (o["obs_type"], o["key"]) if p)
         ctx_lines.append(
             f"- {_date_part(o['observed_at']) or '(undated)'}  {detail}{val}"
-            f"{_dispute_suffix(o)}{_attest_suffix(o)}"
+            f"{_dispute_suffix(o)}{_attest_suffix(o)}{_correction_suffix(o)}"
         )
 
     brief_allergy_lines = [_allergy_line(a) for a in _allergies(conn, person_id, cur)]
@@ -1720,7 +1761,7 @@ def render_journal(
         # the suffix is the only thing that says where the fact came from (issue #110).
         lines.append(
             f"- **{e['type']}** -- {e['summary']}{ref}"
-            f"{_dispute_suffix(e)}{_attest_suffix(e)}"
+            f"{_dispute_suffix(e)}{_attest_suffix(e)}{_correction_suffix(e)}"
         )
 
     if footnote_order:

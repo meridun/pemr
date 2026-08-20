@@ -240,7 +240,10 @@ def query_timeline(
 
     An event off a **human-attested** row (issue #110) additionally carries
     ``attested_by``/``attested_on``; a document-sourced event carries neither key, so an
-    unattested record's event shape is unchanged.
+    unattested record's event shape is unchanged. An event off a row **corrected in
+    place** by `record edit` (issue #134) likewise carries ``edited_at``/``edited_by``, so
+    a corrected value is distinguishable from one the document literally stated; an
+    uncorrected row's event carries neither key.
 
     ``with_identity=True`` additionally stamps ``record_type``, ``dedup_base`` and
     ``record_id`` on every event — the family identity `render_journal` needs to apply
@@ -292,6 +295,15 @@ def query_timeline(
         if _row_get(row, "attested_by"):
             event["attested_by"] = row["attested_by"]
             event["attested_on"] = _row_get(row, "attested_on")
+        # The correction mark (issue #134) travels on the same terms, and for the
+        # same reason: an event off a row whose stored value was edited in place must not
+        # read as a verbatim quotation of the document it is still filed under. Keyed off
+        # `edited_at` because `edited_by` is nullable (an unattributed correction is still
+        # a correction); an uncorrected row - or a restored pre-016 snapshot, where the
+        # columns do not exist - carries neither key.
+        if _row_get(row, "edited_at"):
+            event["edited_at"] = row["edited_at"]
+            event["edited_by"] = _row_get(row, "edited_by")
         if with_identity:
             event["record_type"] = record_type
             event["dedup_base"] = row["dedup_base"]
