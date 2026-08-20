@@ -69,6 +69,12 @@ def _dictionary() -> dict[str, str]:
     return _dedup.load_dictionary(cli._resolve_dictionary_path(_ARGS))
 
 
+def _routine_procedures() -> tuple[str, ...]:
+    """The summary's render-only routine-procedure list (issue #166), from the same file
+    :func:`_dictionary` reads -- so both front doors narrow identically."""
+    return _dedup.load_routine_procedures(cli._resolve_dictionary_path(_ARGS))
+
+
 def _connect() -> sqlite3.Connection:
     """Same missing-database gate the CLI applies, raised as a tool error (issue #55).
 
@@ -183,8 +189,8 @@ def ingest_document(
     ``ocr_text`` is the agent's own transcription — the ``AGENTS.md`` default path.
     The response's ``ocr_text_populated`` lets the agent self-check the FTS-visibility
     contract without a follow-up read. ``ocr=true`` is the fallback: it extracts by
-    whatever route the file type allows (plaintext/`.docx`/`.xlsx` and CCDA `.xml`
-    natively, everything
+    whatever route the file type allows (plaintext/`.docx`/`.xlsx`, CCDA `.xml` and a
+    saved `.html`/`.htm` page natively, everything
     else via tesseract), and stores nothing when nothing could be read — `.pdf`, `.rtf`,
     `.msg` and `.doc` have no route at all (tesseract does not accept PDF input), so
     transcribe those yourself.
@@ -202,8 +208,10 @@ def ingest_document(
     ``mismatch``/``suspect`` verdict refuses the ingest pre-write — per ``AGENTS.md``
     §3, surface the verdict and its evidence to the human and get an explicit
     go-ahead before retrying with ``force=true``. ``suspect`` (a patient-identity
-    header naming nobody on the roster) is scoped by route: it applies to the text you
-    supply and to a tesseract pass, never to anything ``ocr=true`` extracts natively
+    header naming nobody on the roster) is scoped by route, and the split is *structured
+    vs prose*: it applies to the text you supply, to a tesseract pass, and to a natively
+    extracted ``.html``/``.htm`` page (a saved portal page is a printed page). Never to
+    the structured native routes
     (``.txt``/``.md``/``.csv``/``.tsv``/``.json``/``.log``/``.docx``/``.xlsx``, CCDA
     ``.xml``), where
     those words are column labels — so pass your transcription as ``ocr_text`` rather
@@ -460,10 +468,18 @@ def find(
 
 
 def trends(conn: sqlite3.Connection, *, person: str, test: str) -> dict[str, Any]:
-    """[read] min/max/latest/slope for one analyte over time. Mirrors ``pemr trends``."""
+    """[read] min/max/latest/slope for one lab analyte or vital sign over time. Mirrors
+    ``pemr trends``.
+
+    A ``test`` matching both a lab result and a vital is refused, not merged.
+    """
     try:
         return _query.trends(conn, person, test, dictionary=_dictionary())
-    except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
+    except (
+        db.NotMigratedError,
+        _query.PersonNotFoundError,
+        _query.AmbiguousTestError,
+    ) as exc:
         raise _friendly(exc) from exc
 
 
@@ -472,32 +488,76 @@ def trends(conn: sqlite3.Connection, *, person: str, test: str) -> dict[str, Any
 def render_summary(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
     """[read] Master summary for a person -> Markdown. Mirrors ``pemr render summary``."""
     try:
-        markdown = _render.render_summary(conn, person, dictionary=_dictionary())
+        markdown = _render.render_summary(
+            conn,
+            person,
+            dictionary=_dictionary(),
+            routine_procedures=_routine_procedures(),
+        )
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}
 
 
-def render_brief(conn: sqlite3.Connection, *, appointment: int) -> dict[str, str]:
+def render_brief(
+    conn: sqlite3.Connection,
+    *,
+    appointment: int,
+    include_self_reported: bool = False,
+) -> dict[str, str]:
     """[read] Walk-in brief for one appointment -> Markdown. Mirrors ``pemr render brief``.
 
     The Markdown carries a placeholder "Medication Interaction Review" section; per
     ``AGENTS.md`` the agent fills it from general knowledge under the mandated
     verify-with-a-pharmacist framing, and must never claim safety or give dosing advice.
+
+    ``include_self_reported`` mirrors the CLI's ``--include-self-reported`` (issue #180),
+    a pass-through with no logic of its own: the two surfaces must not drift about what
+    the brief contains.
     """
     try:
-        markdown = _render.render_brief(conn, appointment, dictionary=_dictionary())
+        markdown = _render.render_brief(
+            conn,
+            appointment,
+            dictionary=_dictionary(),
+            include_self_reported=include_self_reported,
+        )
     except (db.NotMigratedError, _render.AppointmentNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}
 
 
 def render_journal(
-    conn: sqlite3.Connection, *, person: str, since: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    person: str,
+    since: str | None = None,
+    include_self_reported: bool = False,
 ) -> dict[str, str]:
-    """[read] Narrative chronology for a person -> Markdown. Mirrors ``pemr render journal``."""
+    """[read] Narrative chronology for a person -> Markdown. Mirrors ``pemr render journal``.
+
+    ``include_self_reported`` mirrors the CLI's ``--include-self-reported`` (issue #167),
+    a pass-through with no logic of its own: the two verbs must not drift about what the
+    journal contains.
+    """
     try:
-        markdown = _render.render_journal(conn, person, since=since)
+        markdown = _render.render_journal(
+            conn, person, since=since, include_self_reported=include_self_reported
+        )
+    except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
+        raise _friendly(exc) from exc
+    return {"markdown": markdown}
+
+
+def render_curation(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
+    """[read] Curation audit trail for a person -> Markdown. Mirrors ``pemr render curation``.
+
+    The verdict record that issue #168 moved out of the three clinical documents. Without
+    it here the content would vanish from every MCP-visible surface with no replacement;
+    an empty ``markdown`` means the person has no curation verdicts, not an error.
+    """
+    try:
+        markdown = _render.render_curation(conn, person)
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
     return {"markdown": markdown}
@@ -507,7 +567,7 @@ def render_journal(
 # references every name here; build_server registers exactly these.
 READ_ONLY_TOOLS = (
     "person_list", "person_show", "query", "find", "trends",
-    "render_summary", "render_brief", "render_journal",
+    "render_summary", "render_brief", "render_journal", "render_curation",
 )
 WRITE_TOOLS = (
     "person_add", "person_edit", "ingest", "commit_extraction", "document_set_text",
@@ -586,12 +646,29 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
         return _run(render_summary, person=person)
 
     @server.tool(name="render_brief", annotations=ro)
-    def render_brief_tool(appointment: int) -> dict:
-        return _run(render_brief, appointment=appointment)
+    def render_brief_tool(
+        appointment: int, include_self_reported: bool = False
+    ) -> dict:
+        return _run(
+            render_brief,
+            appointment=appointment,
+            include_self_reported=include_self_reported,
+        )
 
     @server.tool(name="render_journal", annotations=ro)
-    def render_journal_tool(person: str, since: str | None = None) -> dict:
-        return _run(render_journal, person=person, since=since)
+    def render_journal_tool(
+        person: str, since: str | None = None, include_self_reported: bool = False
+    ) -> dict:
+        return _run(
+            render_journal,
+            person=person,
+            since=since,
+            include_self_reported=include_self_reported,
+        )
+
+    @server.tool(name="render_curation", annotations=ro)
+    def render_curation_tool(person: str) -> dict:
+        return _run(render_curation, person=person)
 
     # -- write --
     @server.tool(name="person_add", annotations=rw)

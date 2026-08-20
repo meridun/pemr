@@ -36,6 +36,7 @@ COUNTED_TABLES = (
     "document_tombstone",
     "curation",
     "record_edit",
+    "person_unit_pref",
     "lab_result",
     "medication",
     "procedure",
@@ -183,6 +184,19 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
     remedy at batch scale, beside the per-row `record annotate --clear`. The row-scoped
     stale-breadcrumb notice below is deliberately *not* one of those classes: that verdict
     still resolves by row id, so nothing re-points it.
+
+    A third class is checked here and is likewise **not** an orphan kind (issue #169): a
+    `merged-into` verdict whose `merged_into_base` resolves to a family belonging to a
+    *different person*. #161's write-time guard closed that door in
+    :func:`curation.annotate_record`, but forward-only - a verdict written before it can
+    still point across people, and no orphan check notices, because the target family
+    genuinely exists. It stays out of :func:`curation.orphan_kinds` because neither
+    `record reaffirm` nor `rekey --apply` has a remedy for a live-but-wrong-person target:
+    they would offer to re-point a verdict they cannot fix. Detection only - the repair is
+    a human re-ruling. Note that the schema does not persist `cross_person`, so a merge
+    recorded deliberately with `--allow-cross-person` is indistinguishable from an
+    accidental pre-#161 one and warns too; the message says so, and warning on both is the
+    safer failure mode than staying silent.
     """
     if not curation.has_table(conn):
         return
@@ -230,17 +244,37 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
                 "(removed?) - lift it with `pemr record annotate --clear`"
             )
         target = verdict.get("merged_into_base")
+        # The merge target is always a family, in either scope (`--merged-into`
+        # names a `dedup_base`), so both branches below are scope-independent.
+        ident = (
+            f"{record_type} row #{record_id}" if record_id
+            else f"{record_type}/{short}..."
+        )
         if curation.ORPHAN_DANGLING_MERGE in kinds:
-            # The merge target is always a family, in either scope (`--merged-into`
-            # names a `dedup_base`), so this check is scope-independent.
-            ident = (
-                f"{record_type} row #{record_id}" if record_id
-                else f"{record_type}/{short}..."
-            )
             report.warnings.append(
                 f"curation verdict {ident} merges into "
                 f"{str(target)[:12]}..., which has no live family"
             )
+        elif target:
+            # `elif`, not a second `if`: reaching here means the target family *is*
+            # live, which is what keeps this from double-reporting a dangling target.
+            # Turning it into a standalone `if` reintroduces that bug.
+            if record_id:
+                ruled_id, ruled_slug = curation.row_person(conn, record_type, record_id)
+            else:
+                ruled_id, ruled_slug = curation.family_person(conn, record_type, base)
+            target_id, target_slug = curation.family_person(conn, record_type, target)
+            # Only a *known* mismatch warns - an unknown person on either side is not
+            # evidence of a cross-person merge, the same convention
+            # `curation.annotate_record`'s write-time guard follows (issue #161).
+            if ruled_id is not None and target_id is not None and ruled_id != target_id:
+                report.warnings.append(
+                    f"curation verdict {ident} merges into "
+                    f"{str(target)[:12]}... ({target_slug}), which belongs to a "
+                    f"different person than {ruled_slug} - re-rule with `pemr record "
+                    "annotate` or lift it with `--clear`; if the merge was deliberate "
+                    "(`--allow-cross-person`) this warning is expected"
+                )
 
 
 def _check_med_status(conn: sqlite3.Connection, report: VerifyReport) -> None:

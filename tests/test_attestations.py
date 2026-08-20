@@ -689,6 +689,8 @@ def test_public_row_keeps_an_unattested_payload_byte_identical(conn, jane):
     payload = dedup.public_row(row)
     assert not set(payload) & set(dedup.ATTESTATION_COLUMNS)
     assert not set(payload) & set(dedup.INTERNAL_COLUMNS)
+    # The correction mark (migration 016, issue #134) obeys the same rule.
+    assert not set(payload) & set(dedup.EDIT_MARK_COLUMNS)
     assert payload["document_id"] == doc
 
 
@@ -736,3 +738,79 @@ def test_cli_assert_a_functional_observation_without_a_document(cli_ready, capsy
         "--field", "obs_type=functional", "--field", "key=meal_regularity", "--apply",
     ) == 1
     assert "missing required field 'observed_at'" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# self-reported symptom / activity lanes (issue #167)
+# --------------------------------------------------------------------------- #
+
+SYMPTOM = {"obs_type": "symptom", "key": "right foot ache",
+           "observed_at": "2026-08-16T09:00", "value_num": 3,
+           "value_text": "achy after the walk"}
+
+
+def _assert_obs(conn, payload, **kwargs):
+    return attestations.assert_record(
+        conn, "observation", "jane-doe", dict(payload),
+        attributed_to=kwargs.pop("attributed_to", "Jane Doe"),
+        attested_on=kwargs.pop("attested_on", "2026-08-18"),
+        **kwargs,
+    )
+
+
+def test_a_symptom_asserts_through_the_existing_path(conn, jane):
+    """T4: no new CLI verb and no migration -- `record assert` already carries exactly
+    the right shape (a fact attributed to a person, dated, with no source document)."""
+    report = _assert_obs(conn, SYMPTOM, apply=True)
+    assert report.applied is True
+    row = conn.execute("SELECT * FROM observation").fetchone()
+    assert row["obs_type"] == "symptom"
+    assert row["key"] == "right foot ache"
+    assert row["value_num"] == 3
+    assert row["value_text"] == "achy after the walk"
+    assert row["document_id"] is None
+    assert dedup.attestation_state(row) == "attested"
+
+
+def test_an_activity_asserts_through_the_existing_path(conn, jane):
+    _assert_obs(conn, {"obs_type": "activity", "key": "morning walk",
+                       "observed_at": "2026-08-16T07:30", "value_num": 40,
+                       "unit": "min"}, apply=True)
+    row = conn.execute("SELECT * FROM observation").fetchone()
+    assert row["obs_type"] == "activity" and row["key"] == "morning walk"
+
+
+def test_asserting_a_self_report_never_touches_the_problem_list(conn, jane):
+    """The load-bearing invariant: these lanes live entirely inside the `observation`
+    catch-all and bypass the curation-verdict pipeline that governs `condition`."""
+    _assert_obs(conn, SYMPTOM, apply=True)
+    _assert_obs(conn, {"obs_type": "activity", "key": "morning walk",
+                       "observed_at": "2026-08-16T07:30"}, apply=True)
+    assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM allergy").fetchone()["n"] == 0
+
+
+def test_a_keyless_symptom_assert_is_refused(conn, jane):
+    with pytest.raises(dedup.ValidationError, match="missing required field 'key'"):
+        _assert_obs(conn, {"obs_type": "symptom", "observed_at": "2026-08-16T09:00"},
+                    apply=True)
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
+
+
+def test_a_date_only_symptom_assert_is_refused(conn, jane):
+    """The precision rule reaches the real write path, not just `validate_row`: without
+    it two reports of one complaint on one day would collapse into a single row."""
+    with pytest.raises(dedup.ValidationError, match="requires a time of day"):
+        _assert_obs(conn, dict(SYMPTOM, observed_at="2026-08-16"), apply=True)
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 0
+
+
+def test_two_same_day_symptom_asserts_land_as_two_rows(conn, jane):
+    """The AC the whole D1 decision exists for."""
+    morning = _assert_obs(conn, SYMPTOM, apply=True)
+    evening = _assert_obs(
+        conn, dict(SYMPTOM, observed_at="2026-08-16T21:00", value_num=6), apply=True
+    )
+    assert evening.outcome == "new"
+    assert morning.dedup_key != evening.dedup_key
+    assert conn.execute("SELECT COUNT(*) AS n FROM observation").fetchone()["n"] == 2

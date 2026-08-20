@@ -63,6 +63,11 @@ FIELD_SPECS: dict[str, dict[str, tuple[object, bool]]] = {
         "ended_on": (str, False),
         "prescriber": (str, False),
         "status": (str, False),
+        # Verbatim discontinue reason, parentheses stripped (issue #159): a CCDA med
+        # table states WHY a drug stopped in the same cell as the status word, and
+        # `(Reorder)` (renewed) vs `(Therapy Completed)` (finished) are opposites. Free
+        # text, deliberately NOT an ENUM_FIELDS entry - see migrations/014.
+        "status_reason": (str, False),
     },
     "procedure": {
         "name": (str, True),
@@ -119,6 +124,16 @@ INTERNAL_COLUMNS = ("dedup_key", "dedup_base", "dedup_occurrence")
 # bit-identical for attested and document-sourced rows alike.
 ATTESTATION_COLUMNS = ("attested_by", "attested_on", "attested_at")
 
+# Correction-disclosure columns on every record table (migration 016, issue #134).
+# The :data:`ATTESTATION_COLUMNS` shape for the same reason: they are the row's own
+# provenance caveat - "this stored value no longer matches what its source said" - so they
+# stay visible in the `--json`/MCP payloads rather than being stripped as internal. Equally
+# deliberately NOT in :data:`FIELD_SPECS`: they are engine-set, never accepted from an
+# extraction, unnameable by `record edit`, and their absence is what keeps every dedup key
+# bit-identical for corrected and uncorrected rows alike. The field-level audit trail lives
+# in the `record_edit` ledger; this pair is only the row-level marker the renderers read.
+EDIT_MARK_COLUMNS = ("edited_at", "edited_by")
+
 # Date-typed fields per record type. These feed timeline sort / trends date math and
 # the dedup_key (via _date_only), all of which assume a lexically-sortable ISO date —
 # so validate_row enforces ISO on them, not just the base `str` type. A partial
@@ -147,15 +162,67 @@ ENUM_FIELDS: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 
+# The vitals lane: the `observation` rows render's `Latest Vitals` shows one at a time and
+# `query.trends` charts as a series (issue #176). It lives here rather than beside render's
+# `OBS_ORDER` because `query` became its second consumer and `render` imports `query` —
+# defining it in `render` would invert that edge, the same reasoning the self-attested
+# lanes below already follow.
+OBS_VITAL = "vital"
+
+# The self-attested lanes (issue #167): what the *patient* reports about themselves on a
+# given day, as opposed to what a clinician or a document asserted. Deliberately two
+# obs_types, not one — `activity` is the higher-volume, lower-signal of the pair, and
+# sharing a lane would bury the symptom signal underneath it. Both stay inside the
+# `observation` catch-all and never reach `condition`/`Active Problems`, which is what
+# keeps unfiltered self-attested rows out of the verdict-curated problem list.
+#
+# They live here rather than beside render's `OBS_ORDER` because `query` needs
+# them too and it already imports from this module while `render` imports `query` —
+# defining them in `render` would invert that edge.
+OBS_SYMPTOM = "symptom"
+OBS_ACTIVITY = "activity"
+SELF_REPORTED_OBS_TYPES: frozenset[str] = frozenset({OBS_SYMPTOM, OBS_ACTIVITY})
+
 # Per-`obs_type` required fields, enforced by validate_row after the per-field loop.
 # `observation`'s FIELD_SPECS entry marks `observed_at` optional because vitals and orders
 # legitimately arrive undated, but a `functional` row's whole value is being dated (issue
 # #132: "the running-balance column stops in July") — an undated one is exactly the
-# unqueryable prose that record type exists to eliminate. Scoped to `functional` alone:
-# widening it to the other families would reject already-valid extractions.
+# unqueryable prose that record type exists to eliminate. Scoped to `functional` and the
+# two self-attested lanes: widening it to the other families would reject already-valid
+# extractions. The self-attested pair needs a date because a fluctuating complaint with no
+# date answers no frequency question, and a `key` because a keyless symptom is exactly the
+# untyped blob the lane exists to prevent (issue #167).
 OBS_TYPE_REQUIRED: dict[str, frozenset[str]] = {
     "functional": frozenset({"observed_at"}),
+    OBS_SYMPTOM: frozenset({"observed_at", "key"}),
+    OBS_ACTIVITY: frozenset({"observed_at", "key"}),
 }
+
+# Obs_types whose `observed_at` must additionally carry a **time of day**, enforced right
+# after the OBS_TYPE_REQUIRED loop (issue #167). Kept a separate name from
+# :data:`OBS_TYPE_REQUIRED` so the presence rule and the precision rule stay separately
+# readable and separately testable.
+#
+# Why a precision rule rather than a new dedup discriminator: `norm_ts` already keeps
+# `observation.observed_at` at full precision, so two same-day reports at *different times*
+# already get distinct keys (Architecture.md §3). The collision a same-day repeat hits is
+# therefore not a key defect — it is what a date-only `observed_at` means. Mandating the
+# time on these two lanes fixes it without forking observation identity, and it preserves
+# the property that a correction at the *same* timestamp still collides as a CONFLICT.
+OBS_TYPE_REQUIRES_TIME: frozenset[str] = SELF_REPORTED_OBS_TYPES
+
+# Obs_types whose `value_num` carries a bounded scale, checked at write time right after
+# the precision rule (issue #180). Inclusive bounds. Kept a separate name from its two
+# neighbours above for the same reason they are separate from each other: one rule, one
+# name, one test.
+#
+# `symptom` alone: its `value_num` is the 0-10 severity issue #167 defined and renders as
+# `severity N/10`, so `50` is a data-entry error the document would otherwise repeat back
+# as fact. `OBS_ACTIVITY` is deliberately absent -- it shares the column but stores
+# *minutes*, which has no defensible upper bound, so a column-wide rule would be wrong.
+# The lower bound is inclusive because `value_num == 0` is the "reported resolved"
+# sentinel (see `render._self_reported_symptoms`), not an out-of-range value.
+OBS_TYPE_VALUE_RANGE: dict[str, tuple[float, float]] = {OBS_SYMPTOM: (0.0, 10.0)}
 
 _WS = re.compile(r"\s+")
 # Capturing group so the same pattern both removes a parenthetical (`sub`, giving the
@@ -230,6 +297,30 @@ def _is_iso_date(value: str) -> bool:
     return False
 
 
+def _has_time_component(value: str) -> bool:
+    """True when an ISO date value also carries a time of day (issue #167).
+
+    Correct **only** on a value :func:`_is_iso_date` has already accepted: at that point a
+    string longer than ``YYYY-MM-DD`` can only be a full date followed by the ``T``/space
+    separator and a valid time (month- and year-precision forms permit no time component
+    at all). The caller in :func:`validate_row` guarantees that ordering; the
+    ``len(value) > 10`` guard keeps a shorter value from ever indexing out of range.
+    """
+    return len(value) > 10 and value[10] in ("T", " ")
+
+
+def _is_blank(value: object) -> bool:
+    """True for a value that is *missing* in the sense a required-field rule means.
+
+    ``None`` and a whitespace-only string are the two spellings of the same absence
+    (issue #180): a presence-only ``is None`` test accepts ``key=""`` and renders a
+    blank-labelled symptom line -- precisely the untyped blob the self-attested lanes
+    exist to prevent. Non-strings (a REAL ``0.0``, say) are never blank: only text can
+    be present-but-empty.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 # --------------------------------------------------------------------------- #
 # Dictionary + normalization
 # --------------------------------------------------------------------------- #
@@ -250,6 +341,45 @@ def load_dictionary(path: str | Path | None) -> dict[str, str]:
         data = tomllib.load(fh)
     raw = data.get("synonyms", {})
     return {_collapse(str(k)): str(v).strip() for k, v in raw.items()}
+
+
+def load_routine_procedures(path: str | Path | None) -> tuple[str, ...]:
+    """Load the routine-procedure pattern list (``[procedures].routine``) from the same
+    TOML file :func:`load_dictionary` reads (issue #166).
+
+    Returns the patterns :func:`norm`-normalized (no dictionary -- see below), blanks
+    dropped, duplicates dropped, authoring order preserved. ``None``, a missing file, an
+    absent ``[procedures]`` table and an absent/empty ``routine`` key all give ``()`` --
+    the empty list suppresses nothing, which is the whole point of the default-show rule
+    the render side implements.
+
+    **Render-only.** These patterns narrow the master summary's ``## Procedures`` section
+    and nothing else: they never reach :func:`dedup_key`/:func:`key_token`, no stored row
+    depends on them, and `pemr rekey` must ignore this table entirely. It lives in
+    ``dictionary.toml`` because that is the project's one human-curated naming file, not
+    because it participates in identity.
+
+    Normalization runs **without** the synonym dictionary on purpose: ``[synonyms]`` is
+    lab-analyte vocabulary and must never rewrite a procedure name on either side of the
+    match.
+    """
+    if path is None:
+        return ()
+    p = Path(path)
+    if not p.is_file():
+        return ()
+    with p.open("rb") as fh:
+        data = tomllib.load(fh)
+    table = data.get("procedures", {})
+    entries = table.get("routine", []) if isinstance(table, dict) else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        token = norm(entry)
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return tuple(out)
 
 
 def _collapse(value: str) -> str:
@@ -381,18 +511,24 @@ def _date_only(value: object) -> str:
     return text.replace("T", " ").split(" ")[0]
 
 
-def _norm_ts(value: object) -> str:
-    """Normalize an ISO date/datetime for use as a dedup-key identity part, keeping
-    *full precision* (unlike :func:`_date_only`, which truncates to the date).
+def norm_ts(value: object) -> str:
+    """Normalize an ISO date/datetime for use as a sortable/comparable identity part,
+    keeping *full precision* (unlike :func:`_date_only`, which truncates to the date).
 
-    Its one remaining consumer is ``observation.observed_at``: a timestamped
+    Its dedup consumer is ``observation.observed_at``: a timestamped
     observation (``2026-01-02T09:00``) and a bare-date one (``2026-01-02``) stay
     distinct, and two observations on the same day at different times keep distinct
     keys, so serial same-day repeats survive as separate rows. A re-read/correction of
     the *same* observation carries the same timestamp, collides, and surfaces as a
     CONFLICT via :data:`_COMPARE_FIELDS`. Only the ``T``/space separator and
     surrounding/collapsed whitespace are normalized, so trivial formatting differences
-    don't fork the key."""
+    don't fork the key.
+
+    Public (issue #180) because the render layer needs the same normalization for its
+    newest-wins ordering: the raw string sorts ``T`` (0x54) *after* a space (0x20), so a
+    space-separated 20:00 row loses "latest" to a ``T``-separated 09:00 one on the same
+    date. Ordering and comparing through this function is what makes the two spellings
+    of one timestamp sort as one."""
     if value is None:
         return ""
     return _WS.sub(" ", str(value).strip().replace("T", " "))
@@ -434,7 +570,7 @@ def _key_parts(
     if record_type == "appointment":
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
-        return [person_id, n("obs_type"), _norm_ts(row.get("observed_at")), kt("key")]
+        return [person_id, n("obs_type"), norm_ts(row.get("observed_at")), kt("key")]
     # allergy/condition are DATE-FREE by design: they are standing facts restated on
     # every document with inconsistent or absent dates, so a date in the key would fork
     # one allergy into one row per document. The dates are payload, and a disagreement
@@ -485,9 +621,10 @@ def editable_fields(record_type: str) -> tuple[str, ...]:
 
     The safety property `record edit` (issue #129) rests on: identity is excluded by
     **derivation**, not by a hand-maintained denylist. Provenance is excluded for free —
-    ``document_id``, ``person_id``, the ``dedup_*`` columns and
-    :data:`ATTESTATION_COLUMNS` are not in :data:`FIELD_SPECS` at all, so no caller
-    reading this list can name one.
+    ``document_id``, ``person_id``, the ``dedup_*`` columns,
+    :data:`ATTESTATION_COLUMNS` and :data:`EDIT_MARK_COLUMNS` are not in
+    :data:`FIELD_SPECS` at all, so no caller reading this list can name one — an edit can
+    no more forge its own correction stamp than it can rewrite its provenance.
     """
     if record_type not in FIELD_SPECS:
         raise ValueError(
@@ -588,11 +725,39 @@ def validate_row(record_type: str, row: object) -> None:
         # Matched verbatim (not via enum_token): `obs_type` is stored as written and every
         # reader selects on it with `=`, so a rule keyed to a normalized spelling would
         # bind a value that then renders nowhere.
+        # `_is_blank`, not `is None` (issue #180): `key=""` is missing in exactly the
+        # sense this rule means, and the message text is unchanged so the two spellings
+        # of keyless read identically to a human and to the CLI's error assertions.
         for field in sorted(OBS_TYPE_REQUIRED.get(row["obs_type"], frozenset())):
-            if row.get(field) is None:
+            if _is_blank(row.get(field)):
                 raise ValidationError(
                     f"observation: missing required field '{field}' "
                     f"for obs_type={row['obs_type']!r}"
+                )
+        # Ordering is load-bearing (issue #167): the per-field loop above has already
+        # proven `observed_at` is an ISO value, and the OBS_TYPE_REQUIRED loop has just
+        # proven it is present, so `_has_time_component` may index into it. Moving either
+        # block after this one would turn a ValidationError into an IndexError.
+        if row["obs_type"] in OBS_TYPE_REQUIRES_TIME and not _has_time_component(
+            row["observed_at"]
+        ):
+            raise ValidationError(
+                f"observation.observed_at: obs_type={row['obs_type']!r} requires a time "
+                f"of day (YYYY-MM-DDTHH:MM), got {row['observed_at']!r} - two reports of "
+                "one key on the same day would otherwise dedup into a single row"
+            )
+        # Last of the three, for the same ordering reason: the per-field loop has already
+        # proven `value_num` is a number (`_NUM`), so the comparison below is safe here
+        # and only here. Write-time only -- rows already stored out of range keep
+        # rendering as stored; clamping at render time would make the document disagree
+        # with the row it claims to display (issue #180).
+        bounds = OBS_TYPE_VALUE_RANGE.get(row["obs_type"])
+        if bounds is not None and row.get("value_num") is not None:
+            lo, hi = bounds
+            if not lo <= float(row["value_num"]) <= hi:
+                raise ValidationError(
+                    f"observation.value_num: obs_type={row['obs_type']!r} expects a "
+                    f"severity in {lo:g}-{hi:g}, got {row['value_num']!r}"
                 )
 
 
@@ -641,15 +806,19 @@ def public_row(row: sqlite3.Row | dict) -> dict:
     contract. The attestation columns go only when they are **NULL**: a document-sourced
     row keeps the exact key set it had before migration 009 (the additive-only
     guarantee), while an attested row carries its provenance, which is the whole point of
-    the feature and must never be quietly stripped.
+    the feature and must never be quietly stripped. :data:`EDIT_MARK_COLUMNS` follow the
+    same rule for the same reason (migration 016): an uncorrected row's payload is
+    byte-identical to what it was before, while a corrected row discloses that its stored
+    value diverges from its source.
 
     One function rather than one rule per front door: a payload that discloses provenance
     at the CLI but not over MCP is the drift this feature can least afford.
     """
+    nullable_provenance = ATTESTATION_COLUMNS + EDIT_MARK_COLUMNS
     return {
         name: value for name, value in dict(row).items()
         if name not in INTERNAL_COLUMNS
-        and not (name in ATTESTATION_COLUMNS and value is None)
+        and not (name in nullable_provenance and value is None)
     }
 
 
@@ -688,7 +857,8 @@ class CommitSummary:
 # value_num/value_text appear below.
 _COMPARE_FIELDS: dict[str, list[str]] = {
     "lab_result": ["value_num", "value_text", "unit", "ref_low", "ref_high", "flag", "loinc"],
-    "medication": ["route", "frequency", "ended_on", "prescriber", "status"],
+    "medication": ["route", "frequency", "ended_on", "prescriber", "status",
+                   "status_reason"],
     "procedure": ["provider", "outcome"],
     "appointment": ["specialty", "reason", "summary"],
     "observation": ["value_num", "value_text", "unit"],

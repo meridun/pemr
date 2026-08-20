@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from pemr import (
-    __version__, curation, db, dedup, ingest, mcp_server, persons, tombstones,
+    __version__, curation, db, dedup, ingest, mcp_server, persons, records, tombstones,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -132,6 +132,39 @@ def test_query_with_no_verdicts_carries_no_curation_key(seeded):
         assert rows and all("_curation" not in r for r in rows)
 
 
+def test_query_discloses_a_correction_only_on_the_corrected_row(seeded):
+    """Issue #134 at the MCP front door: the agent's structured read must see the same
+    correction caveat the human view renders, and only there. `dedup.public_row` is what
+    carries it, so the half worth proving here is the additive one — an *uncorrected*
+    row's payload keeps the exact key set it had before migration 016."""
+    before = {
+        kind: mcp_server.query(seeded, kind=kind, person="jane-doe")
+        for kind in ("labs", "meds", "timeline")
+    }
+    assert all("edited_at" not in r for rows in before.values() for r in rows)
+
+    med_id = seeded.execute(
+        "SELECT medication_id FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["medication_id"]
+    records.edit_record(
+        seeded, "medication", med_id, {"route": "oral"},
+        note="route omitted by the extraction", attributed_to="Dr. Smith", apply=True,
+    )
+
+    meds = mcp_server.query(seeded, kind="meds", person="jane-doe")
+    assert meds[0]["edited_by"] == "Dr. Smith" and meds[0]["edited_at"]
+    assert {k: v for k, v in meds[0].items() if k not in dedup.EDIT_MARK_COLUMNS} \
+        == {**before["meds"][0], "route": "oral"}
+
+    # Untouched record types keep their exact payload — no NULL mark leaks out.
+    assert mcp_server.query(seeded, kind="labs", person="jane-doe") == before["labs"]
+
+    events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
+    assert [e["type"] for e in events if "edited_at" in e] == ["med-start"]
+    assert [e for e in events if "edited_at" not in e] \
+        == [e for e in before["timeline"] if e["type"] != "med-start"]
+
+
 def test_find_and_trends(seeded):
     hits = mcp_server.find(seeded, person="jane-doe", query_text="glucose")
     assert hits  # ocr_text was populated, so FTS sees it
@@ -139,6 +172,37 @@ def test_find_and_trends(seeded):
     tr = mcp_server.trends(seeded, person="jane-doe", test="a1c")  # dictionary-normalized
     assert tr["count"] == 2
     assert tr["latest"] == 6.5
+
+
+def test_trends_charts_a_vital_key(seeded):
+    """Issue #176: the tool signature and payload shape are unchanged -- a vitals series
+    is shape-identical to a lab one."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="clinic vitals", doc_date="2026-03-01")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Weight",
+         "value_num": 88.0, "unit": "kg"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Weight",
+         "value_num": 86.0, "unit": "kg"},
+    ]}, d)
+    vital = mcp_server.trends(seeded, person="jane-doe", test="weight")
+    lab = mcp_server.trends(seeded, person="jane-doe", test="a1c")
+    assert set(vital) == set(lab)
+    assert vital["count"] == 2 and vital["latest"] == 86.0
+    assert vital["latest_at"] == "2026-02-01" and vital["unit"] == "kg"
+
+
+def test_trends_collision_is_a_tool_error_not_a_raw_exception(seeded):
+    """A `test` matching both tables is refused, and the refusal reaches the agent as a
+    `ToolError` like every other friendly failure in this wrapper."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="a1c measured twice over", doc_date="2026-04-01")
+    dedup.commit_extraction(seeded, doc, {"observation": [
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "HbA1c",
+         "value_num": 6.1, "unit": "%"},
+    ]}, d)
+    with pytest.raises(mcp_server.ToolError, match="vital observations"):
+        mcp_server.trends(seeded, person="jane-doe", test="a1c")
 
 
 def test_find_household_wide_omits_person(seeded):
@@ -149,10 +213,65 @@ def test_find_household_wide_omits_person(seeded):
 
 
 def test_renderers_return_markdown(seeded):
-    assert mcp_server.render_summary(seeded, person="jane-doe")["markdown"].startswith("#")
+    summary = mcp_server.render_summary(seeded, person="jane-doe")["markdown"]
+    assert summary.startswith("#")
+    # Issue #166: the wrapper passes the routine-procedure list, so the section exists
+    # and the extra kwarg cannot silently drift into a TypeError.
+    assert "## Procedures" in summary
     brief = mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"]
     assert "Medication Interaction Review" in brief  # the placeholder AGENTS.md fills
     assert mcp_server.render_journal(seeded, person="jane-doe")["markdown"].startswith("#")
+
+
+def test_render_curation_mirrors_the_cli_target(seeded):
+    """Issue #168: the appendix left the three clinical documents, so without this tool
+    its content would vanish from every MCP-visible surface. Empty Markdown for an
+    uncurated person is the documented state, not a failure."""
+    assert mcp_server.render_curation(seeded, person="jane-doe")["markdown"] == ""
+
+    base = seeded.execute(
+        "SELECT dedup_base FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["dedup_base"]
+    curation.annotate_record(seeded, "medication", base, status="superseded",
+                             note="duplicate portal import", apply=True)
+
+    md = mcp_server.render_curation(seeded, person="jane-doe")["markdown"]
+    assert md.startswith("# Curation Record: Jane Doe")
+    assert "medication: Metformin" in md and "duplicate portal import" in md
+    # ... and it really is the content the summary no longer carries.
+    assert "Metformin" not in mcp_server.render_summary(seeded, person="jane-doe")["markdown"]
+
+
+def test_render_curation_unknown_person_is_a_friendly_tool_error(seeded):
+    with pytest.raises(mcp_server.ToolError):
+        mcp_server.render_curation(seeded, person="ghost")
+
+
+def test_render_summary_narrows_procedures_like_the_cli(seeded):
+    """Issue #166, verify pass: the MCP front door must *apply* the routine list, not
+    merely accept the kwarg. `test_renderers_return_markdown` asserts only that the
+    section exists, which a `_routine_procedures()` stuck at `()` would also satisfy --
+    so the two front doors could silently disagree. `_ARGS.dictionary` is unset here,
+    exactly as a real server starts, so this resolves the shipped
+    `data/dictionary.example.toml` and its starter patterns: the same file and the same
+    fallback `pemr render summary` uses."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "procedure": [
+            {"name": "Office Visit, Established Patient", "performed_on": "2026-02-01"},
+            {"name": "Total knee arthroplasty", "performed_on": "2026-01-15"},
+        ],
+    }, {})
+    section = mcp_server.render_summary(
+        seeded, person="jane-doe"
+    )["markdown"].split("## Procedures")[1].split("\n## ")[0]
+
+    assert "- 2026-01-15  Total knee arthroplasty" in section   # default-show
+    assert "Office Visit" not in section                        # suppressed
+    assert "_1 routine procedure not shown" in section          # and disclosed
+    # Render-only: the suppressed row is still in the journal both front doors serve.
+    journal = mcp_server.render_journal(seeded, person="jane-doe")["markdown"]
+    assert "Office Visit, Established Patient" in journal
 
 
 def test_read_tools_leave_db_byte_stable(seeded, db_path):
@@ -164,6 +283,7 @@ def test_read_tools_leave_db_byte_stable(seeded, db_path):
     mcp_server.trends(seeded, person="jane-doe", test="a1c")
     mcp_server.render_summary(seeded, person="jane-doe")
     mcp_server.render_journal(seeded, person="jane-doe")
+    mcp_server.render_curation(seeded, person="jane-doe")
     assert _sha(db_path) == before
 
 
@@ -323,6 +443,21 @@ def test_document_set_text_fills_an_empty_ocr_text(seeded):
     assert "ocr_text" not in out
     # FTS is trigger-maintained, so `find` sees it with no reindex.
     assert mcp_server.find(seeded, query_text="thyroid", person="jane-doe")
+
+
+def test_document_set_text_records_attached_provenance(seeded):
+    """The MCP front door is the human/agent write path, so its text is `attached`
+    (issue #175). Proven behaviourally rather than by a line of code in `mcp_server`:
+    the tool passes no `source`, and `set_document_text`'s default is what makes that
+    correct - so this test is what would fail if the default ever flipped."""
+    doc = _doc(seeded, "jane-doe", ocr=None)
+    out = mcp_server.document_set_text(
+        seeded, document_id=doc, text="thyroid panel within range"
+    )
+    assert out["text_source"] == "attached"
+    assert seeded.execute(
+        "SELECT text_source FROM document WHERE document_id = ?", (doc,)
+    ).fetchone()["text_source"] == "attached"
 
 
 def test_document_set_text_refuses_a_populated_document(seeded):
@@ -587,10 +722,19 @@ def test_curation_verbs_are_not_on_the_mcp_surface():
     """Trust boundary (issue #109, the `document rm` / `record rm` precedent): a
     human's clinical verdict is CLI-only. AGENTS.md's blessed write set is
     commit_extraction/person_add/person_edit/ingest/document_set_text, and
-    `record annotate` is deliberately not in it - read or write."""
+    `record annotate` is deliberately not in it - read or write.
+
+    `render_curation` (issue #168) is the one tool that may say "curation" at all, and it
+    is a *renderer*: it reads the verdict table the same way `render_summary` reads the
+    clinical tables. Writing a verdict is still unreachable from here, which is the
+    property this test exists for - so the write surface may never say it."""
     surface = " ".join(mcp_server.TOOL_NAMES).lower()
-    for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
+    for spelling in ("annotate", "record_rm", "record_annotate"):
         assert spelling not in surface, spelling
+    writes = " ".join(mcp_server.WRITE_TOOLS).lower()
+    for spelling in ("annotate", "curation", "record_rm", "record_annotate"):
+        assert spelling not in writes, spelling
+    assert [t for t in mcp_server.TOOL_NAMES if "curation" in t] == ["render_curation"]
 
 
 def test_record_assert_is_not_on_the_mcp_surface():
@@ -614,3 +758,86 @@ def test_record_edit_is_not_on_the_mcp_surface():
     for spelling in ("record_edit", "edit_record", "record_edits"):
         assert spelling not in surface, spelling
     assert "record_edit" not in mcp_server.WRITE_TOOLS
+
+
+# --------------------------------------------------------------------------- #
+# self-reported lanes: CLI/MCP verb parity (issue #167)
+# --------------------------------------------------------------------------- #
+
+def _attest_self_reports(conn, slug="jane-doe"):
+    from pemr import attestations
+
+    for row in (
+        {"obs_type": "symptom", "key": "right foot ache",
+         "observed_at": "2026-08-16T09:00", "value_num": 3},
+        {"obs_type": "activity", "key": "morning walk",
+         "observed_at": "2026-08-16T07:30", "value_num": 40, "unit": "min"},
+    ):
+        attestations.assert_record(
+            conn, "observation", slug, row, attributed_to="Jane Doe",
+            attested_on="2026-08-18", apply=True,
+        )
+
+
+def test_render_journal_tool_mirrors_the_cli_default(seeded):
+    """The MCP front door applies the same default-off filter the CLI does -- the two
+    verbs must not disagree about what the journal contains."""
+    _attest_self_reports(seeded)
+    md = mcp_server.render_journal(seeded, person="jane-doe")["markdown"]
+    assert "right foot ache" not in md and "morning walk" not in md
+
+
+def test_render_journal_tool_forwards_the_opt_in(seeded):
+    _attest_self_reports(seeded)
+    md = mcp_server.render_journal(
+        seeded, person="jane-doe", include_self_reported=True
+    )["markdown"]
+    assert "symptom right foot ache" in md
+    assert "activity morning walk" in md
+
+
+def test_the_self_reported_lanes_add_no_tool(seeded):
+    """`record assert` is CLI-only and stays that way: the lanes are entered through an
+    existing verb, and the MCP surface gains a parameter, never a name."""
+    assert "record_assert" not in mcp_server.TOOL_NAMES
+    assert set(mcp_server.TOOL_NAMES) == set(
+        mcp_server.READ_ONLY_TOOLS + mcp_server.WRITE_TOOLS
+    )
+    assert "render_journal" in mcp_server.READ_ONLY_TOOLS
+
+
+def test_the_query_tool_still_returns_self_reports(seeded):
+    """Only the journal filters. `query timeline` -- CLI and MCP alike -- is the
+    complete record it filters from."""
+    _attest_self_reports(seeded)
+    events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
+    assert any("morning walk" in e["summary"] for e in events)
+    assert any("right foot ache" in e["summary"] for e in events)
+
+
+# --- brief opt-in parity (issue #180) -----------------------------------------
+
+def test_render_brief_tool_mirrors_the_cli_default(seeded):
+    """The brief gains the journal's flag on both surfaces in one pass, or the two
+    verbs drift about what a brief contains."""
+    _attest_self_reports(seeded)
+    md = mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"]
+    assert "right foot ache" not in md and "morning walk" not in md
+    assert "# Appointment Brief" in md          # control: the doc is otherwise whole
+
+
+def test_render_brief_tool_forwards_the_opt_in(seeded):
+    _attest_self_reports(seeded)
+    md = mcp_server.render_brief(
+        seeded, appointment=_appt_id(seeded), include_self_reported=True
+    )["markdown"]
+    assert "symptom right foot ache" in md
+    assert "activity morning walk" in md
+
+
+def test_the_brief_opt_in_registers_no_new_tool(seeded):
+    """A parameter, never a name -- the wire surface is unchanged."""
+    assert "render_brief" in mcp_server.READ_ONLY_TOOLS
+    assert set(mcp_server.TOOL_NAMES) == set(
+        mcp_server.READ_ONLY_TOOLS + mcp_server.WRITE_TOOLS
+    )

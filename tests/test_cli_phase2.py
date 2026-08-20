@@ -733,14 +733,14 @@ def test_a_distinct_resolved_pair_still_renders_as_two_live_problems(
 ):
     """AC2 + AC3 as one chain at the CLI, on the real-world trigger (AC6): declare the
     pair distinct, `rekey --apply` writes the table, and the rendered summary still shows
-    *both* conditions with no `## Superseded / corrected` appendix at all.
+    *both* conditions with an empty curation record.
 
     The `superseded` leg is the control that keeps the assertion honest. Both statuses
     resolve the collision and both produce the identical two-occurrence family, so the
     only thing separating them is `distinct`'s absence from
     `curation.APPENDIX_STATUSES` - and on that leg the ruled row *does* leave Active
-    Problems for the appendix. Without the contrast, "no appendix" could equally mean the
-    appendix never fires for conditions."""
+    Problems, for the curation record (issue #168). Without the contrast, "empty record"
+    could equally mean the record never fires for conditions."""
     old = _dict_file(tmp_path, "old.toml", '"unrelated" = "unrelated"\n')
     new = _dict_file(tmp_path, "fuse.toml", '"diagnosis 2" = "diagnosis"\n')
     _seed_generic_condition_pair(ready, capsys, tmp_path, old)
@@ -771,13 +771,16 @@ def test_a_distinct_resolved_pair_still_renders_as_two_live_problems(
         assert (rows[first_id]["dedup_occurrence"],
                 rows[second_id]["dedup_occurrence"]) == (0, 1)
         summary = render.render_summary(conn, "jane-doe")
+        record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
 
     problems = summary.split("## Active Problems")[1].split("##")[0]
     assert "asthma, per pulmonology" in problems           # never the ruled row
     assert ("hypertension, per cardiology" in problems) is both_live
-    assert ("## Superseded / corrected" not in summary) is both_live
+    assert (record == "") is both_live
+    if not both_live:
+        assert "two diagnoses, numbered labels" in record   # the ruling, with its note
 
 
 def test_rekey_json_still_reports_a_blocking_collision(ready, capsys, tmp_path):
@@ -954,6 +957,188 @@ def test_ocr_auto_makes_a_docx_findable(ready, capsys):
     assert "#1" in capsys.readouterr().out
 
 
+# The five status cells a CCDA med table prints, in the shape the reason arrives in:
+# inline `<content>` inside the same cell as the lifecycle word. The sixth row is the
+# paired fresh prescription a reorder produces in the same export.
+_CCDA_MED_ROWS = (
+    ("Amoxicillin 500 MG", "08/28/2025", "Discontinued"),
+    ("Lisinopril 10 MG", "11/11/2024", "Discontinued<content> (Therapy Completed)</content>"),
+    ("Levothyroxine 50 MCG", "06/11/2026", "Discontinued<content> (Reorder)</content>"),
+    ("Atorvastatin 20 MG", "03/02/2025",
+     "Discontinued<content> (Patient Stopped Taking)</content>"),
+    ("Omeprazole 20 MG", "05/09/2025",
+     "Discontinued<content> (Substitution/Alternate Therapy Placed)</content>"),
+    ("Levothyroxine 50 MCG", "06/12/2026", "Active"),
+)
+
+
+def _ccda_with_med_table(tmp_path, name="DOC0159.XML"):
+    rows = "".join(
+        f"<tr><td>{drug}</td><td>{date}</td><td>{cell}</td></tr>"
+        for drug, date, cell in _CCDA_MED_ROWS
+    )
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ClinicalDocument xmlns="urn:hl7-org:v3">'
+        "<recordTarget><patientRole><patient>"
+        "<name><given>Jane</given><family>Doe</family></name>"
+        '<birthTime value="19620314"/>'
+        "</patient></patientRole></recordTarget>"
+        "<component><structuredBody><component><section>"
+        "<title>Medications</title><text><table>"
+        "<thead><tr><th>Medication</th><th>Date</th><th>Status</th></tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "</table></text></section></component></structuredBody></component>"
+        "</ClinicalDocument>"
+    )
+    p = tmp_path / name
+    p.write_text(doc, encoding="utf-8")
+    return p
+
+
+def test_ccda_discontinue_reason_survives_ingest_to_query_end_to_end(ready, capsys):
+    """Issue #159 through the CLI, whole chain: a CCDA med table's discontinue reason
+    reaches `ocr_text` (#138), lands on `medication.status_reason` at commit time, and
+    changes what `query meds --active` says - a renewal stays current while a completed
+    course does not. Pre-#159 every variant collapsed to a bare `discontinued` and the
+    renewal read as stopped."""
+    tmp_path = ready
+    src = _ccda_with_med_table(tmp_path)
+
+    assert _run(tmp_path, "ingest", str(src), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto") == 0
+    assert "ingested document #1" in capsys.readouterr().out
+
+    # 1. the reason reaches ocr_text attached to its own row's status word (#138)
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        text = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    for drug, _date, cell in _CCDA_MED_ROWS:
+        expected = cell.replace("<content>", "").replace("</content>", "")
+        assert any(line.startswith(drug) and line.endswith(expected)
+                   for line in text.splitlines()), (drug, expected)
+
+    # 2. the lifecycle word and the parenthetical split across two fields (AGENTS.md 8)
+    meds = _write_json(tmp_path, "meds.json", {"medication": [
+        {"name": "Amoxicillin", "dose": "500 MG", "started_on": "2025-08-01",
+         "ended_on": "2025-08-28", "status": "discontinued"},
+        {"name": "Lisinopril", "dose": "10 MG", "started_on": "2024-10-01",
+         "ended_on": "2024-11-11", "status": "discontinued",
+         "status_reason": "Therapy Completed"},
+        {"name": "Levothyroxine", "dose": "50 MCG", "started_on": "2025-06-11",
+         "ended_on": "2026-06-11", "status": "discontinued",
+         "status_reason": "Reorder"},
+        {"name": "Atorvastatin", "dose": "20 MG", "started_on": "2025-01-02",
+         "ended_on": "2025-03-02", "status": "discontinued",
+         "status_reason": "Patient Stopped Taking"},
+        {"name": "Omeprazole", "dose": "20 MG", "started_on": "2025-02-09",
+         "ended_on": "2025-05-09", "status": "discontinued",
+         "status_reason": "Substitution/Alternate Therapy Placed"},
+        {"name": "Levothyroxine", "dose": "50 MCG", "started_on": "2026-06-12",
+         "status": "active"},
+    ]})
+    assert _run(tmp_path, "commit-extraction", "--document", "1",
+                "--json", str(meds)) == 0
+    assert "6 new" in capsys.readouterr().out
+
+    # 3. each reason is stored verbatim and readable off the row - no ocr_text parsing
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--json") == 0
+    stored = {(m["name"], m["started_on"]): m
+              for m in json.loads(capsys.readouterr().out)}
+    assert [stored[k]["status_reason"] for k in (
+        ("Amoxicillin", "2025-08-01"), ("Lisinopril", "2024-10-01"),
+        ("Levothyroxine", "2025-06-11"), ("Atorvastatin", "2025-01-02"),
+        ("Omeprazole", "2025-02-09"), ("Levothyroxine", "2026-06-12"),
+    )] == [None, "Therapy Completed", "Reorder", "Patient Stopped Taking",
+           "Substitution/Alternate Therapy Placed", None]
+    # ...and `status` stays lifecycle-only: the reason is never smuggled back into it
+    assert {m["status"] for m in stored.values()} == {"discontinued", "active"}
+
+    # 4. the human-readable listing shows the reason and marks the renewal
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert out.isascii()                                        # issue #23
+    levo = next(x for x in out.splitlines() if "2026-06-11" in x)
+    assert "[discontinued: Reorder]" in levo
+    assert "-> 2026-06-11 (renewed)" in levo
+    amox = next(x for x in out.splitlines() if "Amoxicillin" in x)
+    assert "[discontinued]" in amox and "(renewed)" not in amox  # bare: unchanged
+    for reason in ("Therapy Completed", "Patient Stopped Taking",
+                   "Substitution/Alternate Therapy Placed"):
+        row = next(x for x in out.splitlines() if reason in x)
+        assert f"[discontinued: {reason}]" in row
+        assert "(renewed)" not in row                            # still terminal
+
+    # 5. the verdict that matters: the renewal survives --active, the completed course
+    #    does not. Both have a terminal status and a past end date.
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--active",
+                "--json") == 0
+    active = {(m["name"], m["started_on"]) for m in json.loads(capsys.readouterr().out)}
+    assert ("Levothyroxine", "2025-06-11") in active     # renewed -> still current
+    assert ("Levothyroxine", "2026-06-12") in active     # the paired fresh row
+    assert ("Lisinopril", "2024-10-01") not in active    # therapy completed -> ended
+    assert ("Atorvastatin", "2025-01-02") not in active
+    assert ("Omeprazole", "2025-02-09") not in active
+    assert ("Amoxicillin", "2025-08-01") not in active   # bare discontinued -> ended
+
+
+def _ooxml_entity_bomb(root, levels=7, width=4, leaf=64):
+    """A `<!DOCTYPE` whose internal subset amplifies ``&e{levels};`` ~1 MB."""
+    chain = "".join(
+        f'<!ENTITY e{n} "{f"&e{n - 1};" * width}">' for n in range(1, levels + 1)
+    )
+    return f'<!DOCTYPE {root} [<!ENTITY e0 "{"A" * leaf}">{chain}]>', levels
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx"])
+def test_ocr_auto_refuses_a_doctype_bearing_ooxml_end_to_end(ready, capsys, kind):
+    """Issue #155 through the CLI: a DOCTYPE member is refused before parsing, and
+    the refusal costs a note — never the document. Pre-fix these ~800-byte files
+    stored 1,048,576 chars of `AAAA…` as `native` text."""
+    tmp_path = ready
+    if kind == "docx":
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("w:document")
+        member = "word/document.xml"
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>{doctype}'
+            f'<w:document xmlns:w="{ns}"><w:body>'
+            f"<w:p><w:r><w:t>&e{levels};</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+    else:
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        doctype, levels = _ooxml_entity_bomb("worksheet")
+        member = "xl/worksheets/sheet1.xml"
+        body = (
+            f'{doctype}<worksheet xmlns="{ns}"><sheetData>'
+            f'<row><c t="str"><v>&e{levels};</v></c></row>'
+            "</sheetData></worksheet>"
+        )
+    src = tmp_path / f"bomb.{kind}"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr(member, body)
+    assert src.stat().st_size < 4096          # well under the extraction byte cap
+
+    assert _run(tmp_path, "ingest", str(src), "--person", "jane-doe",
+                "--sources", str(tmp_path / "sources"), "--ocr", "auto",
+                "--force") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out          # the document is kept
+    assert f"{member} declares a DOCTYPE" in out.err   # named, before any parse
+    assert "no ocr_text stored" in out.err
+    assert "A" * 200 not in out.err
+
+    # nothing expanded into the archive: the amplified text is unfindable
+    assert _run(tmp_path, "find", "--person", "jane-doe", "AAAA") == 0
+    assert "no matches" in capsys.readouterr().out
+
+
 def test_ocr_tesseract_is_rejected(ready, capsys):
     """Issue #91: the misleading `tesseract` alias is gone; argparse names `auto`."""
     tmp_path = ready
@@ -1035,6 +1220,118 @@ def test_lab_export_with_a_patient_column_is_not_refused(ready, capsys):
 
     assert _run(tmp_path, "find", "--person", "jane-doe", "glucose") == 0
     assert "#1" in capsys.readouterr().out
+
+
+# --- saved HTML portal pages at the CLI (issue #173) ---------------------------
+# `tests/test_ingest.py` covers the extractor and both `trust_anchors` call sites at
+# the library level; these two walk the same behaviour through `pemr ingest`/`find`/
+# `document reocr` — the verify-stage real run, kept as a repeatable spec.
+
+_PORTAL_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>MyChart &mdash; Visit Summary</title>
+<style>.banner { color: #003366; font-family: "Helvetica Neue", sans-serif; }</style>
+<script>var portalSessionToken = "abc123"; analytics.send("visit-summary");</script>
+</head><body onload="trackPageView()">
+<div class="banner">Mercy Clinic &amp; Labs</div>
+<p>Patient: Jane Doe<br>DOB: 01/01/1980</p>
+<table><thead><tr><th>Test</th><th>Result</th></tr></thead><tbody>
+<tr><td><div>Ferritin</div></td><td>201&#160;ng/mL</td></tr>
+<tr><td></td><td></td></tr>
+</tbody></table>
+<noscript><p>Enable JavaScript for the interactive chart.</p></noscript>
+</body></html>
+"""
+
+# The same lab table twice, in the two formats whose owner-check verdicts now differ.
+_LAB_TABLE_CSV = "Patient ID,Test,Result\n00998877,Ferritin,201 ng/mL\n"
+_LAB_TABLE_HTML = (
+    "<html><body><table>"
+    "<tr><th>Patient ID</th><th>Test</th></tr>"
+    "<tr><td>00998877</td><td>Ferritin 201 ng/mL</td></tr>"
+    "</table></body></html>"
+)
+
+
+def test_ocr_auto_reads_a_saved_portal_page_end_to_end(ready, capsys):
+    """Issue #173 through the CLI: a saved portal page used to reach tesseract, which
+    cannot decode HTML, so it stored nothing and never entered `find`. Now it is read
+    natively on the `native-prose` route — tags stripped, `<script>`/`<style>` out of
+    the FTS index, the identity header live, and the route named in `reocr` output."""
+    from pemr import ingest as ingest_mod
+
+    tmp_path = ready
+    page = tmp_path / "portal.html"
+    page.write_text(_PORTAL_PAGE, encoding="utf-8")
+    sources = tmp_path / "sources"
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 0
+    out = capsys.readouterr()
+    assert "ingested document #1" in out.out
+    # the anchor is armed on this route, and the header names the owner
+    assert "owner verified: matched 'jane-doe' in document text" in out.out
+    assert "no ocr_text stored" not in out.err
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        text = conn.execute(
+            "SELECT ocr_text FROM document WHERE document_id = 1"
+        ).fetchone()["ocr_text"]
+    finally:
+        conn.close()
+    lines = text.splitlines()
+    assert "Patient: Jane Doe" in lines             # `<br>` ended the line...
+    assert "DOB: 01/01/1980" in lines               # ...so the DOB is its own
+    assert "Mercy Clinic & Labs" in lines           # `&amp;` decoded
+    assert "Ferritin\t201 ng/mL" in lines           # `<div>` did not split the cell
+    assert "\t\t" not in text and "\t" in text      # the all-empty row contributed none
+    assert "<" not in text                          # every tag stripped
+    assert text == ingest_mod.normalize_document_text(text)   # stored normalized
+
+    # `ocr_text` is mirrored into FTS, so the page's code must be unfindable...
+    assert _run(tmp_path, "find", "--person", "jane-doe", "ferritin") == 0
+    assert "#1" in capsys.readouterr().out
+    for junk in ("portalSessionToken", "Helvetica", "JavaScript"):
+        assert _run(tmp_path, "find", "--person", "jane-doe", junk) == 0
+        assert "no matches" in capsys.readouterr().out, junk
+
+    # ...and `document reocr` reports the third route value on its own line (#143)
+    assert _run(tmp_path, "document", "reocr", "1", "--sources", str(sources),
+                "--dry-run", "--force") == 0
+    assert "route native-prose" in capsys.readouterr().out
+
+
+def test_html_lab_table_is_refused_where_the_csv_equivalent_is_not(ready, capsys):
+    """The intended, bounded cost of arming the anchor on HTML: the *same* lab table
+    files as `.csv` (structured — `Patient ID` is a column label, issue #66) and is
+    refused as `suspect` when it arrives as a saved `.html` page. `--force` is the
+    one-flag recovery. Pin it, so the divergence stays a decision rather than drift."""
+    tmp_path = ready
+    sources = tmp_path / "sources"
+    csv = tmp_path / "labs.csv"
+    csv.write_text(_LAB_TABLE_CSV, encoding="utf-8")
+    page = tmp_path / "labs.html"
+    page.write_text(_LAB_TABLE_HTML, encoding="utf-8")
+
+    assert _run(tmp_path, "ingest", str(csv), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 0
+    assert "ingested document #1" in capsys.readouterr().out
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto") == 1
+    err = capsys.readouterr().err
+    assert "owner verification failed" in err
+    assert "re-run with --force" in err
+    assert len(_document_id(tmp_path)) == 1          # pre-write refusal: nothing landed
+
+    assert _run(tmp_path, "ingest", str(page), "--person", "jane-doe",
+                "--sources", str(sources), "--ocr", "auto", "--force") == 0
+    out = capsys.readouterr()
+    assert "ingested document #2" in out.out
+    assert "verdict: suspect" in out.err
+
+
 def _stage_pre_006(tmp_path):
     """Copy every migration below 006 into a staging dir (leaving 006 pending)."""
     import shutil
@@ -1159,10 +1456,12 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
     conn = db.connect(tmp_path / "cli.db")
     try:
         before = render.render_summary(conn, "jane-doe")
+        before_record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
     assert "- Penicillin - anaphylaxis" in before
-    assert "allergy: PCN" in before.split("## Superseded / corrected")[1]
+    assert "PCN" not in before                        # curated out of the summary (#168)
+    assert "allergy: PCN" in before_record
 
     new = _dict_file(tmp_path, "fuse006.toml",
                      '"pcn" = "penicillin"\n"t2dm" = "type 2 diabetes"\n')
@@ -1187,7 +1486,8 @@ def test_migration_006_allergy_collision_clears_when_a_verdict_covers_it(
         # The verdict still covers PCN and only PCN: Penicillin stays where it was.
         after = render.render_summary(conn, "jane-doe")
         assert "- Penicillin - anaphylaxis" in after
-        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+        assert "PCN" not in after
+        assert "allergy: PCN" in render.render_curation(conn, "jane-doe")
         # Nothing orphaned; the narrowing surfaces as a re-affirm notice instead.
         warnings = verify.verify_report(conn).warnings
         assert not any("no live family" in w for w in warnings)
@@ -1237,10 +1537,11 @@ def test_the_re_affirm_notice_from_a_narrowing_is_runnable(tmp_path, capsys):
         warnings = verify.verify_report(conn).warnings
         assert not any("a rekey moved it" in w or "no live family" in w
                        for w in warnings)
-        # Extension unchanged: PCN in the appendix, Penicillin still live.
+        # Extension unchanged: PCN in the curation record, Penicillin still live.
         after = render.render_summary(conn, "jane-doe")
         assert "- Penicillin - anaphylaxis" in after
-        assert "allergy: PCN" in after.split("## Superseded / corrected")[1]
+        assert "PCN" not in after
+        assert "allergy: PCN" in render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
 
@@ -1538,7 +1839,7 @@ def test_same_day_distinct_draw_is_staged_and_keep_both_admits_it(ready, capsys)
 
 
 def test_observation_keeps_its_full_precision_key_at_the_cli(ready, capsys):
-    """The scope boundary: `observation` was deliberately left on `_norm_ts`, so the
+    """The scope boundary: `observation` was deliberately left on `norm_ts`, so the
     same mixed-precision pair still forks there -- two rows, no conflict."""
     tmp_path = ready
     for name, observed_at in (("obs1.txt", "2026-04-02"), ("obs2.txt", "2026-04-02T07:30")):
@@ -1698,3 +1999,71 @@ def test_functional_observation_cli_roundtrip(ready, capsys):
         assert conn.execute("SELECT COUNT(*) AS n FROM condition").fetchone()["n"] == 0
     finally:
         conn.close()
+
+
+# --- a display preference must not touch dedup (issues #129 + #136) ----------
+
+def _reingest_after_a_unit_correction(root, *, with_pref):
+    """ingest -> commit -> `record edit` the unit -> (optionally set a canonical display
+    unit) -> re-commit the *same* extraction off the same document.
+
+    Returns everything the second commit did: its exit code, the conflict rows it
+    staged, and the surviving observation rows.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+
+    def run(*argv):
+        return cli.main(["--db", str(root / "cli.db"), *argv])
+
+    assert run("migrate", "--create") == 0
+    assert run("person", "add", "--slug", "jane-doe", "--name", "Jane Doe") == 0
+    scan = root / "scan.txt"
+    scan.write_bytes(b"weight 180 lbs")
+    assert run("ingest", str(scan), "--person", "jane-doe",
+               "--sources", str(root / "sources")) == 0
+    payload = _write_json(root, "extract.json", {"observation": [
+        {"obs_type": "vital", "key": "weight", "observed_at": "2026-01-02",
+         "value_num": 180.0, "unit": "lbs"},
+    ]})
+    assert run("commit-extraction", "--document", "1", "--json", str(payload)) == 0
+    # Issue #129's scalpel: correct the mislabelled unit in place, provenance intact.
+    assert run("record", "edit", "observation", "1", "--set", "unit=lb",
+               "--note", "normalise unit spelling", "--apply") == 0
+    if with_pref:
+        assert run("person", "unit-pref", "set", "jane-doe", "--key", "weight",
+                   "--unit", "lb") == 0
+
+    rc = run("commit-extraction", "--document", "1", "--json", str(payload))
+    conn = db.connect(root / "cli.db")
+    try:
+        conflicts = [dict(r) for r in conn.execute(
+            "SELECT record_type, dedup_key, existing_json, incoming_json, status "
+            "FROM conflict ORDER BY conflict_id"
+        ).fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT key, value_num, unit, dedup_key FROM observation "
+            "ORDER BY observation_id"
+        ).fetchall()]
+    finally:
+        conn.close()
+    return rc, conflicts, rows
+
+
+def test_a_display_unit_preference_cannot_change_re_ingest_dedup(tmp_path):
+    """Issue #136 AC-7. `unit` is in `dedup._COMPARE_FIELDS`, so a row whose unit was
+    corrected by `record edit` diverges from its own source document on re-ingest --
+    deliberately and loudly (#129's "Re-ingest divergence"). #136 must not quietly
+    change that either way: it is a *display* lever, so the property to prove is **no
+    change at all**, with a preference set or not.
+    """
+    plain = _reingest_after_a_unit_correction(tmp_path / "plain", with_pref=False)
+    preferred = _reingest_after_a_unit_correction(tmp_path / "preferred",
+                                                  with_pref=True)
+    assert plain == preferred
+
+    rc, conflicts, rows = preferred
+    # And the outcome is #129's documented one, so this cannot pass by both sides
+    # silently becoming no-ops.
+    assert rc == 0
+    assert [c["record_type"] for c in conflicts] == ["observation"]
+    assert [(r["unit"], r["value_num"]) for r in rows] == [("lb", 180.0)]

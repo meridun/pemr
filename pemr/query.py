@@ -1,4 +1,4 @@
-"""Phase 3 read layer: structured queries, full-text `find`, and lab `trends`.
+"""Phase 3 read layer: structured queries, full-text `find`, and `trends`.
 
 All functions are pure reads over the tables phases 1–2 populate (Architecture.md §5).
 They return plain Python data (dicts / lists of dicts) with stable field names; the CLI
@@ -16,6 +16,11 @@ The two readers match at deliberately **different granularities** (issue #71):
 ``key_token()`` so a numeric series never interleaves two different assays of one
 analyte (a CMP ``Albumin`` and an SPEP ``Albumin (SPEP)``) — and discloses the rows it
 excluded on that basis rather than dropping them silently.
+
+``trends`` charts a *measurement key*, not a table: it reads lab results and vitals
+``observation`` rows through one aliased row shape (issue #176), so weight, temperature
+and blood pressure reach the same statistics and the same per-person canonical-unit
+conversion an analyte does. ``query_labs`` remains lab-only.
 """
 
 from __future__ import annotations
@@ -25,8 +30,8 @@ import re
 import sqlite3
 from datetime import date, datetime
 
-from . import db
-from .dedup import enum_token, key_token, norm
+from . import db, units
+from .dedup import OBS_VITAL, enum_token, key_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
 # can never be mis-parsed as FTS syntax (each token is quoted as a phrase, AND-ed).
@@ -41,12 +46,26 @@ TERMINAL_MED_STATUSES = frozenset({"completed", "stopped", "discontinued"})
 
 # Every ``status`` value the read layer *recognizes* as a lifecycle state: the terminal
 # set plus the one non-terminal lifecycle value. Deliberately wider than the vocabulary
-# AGENTS.md §MUST-8 tells extraction agents to emit (which omits ``stopped``): the emit
+# AGENTS.md §MUST-9 tells extraction agents to emit (which omits ``stopped``): the emit
 # side is a contract for new rows, this side is tolerance for what is already stored.
 # Anything outside it is not a lifecycle state at all - :func:`med_is_current` still
 # treats it as current (the safe default), and ``pemr verify`` reports it (issue #151)
 # instead of letting it hide, which is the whole fix for ``prn``/``ordered``.
 LIFECYCLE_MED_STATUSES = TERMINAL_MED_STATUSES | frozenset({"active"})
+
+# Medication ``status_reason`` values that mean the prescription was RENEWED rather than
+# stopped (issue #159). A CCDA med table states the reason beside the status word
+# (``Discontinued (Reorder)``), and a reorder's ``ended_on`` is the end of an
+# authorization period, not of therapy — so those rows stay current while every *other*
+# reason (``Therapy Completed``, ``Patient Stopped Taking``, ``Substitution/Alternate
+# Therapy Placed``, or anything unrecognized) keeps ending the course. Matched on
+# ``enum_token``, so stored casing/spacing is irrelevant.
+#
+# **Closed by design.** ``status_reason`` is free text precisely so an unfamiliar reason
+# from another EHR still commits; the safety of that rests on unrecognized reasons
+# degrading to today's terminal behavior. Widening this set is a decision on its own
+# issue, not a build-time convenience.
+RENEWAL_MED_REASONS = frozenset({"reorder", "re-order", "renewal", "renewed"})
 
 
 def _row_get(row: sqlite3.Row | dict, key: str) -> object:
@@ -96,10 +115,24 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
     ``ended_on`` was extracted — the contradiction behind issue #21, where a
     ``completed`` med with a null ``ended_on`` rendered as ``(current)``.
 
+    A **renewal** ``status_reason`` (:data:`RENEWAL_MED_REASONS`) keeps the course open
+    whatever the dates say (issue #159). A CCDA med table records why a drug stopped
+    beside the status word, and ``Discontinued (Reorder)`` does not mean stopped — the
+    prescription was renewed, so its ``ended_on`` is the end of an *authorization
+    period*, not of therapy. Reading that date as an end is the documented harm: a
+    reviewer had to overturn it by hand from clinical knowledge. Every other reason
+    (``Therapy Completed``, ``Patient Stopped Taking``, ``Substitution/Alternate Therapy
+    Placed``, or one this layer doesn't recognize) still ends the course. The trade is
+    deliberate: a renewed drug may over-report as current — the paired fresh row from the
+    same export is a separate row, so one drug can list twice — which beats silently
+    ending a live therapy.
+
     ``now`` is injectable for deterministic tests/renders, like the ``render`` layer's.
     """
     status = str(_row_get(row, "status") or "").strip().lower()
     ended_on = _row_get(row, "ended_on")
+    if enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS:
+        return True
     if ended_on:
         end = _end_of_period(ended_on)
         if end is not None and end < (now or datetime.now()).date():
@@ -110,6 +143,14 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
 
 class PersonNotFoundError(ValueError):
     """Raised when a slug does not resolve to a person (friendly rc=1 at the CLI)."""
+
+
+class AmbiguousTestError(ValueError):
+    """Raised when a ``--test`` token matches numeric rows in **both** ``lab_result`` and
+    vitals ``observation`` (issue #176). :func:`trends` charts one series at a time — an
+    interleaved lab-and-vital series is the wrong chart #71 splits assays to avoid — so
+    the collision is refused rather than resolved by a silent preference. A friendly rc=1
+    at the CLI, like its sibling above."""
 
 
 def resolve_person_id(conn: sqlite3.Connection, slug: str) -> int:
@@ -176,8 +217,11 @@ def query_meds(
     (Architecture.md §5, :func:`med_is_current`). A terminal status
     (completed/stopped/discontinued) ends the course even without an ``ended_on``
     (issue #21), and a *past* ``ended_on`` ends it even under ``status='active'``
-    (issue #57), so both are excluded from ``active``. ``now`` is injectable so the
-    render layer's deterministic clock reaches the currency test."""
+    (issue #57), so both are excluded from ``active``. The one exception is a renewal
+    ``status_reason`` (``Reorder``, :data:`RENEWAL_MED_REASONS`): a renewed prescription
+    is kept in ``active`` even with a past ``ended_on``, because that date ends an
+    authorization period rather than the therapy (issue #159). ``now`` is injectable so
+    the render layer's deterministic clock reaches the currency test."""
     person_id = resolve_person_id(conn, slug)
     sql = ("SELECT * FROM medication WHERE person_id = ? "
            "ORDER BY (started_on IS NULL), started_on, name")
@@ -193,6 +237,7 @@ def query_timeline(
     since: str | None = None,
     *,
     with_identity: bool = False,
+    exclude_obs_types: frozenset[str] | None = None,
 ) -> list[dict]:
     """Merged chronological event stream across the typed tables + observations.
 
@@ -205,7 +250,10 @@ def query_timeline(
 
     An event off a **human-attested** row (issue #110) additionally carries
     ``attested_by``/``attested_on``; a document-sourced event carries neither key, so an
-    unattested record's event shape is unchanged.
+    unattested record's event shape is unchanged. An event off a row **corrected in
+    place** by `record edit` (issue #134) likewise carries ``edited_at``/``edited_by``, so
+    a corrected value is distinguishable from one the document literally stated; an
+    uncorrected row's event carries neither key.
 
     ``with_identity=True`` additionally stamps ``record_type``, ``dedup_base`` and
     ``record_id`` on every event — the family identity `render_journal` needs to apply
@@ -218,6 +266,16 @@ def query_timeline(
     into both contracts. Since issue #131 the `pemr query timeline` CLI handler and the
     MCP ``query`` tool turn it on too — the same overlay `render_journal` applies — and
     both strip the three keys again before emitting anything.
+
+    ``exclude_obs_types`` drops ``observation`` rows whose ``obs_type`` is in the set,
+    before the event is built (issue #167). Keyword-only and **default-off**: ``None``
+    filters nothing, so every existing caller's output is byte-identical. It filters on
+    the *row* rather than on the built event deliberately — an event carries no
+    ``obs_type`` key (it is folded into ``summary``), string-prefix matching a rendered
+    sentence is exactly the fragile thing to avoid, and widening the event dict is the
+    same public-contract problem ``with_identity`` exists to sidestep. `render_journal`
+    is the one caller that passes a set, to keep a few hundred self-reported attestations
+    a year out of a decades-long chronology.
     """
     person_id = resolve_person_id(conn, slug)
     events: list[dict] = []
@@ -247,6 +305,15 @@ def query_timeline(
         if _row_get(row, "attested_by"):
             event["attested_by"] = row["attested_by"]
             event["attested_on"] = _row_get(row, "attested_on")
+        # The correction mark (issue #134) travels on the same terms, and for the
+        # same reason: an event off a row whose stored value was edited in place must not
+        # read as a verbatim quotation of the document it is still filed under. Keyed off
+        # `edited_at` because `edited_by` is nullable (an unattributed correction is still
+        # a correction); an uncorrected row - or a restored pre-016 snapshot, where the
+        # columns do not exist - carries neither key.
+        if _row_get(row, "edited_at"):
+            event["edited_at"] = row["edited_at"]
+            event["edited_by"] = _row_get(row, "edited_by")
         if with_identity:
             event["record_type"] = record_type
             event["dedup_base"] = row["dedup_base"]
@@ -287,6 +354,8 @@ def query_timeline(
     for r in conn.execute(
         "SELECT * FROM observation WHERE person_id = ?", (person_id,)
     ).fetchall():
+        if exclude_obs_types and r["obs_type"] in exclude_obs_types:
+            continue
         value = r["value_num"] if r["value_num"] is not None else r["value_text"]
         unit = f" {r['unit']}" if r["unit"] else ""
         parts = [r["obs_type"]]
@@ -392,6 +461,64 @@ def _ordinal(value: object) -> int | None:
         return None
 
 
+def _series_candidates(
+    conn: sqlite3.Connection, person_id: int
+) -> list[tuple[str, list[sqlite3.Row]]]:
+    """Every numeric measurement of one person, per source, in one row shape.
+
+    Returns ``[("lab_result", rows), ("observation", rows)]``. Both SELECTs alias their
+    table into ``(row_id, value_num, unit, at, label)`` — ``observed_at`` standing in for
+    ``collected_at`` and ``key`` for ``test_name`` — so the matching, the ``other_assays``
+    disclosure and every statistic below read a vital exactly like a lab result, with no
+    per-source branch (issue #176).
+
+    Ordering is load-bearing: ``matched[-1]`` is the latest point and ties break on the
+    greatest row id (most-recently-ingested wins), which holds for vitals only because
+    the vitals SELECT sorts the same way.
+    """
+    labs = conn.execute(
+        "SELECT lab_result_id AS row_id, value_num, unit, collected_at AS at, "
+        "test_name AS label FROM lab_result "
+        "WHERE person_id = ? AND value_num IS NOT NULL "
+        "ORDER BY collected_at, lab_result_id",
+        (person_id,),
+    ).fetchall()
+    vitals = conn.execute(
+        "SELECT observation_id AS row_id, value_num, unit, observed_at AS at, "
+        "key AS label FROM observation "
+        "WHERE person_id = ? AND obs_type = ? AND value_num IS NOT NULL "
+        "ORDER BY observed_at, observation_id",
+        (person_id, OBS_VITAL),
+    ).fetchall()
+    return [("lab_result", labs), ("observation", vitals)]
+
+
+def _match_series(
+    rows: list[sqlite3.Row],
+    target: str,
+    family: str,
+    dictionary: dict[str, str] | None,
+) -> tuple[list[sqlite3.Row], str, dict[str, int]]:
+    """Split one source's candidate rows into ``(matched, matched_token, others)``.
+
+    ``matched`` is the key-token series; ``others`` counts the same-family rows a
+    differing qualifier excluded, which are disclosed rather than dropped (issue #71).
+    """
+    matched: list[sqlite3.Row] = []
+    others: dict[str, int] = {}
+    matched_token = ""
+    for r in rows:
+        token = key_token(r["label"], dictionary)
+        if _loose(token) == target:
+            matched.append(r)
+            # Echo the stored spelling rather than whatever the caller typed, so a
+            # pasted `other_assays` token comes back labelled the way it was disclosed.
+            matched_token = matched_token or token
+        elif _loose(norm(r["label"], dictionary)) == family:
+            others[token] = others.get(token, 0) + 1
+    return matched, matched_token, others
+
+
 def _slope_per_day(points: list[tuple[int, float]]) -> float | None:
     """Least-squares slope (value units per day) of y vs x=ordinal-day. ``None`` when
     fewer than two points or all points share one date (zero x-variance)."""
@@ -413,15 +540,22 @@ def trends(
     test: str,
     dictionary: dict[str, str] | None = None,
 ) -> dict:
-    """Summary stats for one **assay** of one analyte over time.
+    """Summary stats for one **measurement key** over time — a lab analyte's assay or a
+    vital sign (issue #176), whichever the key matches.
 
     Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
-    slope_per_day, other_assays, other_assay_count}``. ``count`` is the number of
+    slope_per_day, other_assays, other_assay_count, canonical_unit, converted_count,
+    unconverted_count}`` — one contract, no source field and no vitals branch, so a
+    vitals series is shape-identical to a lab one. ``count`` is the number of
     numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two distinct
-    collection dates. ``latest`` is the row with the greatest ``collected_at``, ties
-    broken by the greatest ``lab_result_id`` (most-recently-ingested wins);
-    ``latest_tie`` counts how many matched rows share that exact ``collected_at``
-    timestamp.
+    dates. ``latest`` is the row with the greatest timestamp (``collected_at`` for a lab,
+    ``observed_at`` for a vital, which is nullable by design and sorts first), ties broken
+    by the greatest row id (most-recently-ingested wins); ``latest_tie`` counts how many
+    matched rows share that exact timestamp.
+
+    A key token matching numeric rows in **both** tables raises
+    :class:`AmbiguousTestError` rather than merging them: same #71 reasoning as the assay
+    split — a silently interleaved series is a wrong chart even when the tokens coincide.
 
     Matching is on ``key_token()``, not ``norm()`` (issue #71): a series that silently
     interleaves a CMP albumin with an SPEP albumin is a wrong chart, the same class of
@@ -430,28 +564,50 @@ def trends(
     ``other_assays`` lists their key tokens (each usable verbatim as ``--test``, via
     :func:`_loose` — a canonical value may carry underscores that a re-derivation
     cannot reproduce) and ``other_assay_count`` counts the numeric rows behind them.
+
+    A series stated in two unit systems is the same wrong chart (issue #136), so when
+    the person has recorded a canonical display unit for this key
+    (``person_unit_pref``) every point is converted into it **before** the stats are
+    computed — which is what makes ``min``/``max``/``latest``/``slope_per_day`` and the
+    reported ``unit`` incapable of disagreeing. Nothing is written: the conversion is a
+    read-time transform, exactly like the curation overlay. A point whose stored unit
+    cannot be converted (unknown spelling, wrong dimension) is **kept and disclosed**
+    via ``unconverted_count``, never dropped — the ``other_assays`` rule — and
+    ``result["unit"]`` then falls back rather than labelling the series with a unit some
+    of it is not in.
     """
     person_id = resolve_person_id(conn, slug)
     target = _loose(key_token(test, dictionary))
     family = _loose(norm(test, dictionary))
-    rows = conn.execute(
-        "SELECT lab_result_id, value_num, unit, collected_at, test_name FROM lab_result "
-        "WHERE person_id = ? AND value_num IS NOT NULL "
-        "ORDER BY collected_at, lab_result_id",
-        (person_id,),
-    ).fetchall()
-    matched = []
+    # Compared through `_loose` on both sides, the underscore-insensitive spelling the
+    # rest of this function already matches on.
+    canonical = {_loose(k): v for k, v in units.load_prefs(conn, person_id).items()}.get(
+        target
+    )
+    matched: list[sqlite3.Row] = []
     others: dict[str, int] = {}
     matched_token = ""
-    for r in rows:
-        token = key_token(r["test_name"], dictionary)
-        if _loose(token) == target:
-            matched.append(r)
-            # Echo the stored spelling rather than whatever the caller typed, so a
-            # pasted `other_assays` token comes back labelled the way it was disclosed.
-            matched_token = matched_token or token
-        elif _loose(norm(r["test_name"], dictionary)) == family:
-            others[token] = others.get(token, 0) + 1
+    hits: dict[str, int] = {}
+    for source, rows in _series_candidates(conn, person_id):
+        source_matched, source_token, source_others = _match_series(
+            rows, target, family, dictionary
+        )
+        # One disclosure rule, not a per-source branch: a same-family sibling is reported
+        # wherever it lives, and its token pastes back as `--test` and finds it.
+        for token, count in source_others.items():
+            others[token] = others.get(token, 0) + count
+        if source_matched:
+            hits[source] = len(source_matched)
+            matched = source_matched
+            matched_token = matched_token or source_token
+    if len(hits) > 1:
+        # ASCII only: this reaches a cp1252/cp437 console (see `units` on the same rule).
+        raise AmbiguousTestError(
+            f"'{matched_token or target}' matches both lab results "
+            f"({hits['lab_result']} numeric rows) and vital observations "
+            f"({hits['observation']}) - trends charts one series at a time and will "
+            "not merge them"
+        )
 
     result: dict = {
         "test": matched_token or target,
@@ -466,26 +622,44 @@ def trends(
         # Same analyte, different assay: reported so the excluded rows stay findable.
         "other_assays": sorted(others),
         "other_assay_count": sum(others.values()),
+        # Display-unit disclosure (issue #136). All three are inert -- `None`/`0` -- for
+        # a person with no preference for this key, which is every caller today.
+        "canonical_unit": canonical,
+        "converted_count": 0,
+        "unconverted_count": 0,
     }
     if not matched:
         return result
 
-    values = [float(r["value_num"]) for r in matched]
-    units = {r["unit"] for r in matched if r["unit"]}
-    result["unit"] = next(iter(units)) if len(units) == 1 else None
+    shown = [units.display(r["value_num"], r["unit"], canonical) for r in matched]
+    values = [float(d.value) for d in shown]
+    if canonical is not None:
+        result["converted_count"] = sum(1 for d in shown if d.converted)
+        # "Not in the canonical unit", not "not converted": a point already stored in it
+        # needs no conversion and is not a caveat.
+        result["unconverted_count"] = sum(
+            1
+            for r, d in zip(matched, shown)
+            if not (d.converted or units.in_target(r["unit"], canonical))
+        )
+    if canonical is not None and result["unconverted_count"] == 0:
+        result["unit"] = canonical
+    else:
+        # Today's rule, over the units actually displayed (identical to the stored ones
+        # whenever no preference applied).
+        seen = {d.unit for d in shown if d.unit}
+        result["unit"] = next(iter(seen)) if len(seen) == 1 else None
     result["min"] = min(values)
     result["max"] = max(values)
-    latest = matched[-1]  # rows came back ORDER BY collected_at, lab_result_id
-    result["latest"] = float(latest["value_num"])
-    result["latest_at"] = latest["collected_at"]
-    result["latest_tie"] = sum(
-        1 for r in matched if r["collected_at"] == latest["collected_at"]
-    )
+    latest = matched[-1]  # rows came back ORDER BY <timestamp>, <row id>
+    result["latest"] = values[-1]
+    result["latest_at"] = latest["at"]
+    result["latest_tie"] = sum(1 for r in matched if r["at"] == latest["at"])
 
     points = [
-        (o, float(r["value_num"]))
-        for r in matched
-        if (o := _ordinal(r["collected_at"])) is not None
+        (o, value)
+        for r, value in zip(matched, values)
+        if (o := _ordinal(r["at"])) is not None
     ]
     result["slope_per_day"] = _slope_per_day(points)
     return result

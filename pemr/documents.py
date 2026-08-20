@@ -69,6 +69,18 @@ class OcrTextPresentError(ValueError):
     """`set-text` refused: the document already has ``ocr_text`` and ``force`` was off."""
 
 
+# `document.text_source` — which write path produced the current ``ocr_text``
+# (issue #175, migration 015). The closed vocabulary lives here rather than in a DDL
+# `CHECK`, following migration 013's precedent; :mod:`pemr.ingest` imports these names,
+# so there is exactly one definition. Provenance follows the text's *origin*, not the
+# verb that wrote it: `ingest --ocr-text-file` is ``attached``, because the bytes are
+# the caller's own transcription.
+TEXT_SOURCE_ENGINE = "engine"       # pemr extracted it (extract_text_routed / run_ocr /
+                                    # the DICOM header summary)
+TEXT_SOURCE_ATTACHED = "attached"   # the caller supplied it verbatim (CLI or MCP)
+TEXT_SOURCES = frozenset({TEXT_SOURCE_ENGINE, TEXT_SOURCE_ATTACHED})
+
+
 # Editable via `document edit`. None of these feed a dedup_key (keys are built from
 # record fields only), so correcting them is a pure metadata UPDATE. sha256 and
 # source_path are excluded by construction: the blob is content-addressed.
@@ -228,6 +240,21 @@ def _conflicts_anchored_to(conn: sqlite3.Connection, document_id: int) -> list[i
     return sorted(ids)
 
 
+def _text_source(row: sqlite3.Row) -> str | None:
+    """``document.text_source``, or ``None`` when the column isn't there (issue #175).
+
+    Required, not defensive: :func:`db.is_migrated` only looks for migration 001's
+    sentinel table, so a database restored from a pre-015 snapshot passes
+    :func:`db.require_migrated` and :func:`list_documents`' ``SELECT *`` would otherwise
+    raise on the missing key. Same tolerant-read shape as :func:`query._row_get`, and the
+    same reason :func:`curation.has_table` exists.
+    """
+    try:
+        return row["text_source"]
+    except (KeyError, IndexError):
+        return None
+
+
 def _document_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     """One document as a JSON-safe dict. ``ocr_text`` is deliberately replaced by
     ``has_ocr_text`` — a full document transcription has no business in list output."""
@@ -243,6 +270,9 @@ def _document_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "source_path": row["source_path"],
         "ingested_at": row["ingested_at"],
         "has_ocr_text": bool(row["ocr_text"]),
+        # Which write path produced that text (issue #175). ``None`` = no text, or text
+        # written before migration 015 — the two are told apart by ``has_ocr_text``.
+        "text_source": _text_source(row),
         "records": counts,
         "record_count": sum(counts.values()),
     }
@@ -274,6 +304,43 @@ def list_documents(
         f"SELECT * FROM document{where} ORDER BY document_id DESC", params
     ).fetchall()
     return [_document_view(conn, row) for row in rows]
+
+
+def list_documents_without_text(
+    conn: sqlite3.Connection, person_slug: str | None = None
+) -> list[int]:
+    """Ids of documents whose ``ocr_text`` is empty, ascending (`reocr --where-empty`).
+
+    Ascending rather than :func:`list_documents`' newest-first: this feeds a repair
+    sweep, where the useful property is that it works forward through the backlog and a
+    partially-completed run is resumable by eye.
+
+    Emptiness is :func:`normalize_document_text`'s predicate, applied in Python rather
+    than in SQL: `TRIM()` knows about whitespace and nothing about zero-width or other
+    invisible characters, and the invisible-only rows of issue #87 are part of exactly
+    the population this selector exists to find.
+
+    Raises :class:`pemr.persons.PersonNotFoundError` for an unknown ``person_slug``,
+    matching :func:`list_documents` — an unknown slug is a typo, not an empty result.
+    """
+    db.require_migrated(conn)
+    params: list[object] = []
+    where = ""
+    if person_slug is not None:
+        person = get_person(conn, person_slug)
+        if person is None:
+            raise PersonNotFoundError(f"no person with slug '{person_slug}'")
+        where = " WHERE person_id = ?"
+        params.append(person.person_id)
+    return [
+        row["document_id"]
+        for row in conn.execute(
+            f"SELECT document_id, ocr_text FROM document{where} "
+            "ORDER BY document_id ASC",
+            params,
+        )
+        if not normalize_document_text(row["ocr_text"])
+    ]
 
 
 def _show_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
@@ -318,6 +385,7 @@ def set_document_text(
     text: str,
     *,
     force: bool = False,
+    source: str = TEXT_SOURCE_ATTACHED,
 ) -> dict:
     """Attach or replace a document's ``ocr_text`` after ingest (`pemr document set-text`).
 
@@ -331,17 +399,35 @@ def set_document_text(
     The stored value is :func:`normalize_document_text` of the input, matching
     :func:`ingest.ingest_document`.
 
+    ``source`` records the provenance of that text in ``document.text_source`` (issue
+    #175) and must be one of :data:`TEXT_SOURCES`. It defaults to
+    :data:`TEXT_SOURCE_ATTACHED` because this function's own contract is a hand-attach —
+    `pemr document set-text` and the ``document_set_text`` MCP tool, whose text is the
+    caller's verbatim. The one engine caller, :func:`ingest.reocr_documents`, overrides it
+    explicitly. It is written in the *same* UPDATE as ``ocr_text``, so migration 003's
+    ``record_fts_document_au`` trigger still fires exactly once per write; splitting it
+    into a second statement would double-fire it for no benefit.
+
     Raises :class:`DocumentNotFoundError` (unknown id), :class:`OcrTextPresentError` (the
     column already holds *visible* text and ``force`` is off — replacing a transcription is
     not cheaply undoable, so the surprising case is refused rather than silently applied;
     a row holding only invisible characters counts as unpopulated, so it can be repaired
     over MCP, where there is no ``force`` — issue #87), and
     ``ValueError`` for text with no visible content — whitespace, but also zero-width and
-    other invisible characters, which `str.strip()` misses (issue #87). There is
+    other invisible characters, which `str.strip()` misses (issue #87) — or for a
+    ``source`` outside :data:`TEXT_SOURCES`. There is
     deliberately no path to *clear* ``ocr_text``: that only removes FTS visibility, while
     an empty input is far more likely a wrong or truncated file.
     """
     db.require_migrated(conn)
+    # Before any write and before the document lookup's side-effect-free cousins below:
+    # a bad `source` must leave both columns exactly as they were.
+    if source not in TEXT_SOURCES:
+        raise ValueError(
+            f"unknown text source {source!r}; expected one of "
+            + ", ".join(repr(s) for s in sorted(TEXT_SOURCES))
+            + "; nothing was written"
+        )
     row = _require_document(conn, document_id)
     stored = normalize_document_text(text)
     if not stored:
@@ -359,8 +445,8 @@ def set_document_text(
         )
     with conn:
         conn.execute(
-            "UPDATE document SET ocr_text = ? WHERE document_id = ?",
-            (stored, document_id),
+            "UPDATE document SET ocr_text = ?, text_source = ? WHERE document_id = ?",
+            (stored, source, document_id),
         )
     return _show_view(conn, _require_document(conn, document_id))
 

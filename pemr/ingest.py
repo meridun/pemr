@@ -29,6 +29,12 @@ Issue #70 closes that dispatcher's last hole, **PDFs**. They fall through to
 no PDF reader), so every PDF ingest used to store an empty `ocr_text`. See
 :func:`_ocr_pdf`.
 
+Issue #143 adds the *backwards* half of those extractor fixes: :func:`reocr_documents`
+re-runs today's dispatch against a blob already in `sources/`, so a document ingested
+before an extractor improved can gain the text it never got. It calls the same
+:func:`extract_text_routed` `ingest` calls (so the two paths cannot drift) and writes
+through the same :func:`pemr.documents.set_document_text` guard.
+
 Issue #69 adds a second entry point, :func:`ingest_study_dir`: a DICOM study
 *directory* becomes one document whose blob is a canonical zip of its slices (see
 :mod:`pemr.study`). It reuses every rail above — same person lookup, same layer-1
@@ -53,12 +59,18 @@ import zipfile
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from . import db, study as _study, tombstones as _tombstones
-from .documents import normalize_document_text
+from .documents import (
+    TEXT_SOURCE_ATTACHED,
+    TEXT_SOURCE_ENGINE,
+    normalize_document_text,
+    set_document_text,
+)
 from .models import Document, Person
 
 
@@ -316,6 +328,39 @@ def _ocr_pdf(src: Path) -> str | None:
     return normalize_document_text(_PAGE_SEPARATOR.join(pages)) or None
 
 
+def pdf_page_count(src: Path) -> int | None:
+    """How many pages a PDF has, or ``None`` when that cannot be known.
+
+    ``None`` covers every "don't know" — the ``pemr[ocr]`` extra is absent, the file is
+    not a PDF, or it is unreadable/password-protected — so a caller can only ever say
+    "this document is over the cap" on positive evidence. Never raises, same contract
+    as :func:`_ocr_pdf`.
+
+    Deliberately a second, tiny open rather than a refactor of :func:`_ocr_pdf` (which
+    needs the page handles it already holds): both read the one ``OCR_MAX_PAGES``
+    constant, so there is nothing here to drift. Exists for `document reocr` (issue
+    #143), where the operator is not looking at the source document and so cannot see
+    the truncation note `_ocr_pdf` prints.
+    """
+    if src.suffix.lower() != ".pdf":
+        return None
+    backend = _load_pdf_backend()
+    if backend is None:
+        return None
+    try:
+        doc = backend.open(str(src))
+    except _PDF_ERRORS:
+        return None
+    try:
+        if getattr(doc, "needs_pass", False):
+            return None
+        return int(doc.page_count)
+    except _PDF_ERRORS:
+        return None
+    finally:
+        doc.close()
+
+
 def run_ocr(path: str | Path) -> str | None:
     """Best-effort document text for `--ocr`. Soft dependencies throughout:
 
@@ -380,6 +425,20 @@ def run_ocr(path: str | Path) -> str | None:
 
 _PLAINTEXT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".json", ".log"})
 
+# HTML (issue #173) — a saved portal page. Deliberately **not** in
+# `_PLAINTEXT_SUFFIXES`: reading the markup verbatim would store tags and inline
+# scripts as document text (and route it `"native"`, see `_trusts_anchors`).
+_HTML_SUFFIXES = frozenset({".html", ".htm"})
+# Element content that is code/markup, never document text.
+_HTML_SKIP_TAGS = frozenset({"script", "style", "noscript", "template"})
+# Tags that end a line — the ones that render as a block or a line break.
+_HTML_BLOCK_TAGS = frozenset({
+    "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "section", "article", "header", "footer",
+    "blockquote", "hr", "pre", "dt", "dd", "ul", "ol", "title",
+})
+_HTML_CELL_TAGS = frozenset({"td", "th"})
+
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
@@ -442,11 +501,33 @@ def _member_reader(zf: zipfile.ZipFile) -> Callable[[str], bytes]:
     return read
 
 
+def _parse_ooxml_member(read: Callable[[str], bytes], name: str) -> ET.Element:
+    """Read one OOXML member and parse it — refusing a `<!DOCTYPE` first (issue #155).
+
+    The only convenient way to parse a zip member, deliberately: `_member_reader`'s cap
+    bounds a member's *declared* uncompressed size, which does not bound entity
+    expansion — an internal subset expands after that check passes (a 355-byte `.docx`
+    rendered 4,194,304 chars). A future extractor that reaches for a fourth member must
+    not be able to forget the probe, so the probe lives here rather than inline at each
+    call site.
+
+    The probe is :func:`_xml_declares_doctype` (encoding-agnostic by construction — the
+    argument is on that function; do not reimplement it as a byte scan), and it runs on
+    the exact bytes handed to `ET.fromstring`, with no re-read between them. `ValueError`
+    is what a malformed member already raises, so :func:`extract_text_routed` degrades a
+    refusal to "no ocr_text" at exactly the cost of today's malformed-file path.
+    """
+    data = read(name)
+    if _xml_declares_doctype(data):
+        raise ValueError(f"{name} declares a DOCTYPE; refusing to parse")
+    return ET.fromstring(data)
+
+
 def _extract_docx(path: Path) -> str:
     """`.docx` body text: concat `w:t` runs, one line per `w:p` paragraph."""
     with zipfile.ZipFile(path) as zf:
         read_member = _member_reader(zf)
-        root = ET.fromstring(read_member("word/document.xml"))
+        root = _parse_ooxml_member(read_member, "word/document.xml")
     return "\n".join(
         _xml_text(para, f"{_WORD_NS}t") for para in root.iter(f"{_WORD_NS}p")
     )
@@ -480,7 +561,7 @@ def _extract_xlsx(path: Path) -> str:
         names = zf.namelist()
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(read_member("xl/sharedStrings.xml"))
+            root = _parse_ooxml_member(read_member, "xl/sharedStrings.xml")
             shared = [
                 _xml_text(si, f"{_SHEET_NS}t") for si in root.iter(f"{_SHEET_NS}si")
             ]
@@ -492,7 +573,10 @@ def _extract_xlsx(path: Path) -> str:
         )
         lines: list[str] = []
         for name in sheets:
-            root = ET.fromstring(read_member(name))
+            # A DOCTYPE on any one member refuses the whole workbook: the `ValueError`
+            # propagates out to `extract_text_routed`, deliberately not caught per sheet
+            # (all-or-nothing degrade, as on the CCDA route — not a best-effort result).
+            root = _parse_ooxml_member(read_member, name)
             for row in root.iter(f"{_SHEET_NS}row"):
                 lines.append("\t".join(
                     _cell_text(cell, shared) for cell in row.iter(f"{_SHEET_NS}c")
@@ -746,6 +830,169 @@ def _extract_ccda(path: Path) -> str | None:
     return "\n".join(lines)
 
 
+class _HtmlText(HTMLParser):
+    """Readable text out of an HTML page: tags stripped, `<script>`/`<style>` dropped.
+
+    Rendering mirrors :func:`_ccda_narrative` / :func:`_ccda_table_rows` (issue #138) so
+    both native routes produce the same *shaped* text — one line per block element,
+    one tab-delimited line per `<tr>` — which is what keeps a lab table's header cell
+    on the same line as its value.
+
+    Unlike the CCDA walk this is event-driven, so there is **no recursion here at all**
+    and no `RecursionError` surface, however deeply the page nests.
+    """
+
+    def __init__(self) -> None:
+        # `convert_charrefs` (the default) must stay on: with it off, every `&amp;` /
+        # `&#160;` would need `handle_entityref`/`handle_charref` or be silently lost.
+        super().__init__(convert_charrefs=True)
+        self.lines: list[str] = []
+        self._parts: list[str] = []          # the line being built
+        self._cells: list[str] | None = None  # non-None while a `<tr>` is open
+        # A *depth counter*, not a boolean. `<script>`/`<style>` are the easy half —
+        # the stdlib reads them in CDATA mode, so their bodies never re-enter the tag
+        # machinery — but `<noscript>`/`<template>` are parsed normally and do nest, and
+        # a boolean flips back on the innermost close, leaking their contents into
+        # `ocr_text` and thence the FTS index. The counter also has to floor at 0, or a
+        # stray `</script>` (ordinary in a saved page) would swallow the rest of it.
+        self._skip = 0
+
+    # -- line/cell plumbing --------------------------------------------------- #
+
+    def _take(self) -> str:
+        """The pending text, whitespace-collapsed as `_ccda_flat` does — `str.split()`
+        also folds the `\\xa0` that `&nbsp;` decodes to."""
+        chunk = " ".join("".join(self._parts).split())
+        self._parts.clear()
+        return chunk
+
+    def _break(self) -> None:
+        """A block boundary. Ends the current line — except **inside a `<tr>`**, where it
+        is only a word separator: a `<div>` wrapping a cell's value must not split the
+        cell, which is what keeps a lab row's header cell beside its value."""
+        if self._cells is not None:
+            self._parts.append(" ")
+            return
+        chunk = self._take()
+        if chunk:
+            self.lines.append(chunk)
+
+    def _close_cell(self) -> None:
+        """`</td>`/`</th>`: the pending text becomes one cell — empty ones included, so
+        columns stay aligned."""
+        chunk = self._take()
+        if self._cells is None:      # a stray `</td>` outside any row: keep its text
+            if chunk:
+                self.lines.append(chunk)
+        else:
+            self._cells.append(chunk)
+
+    def _end_row(self) -> None:
+        trailing = self._take()      # text after the last `</td>`, if any
+        cells, self._cells = self._cells or [], None
+        if trailing:
+            cells.append(trailing)
+        # `any(cells)` is `_ccda_table_rows`'s rule (line 609): an all-empty row
+        # contributes nothing.
+        if any(cells):
+            self.lines.append("\t".join(cells))
+
+    # -- HTMLParser hooks ----------------------------------------------------- #
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _HTML_SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag == "tr":
+            self._break()
+            self._cells = []
+        elif tag in _HTML_CELL_TAGS:
+            self._parts.append(" ")   # separator only; the cell closes on `</td>`
+        elif tag in _HTML_BLOCK_TAGS:
+            self._break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _HTML_SKIP_TAGS:
+            # Floored: an unmatched `</script>` must not push the depth negative, or
+            # every later close would keep us "inside" a skip and drop the real page.
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip:
+            return
+        if tag == "tr":
+            self._end_row()
+        elif tag in _HTML_CELL_TAGS:
+            self._close_cell()
+        elif tag in _HTML_BLOCK_TAGS:
+            self._break()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip:
+            return
+        self._parts.append(data)
+
+    def text(self) -> str:
+        """The page as lines. Flushes whatever an unclosed final tag left open."""
+        if self._cells is not None:
+            self._end_row()
+        else:
+            self._break()
+        return "\n".join(self.lines)
+
+
+def _extract_html(path: Path) -> str:
+    """Readable text from a saved HTML page (`.html`/`.htm`, issue #173).
+
+    Same shape and contract as :func:`_extract_ccda`, except it never returns ``None``:
+    dispatch is on the suffix, not on sniffed content, so there is no "not actually
+    HTML, fall through to OCR" case — a `.html` that is really something else extracts
+    to little or nothing and takes the usual stderr note. Tesseract could not read it
+    either.
+    """
+    size = path.stat().st_size
+    if size > _MAX_EXTRACT_BYTES:
+        raise ValueError(
+            f"{size} bytes, past the {_MAX_EXTRACT_BYTES}-byte extraction cap"
+        )
+    # Same trade as the plaintext branch: utf-8-sig eats a BOM, errors="replace" keeps a
+    # legacy-encoded page usable rather than losing it. No `<meta charset>` sniffing.
+    data = path.read_text(encoding="utf-8-sig", errors="replace")
+    parser = _HtmlText()
+    try:
+        parser.feed(data)
+        parser.close()
+    except AssertionError as exc:
+        # `_markupbase.ParserBase.parse_marked_section` ends in a plain
+        # `raise AssertionError(...)` (so `python -O` does not remove it), which input as
+        # ordinary as `<![foo[ x ]]>` reaches. `AssertionError` is not in
+        # `_EXTRACT_ERRORS` and would escape the "never raises" contract and cost the
+        # document — the defect class the #138 audit caught with `RecursionError`.
+        # Translated here rather than by widening `_EXTRACT_ERRORS`, which would swallow
+        # our own asserts, including the ones tests use as tripwires.
+        raise ValueError(f"malformed HTML markup: {exc}") from exc
+    return parser.text()
+
+
+def _trusts_anchors(route: str) -> bool:
+    """Whether :func:`check_owner` may read `Patient`/`DOB`/`MRN` as an identity claim.
+
+    The route vocabulary, and the reason it has three words rather than two:
+
+    - ``"native"`` — natively extracted **structured** data (plaintext-ish suffixes,
+      `.docx`/`.xlsx`, CCDA). A `Patient ID` there is a column label, not a claim, so
+      anchors are **not** trusted (issue #66 audit).
+    - ``"native-prose"`` — natively extracted **prose** (HTML, issue #173). Tags aside,
+      a saved portal page is a printed page: its `Patient:` header is a claim.
+    - ``"ocr"`` — tesseract output or an agent transcription; prose by definition.
+
+    One definition for both call sites (:func:`ingest_document`,
+    :func:`reocr_documents`), so a fourth route can never disagree with itself.
+    """
+    return route != "native"
+
+
 def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     """:func:`extract_text` plus the **route** that produced the text.
 
@@ -754,7 +1001,10 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     `.xml` (issue #138) is rendered natively too — sections' narrative plus a
     `recordTarget` identity header — but on the parsed **root element**, not the
     suffix: a non-CCDA or malformed `.xml` falls through to the OCR route exactly as
-    it did before that branch existed.
+    it did before that branch existed. A saved `.html`/`.htm` portal page (issue #173)
+    is rendered natively as well, but on the third route ``"native-prose"``: it is
+    natively extracted *and* prose, which the two-word vocabulary could not express —
+    see :func:`_trusts_anchors`.
     **Everything else falls through to :func:`run_ocr`** (route ``"ocr"``) — the same
     thing `ocr=True` did before this dispatcher existed. Deliberately not a suffix
     allowlist: image extensions vary far too widely (`.jfif`, `.jpe`, extension-less
@@ -774,6 +1024,10 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
     """
     src = Path(path)
     suffix = src.suffix.lower()
+    # Hoisted so the failure path reports the branch's own route: a `.html` that fails
+    # extraction reads `route native-prose` in `pemr document reocr` output, not a fixed
+    # word. Every existing format keeps `"native"`.
+    route = "native"
     try:
         if suffix in _PLAINTEXT_SUFFIXES:
             size = src.stat().st_size
@@ -788,6 +1042,9 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             text = _extract_docx(src)
         elif suffix == ".xlsx":
             text = _extract_xlsx(src)
+        elif suffix in _HTML_SUFFIXES:
+            route = "native-prose"     # set *before* the call, so `except` sees it
+            text = _extract_html(src)
         # `.xml` deliberately stays out of `_PLAINTEXT_SUFFIXES`: only a file whose
         # root element is `{urn:hl7-org:v3}ClinicalDocument` is read natively, and
         # every other `.xml` falls through to the `run_ocr` branch below unchanged.
@@ -810,11 +1067,11 @@ def extract_text_routed(path: str | Path) -> tuple[str | None, str]:
             "storing without ocr_text",
             file=sys.stderr,
         )
-        return None, "native"
+        return None, route
     # Same predicate as the supplied-text route below - one emptiness notion per
     # column, so `--ocr auto` cannot store what `--ocr-text-file` rejects (issue #87).
     text = normalize_document_text(text)
-    return (text or None), "native"
+    return (text or None), route
 
 
 def extract_text(path: str | Path) -> str | None:
@@ -1140,6 +1397,21 @@ def _person_for_slug(conn: sqlite3.Connection, slug: str) -> Person:
     return Person.from_row(row)
 
 
+def _person_for_id(conn: sqlite3.Connection, person_id: int | None) -> Person | None:
+    """The claimed owner of an already-filed document, or ``None`` when unowned.
+
+    Sibling of :func:`_person_for_slug` for the re-run path (issue #143), where the
+    owner comes from the stored row rather than a `--person` flag. Unowned is not an
+    error here — there is simply nobody to check the recovered text against.
+    """
+    if person_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM person WHERE person_id = ?", (person_id,)
+    ).fetchone()
+    return Person.from_row(row) if row is not None else None
+
+
 def _roster(conn: sqlite3.Connection) -> list[Person]:
     """Everyone on the roster, **including deactivated people** — a deactivated person
     is still a real person whose documents must not land on someone else."""
@@ -1159,8 +1431,13 @@ def _insert_document(
     category: str | None,
     provider: str | None,
     ocr_text: str | None,
+    text_source: str | None,
 ) -> Document:
     """Insert the `document` row and read it back. Shared by both ingest paths.
+
+    ``text_source`` is the provenance of ``ocr_text`` (issue #175) — ``None`` when there
+    is no text at all. This helper deliberately does not *infer* it: only the caller knows
+    whether the text came off the page through pemr or arrived from the caller verbatim.
 
     Blob cleanup on failure stays with the caller: the file path copies its blob in
     and the study path renames one in, so only they know what to undo.
@@ -1170,8 +1447,8 @@ def _insert_document(
             """
             INSERT INTO document
               (sha256, person_id, doc_date, category, provider, source_path,
-               ocr_text, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ocr_text, text_source, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sha,
@@ -1181,6 +1458,7 @@ def _insert_document(
                 provider,
                 _relative_source_path(sha, ext),
                 ocr_text,
+                text_source,
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
         )
@@ -1290,12 +1568,20 @@ def ingest_document(
     else:
         ocr_text, route = None, "ocr"  # no text at all; the route is moot
 
+    # Provenance follows the text's origin, not the verb (issue #175): `--ocr-text-file`
+    # supplies the *caller's* transcription (the `AGENTS.md` default path), so recording
+    # it as engine output would misclassify exactly the rows this column exists to tell
+    # apart. No text at all leaves both columns NULL.
+    text_source = (
+        None if not ocr_text
+        else (TEXT_SOURCE_ATTACHED if supplied else TEXT_SOURCE_ENGINE)
+    )
+
     roster = _roster(conn)
-    # Natively-extracted text (CSV/OOXML/JSON) is structured, so a `Patient ID` column
-    # header is not an identity claim — trusting anchors there refuses ordinary lab
-    # exports as belonging to a stranger. `mismatch` still blocks on every route.
+    # Structured vs prose per route — see `_trusts_anchors`. `mismatch` still blocks on
+    # every route.
     owner_check = check_owner(
-        ocr_text, person, roster, trust_anchors=(route != "native")
+        ocr_text, person, roster, trust_anchors=_trusts_anchors(route)
     )
     if owner_check.blocks and not force:
         raise OwnerMismatchError(
@@ -1322,6 +1608,7 @@ def ingest_document(
             category=category,
             provider=provider,
             ocr_text=ocr_text,
+            text_source=text_source,
         )
     except Exception:
         if blob_created:
@@ -1443,6 +1730,9 @@ def ingest_study_dir(
     # study summary wins rather than an invisible character (issue #87).
     supplied = normalize_document_text(ocr_text) or None
     text = supplied or _study.summary_text(scan, metadata)
+    # The derived modality/date/series summary is engine output; caller-supplied text (a
+    # transcribed radiology report) is not (issue #175).
+    text_source = TEXT_SOURCE_ATTACHED if supplied else TEXT_SOURCE_ENGINE
 
     roster = _roster(conn)
     owner_check = _strongest_check([
@@ -1492,6 +1782,7 @@ def ingest_study_dir(
                 category=category or _STUDY_CATEGORY,
                 provider=provider,
                 ocr_text=text,
+                text_source=text_source,
             )
         except Exception:
             if blob_created:
@@ -1503,3 +1794,219 @@ def ingest_study_dir(
     return IngestResult(
         status="new", document=document, owner_check=owner_check, tombstone=tombstone
     )
+
+
+# --------------------------------------------------------------------------- #
+# Re-extraction against an already-stored blob (issue #143)
+# --------------------------------------------------------------------------- #
+#
+# `ingest` writes `ocr_text` once, from whatever the extractor could read that day.
+# Every later extractor fix (#70's PDF route, #138's CCDA route) therefore only helps
+# documents ingested *after* it landed; the ones already on file keep the empty column
+# they got. `document set-text` cannot close that gap — it takes text derived
+# out-of-band, which is a transcription path, not a re-run.
+#
+# `reocr_documents` is the missing verb's engine: a selector and a policy layer over
+# two functions that already exist. It calls `extract_text_routed` (the one `ingest`
+# calls, not a copy) and writes through `set_document_text` (the one `set-text` calls),
+# so the re-run cannot drift from the ingest path and cannot bypass the overwrite guard.
+
+
+@dataclass(frozen=True)
+class ReocrResult:
+    """What a re-extraction did — or refused to do — for one document.
+
+    Same shape and spirit as :class:`IngestResult`: one frozen row per document, so a
+    262-document sweep is a list a caller can print, count and serialise without a
+    second pass over the database.
+
+    ``status``:
+
+    * ``written`` — the recovered text is stored.
+    * ``would-write`` — ``dry_run``; ``chars`` is what *would* have been stored.
+    * ``has-text`` — the column already holds visible text and ``force`` was off.
+      Refused **before** extraction, so the skip is cheap.
+    * ``no-text`` — extraction ran and recovered nothing. A warning, not an error.
+    * ``owner-mismatch`` — the recovered text affirmatively names a *different* roster
+      person (issue #61's check, re-run against text that did not exist at ingest).
+    * ``shorter-text`` — the re-derived text is shorter than the text already stored,
+      and ``allow_shrink`` was off (issue #174). Nothing written: a replacement that
+      drops characters is a loss unless the operator says otherwise.
+    * ``missing-blob`` — ``source_path`` does not resolve under ``sources_dir``.
+    * ``study-blob`` — a packed DICOM study, whose ``ocr_text`` is a derived header
+      summary rather than extracted text (see :func:`ingest_study_dir`).
+    """
+
+    document_id: int
+    status: str
+    chars: int = 0
+    previous_chars: int = 0
+    route: str | None = None
+    pages: int | None = None
+    truncated: bool = False
+    owner_check: OwnerCheck | None = None
+    blob_path: str | None = None
+
+    @property
+    def wrote(self) -> bool:
+        return self.status == "written"
+
+    @property
+    def shrunk(self) -> bool:
+        """Whether the re-derived text is shorter than what is already stored (#174).
+
+        Gated on the statuses whose ``chars`` is a real would-be-stored length. The
+        skips (``has-text``, ``missing-blob``, ``study-blob``) and ``no-text`` carry
+        ``chars == 0`` beside a populated ``previous_chars``, so a bare comparison would
+        call every one of them shrunk — including the has-text skip, which by definition
+        never got as far as extracting anything to compare.
+        """
+        return (
+            self.status in ("written", "would-write", "shorter-text")
+            and self.chars < self.previous_chars
+        )
+
+    @property
+    def refused(self) -> bool:
+        """Whether the caller asked for work that was declined (drives the exit code).
+
+        ``no-text`` is deliberately excluded: a document that genuinely has no readable
+        text is an expected outcome of a sweep, and a sweep that exits non-zero on
+        expected outcomes trains `|| true` — the same reasoning as
+        :attr:`IngestResult.is_tombstoned`.
+        """
+        return self.status in ("has-text", "owner-mismatch", "shorter-text",
+                               "missing-blob", "study-blob")
+
+
+def reocr_documents(
+    conn: sqlite3.Connection,
+    document_ids: Sequence[int],
+    sources_dir: str | Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    allow_shrink: bool = False,
+) -> list[ReocrResult]:
+    """Re-derive ``ocr_text`` for each document from its stored blob (`document reocr`).
+
+    Every id is resolved **before** any extraction runs: an unknown id is a typo, and a
+    sweep must not half-run on one. After that, each document is independent — there is
+    deliberately **no transaction across the sweep** (each write is
+    :func:`pemr.documents.set_document_text`'s own), so an interrupted 262-document run
+    leaves the finished documents committed and is safely re-runnable.
+
+    ``force`` means both "replace existing ``ocr_text``" and "store despite an owner
+    mismatch", matching what ``--force`` already means on `ingest`. ``dry_run`` reports
+    what would be stored and writes nothing.
+
+    ``allow_shrink`` is the separate override for storing text *shorter* than what is
+    already there (issue #174) — deliberately not ``force``, which a populated corpus
+    already needs just to reach the write, so reusing it would conflate "replace the
+    stored text" with "and discard most of it".
+
+    Raises :class:`IngestError` for an unknown document id.
+    """
+    db.require_migrated(conn)
+    root = Path(sources_dir)
+
+    rows: list[Document] = []
+    for document_id in document_ids:
+        row = get_document_by_id(conn, document_id)
+        if row is None:
+            raise IngestError(
+                f"no document with id {document_id} - see `pemr document list`"
+            )
+        rows.append(row)
+
+    roster = _roster(conn)
+    results: list[ReocrResult] = []
+    for row in rows:
+        previous = normalize_document_text(row.ocr_text)
+        common = {"document_id": row.document_id, "previous_chars": len(previous)}
+
+        if row.source_path.endswith(STUDY_EXT):
+            # A study's `ocr_text` is a DICOM-header summary built from the unpacked
+            # slices, not text extracted from the blob. Re-deriving it is a different
+            # pipeline (see `ingest_study_dir`), so this verb reports and skips.
+            results.append(ReocrResult(status="study-blob", **common))
+            continue
+
+        # Before extraction, not after: the skip has to be cheap, or a sweep across a
+        # mostly-populated corpus pays for OCR it then discards. Same normalised
+        # predicate `set_document_text` uses, so an invisible-characters-only row
+        # (issue #87) correctly counts as empty and gets repaired.
+        if previous and not force:
+            results.append(ReocrResult(status="has-text", **common))
+            continue
+
+        blob = root / row.source_path
+        # Recorded even when it does not resolve — a `missing-blob` result is only
+        # actionable if it names the path that was looked for.
+        common["blob_path"] = str(blob)
+        if not blob.is_file():
+            results.append(ReocrResult(status="missing-blob", **common))
+            continue
+
+        text, route = extract_text_routed(blob)
+        # What `set_document_text` would actually store, so `--dry-run`'s character
+        # count is the number the write reports and not one character more.
+        text = normalize_document_text(text)
+        pages = pdf_page_count(blob)
+        common.update(
+            route=route, pages=pages,
+            truncated=pages is not None and pages > OCR_MAX_PAGES,
+        )
+        if not text:
+            results.append(ReocrResult(status="no-text", **common))
+            continue
+
+        person = _person_for_id(conn, row.person_id)
+        owner_check = None
+        if person is not None:
+            owner_check = check_owner(     # structured vs prose — see `_trusts_anchors`
+                text, person, roster, trust_anchors=_trusts_anchors(route)
+            )
+        common["owner_check"] = owner_check
+        # Only `mismatch` refuses here, unlike ingest where `suspect` blocks too: this
+        # document is *already filed* under that owner, so withholding the text does
+        # not un-file it — it only hides the evidence and keeps the document invisible
+        # to `find`, which is the bug this verb exists to close. `mismatch` is
+        # affirmative evidence of a cross-owner leak, so it still earns the refusal.
+        if owner_check is not None and owner_check.verdict == "mismatch" and not force:
+            results.append(ReocrResult(status="owner-mismatch", **common))
+            continue
+
+        # Issue #174: a replacement shorter than what is stored is a loss, and only the
+        # page-cap case (`truncated`) was ever loud about it. Any shrinkage refuses —
+        # no percentage floor, because this is only reachable under `force` at all (the
+        # has-text skip above returns first whenever `previous` is non-empty), so the
+        # `--where-empty` backlog sweep cannot trip it and one predicate can drive the
+        # refusal, the human line and the JSON key alike. Placed *after* the owner check
+        # so `owner_check` is still populated on the refusal — a `--force --dry-run`
+        # owner audit over a populated corpus is the only read-only owner verification
+        # there is — and *before* `dry_run`, so a dry run and a real run report the same
+        # refusal; nothing was going to be written either way.
+        if len(text) < len(previous) and not allow_shrink:
+            results.append(
+                ReocrResult(status="shorter-text", chars=len(text), **common)
+            )
+            continue
+
+        if dry_run:
+            results.append(
+                ReocrResult(status="would-write", chars=len(text), **common)
+            )
+            continue
+
+        # `force=True` unconditionally: this call is only reached once the `has-text`
+        # guard above has already applied the caller's own force policy, and re-testing
+        # it here would refuse the invisible-only rows that guard deliberately admits.
+        # `source` is the one thing that distinguishes this engine caller from the
+        # hand-attach `set_document_text` otherwise assumes (issue #175): re-OCR text is
+        # `extract_text_routed` output, so it stamps `engine` over whatever was there.
+        set_document_text(
+            conn, row.document_id, text, force=True, source=TEXT_SOURCE_ENGINE
+        )
+        results.append(ReocrResult(status="written", chars=len(text), **common))
+    return results

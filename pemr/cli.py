@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import (
     __version__, attestations, backup, curation, db, dedup, documents, ingest, persons,
-    query, records, render, restore, study, tombstones, verify,
+    query, records, render, restore, study, tombstones, units, verify,
 )
 
 # Shipped starter analyte/name dictionary (framework, not user data — see .gitignore).
@@ -382,6 +382,78 @@ def _cmd_person_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- per-person canonical display units (issue #136) ------------------------
+#
+# A display lever, not an identity one: these three verbs only ever write
+# `person_unit_pref`, which `render summary` and `trends` read at render time. No stored
+# row, unit string or dedup key moves - correcting a mislabelled unit *in place* is
+# `record edit` (issue #129), a different verb for a different problem.
+
+
+def _unit_pref_conn(args: argparse.Namespace, work):
+    """`_cmd_person_edit`'s error shape for the three unit-pref verbs: an unknown slug,
+    an unknown unit and an empty key are all ordinary user mistakes (rc=1 on stderr),
+    and none of them writes anything."""
+    conn = _connect_db(args)
+    try:
+        try:
+            return work(conn)
+        except (persons.PersonNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+
+def _cmd_person_unit_pref_set(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        pref = units.set_pref(
+            conn, args.slug, args.key, args.unit, dictionary=dictionary
+        )
+        print(
+            f"{args.slug}: {pref['key']} displays in {pref['unit']} "
+            f"(set {pref['set_at']})"
+        )
+        return 0
+
+    return _unit_pref_conn(args, work)
+
+
+def _cmd_person_unit_pref_clear(args: argparse.Namespace) -> int:
+    def work(conn):
+        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        cleared = units.clear_pref(conn, args.slug, args.key, dictionary=dictionary)
+        token = dedup.key_token(args.key, dictionary)
+        if cleared:
+            print(f"{args.slug}: cleared display unit for {token}")
+        else:
+            # Not an error: the requested end state (no preference) already holds.
+            print(f"{args.slug}: no display unit was set for {token}")
+        return 0
+
+    return _unit_pref_conn(args, work)
+
+
+def _cmd_person_unit_pref_list(args: argparse.Namespace) -> int:
+    def work(conn):
+        rows = units.list_prefs(conn, args.slug)
+        if args.json:
+            _print_json(rows)
+            return 0
+        if not rows:
+            print(
+                f"no display units set for {args.slug} - `pemr person unit-pref set "
+                f"{args.slug} --key <key> --unit <unit>`"
+            )
+            return 0
+        for row in rows:
+            print(f"{row['key']:24} {row['unit']:8} set {row['set_at']}")
+        return 0
+
+    return _unit_pref_conn(args, work)
+
+
 # --------------------------------------------------------------------------- #
 # document recovery (list / edit / reassign / rm) - issue #54
 # plus per-document detail + post-ingest text (show / set-text) - issue #62
@@ -474,6 +546,9 @@ def _print_document_show(doc: dict) -> None:
         ("source_path", _fmt(doc["source_path"])),
         ("ingested_at", _fmt(doc["ingested_at"])),
         ("has_ocr_text", f"yes ({chars} chars)" if doc["has_ocr_text"] else "no"),
+        # Not `_fmt`: it renders None as an empty string, which would make "provenance
+        # unknown" (a pre-015 row, or no text at all) look like a rendering bug (#175).
+        ("text_source", doc["text_source"] or "unknown"),
         ("records", records),
         ("conflicts", conflicts),
     ]
@@ -540,6 +615,164 @@ def _cmd_document_set_text(args: argparse.Namespace) -> int:
         )
         _print_document_show(doc)
         return 0
+
+    return _with_document_conn(args, work)
+
+
+def _reocr_json(result: "ingest.ReocrResult") -> dict:
+    """One :class:`ingest.ReocrResult` as a stable-key JSON dict.
+
+    ``owner_check`` is nested (or null) in the shape MCP's `ingest` already returns it,
+    so a caller that parses one parses both.
+    """
+    check = result.owner_check
+    return {
+        "document_id": result.document_id,
+        "status": result.status,
+        "chars": result.chars,
+        "previous_chars": result.previous_chars,
+        "route": result.route,
+        "pages": result.pages,
+        "truncated": result.truncated,
+        "shrunk": result.shrunk,
+        "blob_path": result.blob_path,
+        "owner_check": None if check is None else {
+            "verdict": check.verdict,
+            "matched_slug": check.matched_slug,
+            "evidence": check.evidence,
+        },
+    }
+
+
+def _print_reocr_result(result: "ingest.ReocrResult") -> None:
+    """One human line per document, plus the three things a sweep must not miss:
+    truncation against `OCR_MAX_PAGES`, text that shrank against what is stored
+    (issue #174), and any owner verdict that isn't reassuring."""
+    was = (
+        f"was {result.previous_chars} chars"
+        if result.previous_chars
+        else "was empty"
+    )
+    route = f"  route {result.route}" if result.route else ""
+    if result.status == "written":
+        line = f"written      {result.chars} chars ({was}){route}"
+    elif result.status == "would-write":
+        line = f"would write  {result.chars} chars ({was}){route}  [dry run]"
+    elif result.status == "has-text":
+        line = (
+            f"skipped      already has ocr_text ({result.previous_chars} chars) - "
+            "pass --force to replace it"
+        )
+    elif result.status == "no-text":
+        line = f"no text      nothing could be extracted from the blob{route}"
+    elif result.status == "owner-mismatch":
+        line = "refused      owner verification failed - nothing written"
+    elif result.status == "shorter-text":
+        line = (
+            f"refused      shorter than stored  {result.chars} chars ({was}){route}"
+        )
+    elif result.status == "missing-blob":
+        line = f"missing blob {result.blob_path}"
+    else:  # study-blob
+        line = (
+            "skipped      packed DICOM study; its ocr_text is a header summary, "
+            "not extracted text"
+        )
+    print(f"#{result.document_id}  {line}")
+
+    if result.status == "shorter-text":
+        print(
+            "    store it anyway with --allow-shrink, or leave the stored text as it is"
+        )
+    if result.truncated:
+        print(
+            f"    pages: {result.pages} (over the {ingest.OCR_MAX_PAGES}-page cap - "
+            "text is truncated)"
+        )
+    # The issue's floor ask, for the shrinkage that was *permitted*: a written or
+    # would-write line reading `104 chars (was 3221 chars)` says nothing about the 97%
+    # that just went away. A refusal already says it on its own line above.
+    if result.shrunk and result.status != "shorter-text":
+        print(
+            f"    shrink: {result.chars} chars replaces {result.previous_chars} - "
+            "the difference is discarded"
+        )
+    check = result.owner_check
+    if check is not None and check.verdict not in ("match", "unverified"):
+        if check.verdict == "mismatch":
+            print(
+                f"    owner: text matches '{check.matched_slug}', "
+                "not this document's owner"
+            )
+            print(
+                f"    fix with `pemr document reassign {result.document_id} "
+                f"--person {check.matched_slug}`, or store anyway with --force"
+            )
+        else:  # suspect - stored, but the operator should look
+            print(
+                "    owner: warning - the text carries an identity header naming "
+                "nobody on the roster"
+            )
+        if check.evidence:
+            print(f'    found in document text: "{check.evidence}"')
+
+
+def _cmd_document_reocr(args: argparse.Namespace) -> int:
+    # Exactly one selector, and `--person` only scopes the filter. An argparse error
+    # (usage + rc=2) rather than a silent guess, following `document rm`'s
+    # parser-on-the-namespace pattern - a sweep that selects the wrong set is worse
+    # than one that refuses to start.
+    if args.document_ids and args.where_empty:
+        args.parser.error(
+            "pass document ids or --where-empty, not both; nothing was written"
+        )
+    if not args.document_ids and not args.where_empty:
+        args.parser.error(
+            "nothing selected - pass document ids or --where-empty; "
+            "nothing was written"
+        )
+    if args.person and not args.where_empty:
+        args.parser.error(
+            "--person only scopes --where-empty; nothing was written"
+        )
+    sources_dir = _resolve_sources_dir(args)
+
+    def work(conn):
+        document_ids = args.document_ids or documents.list_documents_without_text(
+            conn, args.person
+        )
+        if not document_ids:
+            if args.json:
+                _print_json([])
+                return 0
+            print("no documents with empty ocr_text - nothing to do")
+            return 0
+        try:
+            results = ingest.reocr_documents(
+                conn, document_ids, sources_dir,
+                force=args.force, dry_run=args.dry_run,
+                allow_shrink=args.allow_shrink,
+            )
+        except ingest.IngestError as exc:
+            # Not in `_with_document_conn`'s catch list (it is an engine-side
+            # RuntimeError, not one of the `documents` refusals), so translate it here
+            # to the same friendly rc=1 every other `document` verb gives.
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            _print_json([_reocr_json(r) for r in results])
+        else:
+            for result in results:
+                _print_reocr_result(result)
+            counts: dict[str, int] = {}
+            for result in results:
+                counts[result.status] = counts.get(result.status, 0) + 1
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(counts.items()))
+            print(f"{len(results)} document(s): {summary}")
+        # rc=1 when work the operator asked for was refused (see ReocrResult.refused);
+        # `no-text` stays rc=0 so a sweep does not exit non-zero on expected outcomes.
+        return 1 if any(r.refused for r in results) else 0
 
     return _with_document_conn(args, work)
 
@@ -1098,6 +1331,13 @@ def _print_curation_report(report: "curation.CurationReport") -> None:
         print(f"  attributed to: {report.attributed_to}")
     if report.merged_into_base:
         print(f"  merged into: {report.merged_into_base[:12]}")
+    if report.cross_person:
+        # Never silent (issue #161): the escape hatch was taken, so say so where the
+        # verdict itself is read back.
+        print(
+            "  cross-person merge: allowed by --allow-cross-person "
+            "(the target family belongs to a different person)"
+        )
     if report.previous is not None and report.action != "clear":
         print(f"  replaces: {curation.describe(report.previous)}")
 
@@ -1177,6 +1417,7 @@ def _cmd_record_annotate(args: argparse.Namespace) -> int:
             note=args.note,
             attributed_to=args.attributed_to,
             merged_into_base=args.merged_into,
+            allow_cross_person=args.allow_cross_person,
             row=args.row,
             apply=args.apply,
         )
@@ -1463,6 +1704,31 @@ def _plan_one_reaffirm(
                 f"merge target {str(to_merge_base)[:12]}... is not live - the map is "
                 "stale; re-run `pemr rekey --apply --json`"
             )
+        if to_merge_base != to_base:
+            # The #161 guard, refused in the *plan* rather than at write time: the batch
+            # is fully planned before any write, and a mid-batch `ValueError` out of
+            # `annotate_record` would stop the run after N partial writes. No `--map-file`
+            # key plumbs the override through - `rekey` never rewrites `person_id`, so a
+            # cross-person successor can only come from a hand-edited map, which deserves
+            # a refusal rather than an option.
+            if orphan.record_id:
+                ruled_id, ruled_slug = curation.row_person(
+                    conn, orphan.record_type, orphan.record_id
+                )
+            else:
+                ruled_id, ruled_slug = curation.family_person(
+                    conn, orphan.record_type, to_base
+                )
+            target_id, target_slug = curation.family_person(
+                conn, orphan.record_type, to_merge_base
+            )
+            if ruled_id is not None and target_id is not None and ruled_id != target_id:
+                return skip(
+                    f"the merge target belongs to a different person ({ruled_slug} -> "
+                    f"{target_slug}) - the fact would leave one chart without appearing "
+                    "on the other; re-rule it with `pemr record annotate ... "
+                    "--allow-cross-person` if that is genuinely intended"
+                )
         if to_merge_base == to_base and not orphan.record_id:
             # This rekey fused the ruled family into its own merge target. A family merged
             # into itself renders nowhere at all (`annotate_record` refuses it at family
@@ -2434,8 +2700,9 @@ def _fmt(value: object) -> str:
 
 
 def _with_conn_person(args: argparse.Namespace, work):
-    """Open the DB, run ``work(conn)``, translating the two friendly failure modes
-    (un-migrated DB, unknown person slug) into an rc=1 stderr message."""
+    """Open the DB, run ``work(conn)``, translating the friendly failure modes
+    (un-migrated DB, unknown person slug, a ``--test`` token that collides across two
+    record types) into an rc=1 stderr message."""
     conn = _connect_db(args)
     try:
         try:
@@ -2443,7 +2710,7 @@ def _with_conn_person(args: argparse.Namespace, work):
         except db.NotMigratedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        except query.PersonNotFoundError as exc:
+        except (query.PersonNotFoundError, query.AmbiguousTestError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
@@ -2538,14 +2805,19 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
         for r in shown:
             dose = f"  {r['dose']}" if r["dose"] else ""
             freq = f"  {r['frequency']}" if r["frequency"] else ""
+            current = query.med_is_current(r)
             if r["ended_on"]:
-                end = f" -> {r['ended_on']}"
-            elif query.med_is_current(r):
+                # A renewal's end date closes an authorization period, not the therapy
+                # (issue #159) - mark it, so a row that appears under --active does not
+                # read as flatly ended.
+                end = f" -> {r['ended_on']}" + (" (renewed)" if current else "")
+            elif current:
                 end = " -> (current)"
             else:  # terminal status but no explicit end date (issue #21)
                 end = " -> (ended)"
             span = _fmt(r["started_on"]) + end
-            status = f"  [{r['status']}]" if r["status"] else ""
+            bits = [str(b) for b in (r["status"], r.get("status_reason")) if b]
+            status = f"  [{': '.join(bits)}]" if bits else ""
             print(f"{r['name']:24}{dose}{freq}  {span}{status}"
                   f"{_verdict_suffix(r, raw=args.raw)}")
         if hidden:
@@ -2623,6 +2895,25 @@ def _print_other_assays(result: dict) -> None:
     print(f"  note   {count} more row(s) of this analyte under another assay: {tokens}")
 
 
+def _print_unit_notes(result: dict) -> None:
+    """Disclose display-unit conversion in a `trends` series (issue #136).
+
+    A converted number must never read as the one the document printed, and a point the
+    preference could not reach must not hide inside a series labelled with that unit —
+    the same disclose-don't-drop rule as :func:`_print_other_assays`."""
+    canonical = result.get("canonical_unit")
+    if not canonical:
+        return
+    if result.get("converted_count"):
+        print(f"  note   converted to {canonical} (canonical unit for this key)")
+    left = result.get("unconverted_count", 0)
+    if left:
+        print(
+            f"  note   {left} point(s) left in their stored unit "
+            f"(not convertible to {canonical})"
+        )
+
+
 def _cmd_trends(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
@@ -2648,6 +2939,7 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             print("  slope  n/a (need >=2 distinct dates)")
         else:
             print(f"  slope  {result['slope_per_day']:+.4g}{unit}/day")
+        _print_unit_notes(result)
         _print_other_assays(result)
         return 0
 
@@ -2655,11 +2947,17 @@ def _cmd_trends(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 4: render (summary / brief / journal)
+# Phase 4: render (summary / brief / journal / curation)
 # --------------------------------------------------------------------------- #
 
 def _emit_markdown(markdown: str, out: str | None) -> int:
-    """Write rendered Markdown to ``--out`` or stdout (the §5 shell-redirect default)."""
+    """Write rendered Markdown to ``--out`` or stdout (the §5 shell-redirect default).
+
+    An **empty** document (``render curation`` for a subject with no verdicts, issue #168)
+    writes a genuinely zero-byte file and prints nothing at all -- the additive-only
+    guarantee reaches the bytes on disk, and a lone newline on stdout would be a document
+    where there is none. Every non-empty target is unaffected.
+    """
     if out:
         try:
             with open(out, "w", encoding="utf-8", newline="\n") as fh:
@@ -2668,6 +2966,8 @@ def _emit_markdown(markdown: str, out: str | None) -> int:
             print(f"error: cannot write {out}: {exc}", file=sys.stderr)
             return 1
         print(f"wrote {out}")
+        return 0
+    if not markdown:
         return 0
     # Default stdout keeps the documented `> exports/...` redirect contract. Output is
     # ASCII-only by construction (render layer), so a cp1252/cp437 console is safe.
@@ -2694,8 +2994,16 @@ def _render_with_conn(args: argparse.Namespace, work) -> int:
 
 def _cmd_render_summary(args: argparse.Namespace) -> int:
     def work(conn):
-        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
-        markdown = render.render_summary(conn, args.person, dictionary=dictionary)
+        # One resolved path, two overlays read from it: the synonym map and the
+        # render-only routine-procedure list (issue #166). No new flag -- `--dictionary` /
+        # `PEMR_DICTIONARY` / `[paths].dictionary_file` already select the file.
+        path = _resolve_dictionary_path(args)
+        markdown = render.render_summary(
+            conn,
+            args.person,
+            dictionary=dedup.load_dictionary(path),
+            routine_procedures=dedup.load_routine_procedures(path),
+        )
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -2704,7 +3012,12 @@ def _cmd_render_summary(args: argparse.Namespace) -> int:
 def _cmd_render_brief(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
-        markdown = render.render_brief(conn, args.appointment, dictionary=dictionary)
+        markdown = render.render_brief(
+            conn,
+            args.appointment,
+            dictionary=dictionary,
+            include_self_reported=args.include_self_reported,
+        )
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -2712,7 +3025,20 @@ def _cmd_render_brief(args: argparse.Namespace) -> int:
 
 def _cmd_render_journal(args: argparse.Namespace) -> int:
     def work(conn):
-        markdown = render.render_journal(conn, args.person, since=args.since)
+        markdown = render.render_journal(
+            conn,
+            args.person,
+            since=args.since,
+            include_self_reported=args.include_self_reported,
+        )
+        return _emit_markdown(markdown, args.out)
+
+    return _render_with_conn(args, work)
+
+
+def _cmd_render_curation(args: argparse.Namespace) -> int:
+    def work(conn):
+        markdown = render.render_curation(conn, args.person)
         return _emit_markdown(markdown, args.out)
 
     return _render_with_conn(args, work)
@@ -2982,6 +3308,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_remove.add_argument("slug")
     p_remove.set_defaults(func=_cmd_person_remove)
 
+    # --- canonical display units (issue #136) -----------------------------
+    # A third level under `person`, the `document tombstone` precedent. `--dictionary`
+    # is on set/clear because the key is stored as a `key_token`, resolved exactly as
+    # `query`/`trends`/`render` resolve it.
+    p_unit_pref = person_sub.add_parser(
+        "unit-pref",
+        help="canonical display unit per measurement key (display-only; storage is "
+             "never rewritten)",
+    )
+    unit_pref_sub = p_unit_pref.add_subparsers(
+        dest="unit_pref_command", required=True
+    )
+
+    up_set = unit_pref_sub.add_parser(
+        "set", help="set the unit `render summary` and `trends` display this key in"
+    )
+    up_set.add_argument("slug")
+    up_set.add_argument(
+        "--key", required=True,
+        help="measurement key or analyte, e.g. weight, temperature, A1c",
+    )
+    up_set.add_argument(
+        "--unit", required=True,
+        help=f"canonical unit: {', '.join(units.known_units())}",
+    )
+    up_set.add_argument("--dictionary", help="synonym dictionary TOML (key resolution)")
+    up_set.set_defaults(func=_cmd_person_unit_pref_set)
+
+    up_clear = unit_pref_sub.add_parser(
+        "clear", help="drop the display unit for one key (rows are unaffected)"
+    )
+    up_clear.add_argument("slug")
+    up_clear.add_argument("--key", required=True, help="measurement key or analyte")
+    up_clear.add_argument(
+        "--dictionary", help="synonym dictionary TOML (key resolution)"
+    )
+    up_clear.set_defaults(func=_cmd_person_unit_pref_clear)
+
+    up_list = unit_pref_sub.add_parser(
+        "list", help="display units recorded for a person"
+    )
+    up_list.add_argument("slug")
+    up_list.add_argument("--json", action="store_true", help="machine-readable output")
+    up_list.set_defaults(func=_cmd_person_unit_pref_list)
+
     # --- document recovery (misfiled document escape hatch, issue #54) ----
     p_document = sub.add_parser(
         "document", help="inspect and recover misfiled documents"
@@ -3025,6 +3396,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d_set_text.add_argument("--json", action="store_true", help="machine-readable output")
     d_set_text.set_defaults(func=_cmd_document_set_text)
+
+    # --- re-run extraction against the stored blob (issue #143) -----------
+    d_reocr = document_sub.add_parser(
+        "reocr",
+        help="re-derive ocr_text from a document's stored blob, using the same "
+             "extraction dispatch as `ingest`",
+    )
+    d_reocr.add_argument(
+        "document_ids", nargs="*", type=int, metavar="ID",
+        help="document id(s) to re-extract; omit and pass --where-empty instead",
+    )
+    d_reocr.add_argument(
+        "--where-empty", dest="where_empty", action="store_true",
+        help="select every document whose ocr_text is empty (the repair sweep)",
+    )
+    d_reocr.add_argument(
+        "--person", help="scope --where-empty to one owner slug"
+    )
+    d_reocr.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="report the character count that would be stored; write nothing",
+    )
+    d_reocr.add_argument(
+        "--force", action="store_true",
+        help="replace existing ocr_text, and store despite an owner mismatch "
+             "(both refused without this, same as `ingest --force`)",
+    )
+    d_reocr.add_argument(
+        "--allow-shrink", dest="allow_shrink", action="store_true",
+        help="store re-derived text that is shorter than the text already stored "
+             "(refused without this; --force does not imply it)",
+    )
+    d_reocr.add_argument("--sources", help="sources blob dir (overrides config)")
+    d_reocr.add_argument("--json", action="store_true", help="machine-readable output")
+    # `parser` rides along for the selector-combination checks in the handler, so the
+    # usage line names `pemr document reocr` (same pattern as `document rm`).
+    d_reocr.set_defaults(func=_cmd_document_reocr, parser=d_reocr)
 
     d_edit = document_sub.add_parser(
         "edit", help="correct a document's date/category/provider (partial)"
@@ -3204,6 +3612,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="target family, required with --status merged-into",
     )
     r_annotate.add_argument(
+        "--allow-cross-person", action="store_true",
+        help="allow --merged-into to name a family belonging to a DIFFERENT person "
+             "(refused by default: the fact would leave one chart without appearing "
+             "on the other)",
+    )
+    r_annotate.add_argument(
         "--list", action="store_true", help="list current verdicts and exit"
     )
     r_annotate.add_argument(
@@ -3313,7 +3727,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument(
         "--ocr",
         choices=["auto"],
-        help="pre-fill ocr_text: text/.docx/.xlsx/CCDA .xml read natively, "
+        help="pre-fill ocr_text: text/.docx/.xlsx/CCDA .xml/.html read natively, "
              "PDF page by page "
              "(text layer + rendered-page OCR), other files via tesseract "
              "(soft dependency)",
@@ -3424,15 +3838,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.set_defaults(func=_cmd_find)
 
     p_trends = sub.add_parser(
-        "trends", help="min/max/latest/slope for one analyte over time"
+        "trends", help="min/max/latest/slope for one lab analyte or vital sign over time"
     )
     p_trends.add_argument("--person", required=True, help="owner slug")
-    p_trends.add_argument("--test", required=True, help="analyte name (dictionary-normalized)")
+    p_trends.add_argument(
+        "--test",
+        required=True,
+        help="analyte or vital key (dictionary-normalized); refused, not merged, if it "
+        "matches both a lab result and a vital observation",
+    )
     p_trends.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
     p_trends.add_argument("--json", action="store_true", help="machine-readable output")
     p_trends.set_defaults(func=_cmd_trends)
 
-    # --- phase 4: render (summary / brief / journal) ----------------------
+    # --- phase 4: render (summary / brief / journal / curation) -----------
     p_render = sub.add_parser(
         "render", help="generate Markdown documents from DB state (read-only)"
     )
@@ -3442,7 +3861,11 @@ def build_parser() -> argparse.ArgumentParser:
         "summary", help="master summary for a person -> Markdown on stdout"
     )
     r_summary.add_argument("--person", required=True, help="owner slug")
-    r_summary.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_summary.add_argument(
+        "--dictionary",
+        help="synonym dictionary TOML (overrides default); also supplies the "
+             "[procedures].routine list the Procedures section narrows against",
+    )
     r_summary.add_argument("--out", help="write to file instead of stdout")
     r_summary.set_defaults(func=_cmd_render_summary)
 
@@ -3453,6 +3876,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--appointment", type=int, required=True, help="appointment id"
     )
     r_brief.add_argument("--dictionary", help="synonym dictionary TOML (overrides default)")
+    r_brief.add_argument(
+        "--include-self-reported", dest="include_self_reported", action="store_true",
+        help="include self-reported symptom and activity observations (excluded by default)",
+    )
     r_brief.add_argument("--out", help="write to file instead of stdout")
     r_brief.set_defaults(func=_cmd_render_brief)
 
@@ -3461,8 +3888,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r_journal.add_argument("--person", required=True, help="owner slug")
     r_journal.add_argument("--since", help="ISO date; keep events on/after this date")
+    r_journal.add_argument(
+        "--include-self-reported", dest="include_self_reported", action="store_true",
+        help="include self-reported symptom and activity events (excluded by default)",
+    )
     r_journal.add_argument("--out", help="write to file instead of stdout")
     r_journal.set_defaults(func=_cmd_render_journal)
+
+    r_curation = render_sub.add_parser(
+        "curation", help="curation audit trail for a person -> Markdown on stdout"
+    )
+    r_curation.add_argument("--person", required=True, help="owner slug")
+    r_curation.add_argument("--out", help="write to file instead of stdout")
+    r_curation.set_defaults(func=_cmd_render_curation)
 
     # --- phase 6: backup (VACUUM INTO snapshot + rotation) ----------------
     p_backup = sub.add_parser(

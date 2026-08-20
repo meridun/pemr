@@ -39,10 +39,14 @@ Read-only tools (never mutate the DB; safe to call freely):
 - `person_show` — one person by slug.
 - `query` — structured reads; `kind` = `labs` | `meds` | `timeline`.
 - `find` — full-text search over `ocr_text` + record fields.
-- `trends` — min/max/latest/slope for one analyte.
+- `trends` — min/max/latest/slope for one lab analyte or vital sign; a key matching both is
+  refused, not merged.
 - `render_summary` — master summary Markdown for a person.
 - `render_brief` — walk-in brief Markdown for one appointment.
 - `render_journal` — narrative chronology Markdown for a person.
+- `render_curation` — curation audit trail Markdown for a person: every recorded verdict that
+  removed a row from the three documents above, grouped by ruling. Empty Markdown means the
+  person has no verdicts, not a failure.
 
 Write tools (mutate the DB; the only tools that do):
 
@@ -83,6 +87,12 @@ The verbs above are CLI-only; verdict *content* is not. Since issue #131, `query
 payload, same as `--json` — an agent reading `query` sees which rows a human has marked
 `superseded`, `erroneous-in-source`, `merged-into`, or `disputed`, and why. That is unchanged
 from the rule above: an agent may read a verdict, never write or clear one.
+
+The same read/write split applies to a `record edit` correction (issue #134): `query`,
+`render_summary` and `render_journal` disclose a corrected row's `edited_at`/`edited_by` on the
+MCP payload exactly when the row carries them (never a NULL pair), same as `--json` — an agent
+sees that a value was corrected and by whom, but `record edit` itself stays off the tool surface,
+so only a human at the CLI can make or clear a correction.
 
 ## MUST rules
 
@@ -219,7 +229,9 @@ to `find` (FTS5); an ingest without it is silently unsearchable.
 - **Fallback:** `ocr=true` (CLI: `--ocr auto`) only when you cannot read the file type yourself.
   It extracts by whatever route the type allows — plaintext/`.csv`/`.json` read directly,
   `.docx`/`.xlsx` parsed from their OOXML, a CCDA `.xml` (a portal "download my record"
-  export) rendered from its section narrative, everything else (images, unknown suffixes)
+  export) rendered from its section narrative, a saved `.html`/`.htm` page parsed with the
+  stdlib HTML parser (tags stripped, scripts and styles dropped), everything else (images,
+  unknown suffixes)
   through tesseract. A `.pdf` is read page by page — embedded text layer where there is one, a
   300-dpi render OCR'd where there isn't (first 20 pages, joined by `\f`); that route needs the
   optional `pip install pemr[ocr]` extra, and without it a PDF stores no text and says so on
@@ -250,10 +262,12 @@ ingest-time owner check: it scans that text for the claimed person's name/DOB an
 *different* roster person), `suspect` (a patient-identity header naming nobody on the roster), or
 `unverified` (no text, no identity anchor in it, or a claimed person whose name is too short to
 carry a signal — their absence from the text is ignorance, not evidence). `mismatch`/`suspect`
-**refuse the ingest** before anything is written. `suspect` is scoped by **route**: it applies to
-the text you supply and to a tesseract pass, and never to anything `--ocr auto` extracts natively
-— the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx` set, CCDA `.xml`
-included — because in a
+**refuse the ingest** before anything is written. `suspect` is scoped by **route**, and the split
+is *structured vs prose*, not native vs OCR: it applies to the text you supply, to a tesseract
+pass, and to a natively-extracted `.html`/`.htm` page (route `native-prose` — a saved portal page
+is a printed page, so its `Patient:` header is a real claim). It never applies to the
+**structured** native routes — the whole `.txt`/`.md`/`.csv`/`.tsv`/`.json`/`.log`/`.docx`/`.xlsx`
+set, CCDA `.xml` included — because in a
 structured export `Patient`/`DOB`/`MRN` are column labels rather than an identity header. The
 route is the line, not how prose-like the format is: a transcript you save as `.txt` and ingest
 with `--ocr auto` gets no identity-header check either, so pass your transcription as `ocr_text` /
@@ -360,11 +374,45 @@ day or month the source didn't state, and never fall back to stashing an impreci
   second stages a conflict. Emitting a time you invented is never the fix — the recovery path is
   `keep both` under human sign-off (§5).
 
-### 8. Medication rows — `status` is lifecycle only
+### 8. Medication discontinue reason
+
+A med-list status cell often states **why** a drug stopped, in the same cell as the status word:
+`Discontinued (Reorder)`, `Discontinued (Therapy Completed)`, `Discontinued (Patient Stopped
+Taking)`, `Discontinued (Substitution/Alternate Therapy Placed)`. The two halves go to two fields.
+
+- The **lifecycle word** goes in `medication.status` (`discontinued`), exactly as today.
+- The **parenthetical** goes in `medication.status_reason`, **verbatim, parentheses stripped**
+  (`Reorder`, `Therapy Completed`, ...). Preserve the source's own casing and spacing.
+- NEVER concatenate the two into `status` (`discontinued (reorder)`, `discontinued-reorder`) —
+  `status` stays a lifecycle word, and the reason is the read layer's own axis.
+- OMIT `status_reason` when the source states no reason. Never invent one and never write `none` /
+  `n/a` — a bare `Discontinued` row is absent-reason, and behaves exactly as it always has.
+- The field is **free text**, not a closed vocabulary: a reason this list doesn't name (`Never
+  Started`, `Provider Discontinued`, ...) is emitted **as stated** rather than forced into a
+  familiar one.
+
+Why it is worth a field of its own: `(Reorder)` and `(Therapy Completed)` are **opposites**. A
+reorder means the prescription was renewed and therapy continues, so its `ended_on` is the end of an
+authorization period; a therapy-completed row is a genuine end. The read layer treats only a
+*renewal* reason as non-terminal (`query.RENEWAL_MED_REASONS`) and every other reason — recognized
+or not — as ending the course, so an unfamiliar reason degrades safely rather than silently
+resurrecting a stopped drug.
+
+Re-ingesting the same medication with a *different* `status_reason` stages a **conflict** (§5), like
+a differing `status` does — it is a real disagreement between documents, not noise to be smoothed.
+
+**Rows committed before migration 014 have `status_reason IS NULL`** — there is no automated
+backfill, because matching an `ocr_text` table line back to an already-committed row is a name/date
+heuristic over PHI and belongs to a human-in-the-loop curation pass, not a migration. The reason is
+not lost, though: it still sits verbatim in `document.ocr_text` for any already-ingested CCDA, and is
+recoverable per row with `pemr record edit medication <id> --set status_reason="Reorder"` (this does
+not move `dedup_key` — §5's identity guarantee holds for this field like any other editable one).
+
+### 9. Medication rows — `status` is lifecycle only
 
 `medication.status` answers exactly one question: **is this course still running?** Emit `active`,
 `completed` or `discontinued`, or leave it absent when the source doesn't say. Nothing else belongs
-in it (issue #151).
+in it (issue #151). The *reason* a course ended is a separate axis — `status_reason` (§8).
 
 - **PRN is a dosing pattern, not a lifecycle state.** "As needed" / "PRN" goes in `frequency` (or
   `dose`) verbatim, exactly as the source words it — `frequency="PRN"`, `frequency="q6h PRN"`.

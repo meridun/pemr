@@ -55,7 +55,8 @@ pemr/
     <sha256[:2]>/<sha256>.pdf  # dedup-friendly, immutable blob store
     .tmp/                      # staging for study archives (§4); exclude from cloud sync
   inbox/                       # drop zone for new un-ingested scans
-  exports/                     # generated docs (disposable): summaries, briefs, journal
+  exports/                     # generated docs (disposable): summaries, briefs, journal,
+                               #   curation records
   backups/                     # local VACUUM INTO snapshots before they sync
   config.toml                  # paths, cloud backup dir, people roster
   AGENTS.md                    # conventions + tool contract for any agent
@@ -97,6 +98,7 @@ CREATE TABLE document (
   provider      TEXT,
   source_path   TEXT NOT NULL,            -- sources/<hash>.<ext>
   ocr_text      TEXT,                     -- extracted full text (agent or tesseract)
+  text_source   TEXT,                     -- 'engine'|'attached'; NULL = none/pre-015 (#175)
   ingested_at   TEXT NOT NULL
 );
 
@@ -132,7 +134,8 @@ CREATE TABLE curation (
   record_id        INTEGER NOT NULL DEFAULT 0,  -- 0 = family scope; else <record_type>_id
   status           TEXT NOT NULL,   -- confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
   note             TEXT NOT NULL,   -- required: the why, and who said so
-  merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY
+  merged_into_base TEXT,            -- set iff status = 'merged-into'; always a FAMILY, and of the
+                                    -- SAME person unless --allow-cross-person (issue #161)
   attributed_to    TEXT,
   created_at       TEXT NOT NULL,   -- ISO8601 UTC
   PRIMARY KEY (record_type, dedup_base, record_id)
@@ -157,7 +160,9 @@ CREATE UNIQUE INDEX idx_curation_row ON curation(record_type, record_id)
 -- retiring one would destroy the audit trail the table exists to create, while a stale
 -- entry mis-renders nothing. `record rm` discloses (never deletes) the entries naming the
 -- row it removes, and the dedup_base breadcrumb tells a reader whether a later occupant
--- of that id is even the same family.
+-- of that id is even the same family. The row-level DISCLOSURE that a correction happened
+-- is a separate thing, stamped on the row itself (edited_at/edited_by, migration 016) -
+-- see "A corrected row says so" below.
 CREATE TABLE record_edit (
   record_edit_id INTEGER PRIMARY KEY,
   record_type    TEXT NOT NULL,    -- one of dedup.KNOWN_TYPES; validated in Python
@@ -173,6 +178,20 @@ CREATE TABLE record_edit (
 CREATE INDEX record_edit_row ON record_edit (record_type, record_id);
 ```
 
+A `merged_into_base` names a family **of the same person**. A `dedup_base` folds
+`person_id` in (§3), so two people's same-named facts never collide — which is exactly why
+an accidental cross-person merge is silent: the target family genuinely exists, so `verify`
+reports no orphan, while the fact leaves the annotated person's chart and never appears on
+the target person's. `record annotate` therefore refuses a cross-person `--merged-into`,
+and `record reaffirm` refuses the same shape at plan time (issue #161).
+`--allow-cross-person` is the explicit escape hatch for the rare deliberate case: never the
+default, and disclosed in the report (`cross_person`) rather than recorded silently. That
+guard is forward-only, so `pemr verify` also **flags** a stored `merged_into_base` that
+resolves to another person's live family (issue #169) — the shape a verdict written before
+#161 can still carry. `cross_person` is not persisted on the row, so a deliberate
+`--allow-cross-person` merge shows up in that warning too; the message says as much, and
+warning on both beats staying silent on the accidental one.
+
 A correction is **not** a re-attribution. Before `record edit`, a wrong display field
 could only be repaired by re-submitting the row through `commit-extraction` (or deleting
 and re-committing it), both of which re-file the fact under whichever document is passed
@@ -182,6 +201,70 @@ An edit keeps the row's provenance exactly as it was; what changes is that the r
 divergence. The visible consequence: since `unit` is one of the compared payload fields
 (§4), re-ingesting the original document after a unit correction stages a **conflict**
 rather than deduping. That is the honest outcome, not a bug.
+
+**A corrected row says so** (migration 016, issue #134). Keeping the provenance intact
+creates a second obligation: the row is still filed under a document that never stated the
+corrected value, so on the page it would read as a verbatim quotation of that document.
+`record edit` therefore stamps two columns on the row in the same transaction as the
+UPDATE and its ledger rows — `edited_at` (the newest correction's ISO8601 UTC stamp) and
+`edited_by` (its `--attributed-to`, nullable) — and every renderer discloses them:
+`(corrected by <who> <date>)`, or `(corrected <date>)` when unattributed, appended at every
+line builder that already carries `_attest_suffix`, and carried on a `query timeline`
+event. This is #110's failure mode in mirror image, so it gets #110's shape: columns on the
+row, one predicate, one suffix builder, `dedup.public_row` stripping the pair while it is
+NULL so an uncorrected row's `--json`/MCP payload is unchanged.
+
+Columns rather than a read-time join on `record_edit`, which would need no migration and is
+unsound: ledger entries deliberately outlive their row and a record id is a reusable rowid
+alias, so a stale entry would caveat an unrelated later occupant (the #114 hazard). The
+mark on the row closes that by construction. The duplication is deliberate and one-way —
+the ledger is the field-level audit trail (`old -> new`, every correction), the columns are
+only the row-level "corrected, by whom, when" marker; last correction wins on the row, and
+`record edit --list` is where a human reconciles the two. The one-time backfill applies the
+same breadcrumb guard: a ledger entry whose `dedup_base` no longer matches the row's is
+skipped, so the upgrade can leave a rekeyed family unmarked but can never mark the wrong
+fact.
+
+The mark is not a lever: `edited_at`/`edited_by` are outside `dedup.FIELD_SPECS`, so they
+are unnameable by `record edit`, invisible to `dedup_key`/`rekey`, and an edit cannot forge
+its own disclosure. **Identity-field refinement stays out of scope** — moving one row's
+identity in place (a `condition.name` rename) is a rekey, not a correction: it recomputes
+`dedup_key`/`dedup_base`, can collide with a live family and re-anchors staged conflicts.
+`pemr rekey` owns that operation with full collision resolution when the two names are
+synonyms; `record rm` + re-commit owns the case where the stored fact is simply wrong.
+
+The **display-unit overlay** (migration 013, issue #136) — one canonical *display* unit
+per person per measurement key:
+
+```sql
+-- Display-only lever. Nothing resolves through it: dedup, rekey, commit-extraction, the
+-- conflict resolver, verify's identity checks and the render curation overlay never read
+-- it. `unit` is a non-key field for lab_result and observation, which is what makes a
+-- display lever possible without touching identity at all. Only `render summary` and
+-- `query.trends` honour it, and each discloses every conversion on the line it changes.
+-- ON DELETE CASCADE, and deliberately absent from `persons._CHILD_TABLES`: a display
+-- preference is not medical history and must never block a childless `person remove`.
+CREATE TABLE person_unit_pref (
+  person_id INTEGER NOT NULL REFERENCES person(person_id) ON DELETE CASCADE,
+  key       TEXT NOT NULL,   -- dedup.key_token of the measurement key / analyte
+  unit      TEXT NOT NULL,   -- a pemr.units canonical unit id; validated in Python
+  set_at    TEXT NOT NULL,   -- ISO8601 UTC seconds
+  PRIMARY KEY (person_id, key)
+);
+```
+
+Canonicalising a unit is **display-time and per-person, and storage never mutates**. The
+obvious alternative — normalise at `commit-extraction` and migrate the corpus once — was
+rejected: a genuine unit-of-measure difference is not a spelling mistake, so rewriting a
+`kg` row into `lb` would mutate a document-sourced fact, and no person's internally
+consistent unit system is more correct than another's. The unit's measurement system is
+therefore **derived** from the stored unit string through a static registry in
+`pemr/units.py` rather than stored in a new column — which is what lets rows committed
+long before this shipped convert correctly. That registry is Python, not a
+`data/dictionary.toml` section, because the two differ in kind: the dictionary is
+user-grown medical *vocabulary* and an identity lever (it feeds `dedup_key`), a unit table
+is fixed physics and a display lever. Correcting a genuinely mislabelled unit *in place*
+remains `record edit`'s job (above) — a different verb for a different problem.
 
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
 005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
@@ -217,7 +300,9 @@ CREATE TABLE medication (
   ended_on      TEXT,                     -- NULL = current
   prescriber    TEXT,
   status        TEXT,                     -- lifecycle only: active|completed|discontinued|NULL
-                                          -- (AGENTS.md §MUST-8; prn/ordered are not lifecycle)
+                                          -- (AGENTS.md §MUST-9; prn/ordered are not lifecycle);
+                                          -- a discontinue reason belongs in status_reason
+  status_reason TEXT,                     -- verbatim discontinue reason; NULL = none stated
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
@@ -282,8 +367,11 @@ CREATE TABLE observation (
   document_id    INTEGER REFERENCES document(document_id),
   obs_type       TEXT NOT NULL,           -- 'vital' (key = canonical vital token, e.g.
                                            -- 'blood_pressure'/'weight'), 'order',
-                                           -- 'screening', 'immunization', 'functional'
-                                           -- ('functional' alone requires observed_at;
+                                           -- 'screening', 'immunization', 'functional',
+                                           -- 'symptom'/'activity' (self-reported, #167)
+                                           -- ('functional' requires observed_at;
+                                           -- symptom/activity require a `key` and an
+                                           -- observed_at carrying a time of day;
                                            -- condition/allergy graduated in 006)
   observed_at    TEXT,
   key            TEXT,
@@ -434,9 +522,9 @@ recommends `record annotate` when annotating that row could actually change the 
 a row already released is never named. Once every colliding row is released the attestation
 proceeds as an ordinary new occurrence of the identity (the next free `dedup_occurrence`),
 not a replacement of what is stored. One consequence worth knowing: a **family**-scoped
-release covers that new occurrence too, so the freshly attested row itself renders in the
-`## Superseded / corrected` appendix (§6) until the verdict is re-scoped to the rows it
-meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
+release covers that new occurrence too, so the freshly attested row itself leaves the
+clinical documents for the curation record (§6) until the verdict is re-scoped to the rows
+it meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
 
 `norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
 synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
@@ -459,6 +547,16 @@ The `norm()`/`key_token()` split is visible in the read layer too: `pemr labs --
 albumin` matches on `norm()` and lists the whole analyte family, while `pemr trends`
 matches on `key_token()` so a numeric series never interleaves two assays — and reports
 the rows it excluded on that basis (`other_assays`) instead of dropping them silently.
+
+`trends` charts a measurement **key**, not a table (issue #176): it reads `lab_result`
+rows *and* `obs_type='vital'` `observation` rows through one aliased row shape
+(`observed_at` standing in for `collected_at`, `key` for `test_name`), so weight,
+temperature and blood pressure reach the same statistics and the same per-person
+canonical-unit conversion an analyte does — the four vitals dimensions the units registry
+carries exist for exactly this population. A `--test` token matching numeric rows in
+*both* tables is **refused**, not merged: the same reasoning as the assay split, since a
+silently interleaved lab-and-vital series is a wrong chart even when the tokens coincide.
+`pemr labs` remains lab-only.
 
 **A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
@@ -593,7 +691,10 @@ the warning it answers would re-annotate the wrong rows. It owns exactly two cla
 `dangling-merge-target` (either scope, `merged_into_base` names no live family). The
 row-scoped **stale breadcrumb** is deliberately not one of them — that verdict still
 resolves by row id, so nothing may re-point it — nor is the removed-row case, whose remedy
-is `--clear --row` and which the removal write paths already retire.
+is `--clear --row` and which the removal write paths already retire. Nor is the
+cross-person merge target (#169): its family is *live*, just the wrong person's, and
+neither `record reaffirm` nor `rekey --apply` has a remedy for that — making it a kind
+would have them offer to re-point a verdict only a human re-ruling can fix.
 
 The two halves compose **by file**, and have to: a `dedup_base` is a content hash
 overwritten in place, so once the run is over nothing in the database records that `F_old`
@@ -688,7 +789,10 @@ two rows preserved; a correction or OCR re-read of the *same* reading carries th
 timestamp → collides → surfaces as a conflict (below). When only a date is available,
 same-day differing values collide → conflict; that safety bias is intentional (a spurious
 conflict on a genuine repeat is human-recoverable, a silent duplicate of a correction
-poisons `trends`/brief/`query` irrecoverably).
+poisons `trends`/brief/`query` irrecoverably). The self-reported lanes
+(`obs_type='symptom'`/`'activity'`, issue #167) therefore *mandate* the time component in
+`validate_row`, so a same-day repeat is a second row rather than a conflict — a
+fluctuating complaint is reported several times a day by design.
 
 `lab_result.collected_at` is **truncated to the date** for key purposes (issue #117); the
 column itself still stores the most precise prefix the source gave, and the read layer
@@ -827,8 +931,16 @@ Optional `--ocr auto` flag pre-fills `document.ocr_text`, giving the agent text 
 from instead of re-reading the source every time. It extracts by whatever route the file
 type allows (issue #66), with only the image and PDF routes reaching outside the stdlib:
 `.txt/.md/.csv/.tsv/.json/.log` read directly, `.docx`/`.xlsx` unzipped and their OOXML
-parsed, **everything else** through `tesseract` (a soft dependency) — no image-suffix
-allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image.
+parsed, `.html`/`.htm` parsed with `html.parser` (issue #173 — tags stripped,
+`<script>`/`<style>` dropped, tables as tab-delimited rows), **everything else** through
+`tesseract` (a soft dependency) — no image-suffix
+allowlist, so `.jfif`, `.jpe` and extension-less scans OCR like any other image. Every
+OOXML member goes through one guarded parse helper that applies the same encoding-agnostic
+`<!DOCTYPE` refusal described for CCDA below before `ElementTree` sees the bytes (issue
+#155): the byte cap bounds a member's *declared* uncompressed size, not entity expansion,
+so a 355-byte `.docx` expanded to 4,194,304 stored chars before the guard. A DOCTYPE on
+any member refuses the whole file, degrading exactly like a malformed one — stderr note,
+no `ocr_text`, document kept.
 
 A **CCDA** `.xml` (C-CDA / HL7 CDA R2 — what a US portal's "download my record" produces)
 is read natively too (issue #138): each `structuredBody` section's title and narrative,
@@ -879,12 +991,29 @@ capped at 32 MiB per file — `ocr_text` is mirrored into the FTS index, so an u
 both a database-size problem and a decompression-bomb surface (a small `.docx` can declare a
 gigabyte of `word/document.xml`).
 
-Extraction route feeds the owner check: the identity-anchor (`suspect`) verdict is applied
-only to an agent transcription or a tesseract pass, never to natively-extracted text —
-the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx` set, CCDA `.xml` included. In a
+Whichever route produced it, the *provenance* of the stored text is recorded alongside it in
+`document.text_source` (issue #175, migration 015): text pemr extracted itself — any of the
+routes above, a `document reocr` re-derivation, or a study's DICOM-header summary — is
+`engine`; text the caller handed over verbatim (`--ocr-text-file`, `pemr document set-text`,
+the `document_set_text` MCP tool) is `attached`. It follows the text's *origin*, not the verb
+that wrote it, because engine text carries OCR-typical noise that a downstream consumer may
+want to weigh differently, and the distinction is unrecoverable afterwards — a transcription
+can be byte-identical to what OCR would have produced. `NULL` means no text, or text written
+before 015; pre-015 rows are deliberately **not** backfilled, since hand-attached rows already
+exist and a blanket `engine` would misclassify exactly the rows the column exists to find.
+
+Extraction route feeds the owner check, and the route vocabulary has **three** words for
+it: `native` (natively extracted, *structured*), `native-prose` (natively extracted,
+*prose* — HTML, issue #173) and `ocr` (a tesseract pass or an agent transcription, prose
+by definition). The identity-anchor (`suspect`) verdict is applied on the two prose
+routes and withheld on `native` — the whole `.txt/.md/.csv/.tsv/.json/.log/.docx/.xlsx`
+set, CCDA `.xml` included. In a
 structured export
 `Patient`/`DOB`/`MRN` are column labels and field keys, and counting them as an identity
-header refuses ordinary lab exports as belonging to a stranger. The line is the *route*
+header refuses ordinary lab exports as belonging to a stranger. A saved portal page is
+the other case: tags aside it is a printed page, so its `Patient:` header **is** a claim
+and the anchor stays armed — which is the whole reason the boolean `route != "native"`
+grew into `_trusts_anchors()`, one predicate both call sites share. The line is the *route*
 rather than how prose-like the format is, because the route is what the extractor actually
 knows; the cost is that a prose transcript saved as `.txt` and ingested with `--ocr auto`
 loses the anchor check too. That is no worse than before native extraction existed (such a
@@ -895,6 +1024,32 @@ the person ingesting it verdicts `match` — only the "names a stranger nobody o
 knows" case softens to `unverified`. `mismatch` — an affirmative name/DOB match on a
 *different* roster person — is the half that actually prevents misfiling, and it blocks on
 every route.
+
+`document reocr` (issue #143) re-runs this same dispatch against a blob already in
+`sources/`, closing the gap for documents ingested before an extractor fix (#70, #138)
+landed — same routing, so the two paths cannot drift. Its `--force` carries two meanings at
+once: it overrides both the has-text refusal (replace a populated `ocr_text`) *and* a
+`mismatch` owner-check refusal on the recovered text, and the exit code stays 0 when the
+latter fires. The verb's own backlog use case, `--where-empty`, needs neither sense of
+`--force` — the population is unpopulated by definition, so a `mismatch` there still
+refuses on its own and names `document reassign` as the remedy. `suspect` (no roster match
+either way) stores and warns rather than refusing, since the recovered text cannot name the
+wrong household member — refusing would only withhold the evidence that the document is
+misfiled at the row level.
+
+Both of `--force`'s meanings stop at the **shrinkage guard** (issue #174): re-derived text
+shorter than the `ocr_text` already stored is refused (`shorter-text`, a `refused` status,
+so rc=1), and `--allow-shrink` is the separate override. Separate deliberately — a
+populated corpus needs `--force` just to reach the write at all, so it cannot also mean
+"and discard most of it", and the only read-only owner audit there is (`reocr --force
+--dry-run`, since `check_owner`'s three call sites are all write paths) would otherwise be
+one missing flag away from losing text. The threshold is any shrinkage rather than a
+percentage: it is unreachable without `--force` — the has-text skip returns first — so
+`--where-empty` never trips it, and one predicate drives the refusal, the human line and
+the `--json` `shrunk` key alike. `shrunk` also rides the writes that *are* permitted, so a
+shorter replacement warns on its own line instead of reading as an ordinary success.
+Truncation against `OCR_MAX_PAGES` is one *cause* of a shorter replacement, not the
+condition — a document that is both reports both.
 
 ### Study directories (issue #69)
 
@@ -946,6 +1101,13 @@ one document type a human cannot eyeball to catch a misfile.
 
 ```
 pemr person add|list|show|edit|deactivate|reactivate|remove
+pemr person unit-pref set <slug> --key <key> --unit <unit> [--dictionary <toml>]
+                                                         # the canonical unit `render summary` and `trends`
+                                                         # DISPLAY this key in (§2 person_unit_pref); stored
+                                                         # rows are never rewritten - to correct a genuinely
+                                                         # mislabelled unit use `record edit`
+pemr person unit-pref clear <slug> --key <key> [--dictionary <toml>]
+pemr person unit-pref list <slug> [--json]
 pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip owner verification
 pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
@@ -964,14 +1126,18 @@ pemr record edit <table> <id> --set NAME=VALUE [--set ...] --note <text>
                  [--attributed-to ...] [--apply]         # correct a row's NON-KEY fields in place (§2 record_edit);
                                                          # document_id/dedup_key/source blob untouched; NAME= clears;
                                                          # identity fields refused (that is a dictionary edit + rekey);
-                                                         # every change ledgered; dry run by default
+                                                         # every change ledgered; the row is stamped edited_at/edited_by
+                                                         #        so render/query disclose it (§2); dry run by default
 pemr record edit --list [<table>] [--json]               # recorded corrections, newest first (field: old -> new)
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
-                     [--merged-into <base-or-id>] [--row] [--apply]
+                     [--merged-into <base-or-id>] [--allow-cross-person] [--row] [--apply]
                                                          # record a human verdict over a record FAMILY (§2 curation):
                                                          # confirmed|superseded|erroneous-in-source|disputed|merged-into|distinct
                                                          # distinct: two rows that recompute to one dedup_key are TWO facts
                                                          #        (generic extracted labels); unblocks `rekey`, both stay live
+                                                         # --merged-into must name a family of the SAME person; a cross-person
+                                                         #        merge is refused (the fact would leave one chart without
+                                                         #        appearing on the other) unless --allow-cross-person says so
                                                          # --row: scope it to that ROW only (a keep-both family holds
                                                          #        two live rows; row scope beats family scope there)
                                                          # pure overlay - no record row is mutated; dry run by default
@@ -998,8 +1164,19 @@ pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--n
                                                          # pre-emptive exclusion; ingests and copies nothing
 pemr document tombstone rm <sha256>                      # lift one (full hash only)
 pemr document set-text <id> --ocr-text-file <path> [--force]     # attach/replace ocr_text after ingest; FTS follows via trigger
+pemr document reocr [<id>...] [--where-empty [--person <slug>]] [--dry-run] [--force] [--allow-shrink]
+                                                         # re-derive ocr_text from the stored blob using the ingest dispatch
+                                                         # --allow-shrink: store text shorter than what is there (refused otherwise)
 pemr query labs --person jane --test hba1c --since 2023-01-01 [--raw]
-pemr query meds --person jane --active [--raw]
+pemr query meds --person jane --active [--raw]           # --active = query.med_is_current per row:
+                                                         # a past ended_on or a terminal status ends
+                                                         # the course, EXCEPT when status_reason is a
+                                                         # renewal (query.RENEWAL_MED_REASONS, e.g.
+                                                         # a CCDA's "Discontinued (Reorder)") - a
+                                                         # renewed prescription's end date closes an
+                                                         # authorization period, not the therapy, so
+                                                         # it stays current and prints "(renewed)".
+                                                         # Every other reason still ends the course
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
                                                          # all three (issue #131): filtered at read
                                                          # time against the curation overlay, same
@@ -1010,10 +1187,21 @@ pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stre
 pemr find --person jane "cholesterol"                    # full-text over ocr_text + records
 pemr find "mmr booster"                                  # omit --person: whole-household, slug-prefixed hits
 pemr trends --person jane --test hba1c                   # min/max/latest/slope
+                                                         # a canonical display unit for the key (above)
+                                                         # converts every point BEFORE the stats, so the
+                                                         # numbers and the printed unit cannot disagree;
+                                                         # a point that cannot be converted is kept and
+                                                         # disclosed, never dropped
+pemr trends --person jane --test weight                  # a vital key charts too (labs + obs_type='vital');
+                                                         # a token present in BOTH tables is refused, not
+                                                         # merged - rc=1 naming both sources
 pemr due --person jane                                   # screening/vaccine gaps — NOT IMPLEMENTED (phase 7)
 pemr render summary --person jane        > exports/jane-summary.md
 pemr render brief --appointment <id>     > exports/brief.md
+                                                         # --include-self-reported: also show symptom/activity
+                                                         # rows in Procedures & Observations (default: hidden, #180)
 pemr render journal --person jane        > exports/jane-journal.md
+pemr render curation --person jane       > exports/jane-curation.md  # curation audit trail (empty = no verdicts)
 pemr backup                                              # VACUUM INTO snapshot
 pemr restore latest [--force]                            # install a snapshot back over pemr.db (§8)
 pemr verify                                              # integrity + row counts + source-blob resolution
@@ -1037,7 +1225,8 @@ under a PEP 660 editable install); see issue #22.
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,
-`trends`, `render_summary`, `render_brief`, `render_journal`. Write: `person_add`, `person_edit`,
+`trends`, `render_summary`, `render_brief`, `render_journal`, `render_curation`. Write:
+`person_add`, `person_edit`,
 `ingest` (`study="dicom"` + `allow_large` make `file` a study directory, §4), `commit_extraction`,
 `document_set_text` (fills an empty `ocr_text` only — the `--force`
 replace is CLI-only), `review_conflicts` (resolution gated on human sign-off). Each returns the
@@ -1078,27 +1267,85 @@ default to the same exclusion unless a human explicitly decides otherwise.
 `render.py` produces your current deliverables as pure functions of DB state:
 
 - **master summary** — active meds, conditions, allergies, latest vitals, recent
-  abnormal labs, open follow-ups, open conflicts. One query bundle → Markdown. The
-  conflicts section is not decoration: an open conflict means a stored value is disputed
-  and its correction is still staged, so the summary would otherwise print the stale
-  value silently (the brief carries the same section, but it is per-appointment). An
+  abnormal labs, open follow-ups. One query bundle → Markdown. Open conflicts are not
+  decoration: an open conflict means a stored value is disputed and its correction is
+  still staged, so the summary would otherwise print the stale value silently. Since
+  issue #168 the summary says so in a single `> [!WARNING]` line under the header,
+  emitted only when the count is non-zero — the safety property of issue #59 without an
+  always-present `## Open Conflicts` / `_none_` header on the common case. The brief keeps
+  the per-conflict section, since it is per-appointment. An
   order in `Orders & Referrals` leaves the section once a matching `lab_result` lands
   (issue #128) — matching is deliberately narrow (exact `key_token` plus a tight,
   edge-tested date window) and biased toward under-suppression, since age alone is never
   a signal and a hidden-but-still-open order would be the worse failure; the window
   constants are guarded by a pinned edge test so a casual widening doesn't slip through.
+  A *compound* order key (one order naming several analytes, `cbc,cmp,ldh`) decomposes on
+  `,`/`/` at parenthesis depth 0 into component tokens, each still matched exactly, and
+  leaves the section only when **every** component resulted in window (issue #145) — the
+  order side alone decomposes, and a partially resulted panel is still outstanding. A
+  decomposed component drops structural words that name no analyte (`panel`, `profile`,
+  `extensive`), so `Immunofixation Panel` can match an `Immunofixation` result; if that
+  leaves a component with nothing readable, the whole key is voided rather than the
+  component dropped, so the surviving analytes can't suppress an order still naming
+  something unread. Those
+  separators are content, not structure, inside many single analytes' names (`Glucose,
+  fasting`, `Kappa/Lambda Ratio`), so two guards keep #128's behaviour reachable: a key
+  the dictionary declares as one analyte is never split, and the whole-key match is tried
+  before the per-component one — decomposition can only ever move an order from
+  "renders" toward "suppressed", never take away a suppression that already worked.
+  `Abnormal Labs` is bounded to the last 12 months of the render's `now` (issue #165) —
+  unbounded it renders the entire abnormal history, where a live marker reads exactly like
+  one abnormal a decade ago — with a **keep-latest-per-analyte guard** that always retains
+  an analyte's most recent abnormal result however old it is. The guard is not politeness:
+  a fixed window alone renders the section *empty* for a person on a slow draw cadence,
+  and an empty section reads as "nothing flagged", which is worse than the dump it
+  replaces. Like the #128 order constants the window is a named constant, and the heading
+  text is built from it, so the stated window and the actual filter cannot desync.
+  `Procedures` (issue #166) lists `procedure` rows reverse-chronologically, undated last,
+  narrowed by a routine-pattern list authored in `dictionary.toml` (`[procedures].routine`)
+  — those rows arrive largely from billing documents, so the table mixes genuine
+  procedural history with routine service lines (office visits, serial radiographs,
+  venipuncture) and rendering all of them recreates the unreadable-section problem #165
+  bounds. The list is **default-show** (a name matching no pattern always renders, so
+  significance is never established by absence from a list), **suppress-only and
+  summary-only** (the brief and the journal stay the complete record and no stored row
+  changes), and **disclosed** — the section states how many rows it hid, on #93's
+  precedent. Matching is token-boundary on normalized text, both sides, so `cast` cannot
+  suppress `Castration`: over-suppression is the failure that matters here, and
+  under-suppression only costs a line. Normalization also strips parenthetical qualifiers
+  on both sides, so `cast application` also suppresses `Cast application (open reduction
+  internal fixation)`, and a pattern written entirely inside parentheses matches nothing.
+  Unlike `[synonyms]` the list never reaches a dedup key, so editing it needs no
+  `pemr rekey`.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
-  questions. This is your "walk-in readiness" as a repeatable command.
+  questions. This is your "walk-in readiness" as a repeatable command. Since issue #180,
+  `## Procedures & Observations` hides self-attested `symptom`/`activity` rows by
+  default (`include_self_reported: bool = False`, `--include-self-reported` /
+  `include_self_reported` on the CLI and MCP surfaces, mirroring `render_journal`'s
+  identical #167 flag) — a record with none renders byte-identically to before the
+  flag existed. Unlike the routine-procedures list (above) and order grouping's `+N
+  earlier` (#93), this suppression is **not disclosed on the page**: no `+N hidden`
+  line and no collapsed summary section catch the hidden rows in the brief itself
+  (they remain fully visible via `pemr query timeline`). This is a deliberate,
+  human-approved exception to the disclosed-suppression convention this section
+  otherwise follows — flagged at audit for the merge reviewer, not a bug.
 - **journal** — chronological event stream (documents + appointments + procedures)
   rendered as a narrative timeline.
+- **curation record** (issue #168) — the audit trail: every recorded verdict that removed a
+  row from the three documents above, grouped **by ruling** rather than by row, so one merge
+  session's note against forty families is one block with a count. Read from the stored
+  `curation` table (not from a render pass), so it is person-scoped and complete rather than
+  "whatever sections happened to select" — a deliberate superset of the
+  `## Superseded / corrected` appendix it replaced. Empty output when the person has no
+  verdicts, which is what keeps the additive-only guarantee below true.
 
 Every section is filtered at read time against the `curation` overlay (§2, issues #109 and
-#114): `superseded` / `erroneous-in-source` / `merged-into` leave their section for a
-`## Superseded / corrected` appendix, `disputed` renders in place with a
+#114): `superseded` / `erroneous-in-source` / `merged-into` leave their section entirely
+(their trail is the curation record), `disputed` renders in place with a
 `[DISPUTED: <note>]` marker and reaches the brief's `## Questions for the Clinician`, and
 `confirmed` — and `distinct` (§3, issue #122), whose whole point is that both rows stay
-live — render unchanged. Both new sections are omitted entirely when empty, so a record
+live — render unchanged. The questions section is omitted entirely when empty, so a record
 with no verdicts renders byte-identically to before the overlay existed. This does not weaken
 the purity rule: the filter is a read, and output changes after a verdict because the
 *database* changed. Resolution is **per row**: a row-scoped verdict affects only its own
@@ -1131,6 +1378,22 @@ delete a record row (`record rm`, `document rm`) therefore name any row-scoped v
 doomed rows in their dry run and lift it in the same transaction as the delete. Family scope
 needs no such rule: `dedup_base` is content-derived, so re-attaching to a re-ingest of the
 same fact is the intended behaviour.
+
+**Display-time unit canonicalisation** (issue #136) is a second read-time overlay, and it
+rests on exactly the same purity argument. When a person has recorded a canonical display
+unit for a measurement key (`person_unit_pref`, §2), `render summary` converts that key's
+Latest Vitals and Abnormal Labs into it — value *and* reference interval together,
+since a value in `lb` beside a `(ref ...)` still in kg is a clinical misread — and `trends`
+converts every point of the series **before** computing min/max/latest/slope, so the stats
+and the printed unit cannot disagree. Every converted number is disclosed where it prints
+(`[converted from 77.6 kg]` in the summary, a `note` line in `trends`), and unit conversion
+is arithmetic, never a relabel: temperature is affine, and an unknown unit, an absent unit,
+a non-numeric value or a cross-dimension preference all resolve to "print the stored value
+untouched" rather than guess at a scale. Two deliberate limits keep it inert everywhere
+else: **abnormality is still decided on stored values**, so no preference can change which
+labs appear in a section; and only the two read paths named here honour it — `render brief`,
+`render journal`, `query labs` and the MCP write surface are untouched. A person with no
+preference set renders byte-identically to before the overlay existed.
 
 Because they regenerate from truth, they never drift. Old exports are disposable.
 

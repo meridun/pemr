@@ -115,6 +115,62 @@ def test_query_meds_terminal_status_renders_ended_not_current(ready, capsys):
     assert "(current)" in metformin
 
 
+def test_query_meds_shows_the_discontinue_reason_and_marks_a_renewal(ready, capsys):
+    """Issue #159: the reason prints beside the lifecycle word, and a renewed
+    prescription's end date is marked rather than reading as a flat stop."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "started_on": "2024-11-01",
+             "ended_on": "2024-11-11", "status": "discontinued",
+             "status_reason": "Therapy Completed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    levo = next(line for line in out.splitlines() if "Levothyroxine" in line)
+    assert "[discontinued: Reorder]" in levo
+    assert "-> 2026-06-11 (renewed)" in levo
+    amox = next(line for line in out.splitlines() if "Amoxicillin" in line)
+    assert "[discontinued: Therapy Completed]" in amox
+    assert "(renewed)" not in amox
+    assert out.isascii()
+
+    # ...and only the renewal survives --active.
+    assert _run(ready, "query", "meds", "--person", "jane-doe", "--active",
+                "--json") == 0
+    names = [m["name"] for m in json.loads(capsys.readouterr().out)]
+    assert "Levothyroxine" in names and "Amoxicillin" not in names
+
+
+def test_query_meds_bare_discontinued_line_is_unchanged(ready, capsys):
+    """A row with no reason prints exactly as it always did - no empty bracket, no
+    stray separator (issue #159's no-regression bar)."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": "Atorvastatin", "dose": "20mg",
+                        "started_on": "2025-01-01", "ended_on": "2025-08-28",
+                        "status": "discontinued"}],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    line = next(x for x in capsys.readouterr().out.splitlines()
+                if "Atorvastatin" in x)
+    assert "[discontinued]" in line
+    assert "-> 2025-08-28" in line and "(renewed)" not in line
+    assert ": ]" not in line
+
+
 def test_query_meds_active_drops_expired_course_labelled_active(ready, capsys):
     """Issue #57 repro: a 2024 ten-day course carrying status='active' must not come
     back from `query meds --active`; a future end date under the same status must."""
@@ -142,6 +198,36 @@ def test_query_timeline_json(ready, capsys):
     events = json.loads(capsys.readouterr().out)
     assert [e["date"] for e in events] == sorted(e["date"] for e in events)
     assert {"date", "type", "summary", "document_id"} <= set(events[0])
+
+
+def test_query_json_discloses_a_correction_only_on_the_corrected_row(ready, capsys):
+    """Issue #134 at the CLI front door: `--json` must carry the correction caveat on a
+    row `record edit` changed, and must be byte-identical to before on every row it did
+    not — the additive-only half of the contract, at the door the agent layer reads."""
+    def _json(*argv):
+        assert _run(ready, *argv, "--json") == 0
+        return json.loads(capsys.readouterr().out)
+
+    before_labs = _json("query", "labs", "--person", "jane-doe")
+    before_meds = _json("query", "meds", "--person", "jane-doe")
+    before_events = _json("query", "timeline", "--person", "jane-doe")
+    assert all("edited_at" not in r for r in before_labs + before_meds + before_events)
+
+    assert _run(ready, "record", "edit", "medication", str(before_meds[0]["medication_id"]),
+                "--set", "route=oral", "--note", "route omitted by the extraction",
+                "--attributed-to", "Dr. Smith", "--apply") == 0
+    capsys.readouterr()
+
+    meds = _json("query", "meds", "--person", "jane-doe")
+    assert meds[0]["edited_by"] == "Dr. Smith" and meds[0]["edited_at"]
+    assert {k: v for k, v in meds[0].items() if not k.startswith("edited_")} \
+        == {**before_meds[0], "route": "oral"}
+    assert _json("query", "labs", "--person", "jane-doe") == before_labs
+
+    events = _json("query", "timeline", "--person", "jane-doe")
+    assert [e["type"] for e in events if "edited_at" in e] == ["med-start"]
+    assert [e for e in events if "edited_at" not in e] \
+        == [e for e in before_events if e["type"] != "med-start"]
 
 
 def test_find_human_and_json(ready, capsys):
@@ -458,6 +544,7 @@ def test_query_meds_active_agrees_with_render_summary(curated, capsys):
         md = render.render_summary(
             conn, "jane-doe", dictionary=dedup.load_dictionary(DICT_ARG[1])
         )
+        record = render.render_curation(conn, "jane-doe")
     finally:
         conn.close()
     section = md.split("## Active Medications", 1)[1].split("\n## ", 1)[0]
@@ -470,5 +557,186 @@ def test_query_meds_active_agrees_with_render_summary(curated, capsys):
     # ... and the one the summary *would* have listed is accounted for, not lost.
     # (Prednisone is absent from both sides: an ended 2016 course never reaches the
     # Active Medications query in the first place, so nothing about it is suppressed.)
-    appendix = md.split("## Superseded / corrected", 1)[1]
-    assert "Breo Ellipta" in appendix
+    assert "Breo Ellipta" not in md            # nowhere in the summary at all (#168)
+    assert "Breo Ellipta" in record            # accounted for in the curation record
+
+
+# --- trends: display-unit conversion + its disclosure (issue #136) ------------
+
+def _seed_dry_weights(tmp_path):
+    """Two dry-weight readings, one clinic in kg and one in lb."""
+    conn = db.connect(tmp_path / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    # Not `_doc`: its sha is derived from `conn.total_changes`, which restarts at 0 on
+    # this fresh connection and collides with the fixture's document.
+    doc = conn.execute(
+        "INSERT INTO document (sha256, person_id, doc_date, source_path, ocr_text, "
+        "ingested_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"sha-{uuid.uuid4()}", pid, "2026-02-01", "aa/dw.pdf",
+         "dialysis flowsheets", "2026-01-01T00:00:00"),
+    ).lastrowid
+    conn.commit()
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": "Dry Weight", "collected_at": "2026-01-01", "value_num": 90.0,
+         "unit": "kg"},
+        {"test_name": "Dry Weight", "collected_at": "2026-01-31", "value_num": 196.0,
+         "unit": "lb"},
+    ]}, d)
+    conn.close()
+
+
+def test_trends_prints_the_converted_unit_and_its_note(ready, capsys):
+    _seed_dry_weights(ready)
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "198.42 lb" in out                                  # max, converted from kg
+    assert "converted to lb (canonical unit for this key)" in out
+    assert "left in their stored unit" not in out              # nothing was left behind
+    assert out.isascii()
+    out.encode("cp437")
+
+
+def test_trends_discloses_the_points_it_could_not_convert(ready, capsys):
+    _seed_dry_weights(ready)
+    _seed_lab(ready, "jane-doe", test_name="Dry Weight", value_num=195.0,
+              unit="stone-ish", collected_at="2026-02-15")
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "1 point(s) left in their stored unit (not convertible to lb)" in out
+    assert out.isascii()
+
+
+def test_trends_json_carries_the_unit_disclosure_keys(ready, capsys):
+    _seed_dry_weights(ready)
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key", "Dry Weight",
+                "--unit", "lb", *DICT_ARG) == 0
+    capsys.readouterr()
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "Dry Weight",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["canonical_unit"] == "lb"
+    assert t["converted_count"] == 1 and t["unconverted_count"] == 0
+    assert t["unit"] == "lb" and t["max"] == 198.42
+
+
+def test_trends_json_keys_are_inert_without_a_preference(ready, capsys):
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["canonical_unit"] is None
+    assert t["converted_count"] == 0 and t["unconverted_count"] == 0
+    assert "converted to" not in json.dumps(t)
+
+
+# --- trends over vitals, through the real CLI (issue #176) --------------------
+
+def _seed_vitals(tmp_path, slug="jane-doe", rows=None):
+    """Commit `obs_type='vital'` observation rows for one person."""
+    conn = db.connect(tmp_path / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug=?", (slug,)
+    ).fetchone()["person_id"]
+    doc = conn.execute(
+        "INSERT INTO document (sha256, person_id, doc_date, source_path, ocr_text, "
+        "ingested_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"sha-{uuid.uuid4()}", pid, "2026-01-01", "aa/vitals.pdf", "clinic vitals",
+         "2026-01-01T00:00:00"),
+    ).lastrowid
+    conn.commit()
+    dedup.commit_extraction(conn, doc, {"observation": rows or []}, d)
+    conn.close()
+
+
+def test_trends_charts_a_vital_key(ready, capsys):
+    """A vitals series prints through the existing formatter and carries the same
+    `--json` key set a lab series does -- no new keys, no vitals branch."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Temperature",
+         "value_num": 37.0, "unit": "degC"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Temperature",
+         "value_num": 38.0, "unit": "degC"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "temperature  (2 point(s))" in out
+    assert "latest 38.0 degC  @ 2026-02-01" in out
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    vital = json.loads(capsys.readouterr().out)
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    lab = json.loads(capsys.readouterr().out)
+    assert set(vital) == set(lab)
+    assert vital["count"] == 2 and vital["latest_at"] == "2026-02-01"
+
+
+def test_trends_ambiguous_test_is_a_friendly_error(ready, capsys):
+    """The one non-additive behaviour change must reach the user as rc=1 with an
+    `error:` line, never a traceback."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "HbA1c",
+         "value_num": 6.1, "unit": "%"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "lab results" in err and "vital observations" in err
+    assert "Traceback" not in err
+
+
+def test_trends_converts_a_vitals_series_through_the_cli(ready, capsys):
+    """The point of #176: #136's canonical-unit machinery, which lives inside
+    `trends`, now reaches the vitals dimensions the units registry carries for it --
+    end to end through the real CLI, not just the query layer."""
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-01-01", "key": "Temperature",
+         "value_num": 98.6, "unit": "degF"},
+        {"obs_type": "vital", "observed_at": "2026-02-01", "key": "Temperature",
+         "value_num": 37.8, "unit": "degC"},
+        {"obs_type": "vital", "observed_at": "2026-03-01", "key": "Temperature",
+         "value_num": 100.4, "unit": "degF"},
+    ])
+    assert _run(ready, "person", "unit-pref", "set", "jane-doe", "--key",
+                "Temperature", "--unit", "degC", *DICT_ARG) == 0
+    capsys.readouterr()
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "38.0 degC" in out                      # max, converted from 100.4 degF
+    assert "converted to degC (canonical unit for this key)" in out
+    assert "left in their stored unit" not in out  # nothing was left behind
+    assert out.isascii()
+    out.encode("cp437")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["unit"] == "degC" and t["canonical_unit"] == "degC"
+    assert t["converted_count"] == 2 and t["unconverted_count"] == 0
+    assert t["count"] == 3 and t["min"] == 37.0 and t["max"] == 38.0
+
+    # A point in a spelling `units` cannot convert is kept and disclosed, never dropped.
+    _seed_vitals(ready, rows=[
+        {"obs_type": "vital", "observed_at": "2026-04-01", "key": "Temperature",
+         "value_num": 37.2, "unit": "quatloos"},
+    ])
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "temperature",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["count"] == 4 and t["unconverted_count"] == 1

@@ -53,7 +53,8 @@ CREATE TABLE medication (
   ended_on      TEXT,                    -- NULL = current
   prescriber    TEXT,
   status        TEXT,                    -- lifecycle only: active|completed|discontinued|NULL
-                                         -- (AGENTS.md §MUST-8; prn/ordered are not lifecycle)
+                                         -- (AGENTS.md §MUST-9; prn/ordered are not lifecycle);
+                                         -- a discontinue reason belongs in status_reason (014)
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );

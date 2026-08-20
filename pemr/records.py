@@ -433,6 +433,13 @@ def edit_record(
     value is not an audit trail. Every changed field is written to the append-only
     ``record_edit`` ledger in the **same transaction** as the UPDATE.
 
+    That same transaction stamps :data:`dedup.EDIT_MARK_COLUMNS` on the row (migration
+    016, issue #134), which is what makes the correction visible in ``render`` and
+    ``query``: the mark is **disclosure**, the ledger is the **audit trail**. A corrected
+    row must never read as a verbatim quotation of its source, and only the row itself can
+    say so safely — the ledger outlives its row by design, so deriving the mark from it at
+    read time would caveat whichever row later inherits a recycled id.
+
     Validation is entirely front-loaded — nothing is written on any raise. In order:
     schema present; known type; row exists; at least one update; every name editable;
     a real note; the merged payload passes :func:`dedup.validate_row` (so type, ISO-date
@@ -548,8 +555,17 @@ def edit_record(
         # without its audit trail is exactly the failure the trail exists to prevent
         # (the `curation.retire_row_verdicts` precedent). record_fts follows via the
         # per-table AFTER UPDATE triggers (migrations 003/006).
-        assignments = ", ".join(f"{c['field']} = ?" for c in changes)
-        values = [updates[c["field"]] for c in changes]
+        # The row also gets the correction *mark* (migration 016, issue #134) in the same
+        # statement: the payload change and its disclosure must land together or not at
+        # all. These two columns are outside FIELD_SPECS, so they can never collide with a
+        # named change. Last correction wins on the row; the ledger below keeps every one.
+        assignments = ", ".join(
+            [f"{c['field']} = ?" for c in changes]
+            + [f"{name} = ?" for name in dedup.EDIT_MARK_COLUMNS]
+        )
+        values = [
+            *(updates[c["field"]] for c in changes), stamp, report.attributed_to,
+        ]
         with conn:
             cur = conn.execute(
                 f"UPDATE {record_type} SET {assignments} WHERE {pk} = ?",
