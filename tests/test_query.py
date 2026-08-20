@@ -333,6 +333,33 @@ def test_lifecycle_med_statuses_covers_the_terminal_set():
     assert "ordered" not in query.LIFECYCLE_MED_STATUSES
 
 
+def test_verify_is_silent_on_a_renewed_prescription(seeded):
+    """#151 and #159 share the ``status`` column and neither may shadow the other: a
+    renewal is ``status='discontinued'`` (a lifecycle value, so no warning) whose
+    ``status_reason`` keeps it current (so the warning's "renders as current
+    indefinitely" framing must not be read as a claim about *this* row)."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    assert _med_warnings(seeded) == []
+    active = {m["name"] for m in query.query_meds(seeded, "jane-doe", active=True, now=NOW)}
+    assert "Levothyroxine" in active
+
+
+def test_verify_med_status_check_is_silent_on_an_empty_database(tmp_path):
+    """A freshly migrated archive has no `medication` rows: the check must add nothing
+    and must not move the exit code (`pemr verify` runs on empty DBs after `restore`)."""
+    conn = db.connect(tmp_path / "empty.db")
+    db.migrate(conn)
+    report = verify.verify_report(conn)
+    assert [w for w in report.warnings if w.startswith("medication row")] == []
+    assert report.ok is True
+
 
 # --- structured: timeline -----------------------------------------------------
 
