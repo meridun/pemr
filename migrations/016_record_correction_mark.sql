@@ -52,6 +52,13 @@
 -- holds the truth; a correction caveat on an unrelated fact is a provenance lie, which is
 -- the whole class of failure this migration exists to prevent.
 --
+-- The guard narrows but does not eliminate the hazard: a recycled row id whose new occupant
+-- shares the SAME dedup_base (record rm then re-commit of the same fact, or another
+-- occurrence of the same family landing on the freed id) still matches the breadcrumb and
+-- is stamped. That is a spurious caveat, not a provenance lie - over-disclosure, which this
+-- migration's own reasoning treats as the safe direction to fail - so it is accepted rather
+-- than guarded against further.
+--
 -- Purely additive: ADD COLUMN + UPDATE, no table rebuild, safe under foreign_keys=ON.
 -- record_edit exists since 012 and migrations apply in order, so no guard is needed.
 -- Every Python reader goes through .get()/_row_get on a mapping, so a restored pre-016

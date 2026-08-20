@@ -88,6 +88,12 @@ payload, same as `--json` — an agent reading `query` sees which rows a human h
 `superseded`, `erroneous-in-source`, `merged-into`, or `disputed`, and why. That is unchanged
 from the rule above: an agent may read a verdict, never write or clear one.
 
+The same read/write split applies to a `record edit` correction (issue #134): `query`,
+`render_summary` and `render_journal` disclose a corrected row's `edited_at`/`edited_by` on the
+MCP payload exactly when the row carries them (never a NULL pair), same as `--json` — an agent
+sees that a value was corrected and by whom, but `record edit` itself stays off the tool surface,
+so only a human at the CLI can make or clear a correction.
+
 ## MUST rules
 
 ### 1. Extraction naming
