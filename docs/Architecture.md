@@ -160,7 +160,9 @@ CREATE UNIQUE INDEX idx_curation_row ON curation(record_type, record_id)
 -- retiring one would destroy the audit trail the table exists to create, while a stale
 -- entry mis-renders nothing. `record rm` discloses (never deletes) the entries naming the
 -- row it removes, and the dedup_base breadcrumb tells a reader whether a later occupant
--- of that id is even the same family.
+-- of that id is even the same family. The row-level DISCLOSURE that a correction happened
+-- is a separate thing, stamped on the row itself (edited_at/edited_by, migration 016) -
+-- see "A corrected row says so" below.
 CREATE TABLE record_edit (
   record_edit_id INTEGER PRIMARY KEY,
   record_type    TEXT NOT NULL,    -- one of dedup.KNOWN_TYPES; validated in Python
@@ -199,6 +201,37 @@ An edit keeps the row's provenance exactly as it was; what changes is that the r
 divergence. The visible consequence: since `unit` is one of the compared payload fields
 (§4), re-ingesting the original document after a unit correction stages a **conflict**
 rather than deduping. That is the honest outcome, not a bug.
+
+**A corrected row says so** (migration 016, issue #134). Keeping the provenance intact
+creates a second obligation: the row is still filed under a document that never stated the
+corrected value, so on the page it would read as a verbatim quotation of that document.
+`record edit` therefore stamps two columns on the row in the same transaction as the
+UPDATE and its ledger rows — `edited_at` (the newest correction's ISO8601 UTC stamp) and
+`edited_by` (its `--attributed-to`, nullable) — and every renderer discloses them:
+`(corrected by <who> <date>)`, or `(corrected <date>)` when unattributed, appended at every
+line builder that already carries `_attest_suffix`, and carried on a `query timeline`
+event. This is #110's failure mode in mirror image, so it gets #110's shape: columns on the
+row, one predicate, one suffix builder, `dedup.public_row` stripping the pair while it is
+NULL so an uncorrected row's `--json`/MCP payload is unchanged.
+
+Columns rather than a read-time join on `record_edit`, which would need no migration and is
+unsound: ledger entries deliberately outlive their row and a record id is a reusable rowid
+alias, so a stale entry would caveat an unrelated later occupant (the #114 hazard). The
+mark on the row closes that by construction. The duplication is deliberate and one-way —
+the ledger is the field-level audit trail (`old -> new`, every correction), the columns are
+only the row-level "corrected, by whom, when" marker; last correction wins on the row, and
+`record edit --list` is where a human reconciles the two. The one-time backfill applies the
+same breadcrumb guard: a ledger entry whose `dedup_base` no longer matches the row's is
+skipped, so the upgrade can leave a rekeyed family unmarked but can never mark the wrong
+fact.
+
+The mark is not a lever: `edited_at`/`edited_by` are outside `dedup.FIELD_SPECS`, so they
+are unnameable by `record edit`, invisible to `dedup_key`/`rekey`, and an edit cannot forge
+its own disclosure. **Identity-field refinement stays out of scope** — moving one row's
+identity in place (a `condition.name` rename) is a rekey, not a correction: it recomputes
+`dedup_key`/`dedup_base`, can collide with a live family and re-anchors staged conflicts.
+`pemr rekey` owns that operation with full collision resolution when the two names are
+synonyms; `record rm` + re-commit owns the case where the stored fact is simply wrong.
 
 The **display-unit overlay** (migration 013, issue #136) — one canonical *display* unit
 per person per measurement key:
@@ -1092,7 +1125,8 @@ pemr record edit <table> <id> --set NAME=VALUE [--set ...] --note <text>
                  [--attributed-to ...] [--apply]         # correct a row's NON-KEY fields in place (§2 record_edit);
                                                          # document_id/dedup_key/source blob untouched; NAME= clears;
                                                          # identity fields refused (that is a dictionary edit + rekey);
-                                                         # every change ledgered; dry run by default
+                                                         # every change ledgered; the row is stamped edited_at/edited_by
+                                                         #        so render/query disclose it (§2); dry run by default
 pemr record edit --list [<table>] [--json]               # recorded corrections, newest first (field: old -> new)
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
                      [--merged-into <base-or-id>] [--allow-cross-person] [--row] [--apply]

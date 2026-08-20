@@ -1616,6 +1616,176 @@ def test_a_disputed_attested_row_carries_both_markers(seeded):
     assert line.index("[DISPUTED:") < line.index("(attested by")
 
 
+# --- corrected rows are never mistaken for verbatim source text (issue #134) --
+#
+# The mirror image of the attestation section above: `record edit` leaves the row's
+# provenance intact on purpose, so without a mark a corrected value would read as a
+# quotation of a document that never said it.
+
+_CORRECT_MARKER = "(corrected by Aunt Ada 2026-03-02)"
+_CORRECT_AT = "2026-03-02T09:00:00+00:00"
+
+
+def _rid(conn, record_type, where, params):
+    return int(conn.execute(
+        f"SELECT {record_type}_id FROM {record_type} WHERE {where}", params
+    ).fetchone()[f"{record_type}_id"])
+
+
+def _correct(conn, record_type, where, params, updates, who="Aunt Ada"):
+    from pemr import records as _records
+
+    return _records.edit_record(
+        conn, record_type, _rid(conn, record_type, where, params), updates,
+        dedup.load_dictionary(DICT_PATH), note="transcription slip",
+        attributed_to=who, now=_CORRECT_AT, apply=True,
+    )
+
+
+def _correct_all(conn):
+    """One in-place correction per typed table, all on jane."""
+    _correct(conn, "lab_result", "test_name = ?", ("Glucose, fasting",), {"flag": "H"})
+    _correct(conn, "medication", "name = ?", ("Metformin",), {"frequency": "daily"})
+    _correct(conn, "procedure", "name = ?", ("Colonoscopy",),
+             {"outcome": "normal, no polyps"})
+    _correct(conn, "appointment", "provider = ?", ("Dr. Smith",),
+             {"reason": "diabetes review"})
+    _correct(conn, "observation", "key = ? AND observed_at = ?",
+             ("weight", "2026-01-01"), {"value_num": 81})
+    _correct(conn, "allergy", "substance = ?", ("Penicillin",),
+             {"reaction": "rash and hives"})
+    _correct(conn, "condition", "name = ? AND status = 'active'",
+             ("Type 2 Diabetes",), {"note": "diet-controlled, reviewed"})
+
+
+def test_uncorrected_renders_are_byte_identical_to_today(seeded):
+    """The additive-only AC: a database with no corrected rows renders exactly as it did
+    before migration 016. Captured before/after correcting *jane*, since john's record is
+    the untouched control."""
+    d = dedup.load_dictionary(DICT_PATH)
+    before = (
+        render.render_summary(seeded, "john-doe", dictionary=d,
+                              now=datetime(2026, 6, 1)),
+        render.render_journal(seeded, "john-doe", now=datetime(2026, 6, 1)),
+    )
+    _correct_all(seeded)
+    after = (
+        render.render_summary(seeded, "john-doe", dictionary=d,
+                              now=datetime(2026, 6, 1)),
+        render.render_journal(seeded, "john-doe", now=datetime(2026, 6, 1)),
+    )
+    assert before == after
+    assert "corrected" not in before[0] and "corrected" not in before[1]
+
+
+def test_summary_marks_a_corrected_row_in_every_section(seeded):
+    _correct_all(seeded)
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    for token in ("Metformin", "Type 2 Diabetes", "Penicillin", "weight",
+                  "Glucose, fasting", "Colonoscopy", "Dr. Smith"):
+        assert any(
+            token in line and _CORRECT_MARKER in line for line in md.splitlines()
+        ), token
+    assert md.isascii()
+
+
+def test_brief_marks_a_corrected_row(seeded):
+    _correct_all(seeded)
+    md = render.render_brief(
+        seeded, _upcoming_appt_id(seeded), dictionary=dedup.load_dictionary(DICT_PATH),
+        recent_labs=50, now=datetime(2026, 6, 1),
+    )
+    for token in ("Metformin", "Penicillin", "Type 2 Diabetes"):
+        assert any(
+            token in line and _CORRECT_MARKER in line for line in md.splitlines()
+        ), token
+
+
+def test_journal_marks_a_corrected_event(seeded):
+    _correct_all(seeded)
+    md = render.render_journal(seeded, "jane-doe", now=datetime(2026, 6, 1))
+    line = next(l for l in md.splitlines() if "Metformin" in l)
+    assert _CORRECT_MARKER in line
+    # The footnote stays: the row is still filed under its source document, which is
+    # exactly why the caveat is needed.
+    assert "[^" in line
+
+
+def test_an_unattributed_correction_renders_the_date_only_form(seeded):
+    _correct(seeded, "medication", "name = ?", ("Metformin",),
+             {"frequency": "daily"}, who="")
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Metformin" in l)
+    assert line.endswith("(corrected 2026-03-02)")
+
+
+def test_adding_an_onset_to_a_document_sourced_condition_is_disclosed(seeded):
+    """The issue's headline example (#134): a row that came from a document gains a date
+    the document never stated, and says so."""
+    _correct(seeded, "condition", "name = ?", ("Chickenpox",), {"onset_on": "2001-05-01"})
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Chickenpox" in l)
+    assert _CORRECT_MARKER in line
+
+
+def test_a_superseded_attestation_that_was_corrected_shows_only_the_correction(seeded):
+    """Two independent provenance facts, each with its own rule: a promoted attestation
+    is deliberately unmarked, a correction always is."""
+    _attest_all(seeded)
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(
+        seeded, doc, {"medication": [dict(_ATTESTED["medication"])]},
+        dedup.load_dictionary(DICT_PATH),
+    )
+    _correct(seeded, "medication", "name = ?", ("Amlodipine",), {"frequency": "daily"})
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Amlodipine" in l)
+    assert _CORRECT_MARKER in line
+    assert _ATTEST_MARKER not in line
+
+
+def test_a_disputed_corrected_row_carries_both_markers_in_order(seeded):
+    """Verdict, then provenance, then correction: the verdict is about the fact, the
+    correction about the value's fidelity to its source, so the caveat reads last."""
+    from pemr import curation as _curation
+
+    row_id = _rid(seeded, "medication", "name = ?", ("Metformin",))
+    _correct(seeded, "medication", "name = ?", ("Metformin",), {"frequency": "daily"})
+    _curation.annotate_record(
+        seeded, "medication", str(row_id), status="disputed",
+        note="pharmacy has no record", row=True, apply=True,
+    )
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    line = next(l for l in md.splitlines() if "Metformin" in l)
+    assert line.index("[DISPUTED:") < line.index("(corrected by")
+
+
+def test_a_mapping_without_the_mark_columns_reads_as_uncorrected(seeded):
+    """A row off a restored pre-016 database carries no mark columns at all; the suffix
+    goes through `.get()`, so it reads as "not corrected" rather than raising."""
+    assert render._correction_suffix({"name": "Metformin"}) == ""
+    md = render.render_summary(
+        seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
+        now=datetime(2026, 6, 1),
+    )
+    assert "corrected" not in md
+
+
 # --- display units: per-person canonical unit at render time (issue #136) -----
 #
 # The overlay is display-only: a preference converts what a summary *prints* and

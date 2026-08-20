@@ -347,6 +347,35 @@ def test_timeline_stamps_attestation_only_on_attested_events(seeded):
     assert [e for e in after if "attested_by" not in e] == before
 
 
+def test_timeline_stamps_the_correction_mark_only_on_corrected_events(seeded):
+    """Issue #134, on the same terms as the attestation stamp above: an uncorrected
+    database's timeline JSON keeps its exact key set."""
+    from pemr import records
+
+    before = query.query_timeline(seeded, "jane-doe")
+    assert all("edited_at" not in e and "edited_by" not in e for e in before)
+
+    row_id = int(seeded.execute(
+        "SELECT medication_id FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["medication_id"])
+    records.edit_record(
+        seeded, "medication", row_id, {"frequency": "daily"},
+        note="transcription slip", attributed_to="Aunt Ada",
+        now="2026-03-02T09:00:00+00:00", apply=True,
+    )
+
+    after = query.query_timeline(seeded, "jane-doe")
+    corrected = [e for e in after if "edited_at" in e]
+    assert [(e["edited_at"], e["edited_by"]) for e in corrected] == [
+        ("2026-03-02T09:00:00+00:00", "Aunt Ada")
+    ]
+    # The mark is the only difference: strip it and the stream is byte-identical.
+    mark = ("edited_at", "edited_by")
+    assert [
+        {k: v for k, v in e.items() if k not in mark} for e in after
+    ] == before
+
+
 def test_timeline_with_identity_stamps_family_and_row_keys(seeded):
     """Issues #109/#114: `render_journal` needs each event's family identity to apply
     the curation overlay and its **row** id to apply a row-scoped verdict; an event

@@ -689,6 +689,8 @@ def test_public_row_keeps_an_unattested_payload_byte_identical(conn, jane):
     payload = dedup.public_row(row)
     assert not set(payload) & set(dedup.ATTESTATION_COLUMNS)
     assert not set(payload) & set(dedup.INTERNAL_COLUMNS)
+    # The correction mark (migration 016, issue #134) obeys the same rule.
+    assert not set(payload) & set(dedup.EDIT_MARK_COLUMNS)
     assert payload["document_id"] == doc
 
 
