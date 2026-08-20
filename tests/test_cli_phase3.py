@@ -200,6 +200,36 @@ def test_query_timeline_json(ready, capsys):
     assert {"date", "type", "summary", "document_id"} <= set(events[0])
 
 
+def test_query_json_discloses_a_correction_only_on_the_corrected_row(ready, capsys):
+    """Issue #134 at the CLI front door: `--json` must carry the correction caveat on a
+    row `record edit` changed, and must be byte-identical to before on every row it did
+    not — the additive-only half of the contract, at the door the agent layer reads."""
+    def _json(*argv):
+        assert _run(ready, *argv, "--json") == 0
+        return json.loads(capsys.readouterr().out)
+
+    before_labs = _json("query", "labs", "--person", "jane-doe")
+    before_meds = _json("query", "meds", "--person", "jane-doe")
+    before_events = _json("query", "timeline", "--person", "jane-doe")
+    assert all("edited_at" not in r for r in before_labs + before_meds + before_events)
+
+    assert _run(ready, "record", "edit", "medication", str(before_meds[0]["medication_id"]),
+                "--set", "route=oral", "--note", "route omitted by the extraction",
+                "--attributed-to", "Dr. Smith", "--apply") == 0
+    capsys.readouterr()
+
+    meds = _json("query", "meds", "--person", "jane-doe")
+    assert meds[0]["edited_by"] == "Dr. Smith" and meds[0]["edited_at"]
+    assert {k: v for k, v in meds[0].items() if not k.startswith("edited_")} \
+        == {**before_meds[0], "route": "oral"}
+    assert _json("query", "labs", "--person", "jane-doe") == before_labs
+
+    events = _json("query", "timeline", "--person", "jane-doe")
+    assert [e["type"] for e in events if "edited_at" in e] == ["med-start"]
+    assert [e for e in events if "edited_at" not in e] \
+        == [e for e in before_events if e["type"] != "med-start"]
+
+
 def test_find_human_and_json(ready, capsys):
     assert _run(ready, "find", "--person", "jane-doe", "cholesterol") == 0
     assert "cholesterol" in capsys.readouterr().out.lower()

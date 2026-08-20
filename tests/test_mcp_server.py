@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from pemr import (
-    __version__, curation, db, dedup, ingest, mcp_server, persons, tombstones,
+    __version__, curation, db, dedup, ingest, mcp_server, persons, records, tombstones,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -130,6 +130,39 @@ def test_query_with_no_verdicts_carries_no_curation_key(seeded):
     for kind in ("labs", "meds", "timeline"):
         rows = mcp_server.query(seeded, kind=kind, person="jane-doe")
         assert rows and all("_curation" not in r for r in rows)
+
+
+def test_query_discloses_a_correction_only_on_the_corrected_row(seeded):
+    """Issue #134 at the MCP front door: the agent's structured read must see the same
+    correction caveat the human view renders, and only there. `dedup.public_row` is what
+    carries it, so the half worth proving here is the additive one — an *uncorrected*
+    row's payload keeps the exact key set it had before migration 016."""
+    before = {
+        kind: mcp_server.query(seeded, kind=kind, person="jane-doe")
+        for kind in ("labs", "meds", "timeline")
+    }
+    assert all("edited_at" not in r for rows in before.values() for r in rows)
+
+    med_id = seeded.execute(
+        "SELECT medication_id FROM medication WHERE name = 'Metformin'"
+    ).fetchone()["medication_id"]
+    records.edit_record(
+        seeded, "medication", med_id, {"route": "oral"},
+        note="route omitted by the extraction", attributed_to="Dr. Smith", apply=True,
+    )
+
+    meds = mcp_server.query(seeded, kind="meds", person="jane-doe")
+    assert meds[0]["edited_by"] == "Dr. Smith" and meds[0]["edited_at"]
+    assert {k: v for k, v in meds[0].items() if k not in dedup.EDIT_MARK_COLUMNS} \
+        == {**before["meds"][0], "route": "oral"}
+
+    # Untouched record types keep their exact payload — no NULL mark leaks out.
+    assert mcp_server.query(seeded, kind="labs", person="jane-doe") == before["labs"]
+
+    events = mcp_server.query(seeded, kind="timeline", person="jane-doe")
+    assert [e["type"] for e in events if "edited_at" in e] == ["med-start"]
+    assert [e for e in events if "edited_at" not in e] \
+        == [e for e in before["timeline"] if e["type"] != "med-start"]
 
 
 def test_find_and_trends(seeded):
