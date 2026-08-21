@@ -10,6 +10,11 @@ One function, two callers: `pemr verify` prints this report, and `pemr restore` 
 the same report as its tail so the issue's acceptance drill is a single command
 afterwards.
 
+Beyond the blob pass the report also carries two per-row scans that need a human's eye
+but are not corruption: inert `curation` verdicts (issues #109, #114) and medication rows
+whose `status` is not a lifecycle value (issue #151). Both append to `warnings`, so
+neither moves the exit code.
+
 **Reports, never repairs.** No FTS rebuild, no blob refetch, no orphan sweep (blobs in
 `sources/` with no `document` row) — those are deliberate non-goals, see the issue's
 design comment.
@@ -21,7 +26,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import curation, db, dedup, ingest
+from . import curation, db, dedup, ingest, query
 
 # Row counts reported, in a stable order. A table missing from the schema (a snapshot
 # predating its migration, checked before `restore` runs `migrate`) is simply omitted.
@@ -272,6 +277,45 @@ def _check_curation(conn: sqlite3.Connection, report: VerifyReport) -> None:
                 )
 
 
+def _check_med_status(conn: sqlite3.Connection, report: VerifyReport) -> None:
+    """Warn about `medication.status` values that are not lifecycle states (issue #151).
+
+    `status` answers one question - is the course still running - but the column is
+    unconstrained at the DB layer, and extraction has written non-lifecycle values into
+    it (`prn`, a dosing pattern; `ordered`, an order-workflow state). Such a row with no
+    `ended_on` renders as current indefinitely, and - unlike an empty status - it does
+    not look like a gap to anyone auditing for one. That is the blind spot: permanently
+    current *and* invisible.
+
+    Deliberately not a `CHECK` constraint: one would reject rows already stored and
+    freeze the vocabulary inside a migration. This warning is the durable defense against
+    future extraction drift instead, which is why membership is tested against
+    :data:`query.LIFECYCLE_MED_STATUSES` in Python, through the same trim/lowercase
+    normalization :func:`query.med_is_current` uses - the check can never disagree with
+    the classifier it is warning about.
+
+    A warning, never a problem: the row is untidy, not corrupt, and correcting it is a
+    curation act with a source document in hand (`pemr record edit`), not something a
+    verify run should fail on.
+    """
+    rows = conn.execute(
+        "SELECT medication_id, status FROM medication "
+        "WHERE status IS NOT NULL AND trim(status) <> '' ORDER BY medication_id"
+    ).fetchall()
+    for row in rows:
+        value = str(row["status"])
+        if value.strip().lower() in query.LIFECYCLE_MED_STATUSES:
+            continue
+        # ASCII-only and PHI-free (issue #23; this repo is public): the row id and the
+        # offending literal, never the drug name and never the person.
+        report.warnings.append(
+            f"medication row #{row['medication_id']}: status '{value}' is not a "
+            "lifecycle value (active|completed|discontinued, or empty) - it renders as "
+            "current indefinitely; correct it with `pemr record edit medication "
+            f"{row['medication_id']} --set status= --note ...`"
+        )
+
+
 def verify_report(
     conn: sqlite3.Connection, sources_dir: str | Path | None = None
 ) -> VerifyReport:
@@ -295,6 +339,9 @@ def verify_report(
     report.row_counts = row_counts(conn)
     if db.is_migrated(conn):
         _check_curation(conn, report)
+        # `medication` ships in 001_init, so `is_migrated` is a sufficient guard - no
+        # `has_table` shim like curation's (that table arrives in a later migration).
+        _check_med_status(conn, report)
 
     if sources_dir is None:
         report.blobs_skipped = "no sources dir configured"

@@ -408,6 +408,29 @@ not lost, though: it still sits verbatim in `document.ocr_text` for any already-
 recoverable per row with `pemr record edit medication <id> --set status_reason="Reorder"` (this does
 not move `dedup_key` — §5's identity guarantee holds for this field like any other editable one).
 
+### 9. Medication rows — `status` is lifecycle only
+
+`medication.status` answers exactly one question: **is this course still running?** Emit `active`,
+`completed` or `discontinued`, or leave it absent when the source doesn't say. Nothing else belongs
+in it (issue #151). The *reason* a course ended is a separate axis — `status_reason` (§8).
+
+- **PRN is a dosing pattern, not a lifecycle state.** "As needed" / "PRN" goes in `frequency` (or
+  `dose`) verbatim, exactly as the source words it — `frequency="PRN"`, `frequency="q6h PRN"`.
+  Never `status='prn'`: an as-needed med with no `ended_on` then reads as current forever, and it
+  hides from an audit for rows whose lifecycle is unrecorded (which is precisely what it is).
+- **An order/workflow state is not a lifecycle state either.** Never `status='ordered'`. If the
+  ordering fact itself is worth keeping, it is an `observation` with `obs_type='order'` (§2) — the
+  schema's existing home for order/workflow facts — never a `medication.status` value.
+- Leaving `status` absent is always better than inventing one. An unrecorded lifecycle is an
+  ordinary gap a human can see and close; a wrong label is one they cannot.
+
+This vocabulary is **not** enforced at the DB layer — there is no `CHECK` on the column, because a
+constraint would reject rows already stored and freeze the vocabulary inside a migration. The
+defense is `pemr verify`, which warns on any `medication.status` that is neither a recognized
+lifecycle value nor empty, naming the row id and the offending literal. Correct such a row with
+`pemr record edit medication <id> --set status= --note ...` (moving any dosing detail into
+`frequency`/`dose` in the same edit), not by re-committing the source document.
+
 ## Privacy posture
 
 This repository is **public**. It is framework + documentation only.
