@@ -23,6 +23,7 @@ process.
 - `Overview.md` — what the system is, for a newcomer
 - `Architecture.md` — hub linking to subsystem docs
 - `Development.md` — local setup, test commands, branch model
-- `Development_AgenticSDLC.md` — if you adopt the `prompts/sdlc/` pipeline, document the stage
-  graph and lane responsibilities here
+- `Development_AgenticSDLC.md` — the Agentic SDLC model and invariants (ported from upstream);
+  `Development_SdlcAdoption.md` (placeholders + setup), `Development_SdlcComposability.md`
+  (9-stage canonical spine), `Development_SdlcLabels.md` (gh-scriptable label list)
 - `Development_TokenTools.md` — vtk/graphify setup notes, if adopted

@@ -6,7 +6,7 @@ specifics.
 
 Pipeline: `stage:intake` → `stage:design` → `stage:queued` → `stage:build` → `stage:verify` →
 `stage:audit` → `stage:ship` → *(PR merged, closed)* — the canonical spine's collapsed-tail form
-(see `docs/Composability.md` (agentic-sdlc repo): ship opens the PR, the human merge **is** the `ready` gate, and
+(see `docs/Development_SdlcComposability.md`: ship opens the PR, the human merge **is** the `ready` gate, and
 `shipping → complete` collapse into merge-and-close).
 
 `stage:design` is a **standard phase**: every triaged item passes through it for a reviewed
@@ -22,7 +22,7 @@ PARK, which is for *missing inputs* mid-phase: parked items beg for an answer; q
 comfortably.
 
 > **Placeholders.** Anything in `<ANGLE_BRACKETS>` is project-specific and must be filled in before
-> use. See `docs/Adoption.md` (agentic-sdlc repo) for the full list. The core ones: `<PROJECT>` (name), `<REPO_PATH>`
+> use. See `docs/Development_SdlcAdoption.md` for the full list. The core ones: `<PROJECT>` (name), `<REPO_PATH>`
 > (local working dir), `<DEFAULT_BRANCH>` (integration branch, e.g. `dev`), `<PROD_BRANCH>`
 > (release branch, off-limits to workers), `<WORKTREE_ROOT>` (e.g. `../<project>-wt`),
 > `<TEST_CMD>` / `<FULL_SUITE_CMD>` / `<LINT_CMD>` / `<BUILD_CMD>` / `<SMOKE_CMD>`, `<INVARIANTS>`
@@ -59,7 +59,7 @@ comfortably.
    creation date (FIFO). If none (or the snapshot is exhausted) → reply `<LANE>: idle` and stop.
 
    **CLI-first** (the primary path when the reference CLI is present — `scripts/sdlc.mjs`, see
-   `docs/Adoption.md` (agentic-sdlc repo)): do **not** re-derive the pick rule by eyeball (the eyeballed mis-claim is
+   `docs/Development_SdlcAdoption.md`): do **not** re-derive the pick rule by eyeball (the eyeballed mis-claim is
    a known failure class — lesson of #640). With a candidate snapshot (or an already-known issue,
    e.g. build's CONTINUE resumption), claim it directly:
    `node scripts/sdlc.mjs claim <issue> <run-id> <lane> --verify` — a non-zero exit means you lost
