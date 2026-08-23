@@ -526,8 +526,9 @@ against oneself has no independent provenance to adjudicate.
 
 Since issue #133, that refusal first consults the `curation` overlay (§2): a colliding row
 already carrying a **releasing** verdict — `superseded` / `erroneous-in-source` /
-`merged-into` (row scope beats family scope, same precedence rule as §6) — no longer blocks.
-Only a `disputed` or unverdicted row still raises, and the error's remedy text only
+`merged-into`, or since issue #186 also `distinct` (row scope beats family scope, same
+precedence rule as §6) — no longer blocks. Only a `disputed`, `confirmed` or unverdicted row
+still raises, and the error's remedy text only
 recommends `record annotate` when annotating that row could actually change the outcome —
 a row already released is never named. Once every colliding row is released the attestation
 proceeds as an ordinary new occurrence of the identity (the next free `dedup_occurrence`),
@@ -535,6 +536,17 @@ not a replacement of what is stored. One consequence worth knowing: a **family**
 release covers that new occurrence too, so the freshly attested row itself leaves the
 clinical documents for the curation record (§6) until the verdict is re-scoped to the rows
 it meant or lifted — the CLI prints a note when this happens so it is not a silent surprise.
+
+The two releasing vocabularies release for opposite reasons, and the asymmetry is the point.
+An **appendix** status says *one fact filed twice*, so the released row (and, at family
+scope, the freshly attested one) leaves the live view for the curation record. `distinct`
+says *two real facts that happen to share a key* (#122) — it is deliberately **not** an
+appendix status, so **both** rows stay live in their clinical section, which is exactly the
+rendering a genuine second occurrence of a recurring fact needs. That makes
+`record annotate <type> <id> --row --status distinct`, then retry, the non-destructive
+remedy for a repeat: nothing sourced is deleted and no documented date is overwritten
+(issue #186 — the deliberate stopgap for the condition-episode model of #152, and the
+standing answer for the record types whose identity carries no occurrence date).
 
 `norm()` = lowercase, trim, collapse whitespace, drop parenthetical qualifiers, map
 synonyms via an **analyte/name dictionary** (`data/dictionary.toml`) — e.g. `A1c`,
@@ -1266,8 +1278,9 @@ pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
                                                          # commit a fact attested by a PERSON, with no
                                                          # source document (§2 attestation); dry run by default
                                                          # a colliding family fully released by curation
-                                                         # verdicts no longer blocks (§3, issue #133);
-                                                         # disputed/unverdicted rows still refuse it
+                                                         # verdicts no longer blocks (§3, issues #133/#186:
+                                                         # appendix statuses or `distinct`);
+                                                         # disputed/confirmed/unverdicted rows still refuse it
 pemr record assert --list [<table>] [--all] [--json]     # attested rows still needing a source document
 pemr document tombstone list [--json]                    # recorded intentional removals, newest first
 pemr document tombstone add (--file <path> | --sha256 <hex>) [--reason ...] [--note ...]
