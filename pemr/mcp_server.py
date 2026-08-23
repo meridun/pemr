@@ -335,6 +335,7 @@ def review_conflicts(
     signoff: str | None = None,
     note: str | None = None,
     fields: dict[str, str] | None = None,
+    adopt_source: bool = False,
     all: bool = False,
 ) -> Any:
     """[read to list / write to resolve] List or resolve staged dedup conflicts.
@@ -351,11 +352,21 @@ def review_conflicts(
     ``fields`` = ``{"<field>": "existing"|"incoming"}`` to settle one, and only for a
     field that actually collides.
 
+    ``adopt_source=True`` is a modifier of ``keep="existing"`` (refused with any other
+    keep): the stored row's payload is kept in full and only the incoming document's
+    ``document_id`` is copied onto it, which is how a previously *attested* row gains the
+    source that later confirms the same fact. It refuses when the stored row already has
+    a ``document_id`` (adopt-source fills a missing source, it never re-points an
+    existing one — use ``"incoming"``/``"merge"`` to take payload and provenance
+    together) and when the conflict carries no document to adopt.
+
     Listing is free. **Resolution requires explicit human sign-off** (``AGENTS.md``
-    conflict discipline) — ``"both"`` and ``"merge"`` included, and a ``fields`` choice is
-    itself a decision the human has to have made: ``signoff`` must quote the human's
-    instruction verbatim, or the write is refused. The sign-off text is threaded into the
-    stored resolution note so the record shows who authorized it.
+    conflict discipline) — ``"both"``, ``"merge"`` and ``adopt_source`` included, and a
+    ``fields`` choice is itself a decision the human has to have made: ``signoff`` must
+    quote the human's instruction verbatim, or the write is refused. Sign-off for "keep
+    existing" is **not** sign-off for ``adopt_source`` — it is a distinct choice the
+    human has to have named. The sign-off text is threaded into the stored resolution
+    note so the record shows who authorized it.
     """
     if resolve is not None:
         if not (signoff and signoff.strip()):
@@ -368,7 +379,7 @@ def review_conflicts(
         try:
             result = _dedup.resolve_conflict(
                 conn, resolve, keep=keep, note=merged_note, dictionary=_dictionary(),
-                fields=fields,
+                fields=fields, adopt_source=adopt_source,
             )
         # ValueError covers ValidationError, raised when a keep-both payload no longer
         # validates as a row.
@@ -391,6 +402,13 @@ def review_conflicts(
                 "taken": sorted(result.gains),
                 "preserved": sorted(result.preserved),
                 "settled": result.settled,
+            }
+        elif result.adopted_document_id is not None:
+            # Ids only, no payload was touched - same audit-trail rule as above.
+            payload |= {
+                "record_type": result.record_type,
+                "row_id": result.row_id,
+                "adopted_document_id": result.adopted_document_id,
             }
         return payload
 
@@ -708,9 +726,10 @@ def build_server():  # pragma: no cover - exercised only with the mcp SDK instal
     def review_conflicts_tool(resolve: int | None = None, keep: str = "existing",
                               signoff: str | None = None, note: str | None = None,
                               fields: dict[str, str] | None = None,
+                              adopt_source: bool = False,
                               all: bool = False) -> object:
         return _run(review_conflicts, resolve=resolve, keep=keep, signoff=signoff,
-                    note=note, fields=fields, all=all)
+                    note=note, fields=fields, adopt_source=adopt_source, all=all)
 
     return server
 

@@ -308,8 +308,10 @@ Agents never resolve staged conflicts silently.
 
 - `review_conflicts` with no `resolve` id **lists** conflicts — call it freely.
 - **Resolution requires explicit human sign-off.** The human must have named the specific conflict
-  and the chosen resolution (`keep existing` / `keep incoming` / `keep both` / `keep merge`) in the
-  current session. "Clean this up", silence, or a standing general instruction is **not** sign-off.
+  and the chosen resolution (`keep existing` / `keep existing --adopt-source` / `keep incoming` /
+  `keep both` / `keep merge`) in the current session. "Clean this up", silence, or a standing
+  general instruction is **not** sign-off. `keep existing --adopt-source` is a **distinct** choice:
+  sign-off that said only "keep existing" does not authorize adding the flag.
 - Mechanically: `review_conflicts(resolve=…)` requires a non-empty `signoff` param quoting the
   human's instruction verbatim; the wrapper refuses the write otherwise and stores the sign-off
   text with the resolution.
@@ -343,6 +345,15 @@ Agents never resolve staged conflicts silently.
   takes no field, because the row is now filed under a different document.
   On a standing-fact type merge always refuses, because a conflict there is present-and-different by
   construction — use `keep incoming` for those.
+- `keep existing --adopt-source` (`adopt_source=True`) is the provenance-only resolution: the stored
+  row keeps every one of its own values, and the **only** thing written is the incoming document's
+  `document_id` onto it. Propose it for the case it exists for — a row entered by `record assert`
+  (`document_id` NULL) that a later document confirms while disagreeing on some field, where the
+  human wants to keep what was attested *and* link the source. It is refused with any other `keep`
+  (those already take the document's provenance with its payload), refused when the stored row
+  already has a `document_id` — it fills a missing source, it never re-points one — and refused when
+  the conflict carries no document. Report those refusals rather than reaching for a different keep
+  on your own: which payload wins is the human's call.
 - `commit_extraction` **rejects** two rows of one submission that derive the same key and disagree;
   that is an extraction error, not a conflict. For `observation`, re-read the source for times; if
   there genuinely are none, submit them separately and ask the human about `keep both`. For

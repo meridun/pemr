@@ -2594,6 +2594,7 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
                 result = dedup.resolve_conflict(
                     conn, args.resolve, keep=args.keep, note=args.note,
                     dictionary=dictionary, fields=_field_choices(args.fields),
+                    adopt_source=args.adopt_source,
                 )
                 print(f"resolved conflict #{args.resolve} ({_resolved_as(result)})")
                 return 0
@@ -2637,6 +2638,8 @@ def _cmd_review_conflicts(args: argparse.Namespace) -> int:
         "leaves unstated;"
         "\n         settle a field both rows state differently with "
         "`--field NAME=existing|incoming`"
+        "\n         existing = keep the stored payload; add `--adopt-source` to also "
+        "link an\n         unsourced (attested) row to the incoming document"
     )
     return 0
 
@@ -2667,10 +2670,13 @@ def _resolved_as(result: dedup.ResolveResult) -> str:
     those fields keeps the operator's line honest about the write, matching what
     `dedup._resolution_text` persists on the conflict. Field names only, never values --
     the resolution text is an audit trail, not a place to echo clinical data. keep-merge
-    reports through `dedup.merge_summary`, the same wording it persists.
+    and keep-existing + adopt-source report through `dedup.merge_summary` /
+    `dedup.adopt_summary`, the same wordings they persist.
     """
     if result.kept == "merge":
         return dedup.merge_summary(result)
+    if result.adopted_document_id is not None:
+        return dedup.adopt_summary(result)
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
@@ -3827,6 +3833,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only with --keep merge; repeatable. Settles one field both rows state "
              "differently: NAME=existing keeps the stored value, NAME=incoming takes "
              "the document's. Fields that do not collide are rejected",
+    )
+    p_review.add_argument(
+        "--adopt-source", action="store_true", dest="adopt_source",
+        help="only with --keep existing; keeps the stored row's payload untouched and "
+             "copies the incoming document's document_id onto it, so a previously "
+             "attested row gains its source. Refused if the row already has one",
     )
     p_review.add_argument("--note", help="optional resolution note")
     p_review.add_argument(

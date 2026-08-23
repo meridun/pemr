@@ -1390,11 +1390,13 @@ class ResolveResult:
 
     ``row_id``/``occurrence`` describe the row the resolution landed on: the
     *admitted* row for ``keep='both'``, the *overwritten* one for
-    ``keep='incoming'``. ``keep='existing'`` writes nothing, so it leaves them
-    unset. ``dedup_key`` is that row's key (which for an occurrence >= 1 row is
-    *not* the conflict's key — see :func:`_anchor_row`); ``dedup_base`` is the
-    family it joined, re-derived under the current dictionary rather than taken
-    from the conflict (see :func:`_derive_base`).
+    ``keep='incoming'``, the row whose provenance was filled for
+    ``keep='existing'`` **with** ``adopt_source``. Plain ``keep='existing'``
+    writes nothing, so it leaves them unset. ``dedup_key`` is that row's key
+    (which for an occurrence >= 1 row is *not* the conflict's key — see
+    :func:`_anchor_row`); ``dedup_base`` is the family it joined, re-derived
+    under the current dictionary rather than taken from the conflict (see
+    :func:`_derive_base`).
     """
     kept: str
     record_type: str = ""
@@ -1414,6 +1416,10 @@ class ResolveResult:
     # keep-merge only: field -> 'existing'|'incoming', the collisions the operator ruled
     # on explicitly. Everything else on a merge was decided by the silence rule alone.
     settled: dict = field(default_factory=dict)
+    # keep-existing + adopt-source only (issue #190): the document_id copied from the
+    # conflict onto the stored row. `None` on every other path, which is what
+    # `_resolution_text` and the CLI switch on.
+    adopted_document_id: int | None = None
 
 
 @dataclass
@@ -1511,6 +1517,7 @@ def resolve_conflict(
     note: str | None = None,
     dictionary: dict[str, str] | None = None,
     fields: dict[str, str] | None = None,
+    adopt_source: bool = False,
 ) -> ResolveResult:
     """Resolve a staged conflict. ``keep`` is 'existing' (drop the incoming row),
     'incoming' (overwrite the stored record's payload fields with the incoming row),
@@ -1534,6 +1541,20 @@ def resolve_conflict(
     fields keep their stored display form (they are equal after norm() by
     construction, but may differ in casing/spacing); the dedup_key stays put.
 
+    ``adopt_source`` is a modifier of ``keep='existing'`` (issue #190), not a fifth
+    mode: the stored row's payload still wins in full, and the only thing written is
+    the incoming document's ``document_id`` onto that row — the supported way to link a
+    previously *attested* row to the document that later confirms the same fact, without
+    taking the document's differing values. It **refuses** on a row that already has a
+    ``document_id`` (filling a NULL is additive; re-pointing a sourced row at another
+    document while keeping the first document's payload would misattribute it — take
+    ``keep='incoming'`` or ``keep='merge'``, which adopt payload and provenance
+    together), and when the conflict itself carries no document to adopt. It is
+    deliberately *not* gated on ``attested_by``: the invariant is "provenance is filled,
+    never re-pointed", and ``document_id IS NULL`` is exactly that condition — an
+    attestation is the case that produces the interesting state
+    (:func:`attestation_state` -> ``"superseded"``), not the check.
+
     ``keep='both'`` re-validates the staged JSON before it becomes a row, and is
     idempotent by payload: if a sibling already carries that exact payload (two
     conflicts staged from one submission, both resolved 'both') nothing is inserted
@@ -1554,6 +1575,11 @@ def resolve_conflict(
     if fields and keep != "merge":
         raise ValueError(
             f"per-field choices only apply to keep 'merge', not {keep!r}"
+        )
+    if adopt_source and keep != "existing":
+        raise ValueError(
+            f"adopt-source only applies to keep 'existing', not {keep!r} - "
+            f"keep {keep!r} already takes the document's provenance with its payload"
         )
 
     row = conn.execute(
@@ -1579,6 +1605,10 @@ def resolve_conflict(
         )
     elif keep == "merge":
         result = _plan_keep_merge(conn, row, dictionary, fields)
+    elif adopt_source:
+        # Same discipline as the writing keeps: everything that can refuse happens
+        # before the transaction opens.
+        result = _plan_adopt_source(conn, row, dictionary)
     else:
         result = ResolveResult(
             kept=keep, record_type=record_type, dedup_key=row["dedup_key"]
@@ -1605,6 +1635,13 @@ def resolve_conflict(
                 conn, record_type, json.loads(row["incoming_json"]),
                 row["person_id"], row["document_id"],
                 result.dedup_base or row["dedup_key"], result.occurrence or 0,
+            )
+        elif adopt_source:
+            # Inside the transaction so the provenance write and the audit row commit
+            # together (and the rowcount guard rolls both back).
+            _adopt_source(
+                conn, record_type, int(result.row_id),
+                int(result.adopted_document_id),
             )
         resolution = _resolution_text(result) + (f": {note}" if note else "")
         conn.execute(
@@ -1636,12 +1673,29 @@ def merge_summary(result: ResolveResult) -> str:
     return "; ".join(parts)
 
 
+def adopt_summary(result: ResolveResult) -> str:
+    """How a keep-existing + adopt-source resolution describes itself, for the audit
+    trail *and* the CLI success line — one wording, so the stored resolution and what the
+    operator was told can't drift (same rule as :func:`merge_summary`).
+
+    Ids and column names only, never values: the payload was not touched, and the audit
+    trail is not a place to echo clinical data.
+    """
+    return (
+        f"keep-existing +adopt-source -> {result.record_type} #{result.row_id} "
+        f"(document_id={result.adopted_document_id})"
+    )
+
+
 def _resolution_text(result: ResolveResult) -> str:
     """The auditable resolution string stored on the conflict row. keep-both records
-    which row it admitted (or matched), keep-merge which fields came from which side, so
-    the decision stays reconstructable."""
+    which row it admitted (or matched), keep-merge which fields came from which side,
+    adopt-source which row gained which document, so the decision stays
+    reconstructable."""
     if result.kept == "merge":
         return merge_summary(result)
+    if result.adopted_document_id is not None:
+        return adopt_summary(result)
     if result.kept != "both":
         return f"keep-{result.kept}"
     if result.no_op:
@@ -1842,6 +1896,53 @@ def _plan_keep_merge(
         occurrence=int(anchor["dedup_occurrence"]),
         dedup_key=anchor["dedup_key"], dedup_base=anchor["dedup_base"],
         gains=plan.taken, preserved=plan.preserved, settled=plan.settled,
+    )
+
+
+def _plan_adopt_source(
+    conn: sqlite3.Connection,
+    conflict: sqlite3.Row,
+    dictionary: dict[str, str] | None,
+) -> ResolveResult:
+    """Validate the provenance-only write ``keep='existing' + adopt_source`` would make.
+
+    Everything that can refuse happens here, before the transaction opens (same
+    discipline as :func:`_plan_keep_both` / :func:`_plan_keep_merge`). Two refusals, and
+    both are the point of the feature:
+
+    * the conflict must carry a document to adopt (``conflict.document_id`` is nullable);
+    * the anchor row's ``document_id`` must be **NULL**. Filling a NULL is additive;
+      re-pointing an already-sourced row at a different document while keeping the first
+      document's payload would assert that document B says what document A said. That is
+      the provenance guarantee :func:`pemr.records.edit_record` protects, one layer down.
+
+    Reached only when the flag is set, so plain ``keep='existing'`` keeps resolving an
+    empty family (it writes nothing either way) rather than hitting
+    :func:`_anchor_row`'s refusal.
+    """
+    record_type = conflict["record_type"]
+    if conflict["document_id"] is None:
+        raise ValueError(
+            f"conflict {conflict['conflict_id']} carries no document to adopt - "
+            "the incoming row has no document_id, so there is no source to link. "
+            "Nothing was written"
+        )
+    # Same anchor (and same empty-family refusal) as the writing keeps.
+    anchor = _anchor_row(conn, conflict, dictionary)
+    row_id = int(anchor[f"{record_type}_id"])
+    if anchor["document_id"] is not None:
+        raise ValueError(
+            f"conflict {conflict['conflict_id']}: {record_type} #{row_id} already has "
+            f"document_id={anchor['document_id']} - adopt-source fills a missing source, "
+            "it never re-points an existing one at another document. Resolve with keep "
+            "'incoming' or 'merge' to take this document's payload and provenance "
+            "together. Nothing was written"
+        )
+    return ResolveResult(
+        kept="existing", record_type=record_type, row_id=row_id,
+        occurrence=int(anchor["dedup_occurrence"]),
+        dedup_key=anchor["dedup_key"], dedup_base=anchor["dedup_base"],
+        adopted_document_id=int(conflict["document_id"]),
     )
 
 
@@ -2521,4 +2622,34 @@ def _merge_record(
         raise ValueError(
             f"keep-merge matched no {record_type} row (id {row_id}) - refusing to "
             "resolve the conflict, the merged fields would have been discarded"
+        )
+
+
+def _adopt_source(
+    conn: sqlite3.Connection,
+    record_type: str,
+    row_id: int,
+    document_id: int,
+) -> None:
+    """Copy the incoming document's ``document_id`` onto one stored row, by primary key.
+
+    **No payload column is ever named in the assignment list** - that is the whole
+    difference from :func:`_overwrite_record` / :func:`_merge_record`, which take the
+    document's values *and* its provenance. Here the stored row keeps everything it
+    said and gains only the source that confirms it, so an attested row moves from
+    ``"attested"`` to ``"superseded"`` (:func:`attestation_state`) with its attestation
+    columns intact as history (issue #190).
+
+    Primary-key addressing and the ``rowcount`` guard mirror those two functions for the
+    same reasons (see :func:`_anchor_row`): a zero-row UPDATE would stamp the conflict
+    resolved having written nothing.
+    """
+    cur = conn.execute(
+        f"UPDATE {record_type} SET document_id = ? WHERE {record_type}_id = ?",
+        (document_id, row_id),
+    )
+    if cur.rowcount != 1:
+        raise ValueError(
+            f"adopt-source matched no {record_type} row (id {row_id}) - refusing to "
+            "resolve the conflict, the row would have been left unsourced"
         )

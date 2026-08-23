@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from pemr import (
-    __version__, curation, db, dedup, ingest, mcp_server, persons, records, tombstones,
+    __version__, attestations, curation, db, dedup, ingest, mcp_server, persons,
+    records, tombstones,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -650,6 +651,65 @@ def test_review_conflicts_merge_collision_refuses_until_a_field_is_settled(
         "SELECT * FROM medication WHERE medication_id = ?", (res["row_id"],)
     ).fetchone()
     assert (row["status"], row["prescriber"]) == ("completed", "Dr Who")
+
+
+def _stage_attested_med_conflict(seeded, tmp_path, monkeypatch) -> int:
+    """An attested medication row (document_id NULL) plus one open conflict from a
+    document stating a differing payload (issue #190); returns its conflict id."""
+    monkeypatch.setenv("PEMR_SOURCES", str(tmp_path / "sources"))
+    identity = {"name": "metformin", "dose": "500 mg", "started_on": "2024-01-05"}
+    attestations.assert_record(
+        seeded, "medication", "jane-doe", identity | {"status": "ordered"},
+        attributed_to="Mom", attested_on="2026-08-09", apply=True,
+    )
+    scan = tmp_path / "portal.txt"
+    scan.write_bytes(b"portal")
+    doc = mcp_server.ingest_document(
+        seeded, file=str(scan), person="jane-doe", ocr_text="metformin",
+    )["document"]["document_id"]
+    mcp_server.commit_extraction(seeded, document_id=doc, records={
+        "medication": [identity | {"status": "completed"}],
+    })
+    return mcp_server.review_conflicts(seeded)[0]["conflict_id"]
+
+
+def test_review_conflicts_adopt_source_requires_signoff_and_reports_the_document(
+    seeded, tmp_path, monkeypatch
+):
+    """adopt-source writes, so it goes through the *same* sign-off gate - no new bypass -
+    and its payload names ids only, never the values it deliberately did not take."""
+    cid = _stage_attested_med_conflict(seeded, tmp_path, monkeypatch)
+    with pytest.raises(mcp_server.ToolError, match="sign-off"):
+        mcp_server.review_conflicts(seeded, resolve=cid, adopt_source=True)
+    assert seeded.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+    res = mcp_server.review_conflicts(
+        seeded, resolve=cid, keep="existing", adopt_source=True,
+        signoff="Jane said link the row to this document but keep what Mom said",
+    )
+    assert res["keep"] == "existing" and res["record_type"] == "medication"
+    assert res["adopted_document_id"] is not None
+    row = seeded.execute(
+        "SELECT * FROM medication WHERE medication_id = ?", (res["row_id"],)
+    ).fetchone()
+    assert row["document_id"] == res["adopted_document_id"]
+    assert row["status"] == "ordered"          # payload untouched
+    assert dedup.attestation_state(row) == "superseded"
+    assert "ordered" not in str(res) and "completed" not in str(res)
+
+
+def test_review_conflicts_adopt_source_refuses_another_keep(
+    seeded, tmp_path, monkeypatch
+):
+    cid = _stage_attested_med_conflict(seeded, tmp_path, monkeypatch)
+    with pytest.raises(mcp_server.ToolError, match="adopt-source only applies"):
+        mcp_server.review_conflicts(seeded, resolve=cid, keep="merge",
+                                    adopt_source=True, signoff="Jane said adopt it")
+    assert seeded.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
 
 
 def test_review_conflicts_rejects_an_unknown_keep(seeded, tmp_path, monkeypatch):
