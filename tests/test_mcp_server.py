@@ -752,6 +752,26 @@ def test_agents_md_has_the_four_must_sections():
         assert heading in text, f"AGENTS.md missing MUST section: {heading}"
 
 
+def test_agents_md_documents_the_lab_collection_date_rule():
+    """Issue #189's rule has two halves and a repair path, and a later edit must not be
+    able to drop one of them silently: prefer the collection date, fall back to the
+    result date *as* `collected_at`, and name how an already-mis-dated row is fixed.
+    A lint on the load-bearing tokens, not a grader of the prose."""
+    text = AGENTS.read_text(encoding="utf-8")
+    assert "### 10. Lab result dates" in text
+    section = text.split("### 10. Lab result dates", 1)[1].split("\n## ", 1)[0]
+    for token in (
+        "collected_at",          # the field the rule is about
+        "collection date",       # the preferred source
+        "fallback",              # the proxy half, not an alternative
+        "proxy",
+        "--identity",            # first-choice repair (issue #152)
+        "record rm",             # second choice / the collision branch
+        "document reocr",        # re-deriving ocr_text first
+    ):
+        assert token in section, f"AGENTS.md section 10 missing: {token}"
+
+
 # --------------------------------------------------------------------------- #
 # Wire surface — the *registered* tool names must equal TOOL_NAMES (the contract
 # lint above only sees the documented strings; this asserts the real MCP surface,
