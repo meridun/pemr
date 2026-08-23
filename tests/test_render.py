@@ -1632,13 +1632,14 @@ def _rid(conn, record_type, where, params):
     ).fetchone()[f"{record_type}_id"])
 
 
-def _correct(conn, record_type, where, params, updates, who="Aunt Ada"):
+def _correct(conn, record_type, where, params, updates, who="Aunt Ada",
+             identity=False):
     from pemr import records as _records
 
     return _records.edit_record(
         conn, record_type, _rid(conn, record_type, where, params), updates,
         dedup.load_dictionary(DICT_PATH), note="transcription slip",
-        attributed_to=who, now=_CORRECT_AT, apply=True,
+        attributed_to=who, now=_CORRECT_AT, identity=identity, apply=True,
     )
 
 
@@ -1727,8 +1728,14 @@ def test_an_unattributed_correction_renders_the_date_only_form(seeded):
 
 def test_adding_an_onset_to_a_document_sourced_condition_is_disclosed(seeded):
     """The issue's headline example (#134): a row that came from a document gains a date
-    the document never stated, and says so."""
-    _correct(seeded, "condition", "name = ?", ("Chickenpox",), {"onset_on": "2001-05-01"})
+    the document never stated, and says so.
+
+    `--identity` since issue #152: giving a condition an onset now moves its key, so the
+    edit is a one-row rekey. The disclosure rule is unchanged by that - an identity move
+    stamps the correction mark exactly as an ordinary correction does, which is the point
+    of pinning it here."""
+    _correct(seeded, "condition", "name = ?", ("Chickenpox",), {"onset_on": "2001-05-01"},
+             identity=True)
     md = render.render_summary(
         seeded, "jane-doe", dictionary=dedup.load_dictionary(DICT_PATH),
         now=datetime(2026, 6, 1),

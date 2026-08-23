@@ -10,10 +10,11 @@ One function, two callers: `pemr verify` prints this report, and `pemr restore` 
 the same report as its tail so the issue's acceptance drill is a single command
 afterwards.
 
-Beyond the blob pass the report also carries two per-row scans that need a human's eye
-but are not corruption: inert `curation` verdicts (issues #109, #114) and medication rows
-whose `status` is not a lifecycle value (issue #151). Both append to `warnings`, so
-neither moves the exit code.
+Beyond the blob pass the report also carries three per-row scans that need a human's eye
+but are not corruption: inert `curation` verdicts (issues #109, #114), medication rows
+whose `status` is not a lifecycle value (issue #151), and an undated `condition` row
+sitting beside dated episodes of the same problem (issue #152). All three append to
+`warnings`, so none of them moves the exit code.
 
 **Reports, never repairs.** No FTS rebuild, no blob refetch, no orphan sweep (blobs in
 `sources/` with no `document` row) — those are deliberate non-goals, see the issue's
@@ -316,6 +317,69 @@ def _check_med_status(conn: sqlite3.Connection, report: VerifyReport) -> None:
         )
 
 
+def _check_conditions(conn: sqlite3.Connection, report: VerifyReport) -> None:
+    """Warn about an **undated** condition row sitting beside dated episodes of the same
+    problem (issue #152).
+
+    The visible edge of the episode model. Once `onset_on` identifies the episode, an
+    undated umbrella claim ("kidney stones") and a dated episode ("kidney stones,
+    2009-09-15") are two identities, so a later document that dates the problem lands as
+    a **new row** beside the undated one rather than filling it in - `onset_on` left
+    `dedup._COMPARE_FIELDS`, so `_sparse_gains` can no longer enrich it in place.
+
+    That is the intended semantics: an undated umbrella claim and a dated episode are
+    different claims, and auto-absorbing one into the other is exactly the silent fold
+    this issue exists to end. But left unannounced it is silent *duplication* instead of
+    silent folding, which trades one invisible defect for another. So it is announced -
+    the operator decides whether the umbrella row is the same episode (give it the onset,
+    which is a rekey) or a genuinely separate undated claim (rule on it).
+
+    A warning, never a problem: two such rows are untidy, not corrupt, and which of the
+    two remedies applies is a clinical judgment `verify` has no way to make. The pairing
+    is derived dictionary-free (`dedup.norm` with no synonym table), so a synonym pair
+    spelled two ways across documents is a missed warning rather than a false one - the
+    conservative direction for a notice a human acts on.
+    """
+    # `condition` arrives in migration 006, so `is_migrated` is not enough on its own -
+    # the `_check_curation` / `curation.has_table` shim, for the same reason: a restored
+    # older snapshot must report nothing here rather than raise `no such table`.
+    if "condition" not in _existing_tables(conn):
+        return
+    rows = conn.execute(
+        "SELECT * FROM condition ORDER BY condition_id"
+    ).fetchall()
+    # (person, normalized name, subject-without-onset) -> undated ids, dated ids.
+    groups: dict[tuple, tuple[list[int], list[int]]] = {}
+    for row in rows:
+        payload = {name: row[name] for name in dedup.FIELD_SPECS["condition"]}
+        key = (
+            row["person_id"],
+            dedup.norm(row["name"], None),
+            # The episode discriminator with onset stripped: the family an episode
+            # belongs to, which is precisely what `_condition_subject` answers.
+            dedup._condition_episode({**payload, "onset_on": None}, None),
+        )
+        undated, dated = groups.setdefault(key, ([], []))
+        (dated if dedup._date_only(row["onset_on"]) else undated).append(
+            int(row["condition_id"])
+        )
+    for (_person, _name, _subject), (undated, dated) in groups.items():
+        if not undated or not dated:
+            continue
+        for row_id in undated:
+            # ASCII-only and PHI-free (issue #23; this repo is public): row ids only,
+            # never the condition name and never the person.
+            others = ", ".join(f"#{d}" for d in dated)
+            report.warnings.append(
+                f"condition row #{row_id} has no onset_on but the same problem is also "
+                f"stored as dated episode(s) {others} - since onset identifies the "
+                "episode these are separate rows, which may be a real undated claim or "
+                f"the same episode twice; date it with `pemr record edit condition "
+                f"{row_id} --identity --set onset_on=YYYY-MM-DD --note ...`, or rule on "
+                f"it with `pemr record annotate condition {row_id} --status ...`"
+            )
+
+
 def verify_report(
     conn: sqlite3.Connection, sources_dir: str | Path | None = None
 ) -> VerifyReport:
@@ -342,6 +406,7 @@ def verify_report(
         # `medication` ships in 001_init, so `is_migrated` is a sufficient guard - no
         # `has_table` shim like curation's (that table arrives in a later migration).
         _check_med_status(conn, report)
+        _check_conditions(conn, report)
 
     if sources_dir is None:
         report.blobs_skipped = "no sources dir configured"

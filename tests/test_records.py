@@ -1330,6 +1330,243 @@ def test_the_reporters_unit_normalisation_scenario(conn):
     assert dedup.rekey(conn).changes == []
 
 
+# --- `--identity`: the one-row rekey (issue #152) ----------------------------
+
+
+def _condition(conn, name="Type 2 Diabetes"):
+    return _row_id(conn, "condition", "name", name)
+
+
+def test_an_identity_field_is_refused_without_the_flag_and_names_it(seeded):
+    """The door has to be visible from where the operator hits the wall: refusing
+    `onset_on` without pointing at `--identity` just recreates the old dead end
+    (`record rm` + re-commit, which throws the row's provenance away to fix a typo)."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    before = _row(conn, "condition", target)
+    with pytest.raises(records.FieldNotEditableError) as exc:
+        records.edit_record(conn, "condition", target, {"onset_on": "2024-02-01"},
+                            note="wrong date", apply=True)
+    assert "--identity" in str(exc.value)
+    _assert_untouched(conn, "condition", target, before)
+
+
+def test_identity_moves_the_row_and_leaves_provenance_alone(seeded):
+    """The correction the episode model makes necessary: a stored episode's onset was
+    recorded wrong. The row moves onto the corrected identity, keeping its id, its
+    document, its payload and its ledger - the whole reason this is not `rm` + re-commit.
+    """
+    conn = seeded["conn"]
+    target = _condition(conn)
+    before = _row(conn, "condition", target)
+
+    report = records.edit_record(
+        conn, "condition", target, {"onset_on": "2024-03-05"},
+        note="chart says March, not January", attributed_to="Jane", apply=True,
+        identity=True,
+    )
+
+    assert report.identity is True
+    assert report.new_dedup_key != report.dedup_key
+    assert report.new_dedup_base == dedup.dedup_key(
+        "condition", {**before, "onset_on": "2024-03-05"}, before["person_id"]
+    )
+    assert report.new_dedup_occurrence == 0        # the target family was empty
+    assert report.curation_orphaned == [] and report.conflicts_reanchored == []
+
+    after = _row(conn, "condition", target)
+    assert after["onset_on"] == "2024-03-05"
+    assert after["dedup_key"] == report.new_dedup_key
+    assert after["dedup_base"] == report.new_dedup_base
+    assert int(after["dedup_occurrence"]) == 0
+    # Provenance is not rewritten by a correction - the invariant `--identity` must not
+    # weaken, since the whole point is that the row still traces to its source.
+    for column in ("document_id", "person_id", "attested_by", "attested_on",
+                   "attested_at"):
+        assert after[column] == before[column]
+    # Disclosure and audit trail, exactly as an ordinary correction gets them.
+    assert after["edited_at"] and after["edited_by"] == "Jane"
+    ledger = _ledger(conn, "condition")
+    assert [(e["field"], e["old_value"], e["new_value"]) for e in ledger] == [
+        ("onset_on", "2024-01-01", "2024-03-05")
+    ]
+    # The ledger breadcrumb keeps the base the row moved *from*, which is what makes the
+    # move reconstructable afterwards.
+    assert ledger[0]["dedup_base"] == before["dedup_base"]
+    # ... and the engine agrees the row is now stored under the right key.
+    assert dedup.rekey(conn).changes == []
+
+
+def test_identity_is_inert_when_nothing_moves(seeded):
+    """Passing the flag defensively must not turn a no-op into a failure, and must not
+    report a move that did not happen."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    before = _row(conn, "condition", target)
+
+    report = records.edit_record(
+        conn, "condition", target, {"note": "diet-controlled"},
+        note="detail from the visit note", apply=True, identity=True,
+    )
+
+    assert report.identity is False
+    assert report.new_dedup_key == before["dedup_key"] == report.dedup_key
+    assert _row(conn, "condition", target)["dedup_key"] == before["dedup_key"]
+
+
+def test_identity_onto_an_occupied_family_is_refused_as_a_merge(seeded):
+    """Two rows saying the same thing under one identity is a duplicate hidden behind an
+    occurrence number. That call is a recorded human judgment, not something a
+    correction may make silently."""
+    conn = seeded["conn"]
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Type 2 Diabetes", "status": "active", "onset_on": "2020-06-01"},
+    ]})
+    target = _row_id(conn, "condition", "onset_on", "2024-01-01")
+    before = _row(conn, "condition", target)
+    ledger_before = _ledger(conn)
+
+    with pytest.raises(records.IdentityCollisionError) as exc:
+        records.edit_record(conn, "condition", target, {"onset_on": "2020-06-01"},
+                            note="same episode", apply=True, identity=True)
+    assert "merge" in str(exc.value) and "nothing was written" in str(exc.value)
+    assert _row(conn, "condition", target) == before
+    assert _ledger(conn) == ledger_before
+
+
+def test_identity_on_a_drifted_row_is_refused_and_names_the_rekey(seeded):
+    """A row already stored under a stale key has no meaningful base to move *from*, so
+    the move would file it beside siblings the engine can no longer see as one."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    conn.execute(
+        "UPDATE condition SET dedup_key = 'stale', dedup_base = 'stale' "
+        "WHERE condition_id = ?", (target,)
+    )
+    conn.commit()
+    before = _row(conn, "condition", target)
+
+    with pytest.raises(dedup.DictionaryDriftError, match="rekey --apply"):
+        records.edit_record(conn, "condition", target, {"onset_on": "2024-03-05"},
+                            note="wrong date", apply=True, identity=True)
+    _assert_untouched(conn, "condition", target, before)
+
+
+def test_identity_is_refused_when_it_would_strand_an_anchored_conflict(seeded):
+    """The `record rm` rule, for the same reason: the document survives, so `keep both`
+    is still a live resolution and the staged payload is still worth something."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    # A stated lifecycle disagreement on the same episode: same key, different payload.
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Type 2 Diabetes", "status": "resolved", "onset_on": "2024-01-01"},
+    ]})
+    assert dedup.list_conflicts(conn)
+    before = _row(conn, "condition", target)
+
+    with pytest.raises(records.AnchoredConflictError, match="review-conflicts"):
+        records.edit_record(conn, "condition", target, {"onset_on": "2024-03-05"},
+                            note="wrong date", apply=True, identity=True)
+    _assert_untouched(conn, "condition", target, before)
+
+
+def test_a_row_scoped_verdict_follows_the_moved_row(seeded):
+    """Carry-over, half one: nothing to do. `curation` resolves a row verdict by
+    `record_id`, and the stored base it also carries is a breadcrumb nothing consults -
+    the same property that makes a `rekey` safe for row-scoped rulings."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    curation.annotate_record(conn, "condition", str(target), status="confirmed",
+                             note="reviewed with the PCP", row=True, apply=True)
+
+    report = records.edit_record(
+        conn, "condition", target, {"onset_on": "2024-03-05"},
+        note="chart says March", apply=True, identity=True,
+    )
+
+    assert report.curation_orphaned == []
+    verdict = curation.load_verdicts(conn).rows[("condition", target)]
+    assert verdict["status"] == "confirmed"
+    # Not orphaned by the move, and not re-annotated by it either.
+    assert [o.record_id for o in curation.list_orphans(conn)] == []
+
+
+def test_a_family_verdict_on_the_vacated_base_is_reported_and_re_pointable(
+    seeded, tmp_path, capsys
+):
+    """Carry-over, half two: the orphan a base move makes, reported in the shape that
+    already has a remedy. No verdict vanishes and none attaches to a row it never
+    covered - the map entry re-points it onto exactly the family the row moved to."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    old_base = _row(conn, "condition", target)["dedup_base"]
+    curation.annotate_record(conn, "condition", old_base, status="confirmed",
+                             note="family verdict", apply=True)
+
+    report = records.edit_record(
+        conn, "condition", target, {"onset_on": "2024-03-05"},
+        note="chart says March", apply=True, identity=True,
+    )
+
+    assert len(report.curation_orphaned) == 1
+    entry = report.curation_orphaned[0]
+    assert entry["dedup_base"] == old_base
+    assert entry["record_id"] == 0
+    assert entry["successor_base"] == report.new_dedup_base
+    assert curation.ORPHAN_NO_FAMILY in entry["kinds"]
+    # The engine agrees it is orphaned - the report is not making its own claim.
+    live = curation.list_orphans(conn)
+    assert [o.dedup_base for o in live] == [old_base]
+
+    # And the report *is* a `record reaffirm --map-file` payload, unmodified.
+    map_file = tmp_path / "orphans.json"
+    map_file.write_text(json.dumps(report.curation_orphaned), encoding="utf-8")
+    plan = cli._plan_reaffirm(conn, live, cli._load_reaffirm_map(str(map_file)), False)
+    assert [action.action for action in plan] == ["reaffirm"]
+    assert plan[0].to_base == report.new_dedup_base
+
+
+def test_a_family_verdict_with_survivors_is_left_alone(seeded):
+    """`ORPHAN_NO_FAMILY`'s own rule: a base with rows left on it is not orphaned, so the
+    move stays quiet rather than crying wolf over a ruling that still applies."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    base = _row(conn, "condition", target)["dedup_base"]
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Type 2 Diabetes", "status": "resolved", "onset_on": "2024-01-01"},
+    ]})
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"],
+                           keep="both")
+    curation.annotate_record(conn, "condition", base, status="confirmed",
+                             note="family verdict", apply=True)
+
+    report = records.edit_record(
+        conn, "condition", target, {"onset_on": "2024-03-05"},
+        note="chart says March", apply=True, identity=True,
+    )
+
+    assert report.identity is True and report.curation_orphaned == []
+    assert curation.list_orphans(conn) == []
+    assert curation.get_verdict(conn, "condition", base)["status"] == "confirmed"
+
+
+def test_a_dry_run_identity_move_writes_nothing(seeded):
+    """The dry run is the safety mechanism here too - and it has to report the
+    destination, since where the row lands is the whole decision."""
+    conn = seeded["conn"]
+    target = _condition(conn)
+    before = _row(conn, "condition", target)
+
+    report = records.edit_record(
+        conn, "condition", target, {"onset_on": "2024-03-05"},
+        note="chart says March", identity=True,
+    )
+
+    assert report.applied is False and report.identity is True
+    assert report.new_dedup_key and report.new_dedup_key != report.dedup_key
+    _assert_untouched(conn, "condition", target, before)
+
+
 # --- CLI surface -------------------------------------------------------------
 
 
@@ -1385,10 +1622,18 @@ def test_cli_record_edit_json_shape_is_stable(cli_ready, capsys):
     assert set(payload) == {
         "record_type", "row_id", "person", "person_id", "document_id", "label",
         "changes", "unchanged", "dedup_key", "dedup_base", "dedup_occurrence",
+        # Appended by issue #152's identity edit, never inserted: the key set is a
+        # contract that may only widen.
+        "identity", "new_dedup_key", "new_dedup_base", "new_dedup_occurrence",
+        "curation_orphaned", "conflicts_reanchored",
         "note", "attributed_to", "edited_at", "applied",
     }
     assert payload["changes"] == [{"field": "unit", "old": "%", "new": "percent"}]
     assert payload["applied"] is False
+    # An ordinary correction reports standing still, not a null island.
+    assert payload["identity"] is False
+    assert payload["new_dedup_key"] == payload["dedup_key"]
+    assert payload["curation_orphaned"] == [] and payload["conflicts_reanchored"] == []
 
 
 def test_cli_record_rm_json_gained_the_edit_disclosure(cli_ready, capsys):
@@ -1436,6 +1681,29 @@ def test_cli_record_edit_refusals_are_friendly_rc1(cli_ready, capsys):
                 "--set", "value_num=abc", "--note", "n", "--apply") == 1
     assert "value_num" in capsys.readouterr().err
     assert _cli_field(cli_ready, "lab_result", target, "unit") == "%"
+
+
+def test_cli_record_edit_identity_collision_is_friendly_rc1(cli_ready, capsys):
+    """The merge refusal reaches the operator as a message, not a traceback (issue
+    #152): `IdentityCollisionError` is a ValueError, but it is named in the CLI's
+    friendly list so a future re-parenting cannot quietly demote it."""
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        dedup.commit_extraction(conn, 1, {"condition": [
+            {"name": "Type 2 Diabetes", "status": "active", "onset_on": "2020-06-01"},
+        ]})
+        target = _row_id(conn, "condition", "onset_on", "2024-01-01")
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "edit", "condition", str(target), "--identity",
+                "--set", "onset_on=2020-06-01", "--note", "same episode",
+                "--apply") == 1
+    err = capsys.readouterr().err
+    assert "merge, not a correction" in err and "nothing was written" in err
+    assert err.isascii()                       # issue #23
+    assert _cli_field(cli_ready, "condition", target, "onset_on") == "2024-01-01"
 
 
 @pytest.mark.parametrize("argv", [

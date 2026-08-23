@@ -12,7 +12,9 @@ Two operations, both shaped like `documents.remove_document`:
 
     * ``remove_record`` — delete a single typed record row, dry-run by default
     * ``edit_record`` — correct a single row's **non-key** fields in place,
-      dry-run by default, every change written to an append-only ledger
+      dry-run by default, every change written to an append-only ledger; with
+      ``identity=True`` (`record edit --identity`) it instead *moves* the row onto
+      the identity its corrected fields derive — a one-row rekey (issue #152)
 
 ``record_fts`` needs no explicit maintenance for either: migrations 003 and 006
 put AFTER DELETE **and** AFTER UPDATE triggers on every one of
@@ -63,6 +65,34 @@ verdict left behind would re-attach to whatever unrelated record lands on it. Th
 dry run names the verdict; ``apply`` lifts it in the same transaction as the delete
 (:func:`curation.retire_row_verdicts`). Family-scoped verdicts are untouched:
 ``dedup_base`` is content-derived, so re-attachment there is intentional.
+
+**An identity edit is a one-row rekey, not a fourth mechanism** (issue #152). Once
+``condition.onset_on`` identifies the *episode*, correcting a wrong onset date is by
+construction an identity change, and the old advice — "`record rm` and re-commit" —
+throws away the row's provenance and its ledger to fix a typo. ``--identity`` moves
+the row instead: same payload write, same ledger, same correction mark, plus the
+three ``dedup_*`` columns. Its consequences are deliberately the *same* consequences
+`pemr rekey` already has, reported the same way:
+
+    * **row-scoped** verdicts follow the row for free — :mod:`pemr.curation`
+      resolves them by ``record_id``, and a row verdict's stored ``dedup_base`` is a
+      breadcrumb that is never consulted (:data:`curation.ORPHAN_KINDS`);
+    * a **family-scoped** verdict on the base the row vacated orphans exactly as a
+      `rekey` base move orphans one — and *only* when the row was the last of its
+      family, :data:`curation.ORPHAN_NO_FAMILY`'s own rule. The report carries it in
+      the shape `pemr rekey --apply --json` emits, so `pemr record reaffirm
+      --map-file` re-points it with no new plumbing;
+    * ``dedup_occurrence`` is **not** renumbered on either side, for the reason
+      stated above for deletion;
+    * an open conflict anchored to the row is refused when the move would empty its
+      family, and disclosed as re-anchoring when a sibling survives — the
+      :func:`remove_record` rule, for the same reason: the document survives, so
+      `keep both` is still a live resolution.
+
+What it refuses outright is a *merge*: if the target family already holds a row that
+says the same thing, moving this one there would file one fact twice under one
+identity. That is `record rm` / `record annotate --status merged-into` work, and the
+error says so (:class:`IdentityCollisionError`).
 """
 
 from __future__ import annotations
@@ -89,8 +119,21 @@ class FieldNotEditableError(ValueError):
 
     Identity fields are not off-limits because editing them is unthinkable — it is
     because an identity change is a *different operation*, with its own answers
-    (a dictionary edit + `pemr rekey`, or `record rm` + re-commit). The message
-    points there rather than leaving the operator guessing.
+    (a dictionary edit + `pemr rekey`, or — since issue #152 — the same command with
+    ``--identity``). The message points there rather than leaving the operator
+    guessing.
+    """
+
+
+class IdentityCollisionError(ValueError):
+    """Refused: the identity the edit moves the row onto is already occupied by a row
+    saying the same thing (issue #152).
+
+    Not a correction but a **merge**, and merging is a recorded human judgment with its
+    own verbs (`record annotate --status merged-into`, or `record rm` once the operator
+    has decided which row is the survivor). Doing it silently here would file one
+    clinical fact twice under one identity and hide the duplicate behind an occurrence
+    number.
     """
 
 
@@ -148,6 +191,23 @@ class RecordEditReport:
     dedup_key: str = ""
     dedup_base: str = ""
     dedup_occurrence: int = 0
+    # --- identity edit (issue #152) --------------------------------------------
+    # Whether `--identity` was passed AND the corrected payload actually moves the key.
+    # False on an ordinary correction and on an inert `--identity` (nothing moved), so
+    # a reader never has to distinguish "asked for" from "happened".
+    identity: bool = False
+    # Where the row lands. Equal to the three columns above when `identity` is False.
+    new_dedup_key: str = ""
+    new_dedup_base: str = ""
+    new_dedup_occurrence: int = 0
+    # Family-scoped verdicts left pointing at the base this row vacated - only when it
+    # was the family's last row. Each entry is shaped like an entry of `pemr rekey
+    # --apply --json`'s `orphans` array, so the report feeds `pemr record reaffirm
+    # --map-file` unmodified. Empty on an ordinary correction.
+    curation_orphaned: list[dict] = field(default_factory=list)
+    # Open conflicts whose anchor row moves out from under them (siblings survive, so
+    # they re-anchor on their next resolution). The `remove_record` disclosure.
+    conflicts_reanchored: list[int] = field(default_factory=list)
     note: str = ""
     attributed_to: str | None = None
     edited_at: str = ""
@@ -166,6 +226,14 @@ class RecordEditReport:
             "dedup_key": self.dedup_key,
             "dedup_base": self.dedup_base,
             "dedup_occurrence": self.dedup_occurrence,
+            # Additive-only, per the `--json` contract rule: an existing consumer that
+            # never asked about identity edits reads exactly what it read before.
+            "identity": self.identity,
+            "new_dedup_key": self.new_dedup_key,
+            "new_dedup_base": self.new_dedup_base,
+            "new_dedup_occurrence": self.new_dedup_occurrence,
+            "curation_orphaned": self.curation_orphaned,
+            "conflicts_reanchored": self.conflicts_reanchored,
             "note": self.note,
             "attributed_to": self.attributed_to,
             "edited_at": self.edited_at,
@@ -399,6 +467,104 @@ def _same_value(stored: object, incoming: object) -> bool:
     return stored == incoming
 
 
+def _plan_identity_move(
+    conn: sqlite3.Connection,
+    record_type: str,
+    row: sqlite3.Row,
+    before: dict,
+    after: dict,
+    after_base: str,
+    dictionary: dict[str, str] | None,
+    report: RecordEditReport,
+) -> None:
+    """Gate a one-row rekey and fill in where the row lands (issue #152).
+
+    Everything that can refuse the move happens here, before the transaction opens —
+    :func:`dedup._plan_keep_both`'s shape, and for its reason. Writes nothing; it only
+    raises, or populates ``report``'s ``new_dedup_*`` / ``curation_orphaned`` /
+    ``conflicts_reanchored`` fields.
+
+    Called only when the corrected payload genuinely derives a different base, so the
+    "``--identity`` is inert" case never reaches here.
+    """
+    pk = f"{record_type}_id"
+    row_id = int(row[pk])
+    person_id = row["person_id"]
+
+    # 1. Drift. Both bases are checked, not just the one being left: moving *into* a
+    # family whose rows are stored under stale keys would file the row beside a sibling
+    # the engine can no longer see as one. Either way the remedy is the same run of
+    # `pemr rekey --apply`, and its message already says so.
+    dedup._assert_no_key_drift(conn, record_type, [before, after], person_id, dictionary)
+
+    # 2. Occupied target. `_rows_equal` is the engine's own duplicate-vs-conflict
+    # question, so "the same thing" here means exactly what it means at commit time -
+    # including the sparse-type reading, where a thinner stored sibling still counts as
+    # agreeing. The self-exclusion is belt-and-braces: gate 1 guarantees the row is
+    # stored under its pre-move base, so it cannot already be in the target family.
+    target = dedup.load_family(conn, record_type, after_base)
+    twin = next(
+        (m for m in target
+         if int(m[pk]) != row_id and dedup._rows_equal(record_type, m, after)),
+        None,
+    )
+    if twin is not None:
+        raise IdentityCollisionError(
+            f"refusing to move {record_type} {row_id} onto identity "
+            f"{after_base[:12]}...: {record_type} {int(twin[pk])} "
+            f"({dedup._rekey_label(record_type, twin)!r}) already says the same thing "
+            "there. Filing both under one identity is a merge, not a correction - "
+            f"record it with `pemr record annotate {record_type} {row_id} --status "
+            f"merged-into --merged-into {after_base}`, or drop the redundant row with "
+            f"`pemr record rm {record_type} {row_id}`; nothing was written"
+        )
+    # Monotonic over the target family and never reused, so a hole left by an earlier
+    # removal stays a hole rather than letting this row inherit a departed sibling's key.
+    occurrence = max((int(m["dedup_occurrence"] or 0) for m in target), default=-1) + 1
+    report.new_dedup_base = after_base
+    report.new_dedup_occurrence = occurrence
+    report.new_dedup_key = dedup.occurrence_key(after_base, occurrence)
+
+    # 3. Anchored conflicts, and what the vacated family loses. Both turn on the same
+    # question - does anything survive on the old base - so the survivors are computed
+    # once. Occurrence numbers on *that* side are not renumbered either.
+    survivors = [
+        m for m in dedup.load_family(conn, record_type, row["dedup_base"])
+        if int(m[pk]) != row_id
+    ]
+    anchored = dedup.conflicts_anchored_to_row(conn, record_type, row, dictionary)
+    if anchored and not survivors:
+        ids = ", ".join(f"#{cid}" for cid in anchored)
+        raise AnchoredConflictError(
+            f"{record_type} {row_id} ({report.label!r}) is the last row of the "
+            f"identity open conflict(s) {ids} are staged against - moving it to a new "
+            "identity would leave them with nothing to resolve against, and their "
+            "staged payload is not recoverable. Resolve them first with "
+            "`pemr review-conflicts --resolve <id> --keep both|existing`; "
+            "nothing was written"
+        )
+    report.conflicts_reanchored = anchored
+
+    # 4. Verdict carry-over. Row-scoped verdicts need nothing: `curation` resolves them
+    # by `record_id` and never consults the stored base. A family-scoped verdict is
+    # orphaned only when the base it names goes empty - `curation.ORPHAN_NO_FAMILY`'s own
+    # rule - so a family with survivors keeps its ruling and this stays quiet.
+    if not survivors:
+        verdict = curation.get_verdict(conn, record_type, row["dedup_base"])
+        if verdict is not None:
+            report.curation_orphaned = [{
+                **verdict,
+                "kinds": [curation.ORPHAN_NO_FAMILY],
+                "label": "",
+                "family_size": 0,
+                # The two keys `pemr record reaffirm --map-file` re-points on, named
+                # exactly as `pemr rekey --apply --json` names them, so this report is a
+                # valid map file with no reshaping.
+                "successor_base": after_base,
+                "successor_merge_base": None,
+            }]
+
+
 def edit_record(
     conn: sqlite3.Connection,
     record_type: str,
@@ -409,6 +575,7 @@ def edit_record(
     note: str,
     attributed_to: str | None = None,
     now: str | None = None,
+    identity: bool = False,
     apply: bool = False,
 ) -> RecordEditReport:
     """Correct one row's **non-key** fields in place, addressed by primary key.
@@ -449,13 +616,39 @@ def edit_record(
     because it compares like with like: a row whose stored key predates a dictionary edit
     is still editable, since both sides are recomputed under the same dictionary.
 
+    **``identity=True`` inverts that last guard into a move** (issue #152, the module
+    docstring). Identity fields become nameable, and instead of refusing the recomputed
+    key it *writes* it, carrying the row onto the corrected identity. The case it exists
+    for is the one the episode model creates: a ``condition`` whose ``onset_on`` — now
+    part of its key — was recorded wrong. Its own front-loaded gates, in order, nothing
+    written on any raise:
+
+        1. **drift** — :func:`dedup._assert_no_key_drift`. A row already stored under a
+           stale key has no meaningful base to move *from*; `pemr rekey --apply` first.
+        2. **no-move** — the corrected payload derives the same base, so ``--identity``
+           is inert and this is an ordinary correction. Not an error: passing the flag
+           defensively must not turn a no-op into a failure.
+        3. **occupied target** — a row in the destination family already says the same
+           thing (:func:`dedup._rows_equal`): :class:`IdentityCollisionError`, because
+           that is a merge (see the module docstring). Otherwise the row takes
+           ``max(dedup_occurrence) + 1`` of the target family, the monotonic rule
+           :func:`dedup._plan_keep_both` uses, so it can never land on an occupied key.
+        4. **anchored conflict** — :class:`AnchoredConflictError` when the row is the
+           last member of a family an open conflict is staged against; a survivable
+           re-anchoring is disclosed on the report instead.
+
+    A move can only ever *split* a family — adding a discriminator to an identity never
+    fuses two — so, gate 3 aside, it cannot manufacture a ``UNIQUE(dedup_key)`` violation.
+
     **Re-ingest divergence.** Once a unit is corrected, re-committing the *original*
     document stages a CONFLICT rather than deduping, because ``unit`` is one of
     ``dedup._COMPARE_FIELDS`` for ``lab_result`` and ``observation``. That is correct and
     loud: the stored row genuinely no longer says what its source says.
 
-    Raises :class:`FieldNotEditableError`, :class:`RecordNotFoundError`,
-    ``dedup.ValidationError`` or plain ``ValueError`` — all friendly rc=1 at the CLI.
+    Raises :class:`FieldNotEditableError`, :class:`IdentityCollisionError`,
+    :class:`AnchoredConflictError`, :class:`RecordNotFoundError`,
+    ``dedup.DictionaryDriftError``, ``dedup.ValidationError`` or plain ``ValueError`` —
+    all friendly rc=1 at the CLI.
     """
     db.require_migrated(conn)
     _require_type(record_type)
@@ -477,15 +670,19 @@ def edit_record(
         )
     editable = dedup.editable_fields(record_type)
     key_fields = dedup.KEY_FIELDS[record_type]
+    # With `--identity` the key fields join the nameable set; everything outside
+    # FIELD_SPECS stays unnameable in both modes, which is the provenance guarantee.
+    nameable = (*editable, *sorted(key_fields)) if identity else editable
     for name in updates:
-        if name in editable:
+        if name in nameable:
             continue
         if name in key_fields:
             raise FieldNotEditableError(
                 f"{record_type}.{name} is part of the row's identity (it feeds the "
                 "dedup_key), so it cannot be corrected in place - that is a different "
-                "operation: edit `data/dictionary.toml` and run `pemr rekey`, or "
-                f"`pemr record rm {record_type} {row_id}` and re-commit. Editable "
+                "operation: edit `data/dictionary.toml` and run `pemr rekey`, "
+                f"`pemr record rm {record_type} {row_id}` and re-commit, or pass "
+                "`--identity` to move the row onto the corrected identity. Editable "
                 f"{record_type} fields: {', '.join(editable)}; nothing was written"
             )
         raise FieldNotEditableError(
@@ -508,12 +705,13 @@ def edit_record(
     dedup.validate_row(record_type, {k: v for k, v in after.items() if v is not None})
 
     person_id = row["person_id"]
-    before_key = dedup.dedup_key(record_type, before, person_id, dictionary)
-    after_key = dedup.dedup_key(record_type, after, person_id, dictionary)
-    if before_key != after_key:
-        # Unreachable while KEY_FIELDS agrees with dedup._key_parts. Kept as the
-        # structural backstop: if a future key derivation reads a field this table does
-        # not list, the edit refuses instead of silently forking the fact.
+    before_base = dedup.dedup_key(record_type, before, person_id, dictionary)
+    after_base = dedup.dedup_key(record_type, after, person_id, dictionary)
+    moves = before_base != after_base
+    if moves and not identity:
+        # Reachable only when KEY_FIELDS has fallen out of step with dedup._key_parts:
+        # a named field the table does not list as identity nonetheless moved the key.
+        # (An intentional identity change comes through `identity=True` instead.)
         raise FieldNotEditableError(
             f"refusing to edit {record_type} {row_id}: the requested change would move "
             "its dedup_key, which is an identity change rather than a correction "
@@ -524,11 +722,11 @@ def edit_record(
     changes = [
         {"field": name, "old": _ledger_text(before[name]),
          "new": _ledger_text(updates[name])}
-        for name in editable
+        for name in nameable
         if name in updates and not _same_value(before[name], updates[name])
     ]
     unchanged = [
-        name for name in editable
+        name for name in nameable
         if name in updates and _same_value(before[name], updates[name])
     ]
 
@@ -545,10 +743,27 @@ def edit_record(
         dedup_key=row["dedup_key"],
         dedup_base=row["dedup_base"],
         dedup_occurrence=int(row["dedup_occurrence"] or 0),
+        identity=moves,
+        # Default to standing still: an ordinary correction reports the same three
+        # columns on both sides, so a reader never has to special-case the common path.
+        new_dedup_key=row["dedup_key"],
+        new_dedup_base=row["dedup_base"],
+        new_dedup_occurrence=int(row["dedup_occurrence"] or 0),
         note=cleaned_note,
         attributed_to=(attributed_to or "").strip() or None,
         edited_at=stamp,
     )
+
+    key_assignments: list[str] = []
+    key_values: list[object] = []
+    if moves:
+        _plan_identity_move(
+            conn, record_type, row, before, after, after_base, dictionary, report
+        )
+        key_assignments = [f"{name} = ?" for name in dedup.INTERNAL_COLUMNS]
+        key_values = [
+            report.new_dedup_key, report.new_dedup_base, report.new_dedup_occurrence,
+        ]
 
     if apply and changes:
         # One transaction for the UPDATE and its ledger rows: a correction that commits
@@ -559,12 +774,18 @@ def edit_record(
         # statement: the payload change and its disclosure must land together or not at
         # all. These two columns are outside FIELD_SPECS, so they can never collide with a
         # named change. Last correction wins on the row; the ledger below keeps every one.
+        # An identity move carries the three dedup_* columns in the *same* statement
+        # (issue #152): a payload that landed under its old key, or a key with no
+        # payload behind it, is precisely the drift `_assert_no_key_drift` exists to
+        # catch. They are outside FIELD_SPECS too, so they cannot collide with a change.
         assignments = ", ".join(
             [f"{c['field']} = ?" for c in changes]
             + [f"{name} = ?" for name in dedup.EDIT_MARK_COLUMNS]
+            + key_assignments
         )
         values = [
             *(updates[c["field"]] for c in changes), stamp, report.attributed_to,
+            *key_values,
         ]
         with conn:
             cur = conn.execute(

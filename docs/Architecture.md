@@ -151,6 +151,9 @@ CREATE UNIQUE INDEX idx_curation_row ON curation(record_type, record_id)
 -- leaves document_id, person_id, dedup_key and the source blob untouched. The editable
 -- set is DERIVED (dedup.FIELD_SPECS minus dedup.KEY_FIELDS, §3), so identity and
 -- provenance are unreachable from an edit by construction rather than by a denylist.
+-- `--identity` (issue #152, §3 Episodes) opens the identity half of that split and moves
+-- the row's key with the payload; provenance stays unreachable in both modes, and the
+-- ledger entry keeps the OLD dedup_base so the move stays reconstructable.
 -- One row per changed field, all sharing one edited_at, so a single command's correction
 -- reads as one act while each field stays individually legible.
 --
@@ -349,8 +352,11 @@ CREATE TABLE condition (                   -- migration 006 (promoted from obser
   document_id   INTEGER REFERENCES document(document_id),
   name          TEXT NOT NULL,
   status        TEXT NOT NULL,             -- active|resolved|history|family-history
-  onset_on      TEXT,
-  resolved_on   TEXT,
+  onset_on      TEXT,                      -- IDENTITY (§3 Episodes): which episode this
+                                           -- row is. Stored at the source's own precision
+                                           -- (YYYY | YYYY-MM | YYYY-MM-DD), never padded;
+                                           -- correct it with `record edit --identity`
+  resolved_on   TEXT,                      -- payload: an episode's end is not its identity
   relation      TEXT,                      -- family-history only: mother|father|...
   note          TEXT,
   dedup_key     TEXT NOT NULL,
@@ -442,19 +448,23 @@ procedure.dedup_key     = hash(person_id | norm(name) | performed_on)
 appointment.dedup_key   = hash(person_id | provider | scheduled_for)
 observation.dedup_key   = hash(person_id | obs_type | observed_at | key_token(key))
 allergy.dedup_key       = hash(person_id | norm(substance))
-condition.dedup_key     = hash(person_id | norm(name) | subject)
+condition.dedup_key     = hash(person_id | norm(name) | episode)
+    episode = subject + '@' + date_only(onset_on)  when an onset is stated
+            = subject                              otherwise
     subject = 'family:' + norm(relation)  when status = 'family-history'
             = 'self'                      otherwise
 ```
 
-The last two are deliberately **date-free**: allergies and problem lists are *standing
-facts* restated on every document with inconsistent or absent dates, so a date in the key
-would fork one allergy into one row per document. Their dates are payload, and a stated
-disagreement (in a date or anywhere else) stages a conflict. A field the incoming document
-simply omits is silence, not a change, and never conflicts — the one place the
-duplicate-vs-conflict comparison differs by record type (`dedup._SPARSE_TYPES`). The
-`subject` discriminator is a correctness fix, not a nicety: without it a patient's
-diabetes and her mother's derive one key and silently merge.
+`allergy` is deliberately **date-free**: an allergy is a *standing fact* restated on every
+document with inconsistent or absent dates, so a date in the key would fork one allergen
+into one row per document. Its dates are payload, and a stated disagreement (in a date or
+anywhere else) stages a conflict. A field the incoming document simply omits is silence,
+not a change, and never conflicts — the one place the duplicate-vs-conflict comparison
+differs by record type (`dedup._SPARSE_TYPES`). `condition` keeps that sparse reading but
+left the date-free class in issue #152 (**Episodes**, below): a problem that starts and
+stops repeatedly is not one standing fact, so its onset joins the key while its
+`resolved_on` stays payload. The `subject` discriminator is a correctness fix, not a
+nicety: without it a patient's diabetes and her mother's derive one key and silently merge.
 
 That reading is asymmetric by design. Treating a *stored* NULL as silence too would make the
 common terse-then-detailed document sequence lossy: the second document's `criticality` would
@@ -899,6 +909,98 @@ Because siblings legitimately share a date, every same-date ordering is tie-brok
 id (`query labs`, the summary/brief lab sections): the admitted row sorts as the later
 point, so `trends` deltas and "latest value" stay deterministic.
 
+### Episodes (issue #152)
+
+Some clinical states **start and stop repeatedly**: kidney stones, UTIs, fractures, DVTs,
+cellulitis, seizures; a course of antibiotics; an intermittent symptom. A row identified as
+a standing fact cannot hold two of them — the second episode collides with the first, there
+is nowhere for its date to live, and every recurrence folds into one row with the count and
+every date but one silently lost. This is the **episode primitive**, defined once here and
+adopted per record type, so each adopting type extends it rather than inventing a variant.
+`condition` adopts it first; `symptom` and medication courses-as-episodes are separate
+issues and take *this* shape when they land.
+
+**Identity is name + subject + onset.** The onset is folded into the existing subject key
+part (`self@2009-09-15`, `family:mother@2011`), not appended as a fourth part — the
+`key_token()` decision applied again, and the reason the migration is cheap: an **undated**
+row's `dedup_key` stays byte-identical, so only *dated* rows move and every family-scoped
+verdict on an undated family survives untouched. `dedup_occurrence` is **not** replaced by
+this; it is demoted to what it is now needed for — genuinely undated repeats and two
+episodes a source dates identically.
+
+**Onset stores true precision, FHIR-style.** `1998`, `1998-05`, `1998-05-20` are three
+different claims, stored exactly as the source stated them: no sentinel padding to
+`-01-01`, and no separate "approximate" flag. Precision is implicit in the value, and
+ordering is plain lexical comparison because each accepted form is a prefix of the next —
+the same three-precision rule `_is_iso_date` already enforces on every `DATE_FIELDS`
+column, so this needed no storage change (the columns are `TEXT`, and no consumer does date
+arithmetic on `onset_on`). Dates are *expected* for an episode; a genuinely undated one
+falls back to the occurrence tiebreaker.
+
+**Two temporalities, kept apart.** An episode's clinical validity window lives on the row
+(`onset_on` opens it, `resolved_on` closes it — the end is payload, not identity: a
+resolution date is news about an episode, not a different episode). *When we learned it,
+and from which source* stays owned by the provenance and curation layers —
+`document_id`/`attested_*`, `dedup_occurrence`, the verdict overlay. There is deliberately
+no SCD-2 effective-dating (`effective_from`/`effective_to`/`is_current`) on clinical rows:
+that would fuse the two temporalities into one column set and make every read ask which
+kind of time it meant.
+
+**One consequence to know about.** An undated umbrella claim and a dated episode are two
+identities, so a later document that dates a stored undated problem lands as a **new row**
+beside it rather than enriching it in place (`onset_on` left `_COMPARE_FIELDS`, so
+`_sparse_gains` cannot fill it). That is the intended semantics — auto-absorbing one into
+the other is exactly the silent fold this change ends — but unannounced it would trade
+silent folding for silent duplication, so `pemr verify` **warns** when a person has an
+undated condition row beside dated episodes of the same problem, naming both remedies.
+
+**Migration: rekey, then unfold.** The identity change is a key change, so it is a `pemr
+rekey`, not a SQL migration (SQL cannot compute the sha256 — the migration-006 precedent
+above). It is collision-free by construction: adding a discriminator to a key only ever
+*splits* families, never fuses two, and a split sibling keeps its stored
+`dedup_occurrence`, so no two rows can land on one key. A family split leaves a hole (the
+former occurrence 1 sits on `hash(base|1)` of its new base with no occurrence 0); that is
+deliberate, for the same reason deletion does not renumber — renumbering rewrites sibling
+keys out from under any staged conflict.
+
+```
+pemr rekey --apply --json > rekey.json      # dated conditions move; undated ones do not
+pemr record reaffirm --map-file rekey.json  # dry run, then --apply
+```
+
+**Unfolding an umbrella row is an operator sequence, not an inference.** Nothing in a
+stored row says it holds two episodes, and the free-text `note` must never be parsed for
+dates. The operator gives the umbrella row the episode it actually is, then files the other:
+
+```
+pemr record edit condition <id> --identity --set onset_on=2009-09-15 --note "..." --apply
+pemr record assert condition --person <slug> --field name=... --field onset_on=1998-05 ...
+```
+
+**Correcting an onset is itself a rekey, and carries its verdicts across.** With onset in
+the identity, fixing a wrong onset date moves the row's key — so it is `record edit
+--identity` (§5), a one-row rekey rather than an in-place correction, and its consequences
+are the ones `pemr rekey` already has, reported the same way rather than by a new mechanism:
+
+- **row-scoped** verdicts follow the row for free — `curation` resolves them by
+  `record_id`, and the `dedup_base` a row verdict also carries is a breadcrumb nothing
+  consults (that exclusion from the orphan kinds is load-bearing, above);
+- a **family-scoped** verdict on the base the row vacated is orphaned exactly when a
+  `rekey` base move would orphan it — only if the row was the family's last, which is
+  `no-live-family`'s own rule — and the report carries it in `rekey --apply --json`'s
+  `orphans` shape, so `record reaffirm --map-file` re-points it unmodified;
+- payload, provenance and row id are untouched (which is the whole reason this is not
+  `record rm` + re-commit: that re-attributes the row to whichever document is passed at
+  correction time), the correction mark and the edit ledger land as on any correction, and
+  the ledger entry keeps the **old** base as its breadcrumb so the move stays
+  reconstructable;
+- an open conflict anchored to the row is **refused** when the move would empty its family
+  and disclosed as re-anchoring when a sibling survives — `record rm`'s rule, for its
+  reason;
+- moving onto an identity a row already occupies with the same payload is **refused**: that
+  is a merge, and merging is a recorded human judgment (`record annotate --status
+  merged-into`, or `record rm`), not something a correction may do silently.
+
 ---
 
 ## 4. Ingestion pipeline
@@ -1123,11 +1225,19 @@ pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--no
 pemr record rm <table> <id> [--apply]                    # delete ONE record row; its document and every
                                                          # other record it produced survive; dry run by default
 pemr record edit <table> <id> --set NAME=VALUE [--set ...] --note <text>
-                 [--attributed-to ...] [--apply]         # correct a row's NON-KEY fields in place (§2 record_edit);
+                 [--attributed-to ...] [--identity] [--apply]
+                                                         # correct a row's NON-KEY fields in place (§2 record_edit);
                                                          # document_id/dedup_key/source blob untouched; NAME= clears;
-                                                         # identity fields refused (that is a dictionary edit + rekey);
+                                                         # identity fields refused (that is a dictionary edit + rekey,
+                                                         #        or --identity below);
                                                          # every change ledgered; the row is stamped edited_at/edited_by
                                                          #        so render/query disclose it (§2); dry run by default
+                                                         # --identity: name identity fields and MOVE the row onto the
+                                                         #        identity they derive - a one-row rekey (§3 Episodes).
+                                                         #        Payload/provenance/row id/ledger/row verdicts follow;
+                                                         #        a family verdict on an emptied base is reported in
+                                                         #        `record reaffirm --map-file` shape; an occupied
+                                                         #        target is refused (that is a merge, not a correction)
 pemr record edit --list [<table>] [--json]               # recorded corrections, newest first (field: old -> new)
 pemr record annotate <table> <base-or-id> --status <s> --note <text> [--attributed-to ...]
                      [--merged-into <base-or-id>] [--allow-cross-person] [--row] [--apply]

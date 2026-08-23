@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pemr import cli, db, dedup, persons, render
+from pemr import cli, curation, db, dedup, persons, render
 
 DICT_PATH = str(
     Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
@@ -687,3 +687,166 @@ def test_a_blank_key_assert_exits_non_zero(ready, capsys):
     err = capsys.readouterr().err
     assert "missing required field 'key'" in err
     assert err.isascii()
+
+
+# --- issue #152: the episode model, end to end at the CLI ---------------------
+#
+# The fixtures below are SYNTHETIC (AGENTS.md: this repo is public and carries no real
+# PII). The real umbrella row this issue was filed over is operator work in the private
+# data repo; what is pinned here is the *shape* of the unfold and of the migration.
+
+
+def _conditions(tmp_path):
+    """Every stored condition as ``{onset_on: (row_id, dedup_base)}``."""
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        return {
+            row["onset_on"]: (int(row["condition_id"]), row["dedup_base"])
+            for row in conn.execute("SELECT * FROM condition")
+        }
+    finally:
+        conn.close()
+
+
+def _commit_condition(tmp_path, sha, rows):
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    cur = conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ingested_at) "
+        "VALUES (?, ?, 'aa/y.pdf', '2026-01-01T00:00:00')", (sha, pid),
+    )
+    conn.commit()
+    dedup.commit_extraction(conn, cur.lastrowid, {"condition": rows},
+                            dedup.load_dictionary(DICT_PATH))
+    conn.close()
+
+
+def test_unfolding_an_umbrella_condition_into_two_episodes(ready, capsys):
+    """The acceptance case (issue #152), as an operator sequence at the CLI.
+
+    A recurring problem was stored as ONE umbrella row because the old identity had
+    nowhere to put a second date. Unfolding it is deliberately *not* inferred - nothing
+    in the stored row says it holds two episodes, and the `note` text must never be
+    parsed for dates. The operator gives the umbrella row the episode it really is
+    (`record edit --identity`) and files the other one (`record assert`).
+    """
+    tmp_path, _ = ready
+    _commit_condition(tmp_path, "sha-umbrella", [
+        {"name": "Recurrent kidney stones", "status": "resolved",
+         "note": "two episodes; second ultrasound-confirmed"},
+    ])
+    umbrella = _conditions(tmp_path)[None][0]
+    capsys.readouterr()
+
+    # 1. The umbrella row *is* the documented recent episode - date it. That moves its
+    #    key, which is exactly why the flag has to be explicit.
+    assert _run(tmp_path, "record", "edit", "condition", str(umbrella), "--identity",
+                "--set", "onset_on=2009-09-15", "--note",
+                "ultrasound report dates this episode", "--apply") == 0
+    out = capsys.readouterr().out
+    assert "onset_on: (none) -> 2009-09-15" in out
+    assert "-> " in out.split("identity: dedup_key ")[1].splitlines()[0]
+    assert "moved onto its corrected identity" in out
+
+    # 2. The earlier, owner-reported episode is a separate claim with its own date.
+    assert _run(tmp_path, "record", "assert", "condition", "--person", "jane-doe",
+                "--attributed-to", "Jane Doe", "--date", "2026-08-18",
+                "--field", "name=Recurrent kidney stones",
+                "--field", "status=resolved", "--field", "onset_on=1998-05",
+                "--apply") == 0
+    capsys.readouterr()
+
+    rows = _conditions(tmp_path)
+    assert set(rows) == {"1998-05", "2009-09-15"}
+    # Two identities, not one family with two occurrences.
+    assert rows["1998-05"][1] != rows["2009-09-15"][1]
+    assert rows["2009-09-15"][0] == umbrella      # same row, same id, same provenance
+    # And the engine agrees both are stored under the keys it would compute today.
+    assert _run(tmp_path, "rekey") == 0
+    assert "0/2 key(s) change" in capsys.readouterr().out
+
+
+def test_the_rekey_migration_carries_a_family_verdict_across(ready, capsys):
+    """The migration sequence the doc records, composed end to end: `pemr rekey --apply
+    --json` > file, `pemr record reaffirm --map-file`, `pemr verify` clean.
+
+    The pre-#152 state is staged by writing the *old* (onset-free) key onto a dated row,
+    which is exactly what an existing database holds. The undated row beside it is the
+    control: its key must not move, which is the whole reason onset was folded into the
+    subject part instead of appended as a fourth one.
+    """
+    tmp_path, _ = ready
+    _commit_condition(tmp_path, "sha-migrate", [
+        {"name": "Gout", "status": "resolved", "onset_on": "2019-04-02"},
+        {"name": "Eczema", "status": "active"},
+    ])
+
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    gout = int(conn.execute(
+        "SELECT condition_id FROM condition WHERE name='Gout'"
+    ).fetchone()["condition_id"])
+    eczema_key = conn.execute(
+        "SELECT dedup_key FROM condition WHERE name='Eczema'"
+    ).fetchone()["dedup_key"]
+    # The key this row carried before onset joined the identity.
+    old_base = dedup.dedup_key(
+        "condition", {"name": "Gout", "status": "resolved"}, pid,
+        dedup.load_dictionary(DICT_PATH),
+    )
+    conn.execute(
+        "UPDATE condition SET dedup_key = ?, dedup_base = ? WHERE condition_id = ?",
+        (old_base, old_base, gout),
+    )
+    conn.commit()
+    conn.close()
+
+    assert _run(tmp_path, "record", "annotate", "condition", old_base,
+                "--status", "confirmed", "--note", "ruled before the episode model",
+                "--apply") == 0
+    capsys.readouterr()
+
+    assert _run(tmp_path, "rekey", "--apply", "--json") == 0
+    # The composed pipeline is one redirection in a shell (`... --json > f`); pytest
+    # captures stdout instead, so the redirection is spelled out here.
+    report = tmp_path / "rekey.json"
+    report.write_text(capsys.readouterr().out, encoding="utf-8")
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["collisions"] == []
+    assert [c["row_id"] for c in payload["changed"]] == [gout]     # undated row unmoved
+    orphans = payload["orphans"]
+    assert [o["dedup_base"] for o in orphans] == [old_base]
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        assert conn.execute(
+            "SELECT dedup_key FROM condition WHERE name='Eczema'"
+        ).fetchone()["dedup_key"] == eczema_key
+        new_base = conn.execute(
+            "SELECT dedup_base FROM condition WHERE condition_id = ?", (gout,)
+        ).fetchone()["dedup_base"]
+    finally:
+        conn.close()
+    assert orphans[0]["successor_base"] == new_base
+
+    capsys.readouterr()
+    assert _run(tmp_path, "record", "reaffirm", "--map-file", str(report),
+                "--apply") == 0
+    capsys.readouterr()
+
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        moved = curation.get_verdict(conn, "condition", new_base)
+        assert moved is not None and moved["status"] == "confirmed"
+        assert curation.get_verdict(conn, "condition", old_base) is None
+        assert curation.list_orphans(conn) == []
+    finally:
+        conn.close()
+
+    assert _run(tmp_path, "verify") == 0
+    out = capsys.readouterr().out
+    assert "orphan" not in out and "no live family" not in out
