@@ -2291,6 +2291,171 @@ def test_condition_lifecycle_change_stages_a_conflict(conn):
     assert (row["status"], row["resolved_on"]) == ("resolved", "2025-09-01")
 
 
+# --- issue #152: the episode model on `condition` -----------------------------
+
+def test_two_dated_episodes_of_one_condition_both_commit(conn):
+    """The defect this issue exists to fix. A recurring problem - kidney stones, UTIs,
+    fractures - used to fold every recurrence into the first row: the second episode
+    collided with the first, there was nowhere for its date to live, and the count and
+    every date but one vanished with no warning. Onset in the identity keys them apart."""
+    summary = _commit(conn, {"condition": [
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "1998-05"},
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "2009-09-15"},
+    ]})
+    assert summary.counts == {"new": 2, "duplicate": 0, "enriched": 0, "conflict": 0,
+                              "promoted": 0}
+    rows = conn.execute(
+        "SELECT * FROM condition ORDER BY onset_on"
+    ).fetchall()
+    assert [r["onset_on"] for r in rows] == ["1998-05", "2009-09-15"]
+    # Two identities, not one family with two occurrences: the occurrence tiebreaker is
+    # the fallback now, and a dated pair must never need it.
+    assert rows[0]["dedup_base"] != rows[1]["dedup_base"]
+    assert [int(r["dedup_occurrence"]) for r in rows] == [0, 0]
+    # ... and re-stating one of them is still an ordinary duplicate.
+    again = _commit(conn, {"condition": [
+        {"name": "kidney stones", "status": "resolved", "onset_on": "2009-09-15"}]})
+    assert again.counts["duplicate"] == 1
+
+
+def test_an_undated_condition_key_is_unchanged_by_the_episode_model(conn):
+    """The folding guarantee, pinned to a literal hash (issue #152).
+
+    Onset is folded into the existing subject part rather than appended as a fourth key
+    part, so an *undated* condition row hashes exactly what it hashed before the episode
+    model landed. That is what keeps the migration to `pemr rekey --apply` cheap and
+    keeps every family-scoped verdict on an undated family attached. A change here means
+    the whole condition table moved, undated rows included - re-read
+    `dedup._condition_episode` before touching this number."""
+    assert dedup.dedup_key(
+        "condition", {"name": "Chickenpox", "status": "history"}, 1
+    ) == "e5c118be803abf4ec14294ceef69f624c95c2f021a1466eeedcdc6ed0ff39a44"
+    # The family-history subject too - it is the same key part.
+    assert dedup.dedup_key(
+        "condition",
+        {"name": "Chickenpox", "status": "family-history", "relation": "Mother"}, 1,
+    ) == "48b2c929e52fbb0121f1f2805831a3d094a84eef88fd05f8a7312549c61185e8"
+    # A blank onset is *absent*, not an empty discriminator: `""` must key like NULL.
+    assert dedup.dedup_key(
+        "condition", {"name": "Chickenpox", "status": "history", "onset_on": "  "}, 1
+    ) == dedup.dedup_key(
+        "condition", {"name": "Chickenpox", "status": "history"}, 1
+    )
+
+
+def test_an_undated_repeat_still_falls_back_to_the_occurrence_tiebreaker(conn):
+    """`dedup_occurrence` is demoted, not replaced. Two undated statements of one problem
+    still collide - which is correct, since nothing distinguishes them - and `--keep both`
+    is still the recovery path that admits the second as a sibling."""
+    _commit(conn, {"condition": [
+        {"name": "Cellulitis", "status": "resolved", "note": "left calf"}]})
+    # A *stated* disagreement, not an omission: `condition` is a sparse type, so a note
+    # over a stored NULL would enrich the first row instead of colliding with it.
+    summary = _commit(conn, {"condition": [
+        {"name": "Cellulitis", "status": "resolved", "note": "right calf"}]})
+    assert summary.counts["conflict"] == 1
+
+    conflict_id = dedup.list_conflicts(conn)[0]["conflict_id"]
+    dedup.resolve_conflict(conn, conflict_id, keep="both")
+    rows = conn.execute(
+        "SELECT * FROM condition ORDER BY dedup_occurrence"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["dedup_base"] == rows[1]["dedup_base"]
+    assert [int(r["dedup_occurrence"]) for r in rows] == [0, 1]
+
+
+def test_onset_precision_gives_three_identities_stored_verbatim(conn):
+    """Partial dates, FHIR-style: `1998`, `1998-05` and `1998-05-20` are three different
+    claims, stored at the precision the source stated with no sentinel padding, and each
+    a lexical prefix of the next so they sort in that order."""
+    summary = _commit(conn, {"condition": [
+        {"name": "Migraine", "status": "history", "onset_on": "1998-05-20"},
+        {"name": "Migraine", "status": "history", "onset_on": "1998"},
+        {"name": "Migraine", "status": "history", "onset_on": "1998-05"},
+    ]})
+    assert summary.counts["new"] == 3
+    stored = [
+        r["onset_on"] for r in
+        conn.execute("SELECT onset_on FROM condition ORDER BY onset_on").fetchall()
+    ]
+    # Verbatim (no `1998-01-01` padding) and lexically ordered in one assertion.
+    assert stored == ["1998", "1998-05", "1998-05-20"]
+    assert len({
+        dedup.dedup_key("condition",
+                        {"name": "Migraine", "status": "history", "onset_on": v}, 1)
+        for v in stored
+    }) == 3
+    # A stray time component is still truncated to the date, as on every dated type.
+    assert dedup.dedup_key(
+        "condition",
+        {"name": "Migraine", "status": "history", "onset_on": "1998-05-20T09:00"}, 1,
+    ) == dedup.dedup_key(
+        "condition",
+        {"name": "Migraine", "status": "history", "onset_on": "1998-05-20"}, 1,
+    )
+
+
+def test_onset_is_identity_not_payload_in_both_tables():
+    """The two tables that have to agree once onset moved (issue #152): `record edit`
+    stops offering it, and the duplicate-vs-conflict comparison stops naming it - which
+    is what keeps `_sparse_gains` from offering to write an identity field."""
+    assert "onset_on" in dedup.KEY_FIELDS["condition"]
+    assert dedup.editable_fields("condition") == ("resolved_on", "note")
+    assert "onset_on" not in dedup._COMPARE_FIELDS["condition"]
+
+
+def test_rekey_splits_dated_episodes_and_leaves_undated_rows_alone(conn):
+    """The migration, end to end (issue #152). Over a table holding both kinds:
+
+    * every *dated* row's key moves - that is the rekey the identity change owes;
+    * every *undated* row's key does not, the folding guarantee;
+    * a `--keep both` pair with different onsets **splits** into two bases, and the
+      former occurrence-1 row keeps its stored occurrence rather than being renumbered
+      (renumbering would rewrite sibling keys out from under any staged conflict);
+    * nothing collides - adding a discriminator to a key only ever splits families.
+    """
+    doc = _make_document(conn)
+    # Two undated statements of one problem, admitted as a family via `--keep both`,
+    # then dated differently: the umbrella row that the episode model unfolds.
+    _commit(conn, {"condition": [
+        {"name": "UTI", "status": "resolved", "note": "first course"}]}, doc=doc)
+    _commit(conn, {"condition": [
+        {"name": "UTI", "status": "resolved", "note": "second course"}]}, doc=doc)
+    dedup.resolve_conflict(conn, dedup.list_conflicts(conn)[0]["conflict_id"],
+                           keep="both")
+    _commit(conn, {"condition": [{"name": "Eczema", "status": "active"}]}, doc=doc)
+
+    ids = [int(r["condition_id"]) for r in conn.execute(
+        "SELECT condition_id FROM condition ORDER BY condition_id")]
+    first, second, eczema = ids
+    before = {
+        int(r["condition_id"]): r["dedup_key"]
+        for r in conn.execute("SELECT condition_id, dedup_key FROM condition")
+    }
+    for row_id, onset in ((first, "2021-03-02"), (second, "2024-11-18")):
+        conn.execute("UPDATE condition SET onset_on = ? WHERE condition_id = ?",
+                     (onset, row_id))
+    conn.commit()
+
+    report = dedup.rekey(conn, None, apply=True)
+    assert report.collisions == [] and report.blocked == []
+    assert {c.row_id for c in report.changes} == {first, second}
+
+    rows = {int(r["condition_id"]): r
+            for r in conn.execute("SELECT * FROM condition")}
+    assert rows[eczema]["dedup_key"] == before[eczema]          # undated: untouched
+    assert rows[first]["dedup_base"] != rows[second]["dedup_base"]   # split
+    # The hole is deliberate: the second row stays occurrence 1 on its own new base.
+    assert int(rows[first]["dedup_occurrence"]) == 0
+    assert int(rows[second]["dedup_occurrence"]) == 1
+    assert rows[second]["dedup_key"] == dedup.occurrence_key(
+        rows[second]["dedup_base"], 1
+    )
+    # Idempotent: a second run has nothing left to move.
+    assert dedup.rekey(conn, None, apply=True).changes == []
+
+
 def test_sparse_types_do_not_conflict_on_an_omitted_field(conn):
     """A document that simply doesn't restate criticality means "didn't say", not
     "cleared" - otherwise re-ingesting next year's summary stages a conflict per allergy."""
@@ -2326,27 +2491,33 @@ def test_a_stated_field_over_a_stored_null_enriches_rather_than_dedups(conn):
 
 def test_enrichment_fills_only_nulls_and_never_launders_a_disagreement(conn):
     """A stated value must never overwrite a stored one on the quiet path - that is
-    still a conflict, even when the same row also has a NULL the document could fill."""
+    still a conflict, even when the same row also has a NULL the document could fill.
+
+    The fillable NULL is `resolved_on`, not `onset_on`: since issue #152 onset is part of
+    a condition's identity, so an incoming row stating one keys elsewhere entirely and
+    never reaches the duplicate-vs-conflict comparison this test is about."""
     _commit(conn, {"condition": [{"name": "Chickenpox", "status": "history"}]})
     summary = _commit(conn, {"condition": [
-        {"name": "Chickenpox", "status": "active", "onset_on": "1988-03-01"}]})
+        {"name": "Chickenpox", "status": "resolved", "resolved_on": "1988-03-01"}]})
     assert summary.counts == {"new": 0, "duplicate": 0, "enriched": 0, "conflict": 1, "promoted": 0}
     row = conn.execute("SELECT * FROM condition").fetchone()
-    assert (row["status"], row["onset_on"]) == ("history", None)
+    assert (row["status"], row["resolved_on"]) == ("history", None)
 
 
 def test_a_terser_row_later_in_one_submission_does_not_undo_an_enrichment(conn):
     """Both directions inside a single batch: the detailed row enriches the terse one,
-    and a third terse row after it is still just a duplicate."""
+    and a third terse row after it is still just a duplicate.
+
+    `resolved_on` rather than `onset_on`, for the reason the test above states."""
     summary = _commit(conn, {"condition": [
-        {"name": "Anemia", "status": "active"},
-        {"name": "Anemia", "status": "active", "note": "iron deficiency",
-         "onset_on": "2019-02-01"},
-        {"name": "Anemia", "status": "active"},
+        {"name": "Anemia", "status": "resolved"},
+        {"name": "Anemia", "status": "resolved", "note": "iron deficiency",
+         "resolved_on": "2019-02-01"},
+        {"name": "Anemia", "status": "resolved"},
     ]})
     assert summary.counts == {"new": 1, "duplicate": 1, "enriched": 1, "conflict": 0, "promoted": 0}
     row = conn.execute("SELECT * FROM condition").fetchone()
-    assert (row["note"], row["onset_on"]) == ("iron deficiency", "2019-02-01")
+    assert (row["note"], row["resolved_on"]) == ("iron deficiency", "2019-02-01")
 
 
 def test_keep_incoming_on_a_sparse_type_keeps_fields_the_document_did_not_state(conn):

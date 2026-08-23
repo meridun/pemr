@@ -484,6 +484,7 @@ def _with_document_conn(args: argparse.Namespace, work):
             records.RecordNotFoundError,
             records.AnchoredConflictError,
             records.FieldNotEditableError,
+            records.IdentityCollisionError,
             curation.CurationNotFoundError,
             curation.FamilyNotFoundError,
             curation.RowNotFoundError,
@@ -1205,7 +1206,31 @@ def _print_record_edit_report(report: "records.RecordEditReport") -> None:
         print(f"  {name}: unchanged (already that value)")
     owner = f"#{report.document_id}" if report.document_id is not None else "none"
     print(f"  document: {owner} (unchanged - a correction is not a re-attribution)")
-    print(f"  identity: dedup_key {report.dedup_key[:12]}... (unchanged)")
+    if report.identity:
+        # The move, then its fallout. The occurrence is printed because a non-zero one
+        # is how a reader knows the row landed *beside* siblings rather than alone.
+        print(
+            f"  identity: dedup_key {report.dedup_key[:12]}... -> "
+            f"{report.new_dedup_key[:12]}... (occurrence {report.dedup_occurrence} -> "
+            f"{report.new_dedup_occurrence})"
+        )
+        for orphan in report.curation_orphaned:
+            print(
+                f"  warning: the family verdict '{orphan['status']}' on "
+                f"{str(orphan['dedup_base'])[:12]}... is orphaned by this move (no rows "
+                "are left on that base) - re-point it by feeding this command's --json "
+                "output to `pemr record reaffirm --map-file`",
+                file=sys.stderr,
+            )
+        if report.conflicts_reanchored:
+            ids = ", ".join(f"#{cid}" for cid in report.conflicts_reanchored)
+            print(
+                f"  note: open conflict(s) {ids} re-anchor to the lowest surviving "
+                "occurrence of the family this row leaves"
+            )
+        print("  row-scoped verdicts and ledger entries follow the row, by row id")
+    else:
+        print(f"  identity: dedup_key {report.dedup_key[:12]}... (unchanged)")
     print(f"  note: {report.note}")
     if report.attributed_to:
         print(f"  attributed to: {report.attributed_to}")
@@ -1257,6 +1282,7 @@ def _cmd_record_edit(args: argparse.Namespace) -> int:
             dictionary,
             note=args.note,
             attributed_to=args.attributed_to,
+            identity=args.identity,
             apply=args.apply,
         )
         if args.json:
@@ -1266,8 +1292,9 @@ def _cmd_record_edit(args: argparse.Namespace) -> int:
         if not report.changes:
             print("nothing to do: every named field already holds that value")
         elif report.applied:
+            moved = " and moved onto its corrected identity" if report.identity else ""
             print(
-                f"corrected {report.record_type} #{report.row_id} "
+                f"corrected {report.record_type} #{report.row_id}{moved} "
                 f"({len(report.changes)} field(s), recorded in the edit ledger)"
             )
         else:
@@ -3565,11 +3592,21 @@ def build_parser() -> argparse.ArgumentParser:
     r_edit.add_argument(
         "--set", action="append", metavar="NAME=VALUE",
         help="one field to correct; repeat for each (e.g. --set unit=lb). A bare "
-             "NAME= clears the column. Identity fields are refused - correcting one "
-             "is a dictionary edit + `pemr rekey`, not an edit. Note that correcting "
-             "a compared field (e.g. unit) makes a later re-ingest of the original "
-             "document stage a conflict rather than dedup, which is honest: the row "
-             "no longer says what its source says",
+             "NAME= clears the column. Identity fields are refused unless --identity "
+             "is given - correcting one otherwise is a dictionary edit + `pemr rekey`. "
+             "Note that correcting a compared field (e.g. unit) makes a later "
+             "re-ingest of the original document stage a conflict rather than dedup, "
+             "which is honest: the row no longer says what its source says",
+    )
+    r_edit.add_argument(
+        "--identity", action="store_true",
+        help="allow --set to name identity fields (e.g. a condition's onset_on) and "
+             "MOVE the row onto the identity they derive - a one-row rekey (issue "
+             "#152). Payload, provenance, row id, row-scoped verdicts and the edit "
+             "ledger all follow the row; a family-scoped verdict on a base the move "
+             "empties is reported as orphaned, in `pemr record reaffirm --map-file` "
+             "shape. Refused when the target identity already holds a row saying the "
+             "same thing - that is a merge, not a correction",
     )
     r_edit.add_argument(
         "--note", help="required: why the correction is being made"

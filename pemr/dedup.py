@@ -571,14 +571,15 @@ def _key_parts(
         return [person_id, n("provider"), _date_only(row.get("scheduled_for"))]
     if record_type == "observation":
         return [person_id, n("obs_type"), norm_ts(row.get("observed_at")), kt("key")]
-    # allergy/condition are DATE-FREE by design: they are standing facts restated on
-    # every document with inconsistent or absent dates, so a date in the key would fork
-    # one allergy into one row per document. The dates are payload, and a disagreement
-    # in them stages a conflict (issue #63 design).
+    # `allergy` is DATE-FREE by design: an allergy is a standing fact restated on every
+    # document with inconsistent or absent dates, so a date in the key would fork one
+    # allergy into one row per document. Its dates are payload, and a disagreement in them
+    # stages a conflict (issue #63 design). `condition` left that class in issue #152 —
+    # see :func:`_condition_episode`.
     if record_type == "allergy":
         return [person_id, n("substance")]
     if record_type == "condition":
-        return [person_id, n("name"), _condition_subject(row, dictionary)]
+        return [person_id, n("name"), _condition_episode(row, dictionary)]
     raise ValidationError(f"unknown record type: {record_type}")  # guarded by validate()
 
 
@@ -595,6 +596,41 @@ def _condition_subject(row: dict, dictionary: dict[str, str] | None = None) -> s
     return "family:" + norm(row.get("relation"), dictionary)
 
 
+def _condition_episode(row: dict, dictionary: dict[str, str] | None = None) -> str:
+    """*Which episode* of a condition this row is — subject, plus onset when stated.
+
+    The **episode primitive** (issue #152; Architecture.md §3 "Episodes"). A condition
+    whose clinical state starts and stops repeatedly — kidney stones, UTIs, fractures,
+    cellulitis — is not one standing fact but a series of them. Keying on subject alone
+    folded every recurrence into the first row: the second episode collided with the
+    first, there was nowhere for its date to live, and the count and every date but one
+    were lost with no warning.
+
+    ``self`` / ``family:mother`` (:func:`_condition_subject`) when the row states no
+    onset; ``self@2009-09-15`` when it does, at the source's own precision
+    (``self@1998``, ``self@1998-05``). Onset is **folded into the existing subject part**
+    rather than appended as a fourth key part — the :func:`key_token` decision applied
+    again (issue #71). A fourth part would rewrite ``"a|b|c"`` into ``"a|b|c|"`` and so
+    move the key of *every* stored condition row, undated ones included, orphaning every
+    family-scoped verdict in the table. Folding leaves an undated row's ``dedup_key``
+    bit-identical, so `pemr rekey` moves only the dated rows the change actually affects.
+
+    :func:`_date_only` drops a stray time component and leaves each of the three accepted
+    precisions verbatim — no sentinel padding to ``-01-01``. That is what keeps ordering
+    lexical (each form is a prefix of the next) and keeps ``1998`` from claiming a day the
+    source never stated. A blank or whitespace-only ``onset_on`` is *absent*, not an empty
+    discriminator, so it keys identically to a NULL one.
+
+    Undated repeats still exist — a source that dates neither episode — and they still
+    collide. That is what :func:`occurrence_key` is for: `dedup_occurrence` is not replaced
+    by this change, only demoted from primary discriminator to the fallback tiebreaker for
+    same-date collisions and undated rows.
+    """
+    subject = _condition_subject(row, dictionary)
+    onset = _date_only(row.get("onset_on"))
+    return f"{subject}@{onset}" if onset else subject
+
+
 # Per record type: the :data:`FIELD_SPECS` names :func:`_key_parts` reads — the fields
 # whose value participates in the identity. Written down once, here, beside the function
 # it must stay true to, so `record edit` (issue #129) can derive its editable set as
@@ -604,7 +640,9 @@ def _condition_subject(row: dict, dictionary: dict[str, str] | None = None) -> s
 # from the document), so nothing reading this table could offer it for editing anyway.
 # `condition` lists `status` **and** `relation` because :func:`_condition_subject` reads
 # them together — moving status to/from `family-history` moves the key, and `relation` is
-# what it moves it to.
+# what it moves it to. It also lists `onset_on` since issue #152: onset identifies the
+# *episode* (:func:`_condition_episode`), so correcting one is a rekey
+# (`record edit --identity`), not an in-place correction.
 KEY_FIELDS: dict[str, frozenset[str]] = {
     "lab_result": frozenset({"test_name", "collected_at"}),
     "medication": frozenset({"name", "dose", "started_on"}),
@@ -612,7 +650,7 @@ KEY_FIELDS: dict[str, frozenset[str]] = {
     "appointment": frozenset({"provider", "scheduled_for"}),
     "observation": frozenset({"obs_type", "observed_at", "key"}),
     "allergy": frozenset({"substance"}),
-    "condition": frozenset({"name", "status", "relation"}),
+    "condition": frozenset({"name", "status", "relation", "onset_on"}),
 }
 
 
@@ -855,6 +893,11 @@ class CommitSummary:
 # but not the value, so a corrected or re-read value on an otherwise-matching key
 # collides and surfaces here as a CONFLICT instead of a silent duplicate — hence
 # value_num/value_text appear below.
+#
+# `condition.status`/`relation` are the exception that proves the rule: they reach the key
+# only through the `family-history` branch of :func:`_condition_subject`, so `active` vs
+# `resolved` on one episode is a genuine same-key disagreement and belongs here. A field
+# that *always* moves the key — `condition.onset_on` since issue #152 — does not.
 _COMPARE_FIELDS: dict[str, list[str]] = {
     "lab_result": ["value_num", "value_text", "unit", "ref_low", "ref_high", "flag", "loinc"],
     "medication": ["route", "frequency", "ended_on", "prescriber", "status",
@@ -863,7 +906,10 @@ _COMPARE_FIELDS: dict[str, list[str]] = {
     "appointment": ["specialty", "reason", "summary"],
     "observation": ["value_num", "value_text", "unit"],
     "allergy": ["reaction", "criticality", "noted_on"],
-    "condition": ["status", "onset_on", "resolved_on", "relation", "note"],
+    # `onset_on` left this list in issue #152: it identifies the episode now, so a
+    # difference in it yields a different key rather than a collision — and leaving it
+    # here would let `_sparse_gains` / `_merge_plan` offer to write an identity field.
+    "condition": ["status", "resolved_on", "relation", "note"],
 }
 
 # Types whose rows are standing facts restated across documents. For these, an absent

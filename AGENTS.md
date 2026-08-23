@@ -80,7 +80,9 @@ the only path in the system that can put a fact into the record with no external
 human at the CLI may vouch for one. `record edit` sits on the same trust boundary from the other
 side: it mutates a *stored clinical value* with no new source backing the change, so the row stops
 matching what its document says on one person's say-so — which is exactly the kind of write that
-must carry a named human, not an agent.
+must carry a named human, not an agent. Its `--identity` flag (issue #152) is the same verb reaching
+further — it moves the row's `dedup_key` as well as its payload — so it is CLI-only for the same
+reason, and `record edit` in every form stays out of `WRITE_TOOLS`.
 
 The verbs above are CLI-only; verdict *content* is not. Since issue #131, `query`
 (`kind` = `labs`/`meds`/`timeline`) carries each row's `curation` verdict on the MCP read
@@ -207,16 +209,26 @@ carrying a diagnosis or an allergy MUST commit these rows:
   (`mother`, `father`, `sibling`, ... free text) — **never** an `active` condition row. The subject
   is part of the dedup key, so this is what keeps a mother's diabetes out of the patient's own
   problem list; miscommitting it there is a clinical-safety error, not a cosmetic one.
-- Both are **standing facts**: their dedup keys are date-free, so restating the same allergen or
-  problem across documents collapses to one row. A stated disagreement (`penicillin: rash` vs
-  `penicillin: anaphylaxis`, or `active` -> `resolved`) stages a **conflict** for human
-  adjudication (§5); a field the new document simply doesn't mention is silence, not a change, and
-  never conflicts. Do not "helpfully" restate a value the source omitted.
+- **`condition.onset_on` identifies the *episode*** (issue #152). State it whenever the source
+  gives one, at the source's true precision (§7) — never invent or pad a date. Some problems start
+  and stop repeatedly (kidney stones, UTIs, fractures, cellulitis), and the onset is what keeps two
+  episodes of one problem as two rows instead of folding them into one. `resolved_on` is not part
+  of the identity: an episode's end is payload.
+- Both are **standing facts** in the sense that a document restating one is not new news:
+  `allergy`'s key is date-free entirely, and a `condition` restated at the *same* onset collapses to
+  one row. A stated disagreement (`penicillin: rash` vs `penicillin: anaphylaxis`, or
+  `active` -> `resolved`) stages a **conflict** for human adjudication (§5); a field the new
+  document simply doesn't mention is silence, not a change, and never conflicts. Do not "helpfully"
+  restate a value the source omitted.
 - Silence only reads that way in one direction. A field the new document **does** state over a
   stored NULL is new information with nothing to adjudicate: it fills the stored row in place and
   the commit reports it as `enriched` rather than `duplicate`. So emit every field the source
   states even for an allergen or problem you know is already on file — a terse first document
   followed by a detailed one is the normal case, and this is what makes the detail land.
+  The one exception is `condition.onset_on`: it is identity, not payload, so a document that dates
+  a problem the record holds undated lands as a **new row** beside the undated one rather than
+  filling it in. Emit the date anyway — that is honest, and `pemr verify` warns about the pair so a
+  human can decide whether the two are one episode.
 
 ### 4. OCR text at ingest
 

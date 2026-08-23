@@ -1348,6 +1348,71 @@ def test_verify_is_silent_about_warnings_when_there_are_none(seeded):
     assert not any(line.startswith("warnings") for line in verify.format_report(report))
 
 
+# --- issue #152: an undated condition beside dated episodes of the same problem ---
+
+
+def _condition_warnings(conn):
+    return [w for w in verify.verify_report(conn).warnings if w.startswith("condition row")]
+
+
+def test_verify_warns_about_an_undated_condition_beside_a_dated_episode(seeded):
+    """The visible edge of the episode model. Once onset identifies the episode, a later
+    document that dates a problem lands as a *new* row beside the undated umbrella one
+    rather than filling it in - the intended semantics, but silent duplication if nobody
+    is told. The operator decides which of the two remedies applies."""
+    conn = seeded["conn"]
+    assert _condition_warnings(conn) == []
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Kidney stones", "status": "resolved"},
+    ]})
+    assert _condition_warnings(conn) == []          # undated alone: nothing to say
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "2009-09-15"},
+    ]})
+
+    undated = _row_id(conn, "condition", "name", "Kidney stones")
+    report = verify.verify_report(conn)
+    warnings = _condition_warnings(conn)
+    assert len(warnings) == 1
+    assert f"condition row #{undated}" in warnings[0]
+    assert "record edit condition" in warnings[0] and "--identity" in warnings[0]
+    assert "Kidney stones" not in warnings[0]   # row ids only: no problem, no person
+    assert warnings[0].isascii()                # issue #23
+    # A warning is an observation; it must not flip the exit code.
+    assert report.ok is True and report.problems == []
+
+
+def test_verify_is_silent_when_every_episode_is_dated(seeded):
+    """Two dated episodes of one problem are exactly what the episode model is for -
+    warning on them would make the notice noise nobody reads."""
+    conn = seeded["conn"]
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "1998-05"},
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "2009-09-15"},
+    ]})
+    assert _condition_warnings(conn) == []
+
+
+def test_verify_does_not_pair_a_relatives_episode_with_the_patients_own(seeded):
+    """The subject discriminator still separates them: an undated family-history entry
+    and the patient's own dated problem are different subjects, not two episodes of one.
+    """
+    conn = seeded["conn"]
+    dedup.commit_extraction(conn, seeded["doc"], {"condition": [
+        {"name": "Kidney stones", "status": "family-history", "relation": "mother"},
+        {"name": "Kidney stones", "status": "resolved", "onset_on": "2009-09-15"},
+    ]})
+    assert _condition_warnings(conn) == []
+
+
+def test_verify_condition_check_is_silent_on_an_empty_database(tmp_path):
+    """A freshly migrated archive has no `condition` rows: the check must add nothing and
+    must not move the exit code (`pemr verify` runs on empty DBs after `restore`)."""
+    conn = db.connect(tmp_path / "empty.db")
+    db.migrate(conn)
+    assert _condition_warnings(conn) == []
+
+
 def test_verify_warns_about_an_orphaned_row_scoped_verdict(seeded):
     """AC 7: the row-scope twin of the family orphan warning - the **backstop**.
 

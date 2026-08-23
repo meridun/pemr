@@ -708,7 +708,11 @@ def _seed_generic_condition_pair(ready, capsys, tmp_path, old):
     """The `meridun/pemr-data#12` item 6 shape at the CLI: two real, different conditions
     that the extractor labelled with numbered placeholders, one document each. A
     `"diagnosis 2" = "diagnosis"` dictionary entry folds them onto one key - the fuse a
-    dictionary edit cannot undo, because the labels are synonyms of nothing."""
+    dictionary edit cannot undo, because the labels are synonyms of nothing.
+
+    Both rows carry the **same** onset: since issue #152 onset is part of a condition's
+    identity, so two different dates would key the pair apart on their own and there
+    would be no fuse left for this test to exercise."""
     for i, (name, note) in enumerate(
         (("diagnosis", "hypertension, per cardiology"),
          ("diagnosis 2", "asthma, per pulmonology")), start=1
@@ -719,7 +723,7 @@ def _seed_generic_condition_pair(ready, capsys, tmp_path, old):
                     "--sources", str(tmp_path / "sources")) == 0
         doc = _document_id(tmp_path)[-1]["document_id"]
         payload = _write_json(tmp_path, f"generic{i}.json", {"condition": [
-            {"name": name, "status": "active", "onset_on": f"2024-0{i}-05", "note": note},
+            {"name": name, "status": "active", "onset_on": "2024-01-05", "note": note},
         ]})
         assert _run(tmp_path, "commit-extraction", "--document", str(doc),
                     "--json", str(payload), "--dictionary", str(old)) == 0
@@ -1567,6 +1571,11 @@ def test_post_006_stale_key_blocks_the_recommit_instead_of_forking_it(tmp_path, 
     (that was the pre-guard behaviour the doc used to describe). Enforcement is narrow:
     an unrelated condition still commits while the stale key sits there, which is why
     the doc has to tell operators to run the rekey rather than wait to be stopped.
+
+    The re-statement carries the migrated row's `onset_on`, because since issue #152 a
+    condition's onset is part of its identity: an *undated* restatement of a dated stored
+    episode is a different claim, not the same fact under a stale key, so it would
+    (correctly) commit as a new row rather than trip this guard.
     """
     staged = _stage_pre_006(tmp_path)
     assert _run(tmp_path, "migrate", "--create", "--migrations-dir", str(staged)) == 0
@@ -1587,8 +1596,11 @@ def test_post_006_stale_key_blocks_the_recommit_instead_of_forking_it(tmp_path, 
                 "--sources", str(tmp_path / "sources")) == 0
     capsys.readouterr()
 
-    same = _write_json(tmp_path, "same.json",
-                       {"condition": [{"name": "Hypertension", "status": "active"}]})
+    # 006 carries the observation's `observed_at` into `condition.onset_on`, so this is
+    # the same episode restated - what makes it collide with the stale key.
+    same = _write_json(tmp_path, "same.json", {"condition": [
+        {"name": "Hypertension", "status": "active", "onset_on": "2024-01-02"},
+    ]})
     assert _run(tmp_path, "commit-extraction", "--document", "1", "--json", str(same)) == 1
     err = capsys.readouterr().err
     assert "no longer matches the current dictionary" in err
