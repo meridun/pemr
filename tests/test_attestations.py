@@ -670,6 +670,57 @@ def test_cli_walk_from_attestation_to_a_source_document(cli_ready, capsys):
     ]
 
 
+def test_cli_walk_from_attestation_to_a_source_via_adopt_source(cli_ready, capsys):
+    """The same walk when the document *disagrees* (issue #190): the promotion path
+    cannot fire, a conflict is staged instead, and `--keep existing --adopt-source` is
+    what links the attested row to its source without taking the document's values."""
+    assert _run(cli_ready, *_ASSERT_ARGV, "--field", "status=ordered", "--apply") == 0
+    capsys.readouterr()
+
+    scan = cli_ready / "note.txt"
+    scan.write_bytes(b"metformin 500 mg daily, completed")
+    assert _run(cli_ready, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(cli_ready / "sources")) == 0
+    payload = cli_ready / "extract.json"
+    payload.write_text(
+        json.dumps({"medication": [MED | {"status": "completed"}]}), encoding="utf-8"
+    )
+    capsys.readouterr()
+    assert _run(cli_ready, "commit-extraction", "--document", "1",
+                "--json", str(payload)) == 0
+    assert "1 conflict" in capsys.readouterr().out
+
+    assert _run(cli_ready, "review-conflicts", "--resolve", "1",
+                "--keep", "existing", "--adopt-source") == 0
+    out = capsys.readouterr().out
+    assert "keep-existing +adopt-source -> medication #1 (document_id=1)" in out
+
+    # Off the needs-source queue, its attested payload intact.
+    assert _run(cli_ready, "record", "assert", "--list") == 0
+    assert "no attested records" in capsys.readouterr().out
+    assert _run(cli_ready, "record", "assert", "--list", "--all", "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["needs_source"], r["document_id"], r["attested_by"]) for r in rows] == [
+        (False, 1, "Mom")
+    ]
+    assert _run(cli_ready, "query", "meds", "--person", "jane-doe", "--json") == 0
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "ordered"
+
+    # ...and it renders as an ordinary fact, not a live attestation.
+    assert _run(cli_ready, "render", "summary", "--person", "jane-doe") == 0
+    assert "no source document" not in capsys.readouterr().out
+
+
+def test_cli_adopt_source_with_another_keep_is_an_error(cli_ready, capsys):
+    """The refusals reach the operator as `error:` + exit 1, like every other
+    resolution refusal - no new exit code."""
+    assert _run(cli_ready, *_ASSERT_ARGV, "--apply") == 0
+    assert _run(cli_ready, "review-conflicts", "--resolve", "1",
+                "--keep", "incoming", "--adopt-source") == 1
+    err = capsys.readouterr().err
+    assert "adopt-source only applies to keep 'existing'" in err
+
+
 def test_cli_assert_on_an_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     unmigrated_db(tmp_path / "cli.db")
     assert _run(tmp_path, *_ASSERT_ARGV, "--apply") == 1

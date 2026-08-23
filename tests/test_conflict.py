@@ -2,7 +2,7 @@
 
 import pytest
 
-from pemr import db, dedup, persons
+from pemr import attestations, db, dedup, persons
 
 
 @pytest.fixture()
@@ -772,3 +772,148 @@ def test_merge_on_a_sparse_type_always_refuses(conn):
     assert conn.execute(
         "SELECT criticality FROM allergy"
     ).fetchone()["criticality"] == "high"
+
+
+# --- keep existing + adopt-source (issue #190) --------------------------------
+#
+# A row entered by `record assert` has document_id NULL. When a document later carries
+# the same identity with a *differing* payload, a conflict is staged - and `keep
+# existing` used to leave the row permanently unlinked even though the document confirms
+# the same underlying fact. adopt-source keeps the attested payload and fills only the
+# missing provenance, so `attestation_state` moves attested -> superseded.
+
+@pytest.fixture()
+def attested_staged(conn):
+    """An attested medication row (document_id NULL) with one open conflict staged
+    against it from a document stating a *differing* payload."""
+    attestations.assert_record(
+        conn, "medication", "jane-doe", _med(prescriber="Dr Who", status="ordered"),
+        attributed_to="Mom", attested_on="2026-08-09", apply=True,
+    )
+    stored = _med_row(conn)
+    assert (stored["document_id"], dedup.attestation_state(stored)) == (None, "attested")
+    summary = dedup.commit_extraction(
+        conn, _doc(conn, "med-doc"), {"medication": [_med(status="completed")]}
+    )
+    assert summary.counts["conflict"] == 1
+    return dedup.list_conflicts(conn)[-1]["conflict_id"]
+
+
+def test_adopt_source_writes_only_the_document_id(conn, attested_staged):
+    """The core AC: provenance lands, and not one payload column moves toward the
+    incoming row's differing values."""
+    before = dict(_med_row(conn))
+    result = dedup.resolve_conflict(
+        conn, attested_staged, keep="existing", adopt_source=True
+    )
+    after = dict(_med_row(conn))
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM medication").fetchone()["n"] == 1
+    assert after["document_id"] == result.adopted_document_id == 1
+    assert after["status"] == "ordered"          # not the incoming "completed"
+    assert {k: v for k, v in after.items() if k != "document_id"} == {
+        k: v for k, v in before.items() if k != "document_id"
+    }
+
+
+def test_adopt_source_supersedes_the_attestation(conn, attested_staged):
+    dedup.resolve_conflict(conn, attested_staged, keep="existing", adopt_source=True)
+    row = _med_row(conn)
+    assert dedup.attestation_state(row) == "superseded"
+    assert dedup.is_attested(row) is False
+    # The attestation survives as history on the row, not as a marker on the page.
+    assert (row["attested_by"], row["attested_on"]) == ("Mom", "2026-08-09")
+
+
+def test_adopt_source_result_names_the_row_it_landed_on(conn, attested_staged):
+    result = dedup.resolve_conflict(
+        conn, attested_staged, keep="existing", adopt_source=True
+    )
+    row = _med_row(conn)
+    assert (result.kept, result.record_type) == ("existing", "medication")
+    assert (result.row_id, result.occurrence) == (row["medication_id"], 0)
+    assert (result.dedup_key, result.dedup_base) == (row["dedup_key"], row["dedup_base"])
+    assert result.adopted_document_id == 1
+
+
+def test_adopt_source_records_a_distinct_auditable_resolution(conn, attested_staged):
+    dedup.resolve_conflict(
+        conn, attested_staged, keep="existing", adopt_source=True, note="Mom confirmed"
+    )
+    resolution = conn.execute(
+        "SELECT resolution FROM conflict WHERE conflict_id=?", (attested_staged,)
+    ).fetchone()["resolution"]
+
+    assert resolution.startswith(
+        "keep-existing +adopt-source -> medication #1 (document_id=1)"
+    )
+    assert "Mom confirmed" in resolution
+    for value in ("Dr Who", "ordered", "completed", "metformin"):
+        assert value not in resolution.split("Mom confirmed")[0]
+
+
+def test_plain_keep_existing_still_stores_the_bare_resolution(conn, attested_staged):
+    """The other half of "distinctly": without the flag nothing changed - same text,
+    same untouched provenance."""
+    result = dedup.resolve_conflict(conn, attested_staged, keep="existing")
+    assert result.adopted_document_id is None
+    assert conn.execute(
+        "SELECT resolution FROM conflict WHERE conflict_id=?", (attested_staged,)
+    ).fetchone()["resolution"] == "keep-existing"
+    assert _med_row(conn)["document_id"] is None
+
+
+def test_adopt_source_refuses_an_already_sourced_row(conn):
+    """Filling a NULL is additive; re-pointing a sourced row at another document while
+    keeping the first document's payload would misattribute it."""
+    cid = _stage_med(conn, {"status": "ordered"}, {"status": "completed"})
+    before = dict(_med_row(conn))
+    with pytest.raises(ValueError) as exc:
+        dedup.resolve_conflict(conn, cid, keep="existing", adopt_source=True)
+
+    assert "already has document_id=1" in str(exc.value)
+    assert "keep" in str(exc.value) and "'incoming'" in str(exc.value)
+    assert str(exc.value).isascii()          # printed by the CLI (issue #23)
+    assert dict(_med_row(conn)) == before
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (cid,)
+    ).fetchone()["status"] == "open"
+
+
+@pytest.mark.parametrize("keep", ["incoming", "both", "merge"])
+def test_adopt_source_refuses_the_other_keeps(conn, attested_staged, keep):
+    """Those keeps already take the document's provenance with its payload, so the flag
+    would be either redundant or a lie about which payload won."""
+    with pytest.raises(ValueError, match="adopt-source only applies to keep 'existing'"):
+        dedup.resolve_conflict(conn, attested_staged, keep=keep, adopt_source=True)
+    assert _med_row(conn)["document_id"] is None
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (attested_staged,)
+    ).fetchone()["status"] == "open"
+
+
+def test_adopt_source_refuses_a_conflict_with_no_document(conn, attested_staged):
+    """`conflict.document_id` is nullable: nothing to adopt is a refusal, not a
+    resolution that writes NULL over NULL."""
+    conn.execute(
+        "UPDATE conflict SET document_id = NULL WHERE conflict_id = ?",
+        (attested_staged,),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="carries no document to adopt"):
+        dedup.resolve_conflict(conn, attested_staged, keep="existing", adopt_source=True)
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (attested_staged,)
+    ).fetchone()["status"] == "open"
+
+
+def test_adopt_source_refuses_when_the_family_is_empty(conn, orphaned_family):
+    """Same anchor rule as the writing keeps - and the pair with
+    `test_keep_existing_still_resolves_an_empty_family` is the guard that the anchor
+    lookup stays inside the flag's branch."""
+    _drop_occurrence(conn, 1)
+    with pytest.raises(ValueError, match="no stored lab_result row left"):
+        dedup.resolve_conflict(conn, orphaned_family, keep="existing", adopt_source=True)
+    assert conn.execute(
+        "SELECT status FROM conflict WHERE conflict_id=?", (orphaned_family,)
+    ).fetchone()["status"] == "open"

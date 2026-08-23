@@ -516,7 +516,14 @@ comparison path:
   justification for auto-resolving a disagreement, only for recording an agreement.
   `keep incoming` then promotes the row (it already writes `document_id`), `keep existing`
   leaves the attestation live, and `keep both` admits the document row as the next
-  occurrence beside it.
+  occurrence beside it. Since issue #190, `keep existing --adopt-source` is the fourth
+  reading: the stored payload wins in full **and** the row adopts the incoming document's
+  `document_id`, which is how an attested row gains its source without taking the values
+  the human ruled against. It **fills** a missing source, never re-points an existing one
+  — an already-sourced row is refused, because keeping document A's payload under
+  document B's id would misattribute it (the same provenance guarantee `record edit`
+  enforces, one layer down); `keep incoming` / `keep merge` are the honest paths there,
+  since they take payload and provenance together.
 
 The mirror case — `record assert` onto a family the record already holds — is **refused,
 not staged**: an equal payload reports "already recorded" and writes nothing, a differing
@@ -1214,7 +1221,8 @@ pemr ingest <file> --person <slug> [--ocr auto] [--force]        # --force: skip
 pemr ingest <dir>  --person <slug> --study dicom [--allow-large] # a study folder as ONE document (§4)
 pemr commit-extraction --document <id> --json <file>
 pemr review-conflicts [--resolve <id> --keep existing|incoming|both|merge
-                       [--field NAME=existing|incoming ...] [--note ...]] [--dictionary <toml>]
+                       [--field NAME=existing|incoming ...] [--adopt-source] [--note ...]]
+                      [--dictionary <toml>]   # --adopt-source: only with --keep existing
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
