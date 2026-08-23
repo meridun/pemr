@@ -28,9 +28,11 @@ disagreement, only for recording an agreement.
 **Refuse, don't stage.** The mirror case — asserting a fact the record already holds —
 never stages a conflict. An equal payload reports ``duplicate`` and writes nothing; a
 differing one raises :class:`AttestationCollisionError` naming the stored row — *unless*
-every colliding row already carries a verdict that released the identity
-(:data:`curation.APPENDIX_STATUSES`, issue #133), in which case the human has already ruled
-the identity free and the attestation is an ordinary new occurrence. Precedent:
+every colliding row already carries a verdict that released the identity: one of
+:data:`curation.APPENDIX_STATUSES` (issue #133, "one fact filed twice") or one of
+:data:`curation.DISTINCT_STATUSES` (issue #186, "two real facts sharing a key"). Either
+way the human has already ruled the identity free and the attestation is an ordinary new
+occurrence — the difference is only where the rows render. Precedent:
 ``commit_extraction``'s pass 1 already refuses two colliding rows of one submission,
 because the human is at the keyboard and a conflict staged against oneself has no
 independent provenance to adjudicate. A conflict would also have to carry
@@ -139,20 +141,48 @@ def _provenance(row: sqlite3.Row | dict) -> str:
     return "attestation"
 
 
+def _releases_identity(carrier: dict) -> bool:
+    """Whether an annotated row's verdict frees the identity for a new occurrence.
+
+    Two independent checks, deliberately not one tuple (issue #186):
+
+    * :func:`curation.is_appendix` — :data:`curation.APPENDIX_STATUSES` say **one fact
+      filed twice**, and the row leaves the live view for the curation record (#133).
+    * :data:`curation.DISTINCT_STATUSES` — ``distinct`` says **two real facts that
+      happen to share a key** (#122). It settles the identity question just as firmly,
+      which is why it releases here, but it must *not* join the appendix tuple: those
+      two vocabularies being disjoint is the guarantee that both rows of a distinct pair
+      keep rendering in their live clinical section, which is exactly the rendering a
+      genuine second occurrence needs.
+
+    Reads only what :func:`curation.annotate_rows` stamped under
+    :data:`curation.CURATION_FIELD` — never the record's own ``status`` column, which is
+    a *clinical* field (free-form text on ``medication``, an enum on ``condition``) and
+    has nothing to do with a curation verdict.
+    """
+    if curation.is_appendix(carrier):
+        return True
+    verdict = curation.verdict_of(carrier)
+    return verdict is not None and verdict.get("status") in curation.DISTINCT_STATUSES
+
+
 def _blocking_rows(
     conn: sqlite3.Connection, record_type: str, family: list[sqlite3.Row]
 ) -> tuple[list[dict], list[dict]]:
-    """Split a colliding family into ``(blocking, released)`` — issue #133.
+    """Split a colliding family into ``(blocking, released)`` — issues #133, #186.
 
-    A row *releases* the identity when a human already ruled on it with one of
-    :data:`curation.APPENDIX_STATUSES` (``superseded`` / ``erroneous-in-source`` /
-    ``merged-into``); ``disputed`` and unverdicted rows keep blocking, because a disputed
-    row still holds the identity, it is merely flagged.
+    A row *releases* the identity when a human already ruled on it with a verdict
+    :func:`_releases_identity` accepts — one of :data:`curation.APPENDIX_STATUSES`
+    (``superseded`` / ``erroneous-in-source`` / ``merged-into``) or ``distinct``;
+    ``disputed``, ``confirmed`` and unverdicted rows keep blocking, because such a row
+    still holds the identity — a disputed one is merely flagged, a confirmed one is
+    affirmed.
 
     Resolution runs through :func:`curation.annotate_rows`, never a hand-rolled lookup, so
     the row-beats-family precedence rule stays the single site :meth:`VerdictMap.for_row`
-    already is (issue #114) and "leaves the live view" stays :func:`curation.is_appendix`'s
-    vocabulary. Both lists keep the family's occurrence order.
+    already is (issue #114) — at both scopes, for ``distinct`` too, with no second rule —
+    and "leaves the live view" stays :func:`curation.is_appendix`'s vocabulary. Both lists
+    keep the family's occurrence order.
 
     The ``dict`` copy is required: ``annotate_rows`` stamps in place and ``sqlite3.Row`` is
     immutable. The stamped key is inert for every reader downstream of here —
@@ -162,40 +192,56 @@ def _blocking_rows(
     rows = curation.annotate_rows(
         [dict(row) for row in family], record_type, curation.load_verdicts(conn)
     )
-    blocking = [row for row in rows if not curation.is_appendix(row)]
-    released = [row for row in rows if curation.is_appendix(row)]
+    blocking = [row for row in rows if not _releases_identity(row)]
+    released = [row for row in rows if _releases_identity(row)]
     return blocking, released
 
 
 def _collision_remedy(record_type: str, stored: dict, released: int) -> str:
-    """The half of the collision message that must stay honest — issue #133.
+    """The half of the collision message that must stay honest — issues #133, #186.
 
     The defect this fixes was dead advice: the error recommended `record annotate` for a
     row whose verdict could not change the outcome. A row already carrying a releasing
     verdict is never in ``blocking``, so it can never be named here; what remains is a row
     with no verdict (annotating it *would* unblock) or one carrying a non-releasing verdict
     (say which, and name the ones that do release — interpolated from
-    :data:`curation.APPENDIX_STATUSES`, never hand-typed).
+    :data:`curation.APPENDIX_STATUSES` + :data:`curation.DISTINCT_STATUSES`, never
+    hand-typed, so the message can never drift from :func:`_releases_identity`).
+
+    Since #186 that vocabulary includes ``distinct``, and both branches name the
+    ``record annotate ... --row --status distinct`` -> retry flow: for a genuine second
+    occurrence of a recurring fact it is the *only* remedy that is not destructive of
+    what is stored, so a message that omitted it would be dead advice of a second kind.
 
     ``released`` discloses siblings already ruled on, rather than dropping them: an
     operator who annotated three rows of four must not be left guessing why the fourth
-    still refuses.
+    still refuses. Its count includes distinct-released siblings.
     """
     pk = f"{record_type}_id"
     row_id = stored[pk]
     verdict = curation.verdict_of(stored)
-    releasing = ", ".join(f"`{status}`" for status in curation.APPENDIX_STATUSES)
+    releasing = ", ".join(
+        f"`{status}`"
+        for status in curation.APPENDIX_STATUSES + curation.DISTINCT_STATUSES
+    )
+    distinct_cmd = (
+        f"`pemr record annotate {record_type} {row_id} --row --status distinct`"
+    )
     if verdict is None:
         remedy = (
             f"Correct the stored row (`pemr record rm {record_type} {row_id}`, or "
             f"`pemr record annotate {record_type} {row_id} --row --status superseded` "
-            "to rule on it) and retry"
+            "to rule on it) and retry; or, if both rows are real facts and this is a "
+            f"second occurrence of the same identity, rule the stored row `distinct` "
+            f"({distinct_cmd}) and retry"
         )
     else:
         remedy = (
             f"That row already carries the verdict '{verdict.get('status')}', which does "
-            f"not release the identity - only {releasing} do. Re-rule on it "
-            f"(`pemr record annotate {record_type} {row_id} --row --status superseded`) "
+            f"not release the identity - only {releasing} do. The appendix statuses say "
+            "one fact was filed twice; `distinct` says two real facts share a key. "
+            f"Re-rule on it (`pemr record annotate {record_type} {row_id} --row "
+            f"--status superseded`, or {distinct_cmd} for a genuine second occurrence) "
             f"or remove it (`pemr record rm {record_type} {row_id}`) and retry"
         )
     if released:
@@ -236,7 +282,8 @@ def assert_record(
     metadata, :class:`query.PersonNotFoundError` for an unknown slug,
     :class:`dedup.DictionaryDriftError` when a stored row of this identity is on a stale
     key, and :class:`AttestationCollisionError` when the identity is already stored with a
-    different payload.
+    different payload and at least one colliding row still holds it — i.e. no verdict
+    :func:`_releases_identity` accepts (an appendix status, #133, or ``distinct``, #186).
     """
     db.require_migrated(conn)
     _require_type(record_type)
@@ -303,9 +350,10 @@ def assert_record(
         )
         pk = f"{record_type}_id"
         if twin is None:
-            # The identity only still holds if some family row is unreleased (#133):
-            # a family the human already ruled superseded/corrected is theirs to
-            # re-file. Falls through to the ordinary write path when none blocks.
+            # The identity only still holds if some family row is unreleased (#133,
+            # #186): a family the human already ruled superseded/corrected — or ruled
+            # `distinct`, "these are two real facts" — is theirs to re-file. Falls
+            # through to the ordinary write path when none blocks.
             blocking, released = _blocking_rows(conn, record_type, family)
             if blocking:
                 stored = blocking[0]
