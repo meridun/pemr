@@ -34,7 +34,7 @@ upstream templates verbatim (resynced 2026-08-06 from agentic-sdlc `3e0db2d`, wi
 | `<DEFAULT_BRANCH>` | `dev` |
 | `<PROD_BRANCH>` | `main` |
 | `<WORKTREE_ROOT>` | `C:\Claude` (worktrees `pemr-wt-<issue#>`) |
-| `<WORKER_AGENT>` | `general-purpose` subagent with explicit `model` (no dedicated sdlc-worker agent yet) |
+| `<WORKER_AGENT>` | `sdlc-worker` subagent (`.github/agents/sdlc-worker.agent.md`, no Agent tool) with explicit `model` |
 | `<TEST_CMD>` | `pytest <targeted paths>` |
 | `<FULL_SUITE_CMD>` | `pytest` |
 | `<LINT_CMD>` | **unbound** — declare before enabling the scheduled dispatcher |
