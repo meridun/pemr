@@ -396,6 +396,11 @@ day or month the source didn't state, and never fall back to stashing an impreci
 - Date-only precision is also why two genuine same-day results collide: they derive one key, so the
   second stages a conflict. Emitting a time you invented is never the fix — the recovery path is
   `keep both` under human sign-off (§5).
+- This section governs a date's **precision**, never *which* of a document's dates a field takes.
+  For `lab_result.collected_at` that choice is §10: the specimen collection date, with the
+  result/verified date only as a fallback proxy. The rules above apply to that proxy exactly as
+  they apply to any other date — emit it at the precision the source states, and never stash it
+  elsewhere.
 
 ### 8. Medication discontinue reason
 
@@ -453,6 +458,92 @@ defense is `pemr verify`, which warns on any `medication.status` that is neither
 lifecycle value nor empty, naming the row id and the offending literal. Correct such a row with
 `pemr record edit medication <id> --set status= --note ...` (moving any dosing detail into
 `frequency`/`dose` in the same edit), not by re-committing the source document.
+
+### 10. Lab result dates — the collection date, with the result date only as a fallback
+
+A lab results table carries **two** dates per row, and they are not interchangeable. In an
+athenahealth CCDA export the results table renders as
+
+```
+<order/collection date> | <result date> | <panel> | <analyte> | <value> | <unit> | <reference range> | ...
+```
+
+and the same document's **orders** table carries a `collected` column holding the same
+specimen-collection timestamp as results column 1.
+
+**MUST — `lab_result.collected_at` is the specimen collection date whenever it is known**: results
+column 1, or the orders table's `collected` cell; cross-check them when both are present. A result
+reflects the person's condition as of the draw, not as of the lab's verification run.
+
+**MUST NOT take the result date while a collection date exists anywhere in the source.** The result
+date typically runs a day or more after the draw, so the row lands on the wrong day and derives a
+different date-only `dedup_key` (§5) from a portal-sourced copy of the same draw — `trends` then
+shows a phantom second draw that the dictionary cannot fold. For athena exports the collection date
+is the normal path, not the exception: column 1 was populated on every one of the 657 results lines
+of the export that surfaced this rule.
+
+**Fallback — the result date as a proxy for `collected_at` itself.** *Only* where the source
+genuinely carries no collection date anywhere — no results column 1, no orders-table
+cross-reference, or a non-CCDA source stating only a "result date" — the result/verified date may be
+committed **as `collected_at`**. Its cost is real: the row's `dedup_key` is then approximate, so a
+document that later carries the true collection date lands as a **separate row** rather than folding
+into this one. Two hard edges:
+
+- **Never as a second field.** No `lab_result` column holds a result date, and §7 forbids stashing
+  an unplaceable date elsewhere — not in `value_text`, not in a note. It is either `collected_at`
+  or omitted.
+- **Never while a collection date is reachable.** Check the orders table and any accompanying
+  documents first. "No collection date found" must be a conclusion, not a default.
+
+**Precision of the proxy** is §7's ordinary rule: emit it at the precision the source states. Do
+**not** degrade a full date to `YYYY-MM` to signal approximation — that invents a different claim
+about the draw and can be flatly wrong (a result dated the 1st, for a draw on the 28th, lands in the
+wrong month). What makes the proxy honest is **disclosure**: the agent MUST name, in its commit
+summary, which rows were committed on a proxy date, so the human can decide whether to chase a
+better source.
+
+**Read the header; don't index blindly.** The column layout above is athenahealth's shape, not a
+guarantee for every vendor. Map columns from the table's own header. If the header is absent or
+ambiguous *and* there is no orders-table `collected` to cross-check, ask the human — never guess
+which of two dates is the draw.
+
+**Remediation — rows already committed on the result date.** `collected_at` is an identity field
+(it feeds the `dedup_key`), so a plain `record edit --set collected_at=` is refused. Since issue
+#152 the first-choice repair is `record edit --identity`, a **one-row rekey**: the row keeps its
+`document_id`, provenance, row id, row-scoped curation verdicts and edit ledger, and only its
+`dedup_*` columns move. The repair itself is a **human-at-the-terminal** action: `record edit`,
+`record rm`, `record annotate` and `document reocr` are all CLI-only (see *Tool surface*). The
+three `record` verbs are dry-run by default — lead with the dry run and read what it says before
+adding `--apply`; `document reocr` is the inversion (it *writes* unless given `--dry-run`), so ask
+for the dry run explicitly. An agent may run the enumeration in step 2 and hand the human the
+list, nothing further.
+
+1. Optionally `pemr document reocr <document_id> --dry-run` first, if `ocr_text` itself needs
+   re-deriving. Dropping `--dry-run` is not enough here: a document that **already** has
+   `ocr_text` — which every document in this remediation's scope does — is *skipped* unless you
+   also pass `--force`, and text that comes back shorter than what is stored is refused unless you
+   also pass `--allow-shrink` (`--force` does not imply it).
+2. Enumerate: `pemr query labs --person <slug> --json`, filtered to the CCDA's `document_id` (both
+   `lab_result_id` and `document_id` are on the read payload).
+3. `pemr record edit lab_result <id> --set collected_at=<corrected> --identity --note "<why>"`,
+   then re-run with `--apply`. Three branches:
+   - **Nothing at the true date yet** — the move is the whole repair.
+   - **A copy of the same draw already sits at the true date** (e.g. the same result already held
+     from a portal PDF) — the move is refused as an identity collision, because filing both under
+     one identity is a merge, not a correction. The refusal names both repairs: drop the mis-dated
+     duplicate with `pemr record rm lab_result <id>`, or record the merge with
+     `pemr record annotate lab_result <id> --status merged-into --merged-into <base>`.
+   - **The two copies disagree on a value** — the move is *not* refused, and **nothing adjudicates
+     the disagreement for you**. The row simply lands as the next *occurrence* of the target
+     identity, beside the copy already there: no conflict is staged, `pemr review-conflicts` reports
+     nothing, `pemr verify` is silent, and a later re-ingest of either payload dedups against its
+     own occurrence. Only `trends` hints at it, as `(1 of 2 at this timestamp)`. Reconciling the two
+     rows is therefore the operator's own next step — drop the redundant one with
+     `pemr record rm lab_result <id>`, or correct the payload in place with a plain
+     `pemr record edit lab_result <id> --set value_num=<corrected>` (payload columns are not
+     identity fields, so that edit needs no `--identity`).
+4. `record rm` plus a re-commit from `ocr_text` stays the **second** choice, for when the payload
+   itself must be re-derived: it discards the row's edit ledger, which `--identity` exists to avoid.
 
 ## Privacy posture
 

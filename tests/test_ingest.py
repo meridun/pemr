@@ -962,6 +962,63 @@ def test_ccda_med_table_keeps_the_discontinue_reason_in_its_cell(
     assert row.endswith(cell)
 
 
+# The lab-table shape #189's convention (AGENTS.md §10) rests on: a results table whose
+# first two columns are the collection date and the result date - different days - and an
+# orders table repeating the collection date in its own `collected` cell. `_extract_ccda`
+# stays a vendor-neutral flattener (it never learns which column is which), so what this
+# pins is that both dates and the cross-reference survive #138's flattening in order -
+# i.e. the agent transcribing `ocr_text` can honor §10 with today's extraction.
+_CCDA_LABS = (
+    "<section><title>Results</title><text><table>"
+    "<thead><tr><th>Collected</th><th>Resulted</th><th>Panel</th><th>Test</th>"
+    "<th>Value</th><th>Unit</th><th>Reference Range</th></tr></thead>"
+    "<tbody>"
+    "<tr><td>03/01/2024</td><td>03/02/2024</td><td>Basic Panel</td>"
+    "<td>Zylotase</td><td>12</td><td>U/L</td><td>5-20</td></tr>"
+    "<tr><td>03/01/2024</td><td>03/02/2024</td><td>Basic Panel</td>"
+    "<td>Quorbin</td><td>4.1</td><td>g/dL</td><td>3.5-5.0</td></tr>"
+    "<tr><td>07/14/2024</td><td>07/16/2024</td><td>Renal Panel</td>"
+    "<td>Marrowlyte</td><td>138</td><td>mmol/L</td><td>135-145</td></tr>"
+    "</tbody></table></text></section>",
+    "<section><title>Orders</title><text><table>"
+    "<thead><tr><th>Order</th><th>Collected</th><th>Status</th></tr></thead>"
+    "<tbody>"
+    "<tr><td>Basic Panel</td><td>03/01/2024</td><td>Final</td></tr>"
+    "<tr><td>Renal Panel</td><td>07/14/2024</td><td>Final</td></tr>"
+    "</tbody></table></text></section>",
+)
+
+
+@pytest.mark.parametrize("analyte, collected, resulted, panel", [
+    ("Zylotase", "03/01/2024", "03/02/2024", "Basic Panel"),
+    ("Quorbin", "03/01/2024", "03/02/2024", "Basic Panel"),
+    ("Marrowlyte", "07/14/2024", "07/16/2024", "Renal Panel"),
+])
+def test_ccda_results_table_keeps_both_date_columns_in_order(
+    conn, tmp_path, sources, analyte, collected, resulted, panel
+):
+    """Both dates reach `ocr_text` on the analyte's own line, collection date first and
+    result date second, neither collapsed into the other - and the orders table's
+    `collected` cell survives as the cross-reference AGENTS.md §10 tells the agent to
+    check (issue #189's transcription dependency)."""
+    src = _make_ccda(tmp_path, name="DOC0189.XML", sections=_CCDA_LABS)
+    text = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).document.ocr_text
+    row = next(line for line in text.splitlines() if f"\t{analyte}\t" in line)
+    cells = row.split("\t")
+    assert cells[0] == collected
+    assert cells[1] == resulted
+    assert collected != resulted  # the bug this rule exists for: they are different days
+    assert cells[2] == panel
+    # the orders table repeats the collection date - not the result date - in its own row
+    order_row = next(line for line in text.splitlines() if line.startswith(f"{panel}\t"))
+    assert order_row.split("\t")[1] == collected
+    assert resulted not in order_row
+    # the header survives too, so the agent maps columns by name rather than by position
+    assert "Collected\tResulted\tPanel\tTest\tValue\tUnit\tReference Range" in text
+
+
 def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
     def boom(path):  # pragma: no cover - the assertion is that this never runs
         raise AssertionError(f"run_ocr must not be called for {path}")
