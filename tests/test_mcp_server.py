@@ -768,6 +768,14 @@ def test_agents_md_documents_the_lab_collection_date_rule():
         "--identity",            # first-choice repair (issue #152)
         "record rm",             # second choice / the collision branch
         "document reocr",        # re-deriving ocr_text first
+        # The two corrections the engine forced on the remediation ladder: a disagreeing
+        # copy is *not* adjudicated (the row lands as another occurrence and nothing is
+        # staged, so `review-conflicts` shows nothing), and `document reocr` skips a
+        # document that already has `ocr_text` unless `--force`. Both were reassurances
+        # the prose originally got wrong; pinned so they cannot quietly come back.
+        "occurrence",
+        "review-conflicts",
+        "--force",
     ):
         assert token in section, f"AGENTS.md section 10 missing: {token}"
 
