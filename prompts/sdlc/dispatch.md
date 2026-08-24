@@ -21,7 +21,7 @@ executes one pass.
 
 > **Serial variant.** For a simpler single-worker pipeline, replace Step -1 + Step 0 with a global
 > gate — *any* `sdlc:wip` younger than 2h aborts the whole run; else reap and proceed — and run
-> lanes one at a time in pipeline order. See `docs/AgenticSDLC.md` (agentic-sdlc repo). The per-issue version below is
+> lanes one at a time in pipeline order. See `docs/Development_AgenticSDLC.md`. The per-issue version below is
 > the default.
 
 ---
@@ -82,7 +82,7 @@ safe under three rules:
 - **Never abort the cycle over this lock.** Whatever its outcome, proceed to Step 0 and per-lane
   dispatch; only Step 0a is conditional on holding it.
 
-If your repo carries the reference CLI (`scripts/sdlc.mjs`, see `docs/Adoption.md` (agentic-sdlc repo)), the protocol is
+If your repo carries the reference CLI (`scripts/sdlc.mjs`, see `docs/Development_SdlcAdoption.md`), the protocol is
 one command each way: `node scripts/sdlc.mjs maint-lock <run-id>` (exit 1 = held; skip Step 0a) and
 `node scripts/sdlc.mjs maint-release <run-id>`.
 
@@ -192,7 +192,7 @@ that refusal as "in use — leave it", never force.
 
 ### Step 0b — Stage-label integrity (you do this yourself)
 
-Every open issue must carry **exactly one** `stage:*` label (see `docs/Labels.md` (agentic-sdlc repo)). Zero makes it
+Every open issue must carry **exactly one** `stage:*` label (see `docs/Development_SdlcLabels.md`). Zero makes it
 invisible to every lane forever (a triage escapee that will never be built or closed); two makes
 it eligible in two lanes at once — two workers could claim it in one cycle. From the Step 0
 snapshot (no new query — the labels are already in hand), count each open issue's `stage:*` labels
