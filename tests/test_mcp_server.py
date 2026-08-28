@@ -780,6 +780,28 @@ def test_agents_md_documents_the_lab_collection_date_rule():
         assert token in section, f"AGENTS.md section 10 missing: {token}"
 
 
+def test_agents_md_documents_the_epic_narrative_lab_table():
+    """Issue #196: §10 must carry Epic's narrative shape alongside athena's column
+    layout. Its halves have to fail independently of #189's test above — that one
+    pins the general collect-vs-result rule and the repair ladder, and would stay
+    green if the whole Epic sub-block were dropped. This pins the vendor-specific
+    strings the positional reading depends on: the specimen table's header cells,
+    the `Narrative <lab> - <datetime>` result line, the "Final result" header trap,
+    and the SNOMED code naming what the engine deliberately does not parse."""
+    text = AGENTS.read_text(encoding="utf-8")
+    assert "### 10. Lab result dates" in text
+    section = text.split("### 10. Lab result dates", 1)[1].split("\n## ", 1)[0]
+    for token in (
+        "Specimen (Source)",   # the header row the positional rule is read against
+        "Collection Time",     # first timestamp after the header run -> collected_at
+        "Received Time",       # second one -> neither collected_at nor a result date
+        "Narrative",           # the `Narrative <lab> - <datetime>` result-date line
+        "Final result",        # the header trap: carries the *collection* time
+        "17636008",            # structured entry the flattener deliberately ignores
+    ):
+        assert token in section, f"AGENTS.md section 10 missing: {token}"
+
+
 # --------------------------------------------------------------------------- #
 # Wire surface — the *registered* tool names must equal TOOL_NAMES (the contract
 # lint above only sees the documented strings; this asserts the real MCP surface,

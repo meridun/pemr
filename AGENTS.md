@@ -507,6 +507,44 @@ guarantee for every vendor. Map columns from the table's own header. If the head
 ambiguous *and* there is no orders-table `collected` to cross-check, ask the human — never guess
 which of two dates is the draw.
 
+**Epic's shape — a per-specimen table under each result block.** Epic CCDAs do not use athena's
+results/orders column layout. Each result block ends with its own specimen table, headed
+
+```
+Specimen (Source) | Anatomical Location / Laterality | Collection Method / Volume | Collection Time | Received Time
+```
+
+The narrative flattener (`_ccda_narrative`, `pemr/ingest.py`) concatenates table cells with **no
+separators**, so in `document.ocr_text` the header run and the data run abut (synthetic):
+
+```
+...Collection TimeReceived TimeBlood specimen (specimen)VENOUS BLOOD / Unknown03/10/2024 9:15 AM EDT03/10/2024Narrative...
+```
+
+Read it positionally against that header: the **first** timestamp after the header run is the
+**collection time** — that is `collected_at`. The **second** is the **received** date, the moment
+the lab took delivery; it is neither `collected_at` nor a result date, and is never committed.
+Keep the header in view while reading, per *Read the header; don't index blindly* above — the
+positional rule is only safe because the header row names the two columns in order.
+
+**The `Narrative <lab> - <datetime>` line is a result date.** The line that follows the specimen
+table (synthetic: `NarrativeACMELAB - 03/18/2024 4:02 PM EDT`) is when the lab resulted the test —
+this is the value that has been mis-transcribed into `collected_at`. It may reach `collected_at`
+only through the fallback above, with the disclosure that fallback requires, and never while the
+specimen table's collection time is present.
+
+**Trap — "Final result" headers can carry the collection time.** A result-block header such as
+`TSH - Final result (03/10/2024 9:15 AM EDT)` states the *collection* time despite the wording. Do
+not read it as a result date; cross-check it against the specimen table's Collection Time cell.
+
+**Why the narrative is the only source here.** Epic also emits the collection time as a structured
+`<entry>` — a `<component><procedure>` bearing SNOMED `17636008` (*Specimen collection*) — which
+the engine does **not** parse. `_extract_ccda` is a generic narrative flattener with no semantic
+awareness of coded elements (§4, issue #189), so the structured value never reaches `ocr_text` and
+is not available to you. The narrative table is the reachable value, and it is reliably there: a
+14-document sweep found the collection timestamp rendered in the narrative of every document that
+carried the 17636008 procedure.
+
 **Remediation — rows already committed on the result date.** `collected_at` is an identity field
 (it feeds the `dedup_key`), so a plain `record edit --set collected_at=` is refused. Since issue
 #152 the first-choice repair is `record edit --identity`, a **one-row rekey**: the row keeps its
