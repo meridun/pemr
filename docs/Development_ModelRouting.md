@@ -54,10 +54,10 @@ plan changes are a one-line edit (or none).
 Two different delegation regimes, deliberately kept separate:
 
 - **Interactive sessions** (this policy): the orchestrator delegates synchronously and waits.
-- **Scheduled SDLC workers** (`prompts/sdlc/`): workers must never spawn subagents — a headless
+- **Scheduled SDLC workers** (`sdlc/lanes/`): workers must never spawn subagents — a headless
   worker that yields mid-task strands its issue under `sdlc:wip`. There, role names mean "apply
   this stance inline", and cost-tiering happens one level up: the **dispatcher** sets each lane
-  worker's `model` (see `prompts/sdlc/dispatch.md`). The verify and audit lanes inline the
+  worker's `model` (see `sdlc/dispatch.md`). The verify and audit lanes inline the
   `verifier` / `security-executor` stances respectively.
 
 **Dispatcher sizing:** keep the dispatcher itself sonnet-class even though its steps are mostly

@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 
 import { scanText, assertClean, SYNTHETIC_ROSTER } from '../scripts/pii-scan.mjs';
-import { guardOutboundBody } from '../scripts/sdlc.mjs';
+import { guardOutboundBody } from '../sdlc/bindings/gh-issue/sdlc.mjs';
 
 const rules = (text) => scanText(text).map((f) => f.rule);
 

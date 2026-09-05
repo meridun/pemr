@@ -573,7 +573,7 @@ This repository is **public**. It is framework + documentation only.
   | push (messages + introduced lines) | `.githooks/pre-push` |
   | PR title and body | `pii-pr-text` CI job |
   | agent shell commands | `.claude/hooks/pii-guard.py` |
-  | SDLC lane comments | `guardOutboundBody` in `scripts/sdlc.mjs` |
+  | SDLC lane comments | `guardOutboundBody` in `sdlc/bindings/gh-issue/sdlc.mjs` |
 
   All of them shell out to `scripts/pii-scan.mjs`, so there is one set of patterns rather than six
   that drift. Bypass is `--no-verify` and should be rare enough to notice.

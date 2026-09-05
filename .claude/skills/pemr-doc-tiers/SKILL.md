@@ -34,7 +34,7 @@ not duplicate its content here.
 | L2 skills | `.github/skills/*/SKILL.md` | On demand (description match) | ≤400 lines |
 | L3 docs | `docs/*.md` | Explicitly read | Unlimited, governed by `docs/Documentation.md` |
 | Agents | `.github/agents/*.agent.md` | Per spawn | ≤70 lines — shims, content lives in skills |
-| SDLC prompts | `prompts/sdlc/*.md` (if adopted) | Per lane pass | Reference skills/docs, never inline copies |
+| SDLC prompts | `sdlc/lanes/*.md`, `sdlc/dispatch.md` (if adopted) | Per lane pass | Reference skills/docs, never inline copies |
 | Claude memory | `~/.claude/projects/<project>/memory/` | Index every session | One fact per file |
 
 ## Core Principle: Every Token Must Earn Its Tier

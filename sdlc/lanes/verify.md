@@ -22,6 +22,10 @@ Per the README universal loop — lane `stage:verify`, idle reply `VERIFY: idle`
 Idempotency first: a green verify report for the **current branch HEAD** (no new commits since it was
 written) → skip to **ADVANCE**. New commits invalidate a prior report — re-verify. Otherwise:
 
+Apply the `verifier` role's adversarial stance **inline** (you are fresh context relative to the
+build worker — that's the point; see `.github/agents/verifier.agent.md` for the checklist). Never
+spawn it.
+
 - **Enter the issue's worktree** on build's branch (`<type>/<issue#>-<slug>`, named in build's ADVANCE
   comment) — `<WORKTREE_ROOT>/<issue#>`, create from the pushed branch if missing — and pull latest.
   Apply the README staleness rule: merge `origin/<DEFAULT_BRANCH>` only if its changes overlap the
@@ -33,8 +37,9 @@ written) → skip to **ADVANCE**. New commits invalidate a prior report — re-v
     issue names) and name them in your report so audit can isolate the same diff. Any new test then
     has no branch home — flag it for ship.
 - **Run the full suite yourself** — `<FULL_SUITE_CMD>` (not just the targeted files build ran; the
-  point here is to catch regressions build's narrow run couldn't see), plus `<LINT_CMD>` and any
-  project-mandated extra gate (race detector, type-check, integration pass) — everything `<INVARIANTS>`
+  point here is to catch regressions build's narrow run couldn't see), plus `<LINT_CMD>` (where
+  bound to the ratchet: `node sdlc/tools/check-lint-baseline.mjs` passes **and** the branch's touched
+  files lint clean via `npx eslint <files>`) and any project-mandated extra gate (race detector, type-check, integration pass) — everything `<INVARIANTS>`
   and `<LANG_CONVENTIONS>` require. Diagnose failures rather than papering over them.
 - **Known environment limitations — honor them, don't re-derive them.** If the project's profile
   declares `<KNOWN_ENV_LIMITS>` (a gate that cannot run in this environment, its accepted
@@ -55,6 +60,19 @@ written) → skip to **ADVANCE**. New commits invalidate a prior report — re-v
     (e.g. a server-side rejection only a unit test can force). Note any AC whose behavior is
     environment-dependent as unverified-on-<other-env> rather than skipping silently.
   - If the environment genuinely cannot stand up, **PARK** — never ADVANCE on unit tests alone.
+- **Migration validation — mandatory when the diff touches `<MIGRATIONS_DIR>`** (skip the whole
+  bullet if the profile leaves `<MIGRATIONS_DIR>` unbound):
+  - **Fresh apply:** the migrations must apply cleanly to an empty database. If the `<SMOKE_CMD>`
+    harness stands up a fresh DB and migrates on startup, a green smoke run covers it; a standup
+    failure in the migrate step is a BOUNCE → build, not an environment PARK.
+  - **Rollback validity:** each new migration's down-block must actually work — run
+    `<MIGRATE_DOWN_CMD>` for the new migration(s) then `<MIGRATE_UP_CMD>` again (inside the
+    smoke harness's DB or any disposable DB, never a shared one). An empty or broken down-block
+    is a BOUNCE.
+  - **Schema drift:** `<SCHEMA_DUMP>` must be regenerated and committed in the same diff — after
+    applying, confirm `git status` shows no uncommitted change to it. A committed dump that
+    doesn't match the migration chain is a BOUNCE (the branch must carry the regenerated file,
+    not a hand-edit).
 - **Check the diff against the issue body's `## Implementation plan`** — the reviewed plan is the
   spec; an unexplained deviation (files touched outside the plan with no ADVANCE-comment
   rationale) is a BOUNCE.
@@ -93,4 +111,4 @@ One-line result: `VERIFY: <#issue> → ADVANCE(audit)|BOUNCE(build)|PARK — <re
 - **Reuse build's `feat/<issue>` branch** for new tests; don't cut a new one. (Exception: the
   no-branch fallback — an item built outside the pipeline is verified on `<DEFAULT_BRANCH>`, and its
   new specs are handed to ship for a home.)
-- Honors the universal worker loop in [`README.md`](README.md).
+- Honors the universal worker loop in [`../README.md`](../README.md).

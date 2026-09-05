@@ -1,6 +1,6 @@
 # Development_AgenticSDLC.md
 
-If you adopt the `prompts/sdlc/` pipeline (see [prompts/sdlc/README.md](../prompts/sdlc/README.md)
+If you adopt the `sdlc/` pipeline (see [sdlc/README.md](../sdlc/README.md)
 for the stage graph and worker loop), document here:
 
 - How the dispatcher is scheduled (cron, CI, Claude Code scheduled task) and its cadence.
@@ -8,15 +8,17 @@ for the stage graph and worker loop), document here:
 - What's been proven to actually work end-to-end vs. what's still untested, so future changes
   know which tails are load-bearing.
 
-Upstream source: `C:\Claude\agentic-sdlc` — last resynced **2026-08-06** at upstream `79ddc87`
-(prompts, CLI, tests; placeholder bindings live in
-[prompts/sdlc/PROFILE.md](../prompts/sdlc/PROFILE.md)).
+> **Upstream pin:** `meridun/model-repo` **72ceda9** (2026-09-05; carries agentic-sdlc
+> `34b769e`). To re-sync, diff model-repo's `sdlc/`, `test/sdlc.test.mjs`,
+> `.github/agents/sdlc-worker.agent.md`, `docs/Development_Sdlc*.md` against ours, then bump this
+> pin and the one in [sdlc/PROFILE.md](../sdlc/PROFILE.md). Local adaptations to preserve: see
+> **Known deviations from spec** in the profile.
 
 ## The concurrent variant
 
 The pipeline is **per-issue concurrent**: locking is per-issue (the `sdlc:wip` label plus a
 `sdlc:claim <run-id> <lane>` ownership comment, race-checked by `claim --verify`), and each
-branch-touching worker operates in its own issue-scoped git worktree (`../pemr-wt-<issue#>`) —
+branch-touching worker operates in its own issue-scoped git worktree (`C:\Claude\pemr-wt-<issue#>`) —
 git's one-checkout-per-branch rule is a second lock layer. So lane workers run in parallel; a
 fresh wip lock makes only that one issue ineligible for a cycle, never aborting the run. There is
 **no dispatcher singleton**: any number of dispatch runs may execute concurrently; they
@@ -35,7 +37,7 @@ idempotent GitHub writes. (The old pinned `sdlc:dispatch-lock` issue #2 is retir
 
 ## The `sdlc` CLI — deterministic label/branch one-shots
 
-[scripts/sdlc.mjs](../scripts/sdlc.mjs) (`npm run sdlc <cmd>`) holds the deterministic state
+[sdlc/bindings/gh-issue/sdlc.mjs](../sdlc/bindings/gh-issue/sdlc.mjs) (`npm run sdlc <cmd>`) holds the deterministic state
 math; agents supply judgment and comment bodies. It is the upstream reference CLI with pemr
 constants (`DEFAULT_BRANCH = 'dev'`, `PROD_BRANCH = 'main'`). Pure planners are covered by
 `npm test` ([test/sdlc.test.mjs](../test/sdlc.test.mjs), zero-dep `node:test`, 130 tests).

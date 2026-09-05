@@ -36,7 +36,7 @@ Decide the sub-case first (idempotency — schedulers fire on a clock, not on ne
   its existing tests rather than starting parallel ones.
   The reviewed plan stands — don't re-plan unless the merge invalidated it (spec-rot check below).
 - **Nothing started** → implement:
-  - **Read the issue body's sections** — `## Requirements`, `## Acceptance criteria` (intake's),
+  - **Read the issue's artifact sections** — `## Requirements`, `## Acceptance criteria` (intake's),
     `## Design` and `## Implementation plan` (design's, human-reviewed at the queued gate), plus
     any `<DECISION_RECORD>` lines they cite. The plan carries the *decisions* (files, signatures,
     shapes, ordered steps, invariant impact); build's job is **expression** — the code itself.
@@ -60,8 +60,11 @@ Decide the sub-case first (idempotency — schedulers fire on a clock, not on ne
     not this branch). Reuse and extend existing code, don't fork parallel logic, guard boundaries
     (esp. undefined / external results), never assume single-user state. Don't touch unrelated files.
   - **Write/update tests for everything changed** and run them targeted yourself (`<TEST_CMD>`) until
-    green, diagnosing failures. Run the linter/formatter (`<LINT_CMD>`) clean. Do **not** run the full
-    suite here — that's verify's job.
+    green, diagnosing failures. Run the lint gate (`<LINT_CMD>`) clean — where the project binds
+    it to the **ratchet** (`node sdlc/tools/check-lint-baseline.mjs`: no new lint errors vs the
+    committed per-rule baseline), the files you touched must *also* lint clean on their own
+    (`npx eslint <files>`); the inherited backlog is grandfathered, growth is not. Do **not** run
+    the full suite here — that's verify's job.
   - **Invariant check before advancing:** does the change preserve every one of `<INVARIANTS>`? If the
     AC itself conflicts with an invariant, that's a BOUNCE to intake (decision needed), not a silent
     violation.
@@ -73,15 +76,19 @@ Decide the sub-case first (idempotency — schedulers fire on a clock, not on ne
 **Bounce to the lane that owns the failure — not reflexively to design.** The decided design is
 usually sound; most build failures are implementation or readiness, not "the design was wrong."
 
-- **ADVANCE** — branch pushed, complete to the AC and the plan, targeted tests + lint green. Swap
+- **ADVANCE** — branch pushed, complete to the AC and the plan, targeted tests + lint gate green
+  (ratchet passes + touched files clean, where bound). Swap
   `stage:build` → `stage:verify`, remove `sdlc:wip`. Comment: the **branch name**, what was
   implemented (noting any deviation from the reviewed plan and why, plus any small spec gaps you
   filled), which tests pass, and what verify should aim its real-run / integration pass at.
 - **BOUNCE → `stage:queued`** *(the common bounce)* — the item turned out **not ready**: blocked by a
   dependency that must land first, or otherwise not buildable *yet* though the design is fine. This
-  is a **readiness regression**: swap the label back, remove `sdlc:wip`, flip the issue's `ready`
-  label to `blocked` (add `blocked` if neither is present), comment the blocker (link the blocking
-  issue). The human throttle gates re-admission — which is what stops a silent queued→build→queued loop.
+  is a **readiness regression**: swap the stage marker back, remove `sdlc:wip`, and **record
+  the dependency edge** — `dep-edge <this> <blocker>`, this issue *blocked by* the blocking
+  issue. Comment the blocker (link it) as the human mirror. The edge — not a derived `blocked`
+  marker — is what keeps the item out of every lane until the blocker closes; the human throttle
+  then gates re-admission, which is what stops a silent queued→build→queued loop. A blocker the
+  tracker can't link: `sdlc:hold` + the prose line instead.
 - **BOUNCE → `stage:design`** — the reviewed plan **can't be executed as written**: a spec gap the
   plan never resolved, an internal contradiction, or the plan is **materially invalidated** (spec
   rot per the WORK check, or a wrong assumption discovered mid-build). Swap `stage:build` →
@@ -122,4 +129,4 @@ One-line result:
   unless the comment or your own check says otherwise.
 - **Targeted tests only.** Full suite, integration, and a real run belong to verify; build proves the
   unit-level wiring it changed. The PR is ship's job, not build's.
-- Honors the universal worker loop in [`README.md`](README.md).
+- Honors the universal worker loop in [`../README.md`](../README.md).

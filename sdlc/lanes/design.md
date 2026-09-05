@@ -27,7 +27,7 @@ You are the **design worker** for the `<PROJECT>` SDLC pipeline. Process **exact
 then stop.
 
 ### 1. CLAIM
-Per the [README](README.md) universal loop — lane `stage:design`, idle reply `DESIGN: idle`.
+Per the [README](../README.md) universal loop — lane `stage:design`, idle reply `DESIGN: idle`.
 
 ### 2. WORK
 First determine whether **UX design is owed**: the project runs the UX track (its profile binds
@@ -65,9 +65,9 @@ what still holds; reject the rest explicitly, one line each on why, so the queue
 the call. When a partial implementation exists, the plan covers the **gap**: record the branch and
 its HEAD alongside the Baseline, and mark in Touched what's already done vs remaining.
 
-**The implementation plan** is a section you append to the **issue body** (edit the body
-*preserving every existing section* — you own only your sections; see the README's issue
-anatomy). It is a **detailed plan, not code**. The boundary is **decisions vs. expression**: the
+**The implementation plan** is a section you append to the issue's evidence record
+(`write-section`, *preserving every existing section* — you own only your sections; see the
+README's evidence anatomy). It is a **detailed plan, not code**. The boundary is **decisions vs. expression**: the
 plan carries every *decision* — named files and functions, signatures, data shapes, migration
 steps, ordered work steps, test cases — so that build makes **zero architectural decisions**,
 only expression decisions (the actual code). It contains **no code bodies or diffs**: pseudo-code
@@ -89,6 +89,14 @@ are neither. Headings:
     relates to each of `<INVARIANTS>`.
   - **Test strategy**: the test cases (named surfaces + what each proves), unit vs integration.
   - **Out of scope**: what this deliberately does not do.
+
+**Ordering is an edge, not a sentence.** If the plan requires another open issue to land first
+(a provider this consumes, a split-off predecessor, a migration another item owns), record it as
+a **dependency edge** — `dep-edge <this> <blocker>`, this issue *blocked by* that one. The same
+applies when you split an epic into ordered children: each later child *blocked by* the one
+before it. The dispatcher's eligibility gate reads those edges (it never reads a `Depends on #n`
+line or a `blocked` marker — both are human mirrors it derives or ignores), so an ordering that
+lives only in prose is an ordering the pipeline will violate on the next cycle.
 
 Design-exempt items get a **spec-lite** — the same headings, roughly a line each. That's the
 whole cost of the standard phase for a bug fix; don't inflate it.
@@ -147,4 +155,4 @@ One-line result: `DESIGN: <#issue> → ADVANCE(queued)|PARK|BOUNCE(intake) — <
 - **Spec rot is handled at build**, not by re-speccing here on a clock: the plan records its
   baseline SHA and named paths; build revalidates when `<DEFAULT_BRANCH>` has moved over them and
   bounces back only on material invalidation.
-- Honors the universal worker loop in [`README.md`](README.md).
+- Honors the universal worker loop in [`../README.md`](../README.md).

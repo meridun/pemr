@@ -11,7 +11,7 @@ import {
   isValidTransition,
   planClaimVerify,
   lastUnlabeledAt,
-} from './sdlc.mjs';
+} from '../sdlc/bindings/gh-issue/sdlc.mjs';
 
 // Stage-graph invariants (ported from agentic-sdlc's reference suite). The
 // ship→build edge is load-bearing: ship.md documents BOUNCE → stage:build on
@@ -48,7 +48,7 @@ test('planClaimVerify: formatted EMIT comment does not cause a ghost lost race',
     {
       // The exact shape that broke the old `^(ADVANCE|BOUNCE|PARK|CONTINUE)`
       // regex: outcome keyword buried behind Markdown emphasis and a label.
-      body: '**Intake triage: ADVANCE -> stage:queued**\n\nConfirmed at scripts/sdlc.mjs...',
+      body: '**Intake triage: ADVANCE -> stage:queued**\n\nConfirmed at sdlc/bindings/gh-issue/sdlc.mjs...',
       createdAt: '2026-07-12T22:28:22Z',
     },
     { body: 'sdlc:claim dispatch-build build', createdAt: '2026-07-17T01:19:04Z' },
