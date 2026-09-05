@@ -2,7 +2,7 @@
 
 **The one file adoption fills.** Every `<KEY>` a prompt in this tree names resolves to a row
 below. The core (`README.md`, `lanes/`, `dispatch.md`) and the `gh-issue` binding are upstream
-verbatim and are never edited here; every pemr-specific decision is a row in this file or a
+verbatim and are never edited here; every project-specific decision is a row in this file or a
 declared deviation at the bottom.
 
 > **Upstream pin:** `meridun/model-repo` **72ceda9** (2026-09-05; agentic-sdlc `34b769e`). To

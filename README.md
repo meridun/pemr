@@ -75,3 +75,19 @@ documentation-tier system, token-optimizer hooks, role-based model routing, and 
 SDLC pipeline. See [docs/Documentation.md](docs/Documentation.md) and
 [docs/Development_AgenticSDLC.md](docs/Development_AgenticSDLC.md). The skill/agent
 prefix has been renamed from the template default to `pemr-`.
+
+## Shared config
+
+Adoption record for [meridun/model-repo](https://github.com/meridun/model-repo) components (see
+`.github/skills/pemr-upstream-sync/SKILL.md`). Last pull: model-repo **72ceda9** (2026-09-05).
+Declined rows are deliberate and revisitable.
+
+| Component | Status | Pin | Notes |
+|---|---|---|---|
+| Doc-tier system (L1/L2/L3) | adopted | 72ceda9 | prefix `pemr-` |
+| Config sync + meta-drift guard | adopted | 72ceda9 | local: `pemr-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
+| Caveman mode hook | adopted | 72ceda9 | L1 canonical; hook drift-checked |
+| graphify nudge hook + vtk notes | adopted | 72ceda9 (vtk fc4b1a5) | vtk in transparent-wrapper mode |
+| Role-based model routing | adopted | pilotfish v1.1.2 via 72ceda9 | pin in `docs/Development_ModelRouting.md` |
+| Agentic SDLC pipeline | partial | 72ceda9 | core + `gh-issue` binding + CLI adopted; `sdlc/tools/` lint ratchet **declined** (ESLint-only, Python repo); ADO bindings declined; deviations in `sdlc/PROFILE.md` |
+| Upstream sync procedure | adopted | 72ceda9 | `pemr-upstream-sync` |
