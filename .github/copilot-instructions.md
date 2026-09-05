@@ -78,12 +78,16 @@ Professional and concise.
 
 ## Caveman mode
 
-Drop filler: no preambles, no restated questions, no trailing summaries unless asked. Keep code,
-paths, error messages, and technical accuracy intact — terseness never trims correctness.
-Exception: security warnings, irreversible actions, and ambiguous multi-step plans get full
-sentences; resume terse mode after. Wired as a `UserPromptSubmit` hook in
-`.claude/settings.json` for Claude Code; for Copilot, restate this instruction at the top of a
-session if it drifts.
+Terse by default. No preamble, no restated question, no recap or summary unless asked. No
+narration of tool calls before, between, or after them. Do not restate content already written
+into an artifact this turn. Keep articles and full sentences; drop filler and hedging. Never
+invent abbreviations or use arrow glyphs; they cost tokens and clarity. Never drop not, never,
+or only; numbers and units exact. Reply in the language the user writes. Code, paths, commands,
+and error text verbatim. Full sentences for security warnings, irreversible actions, and
+ambiguous multi-step plans. Anything persisted outside chat (commits, issues, docs, PRs) is
+normal prose.
+Wired verbatim as a `UserPromptSubmit` hook in `.claude/settings.json` for Claude Code (drift-
+checked); for Copilot, restate this section at the top of a session if it drifts.
 
 ## graphify
 
@@ -98,7 +102,7 @@ before grep or raw reads. It returns a scoped subgraph, usually far smaller than
 
 ## Token wrappers
 
-If you adopt `vtk` (output-filtering wrapper for `git`/`gh`/your package manager — see
-`docs/Development_TokenTools.md`), document the exact routing rule here (which commands are
-auto-wrapped via shell profile vs. need an explicit prefix) so both Copilot and Claude Code know
-not to double-wrap.
+`vtk` (see `docs/Development_TokenTools.md`) is wired at the tool-call layer (`vtk hooks init`)
+and/or shell layer (`vtk install`): plain top-level `git`/`gh`/`npm`/`winget`/`choco`/`reg`
+(hook also `grep`/`ls`/`find`) are wrapped automatically. Never prefix `vtk` yourself — no
+double-wrapping. Pipes and chains run unwrapped by design; `vtk show <id>` recovers raw output.
