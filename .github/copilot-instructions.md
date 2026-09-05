@@ -12,15 +12,13 @@
   on request or pre-merge.
 - **No git operations** unless explicitly requested.
 - **Git flow** — `{feature} → dev → main`. All work happens on feature branches cut from `dev`
-  (the default/integration branch). `main`/`master` is prod: never branch from, checkout, or merge
-  to it unless explicitly requested. Adjust to your repo's actual branch model.
+  (the default/integration branch). `main` is prod: never branch from, checkout, or merge to it
+  unless explicitly requested.
 
 ## Memory vs Documentation
 
-- Claude Code: use its own `~/.claude` memory for fresh or uncertain lessons. Copilot: use
-  `/memories/` (workspace-local, not version-controlled).
-- Promote to L3 docs once verified, broadly applicable, and useful to humans — then shorten the
-  memory entry to a pointer.
+- Fresh or uncertain lessons go to memory (Claude Code: `~/.claude`; Copilot: `/memories/`).
+- Promote to L3 docs once verified and broadly useful; then shorten the memory entry to a pointer.
 
 ## Documentation Tiers
 
@@ -36,8 +34,6 @@ L3 entry points: [Overview.md](../docs/Overview.md), [Architecture.md](../docs/A
 [Documentation.md](../docs/Documentation.md).
 
 ## Compound Tasks (load skills sequentially, not all at once)
-
-Add rows here as your project grows multi-skill build sequences, e.g.:
 
 | Task | Skill sequence |
 |---|---|
@@ -72,10 +68,6 @@ fan-out inherit the main-session model. Don't delegate single-file reads, decisi
 the user asked *you* to judge — delegation has overhead. If the harness can't spawn subagents
 (some Copilot surfaces), apply each role's checklist inline instead.
 
-## Tone
-
-Professional and concise.
-
 ## Caveman mode
 
 Terse by default. No preamble, no restated question, no recap or summary unless asked. No
@@ -91,18 +83,11 @@ checked); for Copilot, restate this section at the top of a session if it drifts
 
 ## graphify
 
-Once `graphify-out/graph.json` exists (see [graphify](https://github.com/anthropics)), it's your
-**first** action for any architecture / structure / "how do I…, where is…, what does…" question —
-before grep or raw reads. It returns a scoped subgraph, usually far smaller than raw output.
-
-- `graphify query "<question>"` — scoped subgraph for how/where/what; `graphify path "<A>" "<B>"`
-  for relationships; `graphify explain "<concept>"` for a focused concept.
-- Read source files only to modify/debug specific code, when the graph lacks detail, or when it's
-  stale.
+If `graphify-out/graph.json` exists, `graphify query` comes before grep or raw reads for any
+architecture / "where is, how does" question; verbs and rules in `docs/Development_TokenTools.md`.
 
 ## Token wrappers
 
-`vtk` (see `docs/Development_TokenTools.md`) is wired at the tool-call layer (`vtk hooks init`)
-and/or shell layer (`vtk install`): plain top-level `git`/`gh`/`npm`/`winget`/`choco`/`reg`
-(hook also `grep`/`ls`/`find`) are wrapped automatically. Never prefix `vtk` yourself — no
-double-wrapping. Pipes and chains run unwrapped by design; `vtk show <id>` recovers raw output.
+`vtk` (see `docs/Development_TokenTools.md`) is wired as shell wrappers: plain top-level
+`git`/`gh`/`npm` are routed through it inside Claude Code sessions. Never prefix `vtk` yourself.
+Pipes and chains run unwrapped by design; `vtk show <id>` recovers raw output.

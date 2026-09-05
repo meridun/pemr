@@ -84,7 +84,7 @@ Declined rows are deliberate and revisitable.
 
 | Component | Status | Pin | Notes |
 |---|---|---|---|
-| Doc-tier system (L1/L2/L3) | adopted | 72ceda9 | prefix `pemr-` |
+| Doc-tier system (L1/L2/L3) | adopted | 72ceda9 | prefix `pemr-`; L1 local trims: no `## Tone`, no template placeholder prose, graphify section is a two-line pointer, Token wrappers describes the shell-wrapper mode only |
 | Config sync + meta-drift guard | adopted | 72ceda9 | local: `pemr-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
 | Caveman mode hook | adopted | 72ceda9 | L1 canonical; hook drift-checked |
 | graphify nudge hook + vtk notes | adopted | 72ceda9 (vtk fc4b1a5) | vtk in transparent-wrapper mode |
