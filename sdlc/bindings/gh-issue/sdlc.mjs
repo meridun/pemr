@@ -20,6 +20,7 @@
  *   sdlc advance <issue> <to-stage>   validate transition, swap stage label, drop sdlc:wip
  *   sdlc context <issue>              branch + status + issue labels/state + open PRs for branch
  *   sdlc worktree <issue> [<branch>]  add a sibling git worktree for the issue's branch
+ *                                     (junctions its node_modules to the main checkout's install)
  *   sdlc comment <issue> <file>       post a body-file comment (plumbing only)
  *   sdlc dup-check "<keywords>"       rank open-issue dup candidates (exit 2 if any); judgment stays with the caller
  *
@@ -30,15 +31,18 @@
  *   sdlc maint-lock    <run-id>       acquire the per-machine maintenance lock (.git/sdlc-maint.lock);
  *                                     exit 1 = held: skip Step 0a, never abort the cycle
  *   sdlc maint-release <run-id>       release the maintenance lock (idempotent)
- *   sdlc lanes                        per-lane depth + eligibility + the ≠1 stage-label check
+ *   sdlc lanes                        per-lane depth + eligibility + the ≠1 stage-label check;
+ *                                     an issue with an OPEN native blocker is never eligible
  *   sdlc heal     [<lane>] [<issue>]  post-worker self-heal: did the worker clear its lock? (lane-only = auto-discover)
  *   sdlc git-maint                    fetch, ff default branch, prune ancestry/squash-merged branches, PR state
  *   sdlc worktree-sweep [--apply]     remove clean issue-scoped worktrees whose branch is gone/merged or issue closed
  *   sdlc conflict-scan [--apply]      comment + bounce-to-build issues whose open PR conflicts with the default branch
- *   sdlc sweep    [--state <file>]    read-only merge-sweep work-list for intake step 0:
- *                                     merged PRs → closed issues → blocked dependents; `sweep: clear` if none;
- *                                     writes nothing — `sweep --ack` (run after processing) marks merges swept
- *   sdlc cycle-prep [--apply]         the whole pre-dispatch sequence (mint→maint-lock→lanes→gate --reap→
+ *   sdlc deps     [--apply]           readiness labels (blocked/ready) DERIVED from native dependency edges, + lint;
+ *                                     `--migrate` proposes edges from prose `Depends on #n` lines (dry run unless --apply)
+ *   sdlc sweep    [--state <file>]    read-only close-sweep work-list for intake step 0:
+ *                                     closed issues → open issues they were blocking (native edges); `sweep: clear`
+ *                                     if none; writes nothing — `sweep --ack` (run after processing) marks closes swept
+ *   sdlc cycle-prep [--apply]         the whole pre-dispatch sequence (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→
  *                                     sweep→git-maint→worktree-sweep→conflict-scan→maint-release) in one
  *                                     delimited, machine-readable report
  *   sdlc digest   [--state <file>]    queue depths, parked/hold lists, arrivals-diff vs last cycle
@@ -46,10 +50,15 @@
  * The stage graph (forward pipeline edges + the documented bounces):
  *   intake → design → queued → build → verify → audit → ship
  * with `sdlc:wip` as the machine lock and `sdlc:needs-human` / `sdlc:hold` as
- * parks (see prompts/sdlc/README.md).
+ * parks (see sdlc/README.md).
+ *
+ * Blocking is a fourth ineligibility axis and its source of truth is GitHub's
+ * NATIVE issue dependencies (blocked-by / blocking edges), read via GraphQL —
+ * never the `blocked`/`ready` labels (derived, written by `sdlc deps --apply`)
+ * and never prose in a body (#27).
  *
  * Usage:
- *   node scripts/sdlc.mjs <command> [args...]   (or: npm run sdlc <command>)
+ *   node sdlc/bindings/gh-issue/sdlc.mjs <command> [args...]   (or: npm run sdlc <command>)
  */
 
 import { execFileSync } from 'child_process';
@@ -58,7 +67,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { assertClean } from './pii-scan.mjs';
+import { assertClean } from '../../../scripts/pii-scan.mjs';
 
 // --- Adapt to your repo -------------------------------------------------------
 // These are the only project-specific knobs. `<DEFAULT_BRANCH>` is the
@@ -82,7 +91,7 @@ export const STAGES = ['intake', 'design', 'queued', 'build', 'verify', 'audit',
 
 /**
  * Legal stage transitions: the forward pipeline edge(s) plus the documented
- * bounces from prompts/sdlc/. `ship` is terminal on ADVANCE (the ship worker
+ * bounces from sdlc/lanes/. `ship` is terminal on ADVANCE (the ship worker
  * opens a PR; the merge closes the issue) but may still bounce a late code
  * problem or merge conflict back to build. Any edge not listed here is
  * rejected — that is what fixes the label-typo class of bug.
@@ -275,7 +284,7 @@ export function planClaimVerify(comments, myRunId, boundaryIso = null) {
   return { won: winner.runId === myRunId, winner: winner.runId, reason: null };
 }
 
-/** Worker outcomes `sdlc emit` accepts (prompts/sdlc/README.md EMIT step). */
+/** Worker outcomes `sdlc emit` accepts (sdlc/README.md EMIT step). */
 export const EMIT_OUTCOMES = ['ADVANCE', 'BOUNCE', 'PARK', 'CONTINUE', 'CLOSE'];
 
 /**
@@ -346,28 +355,78 @@ export function lastUnlabeledAt(timelineEvents, label) {
   return latest;
 }
 
+// --- Native issue dependencies (GitHub blocked-by / blocking edges) -------------
+
+/**
+ * The readiness axis's derived labels. Since #27 they are written FROM the
+ * native dependency edges (`sdlc deps --apply`), never read by the machine:
+ * eligibility keys off the edges themselves (`openBlockers`), so a hand-edited
+ * label can no longer make a blocked item claimable or hide a ready one.
+ */
+export const BLOCKED_LABEL = 'blocked';
+export const READY_LABEL = 'ready';
+
+/**
+ * Normalize a GraphQL `blockedBy`/`blocking` edge list to `[{ number, state }]`.
+ * Accepts the raw connection (`{ nodes: [...] }`), a bare node array, or
+ * nothing. Pure.
+ */
+export function normalizeEdges(edges) {
+  const nodes = Array.isArray(edges) ? edges : edges?.nodes ?? [];
+  return nodes
+    .filter((n) => n && n.number != null)
+    .map((n) => ({ number: Number(n.number), state: String(n.state ?? 'OPEN').toUpperCase() }));
+}
+
+/**
+ * The issue numbers of an issue's still-OPEN native blockers — the one fact
+ * eligibility keys off. An edge whose blocker is CLOSED is history (edges
+ * persist after close), so it never blocks. Pure.
+ */
+export function openBlockers(blockedBy) {
+  return normalizeEdges(blockedBy)
+    .filter((e) => e.state === 'OPEN')
+    .map((e) => e.number)
+    .sort((a, b) => a - b);
+}
+
 /**
  * Per-lane eligibility + depth from ONE open-issue snapshot, plus the
  * stage-label integrity check. `issues` is
- * `[{ number, labels:[{name}]|[name], createdAt }]`. Pure.
+ * `[{ number, labels:[{name}]|[name], createdAt, blockedBy?:[{number,state}] }]`.
+ * Pure.
  *
- * Eligible = has that stage, not wip and not parked/hold; ordered exactly as a
- * worker's CLAIM would pick — priority (critical › unlabeled › future),
- * then FIFO by createdAt. `integrity` lists every issue whose stage-label
- * state is corrupt (see the zero-vs-flagged rule below). Each lane also
- * carries an `ineligible` breakdown ({hold, needs-human, wip} counts) so the
- * lanes report can explain a deep-but-idle lane at a glance.
+ * Eligible = has that stage, not wip, not parked/hold, AND no OPEN native
+ * blocker (`openBlockers`); ordered exactly as a worker's CLAIM would pick —
+ * priority (critical › unlabeled › future), then FIFO by createdAt.
+ * `integrity` lists every issue whose stage-label state is corrupt (see the
+ * zero-vs-flagged rule below). Each lane also carries an `ineligible`
+ * breakdown ({hold, needs-human, wip, blocked} counts) so the lanes report can
+ * explain a deep-but-idle lane at a glance, plus `blocked`: the per-issue
+ * open-blocker lists behind that bucket (`[{ number, blockers }]`).
+ *
+ * The blocked gate is re-evaluated from live edge state on every snapshot —
+ * no sweep, window, or ack is involved — so a blocker closed by its PR merging
+ * unblocks its dependents on the very next cycle automatically. A snapshot
+ * without `blockedBy` (an adopter that has not wired the GraphQL edge fetch)
+ * simply has no blocked items.
  */
 export function computeLanes(issues) {
   const norm = (issues ?? []).map((i) => ({
     number: i.number,
     createdAt: i.createdAt ?? '',
     labels: (i.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
+    blockers: openBlockers(i.blockedBy),
   }));
 
   const lanes = {};
   for (const lane of WORKER_LANES.concat('queued')) {
-    lanes[lane] = { depth: 0, eligible: [], ineligible: { hold: 0, 'needs-human': 0, wip: 0 } };
+    lanes[lane] = {
+      depth: 0,
+      eligible: [],
+      ineligible: { hold: 0, 'needs-human': 0, wip: 0, blocked: 0 },
+      blocked: [],
+    };
   }
 
   const integrity = [];
@@ -388,16 +447,20 @@ export function computeLanes(issues) {
       lanes[stage].depth += 1;
       const parked = PARK_LABELS.some((p) => issue.labels.includes(p));
       const locked = issue.labels.includes(WIP_LABEL);
-      if (!parked && !locked) {
+      const blocked = issue.blockers.length > 0;
+      if (!parked && !locked && !blocked) {
         lanes[stage].eligible.push(issue);
       } else if (issue.labels.includes('sdlc:hold')) {
         // One bucket per ineligible issue so the breakdown sums to depth −
-        // eligible count. Precedence: hold › needs-human › wip.
+        // eligible count. Precedence: hold › needs-human › wip › blocked.
         lanes[stage].ineligible.hold += 1;
       } else if (issue.labels.includes('sdlc:needs-human')) {
         lanes[stage].ineligible['needs-human'] += 1;
-      } else {
+      } else if (locked) {
         lanes[stage].ineligible.wip += 1;
+      } else {
+        lanes[stage].ineligible.blocked += 1;
+        lanes[stage].blocked.push({ number: issue.number, blockers: issue.blockers });
       }
     }
   }
@@ -420,11 +483,11 @@ export function computeLanes(issues) {
  * the `ineligible` bucket counts a `computeLanes` lane carries. Pure.
  * Zero-count buckets are omitted; returns `''` when nothing is ineligible (a
  * fully-eligible lane, where depth == eligible count, prints unchanged). Bucket
- * order is fixed: hold, needs-human, wip.
+ * order is fixed: hold, needs-human, wip, blocked.
  */
 export function laneIneligibilityBreakdown(lane) {
   const buckets = lane?.ineligible ?? {};
-  const parts = ['hold', 'needs-human', 'wip']
+  const parts = ['hold', 'needs-human', 'wip', 'blocked']
     .filter((k) => (buckets[k] ?? 0) > 0)
     .map((k) => `${k} ${buckets[k]}`);
   return parts.length ? `(${parts.join(', ')})` : '';
@@ -608,7 +671,8 @@ export function classifyStatusForSweep(porcelain, sizeOf) {
  * its target — is safe on every platform: `lstat` reports junctions as
  * symlinks, and a non-recursive `rmSync` unlinks the reparse point without
  * touching what it points at. Only root entries are scanned; the lane
- * convention creates at most one root-level `node_modules` junction.
+ * convention (`linkWorktreeNodeModules`, below) creates at most one root-level
+ * `node_modules` junction.
  *
  * @param {string} treePath worktree root about to be handed to `git worktree remove`
  * @param {(msg:string)=>void} log progress logger
@@ -634,6 +698,60 @@ export function unlinkWorktreeRootLinks(treePath, log = () => {}) {
     }
   }
   return removed;
+}
+
+/**
+ * Provision a freshly-created worktree's `node_modules` by linking it at the
+ * root to the main checkout's install — the creation half of the convention
+ * that `unlinkWorktreeRootLinks` (above) tears down. Without it every lane
+ * worker improvises: a full duplicate install per tree, or none at all and no
+ * way to run `<TEST_CMD>` / `<LINT_CMD>`.
+ *
+ * The link is a Windows **junction** (no admin rights needed, unlike a symlink;
+ * the absolute-target requirement is met since callers pass resolved paths);
+ * on other platforms Node ignores the type and makes a plain directory symlink.
+ * Either way `lstat().isSymbolicLink()` is true, so teardown handles both.
+ *
+ * The existence probe is `lstat`-based on purpose: `fs.existsSync` follows the
+ * link, so a *dangling* junction (shared install since deleted) would report
+ * `false` and `symlinkSync` would then throw `EEXIST`.
+ *
+ * Because the install is shared, `npm install` / `npm ci` run inside a
+ * junctioned worktree mutates the main checkout's `node_modules` (and every
+ * other junctioned worktree). An issue that changes dependencies must unlink
+ * first and install for real — see the share-don't-install rule in
+ * `sdlc/README.md`. Creation-only: there is deliberately no repair
+ * sweep over existing trees; they converge as they are swept and recreated.
+ *
+ * @param {string} root absolute path of the main checkout (the install to share)
+ * @param {string} target absolute path of the worktree just created
+ * @param {(msg:string)=>void} log progress logger
+ * @returns {'linked'|'exists'|'no-source'|'error'} what happened — and why nothing did, when nothing did
+ */
+export function linkWorktreeNodeModules(root, target, log = () => {}) {
+  const link = path.join(target, 'node_modules');
+  const source = path.join(root, 'node_modules');
+  try {
+    fs.lstatSync(link); // lstat, not existsSync: a dangling junction still counts as present
+    log('node_modules: already present (left alone)');
+    return 'exists';
+  } catch {
+    // absent — fall through and link
+  }
+  if (!fs.existsSync(source)) {
+    log('node_modules: none in main checkout — install in the worktree if the project needs one');
+    return 'no-source';
+  }
+  try {
+    fs.symlinkSync(source, link, 'junction');
+    log(`node_modules: junction -> ${source}`);
+    return 'linked';
+  } catch (err) {
+    // Never fail worktree creation over this: the worktree itself is good and
+    // the worker can still install by hand.
+    log(`node_modules: could not link (${String(err.message).split('\n')[0]}) — install by hand`);
+    return 'error';
+  }
 }
 
 /**
@@ -716,73 +834,259 @@ export function computeDigest(issues, prev = null) {
 }
 
 /**
- * The intake merge-sweep work-list (intake.md step 0). Pure.
+ * The intake close-sweep work-list (intake.md step 0). Pure.
  *
- * Maps recently-merged PRs → the issues each closed → the open issues that
- * *depend on* those closed issues (a `#<n>` reference in the body), flagging
- * which dependents carry the `blocked` label — the cascade-unblock candidates
- * intake flips Blocked → Ready. A PR already in `sweptPrs`, one that closed no
- * issue, or (when `sinceMs` is given) one merged at/before that cutoff is
- * skipped, so the sweep is idempotent and bounded. No I/O and no writes — the
- * intake worker consumes the list and performs the actions itself.
+ * Maps recently-CLOSED issues → the open issues they were *blocking* (native
+ * `blocking` edges — never a regex over prose) → for each dependent, whether
+ * every remaining blocker is now closed (`flip: true`: the readiness cascade
+ * candidate) or which blockers still hold it. However an issue closed — a PR's
+ * `Closes #n`, a hand close, a dup close — it cascades, because the edge is
+ * the record, not the PR. An issue already in `sweptIssues`, one blocking
+ * nothing open, or (when `sinceMs` is given) one closed at/before that cutoff
+ * is skipped, so the sweep is idempotent and bounded.
  *
- * @param {Array}  mergedPrs   `[{ number, mergedAt, title, closes: [issueNum] }]`
- * @param {Array}  openIssues  `[{ number, title, labels: [name]|[{name}], body }]`
- * @param {object} [opts]      `{ sinceMs: number|null, sweptPrs: Array<number> }`
+ * Since #27 this list is **bookkeeping, not gating**: `computeLanes` already
+ * refuses to make a dependent eligible while any blocker is OPEN, so a missed
+ * or late sweep can no longer let a blocked item be claimed. What the sweep
+ * hands intake is the human-facing residue — the "blocker landed" comment,
+ * roadmap readiness lines, body strikethrough — and the label flip when
+ * `sdlc deps --apply` is not on the cycle. No I/O and no writes.
+ *
+ * @param {Array}  closedIssues `[{ number, closedAt, title, blocking:[{number,state}] }]`
+ * @param {Array}  openIssues   `[{ number, title, labels: [name]|[{name}], blockedBy:[{number,state}] }]`
+ * @param {object} [opts]       `{ sinceMs: number|null, sweptIssues: Array<number> }`
  * @returns {{ items: Array, closedIssues: number[], empty: boolean }}
  */
-export function computeSweep(mergedPrs, openIssues, { sinceMs = null, sweptPrs = [] } = {}) {
-  const swept = new Set((sweptPrs ?? []).map(Number));
-  const issues = (openIssues ?? []).map((i) => ({
-    number: i.number,
-    title: i.title ?? '',
-    labels: (i.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
-    body: i.body ?? '',
-  }));
-
-  // Open issues that reference `#<closedNum>` in their body (word-boundaried so
-  // `#12` never matches `#123`), flagged if they carry the `blocked` label.
-  const dependentsOf = (closedNum) => {
-    const ref = new RegExp(`#${closedNum}(?!\\d)`);
-    return issues
-      .filter((i) => i.number !== closedNum && ref.test(i.body))
-      .map((i) => ({ number: i.number, title: i.title, blocked: i.labels.includes('blocked') }));
-  };
+export function computeSweep(closedIssues, openIssues, { sinceMs = null, sweptIssues = [] } = {}) {
+  const swept = new Set((sweptIssues ?? []).map(Number));
+  const open = new Map(
+    (openIssues ?? []).map((i) => [
+      Number(i.number),
+      {
+        number: Number(i.number),
+        title: i.title ?? '',
+        labels: (i.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
+        blockers: openBlockers(i.blockedBy),
+      },
+    ]),
+  );
 
   const items = [];
-  for (const pr of mergedPrs ?? []) {
-    if (swept.has(Number(pr.number))) continue;
-    if (sinceMs !== null && pr.mergedAt && new Date(pr.mergedAt).getTime() <= sinceMs) continue;
-    const closes = (pr.closes ?? []).map((n) => ({ number: n, dependents: dependentsOf(n) }));
-    if (!closes.length) continue; // closed no issue — nothing to cascade
-    items.push({ number: pr.number, mergedAt: pr.mergedAt ?? null, title: pr.title ?? '', closes });
+  for (const closed of closedIssues ?? []) {
+    if (swept.has(Number(closed.number))) continue;
+    if (sinceMs !== null && closed.closedAt && new Date(closed.closedAt).getTime() <= sinceMs) continue;
+    // Dependents = the closed issue's OPEN `blocking` targets that are in the
+    // open snapshot (a target missing from it closed since — nothing to flip).
+    const dependents = normalizeEdges(closed.blocking)
+      .filter((e) => e.state === 'OPEN' && open.has(e.number))
+      .map((e) => {
+        const dep = open.get(e.number);
+        return {
+          number: dep.number,
+          title: dep.title,
+          blocked: dep.labels.includes(BLOCKED_LABEL),
+          remainingBlockers: dep.blockers,
+          flip: dep.blockers.length === 0,
+        };
+      })
+      .sort((a, b) => a.number - b.number);
+    if (!dependents.length) continue; // blocked nothing open — nothing to cascade
+    items.push({ number: Number(closed.number), closedAt: closed.closedAt ?? null, title: closed.title ?? '', dependents });
   }
 
-  const closedIssues = [...new Set(items.flatMap((it) => it.closes.map((c) => c.number)))];
-  return { items, closedIssues, empty: items.length === 0 };
+  return { items, closedIssues: items.map((it) => it.number), empty: items.length === 0 };
 }
 
 /**
- * The next `sweptPrs` marker after an ack (intake.md step 0). Pure.
+ * The next `sweptIssues` marker after an ack (intake.md step 0). Pure.
  *
- * Retains only prior swept PRs still present in the fetched merged list (bounds
- * the marker to ≤ the fetch limit) plus every PR merged inside the window.
- * `newlyAcked` is the in-window set not already marked — what this ack adds.
+ * Retains only prior swept issues still present in the fetched closed list
+ * (bounds the marker to ≤ the fetch limit) plus every issue closed inside the
+ * window. `newlyAcked` is the in-window set not already marked — what this ack
+ * adds.
  *
- * @param {Array}  mergedPrs  `[{ number, mergedAt }]`
- * @param {object} [opts]     `{ sinceMs: number|null, sweptPrs: Array<number> }`
+ * @param {Array}  closedIssues `[{ number, closedAt }]`
+ * @param {object} [opts]       `{ sinceMs: number|null, sweptIssues: Array<number> }`
  * @returns {{ nextSwept: number[], newlyAcked: number[] }}
  */
-export function computeSweepAck(mergedPrs, { sinceMs = null, sweptPrs = [] } = {}) {
-  const prior = (sweptPrs ?? []).map(Number);
-  const fetchedNums = new Set((mergedPrs ?? []).map((p) => Number(p.number)));
-  const inWindow = (mergedPrs ?? [])
-    .filter((p) => sinceMs === null || (p.mergedAt && new Date(p.mergedAt).getTime() > sinceMs))
-    .map((p) => Number(p.number));
+export function computeSweepAck(closedIssues, { sinceMs = null, sweptIssues = [] } = {}) {
+  const prior = (sweptIssues ?? []).map(Number);
+  const fetchedNums = new Set((closedIssues ?? []).map((i) => Number(i.number)));
+  const inWindow = (closedIssues ?? [])
+    .filter((i) => sinceMs === null || (i.closedAt && new Date(i.closedAt).getTime() > sinceMs))
+    .map((i) => Number(i.number));
   const priorSet = new Set(prior);
   const nextSwept = [...new Set([...prior.filter((n) => fetchedNums.has(n)), ...inWindow])];
   const newlyAcked = inWindow.filter((n) => !priorSet.has(n));
   return { nextSwept, newlyAcked };
+}
+
+/**
+ * Dependency cycles among OPEN issues, from their `blockedBy` edges. Returns
+ * each cycle once as its member numbers in traversal order, starting from the
+ * lowest member (`[[3, 5, 9]]` = 3 ← 5 ← 9 ← 3). Closed blockers are ignored:
+ * a cycle through a closed issue is already broken. Pure.
+ */
+export function findDependencyCycles(openIssues) {
+  const graph = new Map(
+    (openIssues ?? []).map((i) => [Number(i.number), openBlockers(i.blockedBy)]),
+  );
+  const cycles = [];
+  const seen = new Set(); // canonical cycle keys
+  const visit = (start, node, stack, onStack) => {
+    for (const next of graph.get(node) ?? []) {
+      if (!graph.has(next)) continue; // blocker not in the open snapshot
+      if (next === start) {
+        const min = Math.min(...stack);
+        const rotated = stack.slice(stack.indexOf(min)).concat(stack.slice(0, stack.indexOf(min)));
+        const key = rotated.join('>');
+        if (!seen.has(key)) {
+          seen.add(key);
+          cycles.push(rotated);
+        }
+        continue;
+      }
+      if (onStack.has(next) || next < start) continue; // cycles are found from their lowest member
+      onStack.add(next);
+      stack.push(next);
+      visit(start, next, stack, onStack);
+      stack.pop();
+      onStack.delete(next);
+    }
+  };
+  for (const start of [...graph.keys()].sort((a, b) => a - b)) {
+    visit(start, start, [start], new Set([start]));
+  }
+  return cycles;
+}
+
+/**
+ * The readiness-label plan + lint findings for one open-issue snapshot
+ * (`sdlc deps`, dispatch cycle-prep). Pure.
+ *
+ * Derived labels, from edge state alone:
+ *   any OPEN blocker            → `blocked` (drop `ready`)
+ *   edges, all CLOSED           → `ready`   (drop `blocked`)
+ *   no edges at all             → neither derived; an existing `blocked` label is
+ *                                 AMBIGUOUS (a cross-repo or prose-only block
+ *                                 the machine can't see) → lint, never repaired
+ *
+ * `edits` are the unambiguous auto-repairs (`[{ number, add, remove, reason }]`);
+ * `findings` are for the digest (`[{ kind, number, detail }]`): `label-only-blocked`
+ * (label, no edge), `cycle` (dependency cycle among open issues). Issues on
+ * `sdlc:hold` are still relabeled — readiness is orthogonal to a human keep-off —
+ * but that is a label edit only; hold itself is never touched.
+ *
+ * @param {Array} openIssues `[{ number, labels:[name]|[{name}], blockedBy:[{number,state}] }]`
+ * @returns {{ edits: Array, findings: Array, blocked: number[], ready: number[] }}
+ */
+export function computeDeps(openIssues) {
+  const norm = (openIssues ?? []).map((i) => ({
+    number: Number(i.number),
+    labels: (i.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
+    edges: normalizeEdges(i.blockedBy),
+    blockers: openBlockers(i.blockedBy),
+  }));
+  const edits = [];
+  const findings = [];
+  const blocked = [];
+  const ready = [];
+  for (const issue of norm.sort((a, b) => a.number - b.number)) {
+    const hasBlocked = issue.labels.includes(BLOCKED_LABEL);
+    const hasReady = issue.labels.includes(READY_LABEL);
+    if (issue.blockers.length > 0) {
+      blocked.push(issue.number);
+      const add = hasBlocked ? [] : [BLOCKED_LABEL];
+      const remove = hasReady ? [READY_LABEL] : [];
+      if (add.length || remove.length) {
+        edits.push({ number: issue.number, add, remove, reason: `open blocker${issue.blockers.length === 1 ? '' : 's'} #${issue.blockers.join(', #')}` });
+      }
+    } else if (issue.edges.length > 0) {
+      ready.push(issue.number);
+      const add = hasReady ? [] : [READY_LABEL];
+      const remove = hasBlocked ? [BLOCKED_LABEL] : [];
+      if (add.length || remove.length) {
+        edits.push({ number: issue.number, add, remove, reason: 'every blocker closed' });
+      }
+    } else if (hasBlocked) {
+      findings.push({
+        kind: 'label-only-blocked',
+        number: issue.number,
+        detail: 'carries `blocked` but has no native dependency edge — add the edge (`sdlc deps --migrate`), or drop the label; a cross-repo block is `sdlc:hold` + prose',
+      });
+    }
+  }
+  for (const cycle of findDependencyCycles(norm.map((i) => ({ number: i.number, blockedBy: i.edges })))) {
+    findings.push({
+      kind: 'cycle',
+      number: cycle[0],
+      detail: `dependency cycle ${cycle.map((n) => `#${n}`).join(' ← ')} ← #${cycle[0]} — nothing in it can ever become eligible; a human must cut an edge`,
+    });
+  }
+  return { edits, findings, blocked, ready };
+}
+
+/**
+ * Prose dependency declarations in an issue body, for the one-time migration
+ * to native edges (`sdlc deps --migrate`). Pure.
+ *
+ * Matches only a declaration that STARTS a line (after optional list markers,
+ * emphasis, a `**Dependencies:**` label, and a `blocked`/`depends` heading
+ * colon) — `Depends on #12`, `- Blocked by: #12, #13`, `**Requires** #12`,
+ * `After #12`, `**Dependencies:** Depends on K.3b #161` (a roadmap identifier
+ * may sit between the keyword and the `#n`) — so narrative mentions like "None
+ * depends on #1337" or "does not depend on #1161" (both real false positives of
+ * the old regex-over-bodies sweep) never propose an edge. Self-references are
+ * dropped; results are unique, ascending.
+ */
+export function parseProseDependencies(body, selfNumber = null) {
+  const found = new Set();
+  const LEAD = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?(?:\[[ x]\]\s+)?[*_~`\s]*(?:dependenc(?:y|ies)[*_~`\s]*:?[*_~`\s]*)?(?:depends\s+on|blocked\s+by|blocked\s+on|requires|after)\b[*_~`]*\s*:?\s*(.*)$/i;
+  for (const raw of String(body ?? '').split(/\r?\n/)) {
+    const m = raw.match(LEAD);
+    if (!m) continue;
+    // Only the leading run of `#n` references (with separators, each optionally
+    // preceded by one identifier token such as `K.3b` or `owner/repo`) counts —
+    // "Depends on #12 and the API rework" contributes just #12.
+    const refs = m[1].match(/^(?:\s*(?:,|and|&|\/)?\s*(?:[^\s#,]+\s+)?#\d+)+/i);
+    if (!refs) continue;
+    for (const n of refs[0].match(/#(\d+)/g) ?? []) {
+      const num = Number(n.slice(1));
+      if (selfNumber != null && num === Number(selfNumber)) continue;
+      found.add(num);
+    }
+  }
+  return [...found].sort((a, b) => a - b);
+}
+
+/**
+ * The migration plan from prose to native edges (`sdlc deps --migrate`). Pure.
+ *
+ * For every open issue, each prose-declared blocker that is a known issue
+ * (open or closed — edges to closed blockers are harmless and make `ready`
+ * derivable) and not already a native edge becomes a proposed edge
+ * `{ number, blocker, blockerState, blockerId }`; a reference to an unknown
+ * number (deleted, transferred, or another repo) is `skipped` with a reason.
+ *
+ * @param {Array}  openIssues `[{ number, body, blockedBy }]`
+ * @param {object} known      `{ [number]: { id, state } }` — every issue the edge could point at
+ */
+export function planDependencyMigration(openIssues, known = {}) {
+  const proposals = [];
+  const skipped = [];
+  for (const issue of openIssues ?? []) {
+    const existing = new Set(normalizeEdges(issue.blockedBy).map((e) => e.number));
+    for (const blocker of parseProseDependencies(issue.body, issue.number)) {
+      if (existing.has(blocker)) continue; // already native — nothing to migrate
+      const target = known?.[blocker];
+      if (!target) {
+        skipped.push({ number: Number(issue.number), blocker, reason: 'not an issue in this repo (deleted, transferred, or cross-repo — native edges are per-repo)' });
+        continue;
+      }
+      proposals.push({ number: Number(issue.number), blocker, blockerState: target.state ?? null, blockerId: target.id ?? null });
+    }
+  }
+  return { proposals, skipped };
 }
 
 /**
@@ -937,6 +1241,8 @@ export function scoreDupCandidates(query, issues, opts = {}) {
 
 // --- I/O boundary: gh / git executors (injectable for tests) -------------------
 
+// 64 MB buffer: a GraphQL page of 100 issues with bodies can exceed Node's 1 MB
+// default, which kills the child with SIGTERM and no useful error.
 /**
  * Every outbound `gh` write funnels through here, so the privacy guard lives
  * here too rather than at each `issue comment` call site — a new call site
@@ -963,7 +1269,7 @@ export function guardOutboundBody(args, scan = assertClean) {
 
 const defaultGh = (args) => {
   guardOutboundBody(args);
-  return execFileSync('gh', args, { encoding: 'utf8' });
+  return execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 };
 const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8' });
 
@@ -986,6 +1292,93 @@ function requireIssue(issue) {
 /** One open-issue snapshot that serves a whole cycle (Step 0). */
 function snapshotOpenIssues(gh, fields = 'number,labels,createdAt,title') {
   return JSON.parse(gh(['issue', 'list', '--state', 'open', '--json', fields, '--limit', '200']));
+}
+
+/**
+ * The GraphQL issue query behind every dependency-aware command: one call per
+ * page of 100 returns, for every issue in `states`, its native `blockedBy` /
+ * `blocking` edges WITH each edge's state — the only way to read dependencies
+ * in bulk (`gh issue list --search blocked-by:` returned nothing in the #27
+ * demo; the REST `/dependencies` endpoints are per-issue). `databaseId` is the
+ * numeric id the REST edge-write endpoint wants (`-F issue_id=`), which is NOT
+ * the issue number.
+ */
+const issueGraphQuery = (withBody) => `query($owner:String!,$name:String!,$states:[IssueState!],$after:String){
+  repository(owner:$owner,name:$name){
+    issues(states:$states, first:100, after:$after, orderBy:{field:UPDATED_AT,direction:DESC}){
+      pageInfo{hasNextPage endCursor}
+      nodes{ number databaseId title state closedAt createdAt updatedAt${withBody ? ' body' : ''}
+        labels(first:50){nodes{name}}
+        blockedBy(first:50){nodes{number state}}
+        blocking(first:50){nodes{number state}} }
+    }
+  }
+}`;
+
+/**
+ * Fetch issues + native dependency edges via GraphQL, paginated. Returns
+ * `[{ number, id, title, state, closedAt, createdAt, updatedAt, body, labels:[name],
+ * blockedBy:[{number,state}], blocking:[{number,state}] }]`. `stopWhen(issue)`
+ * ends pagination early (issues arrive newest-updated first, so a time cutoff
+ * on `updatedAt` — which is ≥ `closedAt` — bounds the closed-issue fetch).
+ * Bodies are requested only with `withBody` (the migration parser needs them;
+ * a page of 100 long bodies runs to megabytes, so nothing else asks).
+ */
+function fetchIssueGraph(gh, states, { stopWhen = null, maxPages = 20, withBody = false } = {}) {
+  const issues = [];
+  let after = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    const args = ['api', 'graphql', '-f', `query=${issueGraphQuery(withBody)}`, '-F', 'owner={owner}', '-F', 'name={repo}', '-f', `states=${states}`];
+    if (after) args.push('-f', `after=${after}`);
+    const data = JSON.parse(gh(args));
+    const conn = data?.data?.repository?.issues;
+    if (!conn) throw new SdlcError(`dependency query returned no repository.issues (${JSON.stringify(data?.errors ?? data).slice(0, 200)})`);
+    let stop = false;
+    for (const n of conn.nodes ?? []) {
+      const issue = {
+        number: n.number,
+        id: n.databaseId ?? null,
+        title: n.title ?? '',
+        state: n.state,
+        closedAt: n.closedAt ?? null,
+        createdAt: n.createdAt ?? null,
+        updatedAt: n.updatedAt ?? null,
+        body: n.body ?? '',
+        labels: (n.labels?.nodes ?? []).map((l) => l.name),
+        blockedBy: normalizeEdges(n.blockedBy),
+        blocking: normalizeEdges(n.blocking),
+      };
+      if (stopWhen && stopWhen(issue)) {
+        stop = true;
+        break;
+      }
+      issues.push(issue);
+    }
+    if (stop || !conn.pageInfo?.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+  return issues;
+}
+
+/**
+ * The open-issue snapshot for lane eligibility (`lanes`, `claim --next`,
+ * `cycle-prep`): the `gh issue list` snapshot with each issue's native
+ * `blockedBy` edges merged in from one GraphQL pass. If the edge query fails
+ * (an old `gh`, a token without the scope, a GraphQL outage) the snapshot is
+ * returned WITHOUT edges and the failure is logged loudly — eligibility then
+ * degrades to the pre-#27 label-only gate for this cycle rather than aborting
+ * dispatch, and the report says so.
+ */
+function snapshotOpenIssuesWithDeps(gh, log = () => {}, fields = 'number,labels,createdAt,title') {
+  const snapshot = snapshotOpenIssues(gh, fields);
+  let edges;
+  try {
+    edges = new Map(fetchIssueGraph(gh, 'OPEN').map((i) => [Number(i.number), i.blockedBy]));
+  } catch (err) {
+    log(`deps: edge query FAILED (${String(err.message).split('\n')[0]}) — blocked gate NOT applied this cycle; eligibility is label-only`);
+    return snapshot;
+  }
+  return snapshot.map((i) => ({ ...i, blockedBy: edges.get(Number(i.number)) ?? [] }));
 }
 
 /** Human-readable lock age. */
@@ -1067,7 +1460,7 @@ function cmdClaimNext(args, nextIdx, { gh, git, log }) {
     throw new SdlcError(`unknown lane "${lane}" (valid: ${WORKER_LANES.join(', ')})`);
   }
 
-  const { lanes } = computeLanes(snapshotOpenIssues(gh));
+  const { lanes } = computeLanes(snapshotOpenIssuesWithDeps(gh, log));
   const eligible = lanes[lane]?.eligible ?? [];
   if (eligible.length === 0) {
     log(`claim --next ${lane}: idle — no eligible issues.`);
@@ -1115,7 +1508,7 @@ function cmdClaim(args, { gh, git, log }) {
   let myCommentUrl = null;
   if (runId) {
     // The label is the visibility signal; this comment is the ownership record
-    // and race tiebreaker (see prompts/sdlc/README.md CLAIM).
+    // and race tiebreaker (see sdlc/README.md CLAIM).
     myCommentUrl = String(gh(['issue', 'comment', issue, '--body', `sdlc:claim ${runId} ${lane}`]) ?? '').trim();
   }
   if (verify) {
@@ -1246,6 +1639,7 @@ function cmdWorktree(args, { git, log }, root) {
     git(['worktree', 'add', '-b', branch, target, `origin/${DEFAULT_BRANCH}`]);
   }
   log(`worktree: ${target} (branch ${branch})`);
+  linkWorktreeNodeModules(root, target, log);
 }
 
 function cmdComment(args, { gh, log }) {
@@ -1447,13 +1841,21 @@ function cmdMaintRelease(args, { log }, root) {
 }
 
 function cmdLanes(args, { gh, log }) {
-  const snapshot = snapshotOpenIssues(gh);
+  const snapshot = snapshotOpenIssuesWithDeps(gh, log);
   const { lanes, integrity } = computeLanes(snapshot);
   for (const lane of WORKER_LANES.concat('queued')) {
     const l = lanes[lane];
     const elig = l.eligible.length ? l.eligible.map((n) => `#${n}`).join(', ') : '—';
     const breakdown = laneIneligibilityBreakdown(l);
     log(`${lane}: depth ${l.depth}, eligible ${elig}${breakdown ? ` ${breakdown}` : ''}`);
+  }
+  const blockedItems = WORKER_LANES.concat('queued').flatMap((lane) => lanes[lane].blocked);
+  if (blockedItems.length) {
+    log(
+      `blocked (open native blockers): ${blockedItems
+        .map((b) => `#${b.number} ← ${b.blockers.map((n) => `#${n}`).join(', ')}`)
+        .join('; ')}`,
+    );
   }
   if (integrity.length) {
     log('integrity (corrupt stage-label state — needs human):');
@@ -1875,43 +2277,42 @@ function cmdSweep(args, { gh, log }, root) {
       : path.join(root, '.sdlc-cache', 'last-sweep.json');
   const windowHours = windowIdx >= 0 && args[windowIdx + 1] ? Number(args[windowIdx + 1]) : 24;
 
-  let sweptPrs = [];
+  let sweptIssues = [];
   try {
     if (fs.existsSync(statePath)) {
-      sweptPrs = JSON.parse(fs.readFileSync(statePath, 'utf8')).sweptPrs ?? [];
+      // `sweptPrs` was the pre-#27 (merged-PR keyed) marker; a marker file in
+      // that shape is simply stale and ignored.
+      sweptIssues = JSON.parse(fs.readFileSync(statePath, 'utf8')).sweptIssues ?? [];
     }
   } catch {
-    sweptPrs = [];
+    sweptIssues = [];
   }
 
-  const prs = JSON.parse(
-    gh([
-      'pr', 'list', '--state', 'merged', '--base', DEFAULT_BRANCH,
-      '--json', 'number,mergedAt,title,closingIssuesReferences', '--limit', '50',
-    ]),
-  );
-  const mergedPrs = prs.map((p) => ({
-    number: p.number,
-    mergedAt: p.mergedAt,
-    title: p.title,
-    closes: (p.closingIssuesReferences ?? []).map((r) => r.number),
-  }));
   const sinceMs = Number.isFinite(windowHours) ? Date.now() - windowHours * 3600000 : null;
 
+  // Issues closed in the window — however they closed — with the OPEN issues
+  // each was blocking (native `blocking` edges). Newest-updated first, so the
+  // fetch stops at the first issue not touched since the cutoff (updatedAt ≥
+  // closedAt); a fresh comment on an old closed issue merely makes it appear
+  // and be filtered out by closedAt.
+  const closedIssues = fetchIssueGraph(gh, 'CLOSED', {
+    stopWhen: (i) => sinceMs !== null && i.updatedAt && new Date(i.updatedAt).getTime() <= sinceMs,
+  });
+
   // --ack: the only mode that writes the marker. Run it AFTER processing the
-  // work-list so a worker that dies mid-processing re-lists the same merges on
-  // the next pass (at-least-once; the cascade-unblock itself is idempotent).
+  // work-list so a worker that dies mid-processing re-lists the same closes on
+  // the next pass (at-least-once; the cascade bookkeeping is idempotent).
   if (ack) {
-    const { nextSwept, newlyAcked } = computeSweepAck(mergedPrs, { sinceMs, sweptPrs });
+    const { nextSwept, newlyAcked } = computeSweepAck(closedIssues, { sinceMs, sweptIssues });
     try {
       fs.mkdirSync(path.dirname(statePath), { recursive: true });
       fs.writeFileSync(
         statePath,
-        JSON.stringify({ at: new Date().toISOString(), sweptPrs: nextSwept }, null, 2),
+        JSON.stringify({ at: new Date().toISOString(), sweptIssues: nextSwept }, null, 2),
       );
       log(
         newlyAcked.length
-          ? `sweep: acked ${newlyAcked.length} merge${newlyAcked.length === 1 ? '' : 's'} (${newlyAcked.map((n) => `#${n}`).join(', ')})`
+          ? `sweep: acked ${newlyAcked.length} close${newlyAcked.length === 1 ? '' : 's'} (${newlyAcked.map((n) => `#${n}`).join(', ')})`
           : 'sweep: ack — nothing new',
       );
     } catch (err) {
@@ -1920,34 +2321,104 @@ function cmdSweep(args, { gh, log }, root) {
     return;
   }
 
-  const openIssues = JSON.parse(
-    gh(['issue', 'list', '--state', 'open', '--json', 'number,title,labels,body', '--limit', '200']),
-  );
-  const { items, empty } = computeSweep(mergedPrs, openIssues, { sinceMs, sweptPrs });
+  const openIssues = fetchIssueGraph(gh, 'OPEN');
+  const { items, empty } = computeSweep(closedIssues, openIssues, { sinceMs, sweptIssues });
 
   if (empty) {
     log('sweep: clear');
     return;
   }
   for (const it of items) {
-    log(`PR #${it.number} (merged ${it.mergedAt ?? '?'}) ${it.title}`);
-    for (const c of it.closes) {
-      log(`  closed #${c.number}`);
-      if (c.dependents.length) {
-        for (const d of c.dependents) {
-          log(`    dependent #${d.number}${d.blocked ? ' [blocked → unblock]' : ''} ${d.title}`);
-        }
-      } else {
-        log('    dependents: none');
-      }
+    log(`closed #${it.number} (${it.closedAt ?? '?'}) ${it.title}`);
+    for (const d of it.dependents) {
+      const verdict = d.flip
+        ? `[unblocked${d.blocked ? ' — blocked → ready' : ''}]`
+        : `[still blocked by ${d.remainingBlockers.map((n) => `#${n}`).join(', ')}]`;
+      log(`  dependent #${d.number} ${verdict} ${d.title}`);
     }
   }
   log('sweep: run `sdlc sweep --ack` after processing to mark these swept');
 }
 
 /**
+ * `sdlc deps [--apply]` — the readiness axis derived from native edges, plus
+ * lint; `sdlc deps --migrate [--apply]` — prose `Depends on #n` lines → native
+ * edges (dry-run by default). Edge writes go through the REST endpoint
+ * (`POST issues/<n>/dependencies/blocked_by -F issue_id=<blocker databaseId>`);
+ * label writes are ordinary `gh issue edit`s. Both are idempotent.
+ */
+function cmdDeps(args, { gh, log }) {
+  const apply = args.includes('--apply');
+  const migrate = args.includes('--migrate');
+  const openIssues = fetchIssueGraph(gh, 'OPEN', { withBody: migrate });
+
+  if (migrate) {
+    // Every issue an edge could target: open (already fetched) plus, for each
+    // prose-referenced number not open, one REST lookup — cheaper than paging a
+    // long closed backlog, and a 404 (deleted/transferred) is simply unknown.
+    const known = {};
+    for (const i of openIssues) known[i.number] = { id: i.id, state: 'OPEN' };
+    const referenced = new Set(openIssues.flatMap((i) => parseProseDependencies(i.body, i.number)));
+    for (const n of referenced) {
+      if (known[n]) continue;
+      try {
+        const v = JSON.parse(gh(['api', `repos/{owner}/{repo}/issues/${n}`, '--jq', '{id: .id, state: .state, pull_request: (.pull_request != null)}']));
+        if (v.pull_request) continue; // a PR number, not an issue — no edge possible
+        known[n] = { id: v.id, state: String(v.state).toUpperCase() };
+      } catch {
+        // unknown — planDependencyMigration reports it as skipped
+      }
+    }
+    const { proposals, skipped } = planDependencyMigration(openIssues, known);
+    if (!proposals.length && !skipped.length) {
+      log('deps --migrate: no prose dependency declarations to migrate.');
+      return;
+    }
+    for (const p of proposals) {
+      log(`deps --migrate: #${p.number} blocked_by #${p.blocker} (${p.blockerState})`);
+      if (apply) {
+        if (p.blockerId == null) {
+          log(`  skipped — no databaseId for #${p.blocker}`);
+          continue;
+        }
+        gh(['api', '-X', 'POST', `repos/{owner}/{repo}/issues/${p.number}/dependencies/blocked_by`, '-F', `issue_id=${p.blockerId}`]);
+        log(`  created edge #${p.number} ← #${p.blocker}`);
+      }
+    }
+    for (const s of skipped) {
+      log(`deps --migrate: skipped #${s.number} → #${s.blocker} — ${s.reason}`);
+    }
+    if (!apply && proposals.length) {
+      log('deps --migrate: dry run — re-run with --apply to create the edges (prose stays as a human mirror).');
+    }
+    return;
+  }
+
+  const { edits, findings, blocked, ready } = computeDeps(openIssues);
+  log(`deps: ${blocked.length} blocked (${blocked.map((n) => `#${n}`).join(', ') || '—'}), ${ready.length} ready (${ready.map((n) => `#${n}`).join(', ') || '—'})`);
+  for (const e of edits) {
+    const change = [
+      e.add.length ? `+${e.add.join(', +')}` : null,
+      e.remove.length ? `-${e.remove.join(', -')}` : null,
+    ].filter(Boolean).join(' ');
+    log(`deps: ${apply ? 'relabel' : 'would relabel'} #${e.number} ${change} — ${e.reason}`);
+    if (apply) {
+      const editArgs = ['issue', 'edit', String(e.number)];
+      for (const l of e.remove) editArgs.push('--remove-label', l);
+      for (const l of e.add) editArgs.push('--add-label', l);
+      gh(editArgs);
+    }
+  }
+  for (const f of findings) {
+    log(`deps: LINT ${f.kind} #${f.number} — ${f.detail}`);
+  }
+  if (!edits.length && !findings.length) log('deps: labels match edges; lint clean');
+  else if (!apply && edits.length) log('deps: run with --apply to write the derived labels');
+}
+
+/**
  * `sdlc cycle-prep [--apply]`: the whole fixed, zero-judgment pre-dispatch
- * sequence in one shot — mint → maint-lock → lanes → gate --reap → sweep →
+ * sequence in one shot — mint → maint-lock → lanes → gate --reap → deps-migrate → deps → sweep →
  * (git-maint → worktree-sweep → conflict-scan) → maint-release — emitting one
  * delimited, machine-readable report so the dispatcher runs `cycle-prep`,
  * reads it, spawns workers, then `digest`.
@@ -1986,7 +2457,7 @@ function cmdCyclePrep(args, deps, root) {
   if (!weHoldLock) process.exitCode = savedExit;
 
   try {
-    // Snapshot + per-issue wip gate + merge-sweep peek (dispatch Step 0) — run
+    // Snapshot + per-issue wip gate + deps + close-sweep peek (dispatch Step 0) — run
     // every cycle whether or not we hold the maintenance lock.
     section('lanes');
     cmdLanes([], deps, root);
@@ -1994,8 +2465,35 @@ function cmdCyclePrep(args, deps, root) {
     section('gate');
     cmdGate(['--reap'], deps, root);
 
+    // Prose `Depends on #n` declarations → native edges, every cycle (not only
+    // at adoption): an issue filed between cycles carries its dependencies as
+    // prose the gate cannot see until an edge exists. Runs BEFORE the derived
+    // label pass so a freshly converted edge yields `blocked` this same cycle.
+    // Edge POSTs are idempotent and follow --apply; dry run otherwise. This is
+    // the one pass that fetches issue bodies (its own GraphQL page set).
+    section('deps-migrate');
+    try {
+      cmdDeps(apply ? ['--migrate', '--apply'] : ['--migrate'], deps, root);
+    } catch (err) {
+      log(`deps --migrate: skipped (${String(err.message).split('\n')[0]})`);
+    }
+
+    // Derived readiness labels + dependency lint (#27). Label writes are
+    // idempotent bookkeeping, so they follow --apply like the other mutators;
+    // the gate itself (computeLanes above) never depends on them.
+    section('deps');
+    try {
+      cmdDeps(apply ? ['--apply'] : [], deps, root);
+    } catch (err) {
+      log(`deps: skipped (${String(err.message).split('\n')[0]})`);
+    }
+
     section('sweep');
-    cmdSweep([], deps, root);
+    try {
+      cmdSweep([], deps, root);
+    } catch (err) {
+      log(`sweep: unavailable (${String(err.message).split('\n')[0]})`);
+    }
 
     if (weHoldLock) {
       // Git + worktree maintenance (dispatch Step 0a) — only while holding the lock.
@@ -2048,9 +2546,11 @@ const USAGE = `sdlc — deterministic SDLC pipeline one-shots (reference impleme
   sdlc git-maint                    fetch, ff ${DEFAULT_BRANCH}, prune merged branches, PR state
   sdlc worktree-sweep [--apply]     remove clean issue-scoped worktrees whose branch is gone/merged or issue closed
   sdlc conflict-scan [--apply]      nudge + bounce-to-build issues whose open PR conflicts with ${DEFAULT_BRANCH}
-  sdlc sweep    [--state <file>] [--window <hours>]  merged PRs → closed issues → blocked dependents (read-only, writes nothing)
-  sdlc sweep --ack [--state <file>] [--window <hours>]  mark the window's merges swept (run AFTER processing the work-list)
-  sdlc cycle-prep [--apply]         the whole pre-dispatch sequence in one shot (mint→maint-lock→lanes→gate --reap→sweep→git-maint→worktree-sweep→conflict-scan→maint-release), one delimited report
+  sdlc deps     [--apply]           readiness labels (blocked/ready) derived from native issue dependencies + lint (label-only blocked, cycles)
+  sdlc deps --migrate [--apply]     prose "Depends on #n" lines → native blocked_by edges (dry run unless --apply)
+  sdlc sweep    [--state <file>] [--window <hours>]  closed issues → the open issues they were blocking (native edges; read-only)
+  sdlc sweep --ack [--state <file>] [--window <hours>]  mark the window's closes swept (run AFTER processing the work-list)
+  sdlc cycle-prep [--apply]         the whole pre-dispatch sequence in one shot (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→sweep→git-maint→worktree-sweep→conflict-scan→maint-release), one delimited report
   sdlc digest   [--state <file>]    depths, parked/hold, arrivals-diff vs last cycle
 
 Stages: ${STAGES.join(' → ')}`;
@@ -2072,6 +2572,7 @@ const COMMANDS = {
   'git-maint': cmdGitMaint,
   'worktree-sweep': cmdWorktreeSweep,
   'conflict-scan': cmdConflictScan,
+  deps: cmdDeps,
   sweep: cmdSweep,
   'cycle-prep': cmdCyclePrep,
   digest: cmdDigest,
@@ -2087,7 +2588,7 @@ export function runSdlc(argv, deps = {}) {
     gh = defaultGh,
     git = defaultGit,
     log = (msg) => console.log(msg),
-    root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+    root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..'),
     statSize,
   } = deps;
   const [command, ...rest] = argv;

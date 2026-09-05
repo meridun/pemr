@@ -23,6 +23,9 @@ Per the README universal loop — lane `stage:audit`, idle reply `AUDIT: idle`.
 Idempotency first: a clean audit report for the **current branch HEAD** (no new commits since) → skip
 to **ADVANCE**. New commits invalidate a prior report — re-audit. Otherwise:
 
+Apply the `security-executor` role's checklist **inline**, adversarially (see
+`.github/agents/security-executor.agent.md`). Never spawn it.
+
 - **Fetch build's branch** (`<type>/<issue#>-<slug>`, named in verify's ADVANCE comment) and diff it
   against `origin/<DEFAULT_BRANCH>` (fetch first — the diff must be against current
   `<DEFAULT_BRANCH>`, not a stale local copy). Read-only lane: audit never merges; if the branch no
@@ -45,6 +48,17 @@ to **ADVANCE**. New commits invalidate a prior report — re-audit. Otherwise:
   - **Invariant + pattern compliance** — every one of `<INVARIANTS>` preserved on every new code path;
     the project's layering/placement rules honored; no secrets, tokens, or personal paths in committed
     fixtures or test data.
+- **Diff-scoped consistency checks** (read-only observations of the diff's *shape* — repo-global
+  concerns like the standing dependency-vulnerability sweep live in intake, not here; skip any
+  check whose knob the profile leaves unbound):
+  - Diff touches `<MIGRATIONS_DIR>` → it must also carry the regenerated `<SCHEMA_DUMP>`, and every
+    new migration must have a real down-block (not empty, not a placeholder). Missing either is a
+    BOUNCE (verify proves they *run*; audit checks the diff *shape*).
+  - Diff touches the dependency manifest or lockfile (e.g. `package.json` / `package-lock.json`)
+    → run `<DEP_AUDIT_CMD>` **on the branch**; a high/critical advisory **introduced or made
+    upgradable by this diff** is a blocking finding (BOUNCE → build to bump). Pre-existing
+    advisories the diff didn't touch are advisory notes only — they belong to intake's sweep;
+    don't block this issue on them.
 - If your project names a dedicated review tool or skill for this pass and the harness lacks it
   (headless/cron runs may), the checklist above applied to the diff is sufficient — never PARK
   over a missing tool.
@@ -81,5 +95,5 @@ One-line result: `AUDIT: <#issue> → ADVANCE(ship)|BOUNCE(build)|PARK — <reas
   An item rewound here by a human with a still-valid clean report → re-confirm cheaply and ADVANCE,
   unless their rewind comment names a reason to distrust it — then re-audit that part. Evidence that
   the work already shipped (merged PR) → PARK with the evidence for a human to close.
-- Audit **commits nothing and cuts no branch** — it reads build's branch and relabels.
-- Honors the universal worker loop in [`README.md`](README.md).
+- Audit **commits nothing and cuts no branch** — it reads build's branch and re-stages.
+- Honors the universal worker loop in [`../README.md`](../README.md).

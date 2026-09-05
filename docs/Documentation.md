@@ -24,6 +24,7 @@ process.
 - `Architecture.md` — hub linking to subsystem docs
 - `Development.md` — local setup, test commands, branch model
 - `Development_AgenticSDLC.md` — the Agentic SDLC model and invariants (ported from upstream);
-  `Development_SdlcAdoption.md` (placeholders + setup), `Development_SdlcComposability.md`
-  (9-stage canonical spine), `Development_SdlcLabels.md` (gh-scriptable label list)
+  `Development_SdlcAdoption.md` (copy the tree, pick the binding, fill the profile), `Development_SdlcComposability.md`
+  (9-stage canonical spine), `Development_SdlcProfileExample.md` (worked `gh-issue` profile);
+  pemr's own profile is `sdlc/PROFILE.md` and the label taxonomy lives in `sdlc/bindings/gh-issue/labels.md`
 - `Development_TokenTools.md` — vtk/graphify setup notes, if adopted

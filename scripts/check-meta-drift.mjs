@@ -13,6 +13,10 @@
  *      `.github/skills/<name>/SKILL.md` OR a `.github/agents/<name>.agent.md`
  *      (finding #2/#3 — a prompt hard-depending on a skill that isn't there).
  *   3. SKILL.md files exceeding the L2 length cap from `pemr-agent-skill`.
+ *   4. The Caveman-mode hook drifting from its canonical L1 text. The
+ *      `## Caveman mode` section of copilot-instructions.md is the source of
+ *      truth; the `UserPromptSubmit` hook in `.claude/settings.json` must carry
+ *      the same paragraph verbatim (whitespace-normalised).
  *
  * Intentionally dumb: line counts + a reference regex, no markdown parsing.
  *
@@ -27,8 +31,10 @@ import { fileURLToPath } from 'url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SKILLS_DIR = path.join(ROOT, '.github', 'skills');
 const AGENTS_DIR = path.join(ROOT, '.github', 'agents');
-const SDLC_PROMPTS_DIR = path.join(ROOT, 'prompts', 'sdlc');
+const SDLC_DIR = path.join(ROOT, 'sdlc');
+const SDLC_LANES_DIR = path.join(SDLC_DIR, 'lanes');
 const COPILOT_INSTRUCTIONS = path.join(ROOT, '.github', 'copilot-instructions.md');
+const CLAUDE_SETTINGS = path.join(ROOT, '.claude', 'settings.json');
 
 // Agent files are shims; the largest legitimate shim body today is ~54 lines
 // (pemr-researcher). A content-copy drift blows well past this. Headroom
@@ -66,6 +72,47 @@ export function extractRefs(text) {
   return new Set(refs);
 }
 
+const CAVEMAN_PREFIX = 'Caveman mode: ';
+
+function normalizeWs(text) {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/** Body of the `## Caveman mode` section in L1 (up to the next `## ` heading), or null. */
+export function extractCavemanSection(l1Text) {
+  const m = l1Text.match(/^## Caveman mode\r?\n([\s\S]*?)(?=^## |(?![\s\S]))/m);
+  return m ? m[1] : null;
+}
+
+/** The rule text the UserPromptSubmit hook injects (after the `Caveman mode: ` prefix), or null. */
+export function extractCavemanHookRule(settingsJson) {
+  const hooks = settingsJson?.hooks?.UserPromptSubmit ?? [];
+  for (const group of hooks) {
+    for (const hook of group.hooks ?? []) {
+      const cmd = hook.command ?? '';
+      const idx = cmd.indexOf(CAVEMAN_PREFIX);
+      if (idx === -1) {
+        continue;
+      }
+      // Payload is a JSON string literal inside an echo; take up to the closing quote.
+      const rest = cmd.slice(idx + CAVEMAN_PREFIX.length);
+      const end = rest.indexOf('"');
+      return end === -1 ? rest : rest.slice(0, end);
+    }
+  }
+  return null;
+}
+
+/** True when the hook rule text appears verbatim (whitespace-normalised) in the L1 section. */
+export function cavemanHookMatchesL1(l1Text, settingsJson) {
+  const section = extractCavemanSection(l1Text);
+  const rule = extractCavemanHookRule(settingsJson);
+  if (section === null || rule === null) {
+    return false;
+  }
+  return normalizeWs(section).includes(normalizeWs(rule));
+}
+
 async function readDirEntries(dir) {
   try {
     return await fs.readdir(dir, { withFileTypes: true });
@@ -100,7 +147,8 @@ async function listFiles(dir, filter) {
 /** Files whose pemr-* references must all resolve. */
 async function referenceSources() {
   const files = [
-    ...(await listFiles(SDLC_PROMPTS_DIR, (n) => n.endsWith('.md'))),
+    ...(await listFiles(SDLC_DIR, (n) => n.endsWith('.md'))),
+    ...(await listFiles(SDLC_LANES_DIR, (n) => n.endsWith('.md'))),
     ...(await listFiles(AGENTS_DIR, (n) => n.endsWith('.agent.md'))),
   ];
   try {
@@ -159,6 +207,20 @@ async function main() {
         `${path.relative(ROOT, skillPath)}: ${lines} lines exceeds the L2 cap of ${SKILL_LINE_CAP}.`,
       );
     }
+  }
+
+  // Rule 4: caveman hook text == L1 canonical text.
+  try {
+    const l1 = await fs.readFile(COPILOT_INSTRUCTIONS, 'utf8');
+    const settings = JSON.parse(await fs.readFile(CLAUDE_SETTINGS, 'utf8'));
+    if (extractCavemanHookRule(settings) !== null && !cavemanHookMatchesL1(l1, settings)) {
+      errors.push(
+        '.claude/settings.json: the Caveman-mode UserPromptSubmit hook text is not present verbatim in ' +
+          'the `## Caveman mode` section of .github/copilot-instructions.md. L1 is canonical; update the hook.',
+      );
+    }
+  } catch {
+    // Either file absent or unparsable — nothing to compare.
   }
 
   if (errors.length > 0) {

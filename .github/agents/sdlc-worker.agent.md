@@ -1,14 +1,14 @@
 ---
-description: "Isolated SDLC pipeline lane worker. Spawned by the sdlc-dispatch scheduled task to execute one prompts/sdlc/<lane>.md pass. Deliberately has NO agent-spawning tool: all owner work is done inline."
+description: "Isolated SDLC pipeline lane worker. Spawned by the sdlc-dispatch scheduled task to execute one sdlc/lanes/<lane>.md pass. Deliberately has NO agent-spawning tool: all owner work is done inline."
 tools: [read, search, edit, execute]
 user-invocable: false
 ---
 
-
 You are an **SDLC pipeline lane worker** for the `pemr` project. You execute exactly one pass of
-one worker prompt from `prompts/sdlc/` (the dispatcher's message tells you which lane), honoring every
-invariant in `prompts/sdlc/README.md`. Placeholder bindings (`<DEFAULT_BRANCH>`, `<TEST_CMD>`, …)
-live in `prompts/sdlc/PROFILE.md` — read it alongside the README.
+one worker prompt from `sdlc/lanes/` (the dispatcher's message tells you which lane), honoring every
+invariant in `sdlc/README.md`. Read, in order: `sdlc/README.md`, `sdlc/PROFILE.md` (every
+`<KEY>` below resolves there), `sdlc/bindings/<BINDING>/BINDING.md` (every backticked tracker
+operation resolves there), then the lane file.
 
 ### No delegation — by construction
 
@@ -23,13 +23,15 @@ detached — the worker yields, nothing resumes it, and the item strands under `
 ### Working style
 
 - **Worktree isolation:** never work in the main checkout — use the issue-scoped worktree
-  `C:\Claude\pemr-wt-<issue#>` per the README universal loop. Claim with `sdlc:wip` + an
-  `sdlc:claim <run-id> <lane>` comment, then claim-verify (earliest claim wins).
+  `C:\Claude\pemr-wt-<issue#>` per the README universal loop. Claim with the binding's `claim`
+  operation (`sdlc:wip` + an ownership record; a lost race is normal — move to the next item).
 - Conventions, quality bars, and invariants: `.github/copilot-instructions.md` (loaded for every
-  agent) plus the `PROFILE.md` bindings — the quality-bar commands there are acceptance criteria on
+  agent) plus the `sdlc/PROFILE.md` keys — the quality-bar commands there are acceptance criteria on
   every change.
 - Minimal change; follow existing patterns; defensive at boundaries; never assume single-actor state.
-- Decisions go to an in-issue `decision:` one-liner comment, never into doc prose.
+- Decisions go to `<DECISION_RECORD>`, never into doc prose.
+- Shell-output compactor: `vtk` runs in **transparent-wrapper mode** here (see the L1
+  `## Token wrappers` section) — call `git`/`gh`/`npm` bare, never prefix `vtk`.
 
 ### Output
 

@@ -1,6 +1,6 @@
 # Label taxonomy
 
-The pipeline is driven entirely by GitHub labels. Create these once per repo.
+The `gh-issue` binding's marker substrate: every `stage:*` / `sdlc:*` / `priority:*` marker is a GitHub label. Create these once per repo.
 
 ## The labels
 
@@ -17,18 +17,44 @@ The pipeline is driven entirely by GitHub labels. Create these once per repo.
 | `sdlc:needs-human` | `#e99695` | Parked — a worker needs a human decision. Automation never advances it. |
 | `sdlc:hold` | `#000000` | Human keep-off. No worker touches it. |
 | `priority:critical` | `#b60205` | Claimed first within a lane. |
+| `priority:medium` | `#fbca04` | Default priority. |
 | `priority:future` | `#c2e0c6` | Claimed last. |
+| `blocked` | `#d876e3` | *(derived, optional)* Has an **open native blocker**. Written by `sdlc deps --apply` from the dependency edges; never read by the machine. |
+| `ready` | `#0e8a16` | *(derived, optional)* Has dependency edges and every blocker is closed. Complements `blocked`; same derivation. |
 
-> **pemr divergence from upstream:** upstream also defines `priority:medium` as the default tier.
-> pemr retired it — **unlabeled is the default** and sorts between `critical` and `future`
-> (`scripts/sdlc.mjs` `PRIORITY_RANK`); only the two exceptional tiers carry a label.
-| `blocked` | `#d876e3` | *(optional)* Item bounced to queued as not-yet-buildable; readiness axis. |
-| `ready` | `#0e8a16` | *(optional)* Blocker cleared; complements `blocked`. |
+## Blocking: native issue dependencies are the source of truth
+
+An issue's readiness is a fact about **GitHub's native issue dependencies** (the *blocked by* /
+*blocking* relations on the issue — REST `issues/{n}/dependencies/{blocked_by,blocking}`, GraphQL
+`blockedBy` / `blocking`), not about its labels and not about prose in its body. The dispatcher's
+lane snapshot reads every open issue's `blockedBy` edges in one GraphQL pass and an issue with
+**any OPEN blocker is never eligible** for a worker to claim, in any lane — a fourth ineligibility
+bucket (`blocked`) beside hold, needs-human and wip. The gate is re-evaluated from live edge state
+every cycle, so the moment a blocker closes (its PR merges, or a human closes it) its dependents
+become claimable on the next cycle with no sweep, window or ack involved.
+
+`blocked` / `ready` are therefore **derived labels**: `sdlc deps --apply` (on every `cycle-prep
+--apply`) writes them from edge state so humans keep a readable readiness column, and the machine
+stops trusting them. Hand-flipping `blocked` → `ready` unblocks nothing; adding `blocked` by hand
+blocks nothing. The one ambiguity the lint surfaces rather than repairs is a `blocked` label with
+**no** edge at all: that is either a cross-repo block (native edges are per-repo — represent it
+as `sdlc:hold` plus prose) or a stale label; a human decides which.
+
+**Writing an edge** takes the blocker's numeric *id*, not its number:
+
+```bash
+BLOCKER_ID=$(gh api repos/{owner}/{repo}/issues/<blocker#> --jq .id)
+gh api -X POST repos/{owner}/{repo}/issues/<dependent#>/dependencies/blocked_by -F issue_id=$BLOCKER_ID
+```
+
+Prose (`Depends on #n`) may stay as a human mirror; it is no longer authoritative. Existing prose
+migrates once with `sdlc deps --migrate` (dry run; `--apply` creates the edges —
+see `docs/Development_SdlcAdoption.md` § 4).
 
 ## Exactly one stage label per open issue
 
 Every open issue carries **exactly one** `stage:*` label — the pipeline invariant the dispatcher
-enforces (dispatch.md Step 0b). **Zero** stage labels makes an issue invisible to every lane
+enforces (`sdlc/dispatch.md` Step 0b). **Zero** stage labels makes an issue invisible to every lane
 forever (a triage escapee that will never be built or closed): the dispatcher auto-repairs it to
 `stage:intake` (verify-before-write) — intake is the safe re-entry, re-routing or reconciling from
 there. That covers the post-ship window too: ship's terminal ADVANCE removes `stage:ship` and the
@@ -68,14 +94,15 @@ gh label create "sdlc:hold"         --color 000000 --description "Human keep-off
 
 # priority
 gh label create "priority:critical" --color b60205 --description "Claimed first within a lane" --force
+gh label create "priority:medium"   --color fbca04 --description "Default priority" --force
 gh label create "priority:future"   --color c2e0c6 --description "Claimed last" --force
 
-# optional readiness axis
-gh label create "blocked" --color d876e3 --description "Not yet buildable (bounced to queued)" --force
-gh label create "ready"   --color 0e8a16 --description "Blocker cleared" --force
+# optional readiness axis — DERIVED from native issue dependencies by `sdlc deps --apply`
+gh label create "blocked" --color d876e3 --description "Has an open native blocker (derived — edit the dependency, not the label)" --force
+gh label create "ready"   --color 0e8a16 --description "Every native blocker closed (derived)" --force
 ```
 
 No dispatcher-lock issue exists in this model: there is no dispatcher singleton. Overlapping
 dispatch runs deconflict via per-issue claims, idempotent GitHub writes, and a per-machine
 filesystem lock (`.git/sdlc-maint.lock`) the dispatcher manages itself — nothing to create on the
-tracker. See `prompts/sdlc/dispatch.md` Step -1.
+tracker. See `sdlc/dispatch.md` Step -1.
