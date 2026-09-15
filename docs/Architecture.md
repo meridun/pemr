@@ -1353,6 +1353,12 @@ delegating to `cli.main`) — the latter is the portable fallback when the conso
 launcher isn't generated (e.g. a system Python whose `Scripts`/launcher dir isn't writable
 under a PEP 660 editable install); see issue #22.
 
+Any argparse `help=` (or `usage=`) string built by interpolating data must double a literal
+`%` — `HelpFormatter._expand_help` (and `_format_usage`) treats the whole string as a
+`%`-format spec, so a bare `%` (e.g. the `%` ratio unit) raises `ValueError` at render time.
+`tests/test_cli_ascii.py::test_every_subparser_help_renders_and_is_console_safe` renders
+every subparser's help and guards against a repeat (issue #198).
+
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
 Read-only: `person_list`, `person_show`, `query` (`kind` = `labs`/`meds`/`timeline`), `find`,

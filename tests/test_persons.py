@@ -347,3 +347,23 @@ def test_cli_unit_pref_unknown_slug_fails(roster, capsys):
 def test_cli_unit_pref_clear_of_an_unset_key_is_not_an_error(roster, capsys):
     assert _run(roster, "person", "unit-pref", "clear", "jane", "--key", "weight") == 0
     assert "no display unit was set for weight" in capsys.readouterr().out
+
+
+def test_cli_unit_pref_set_help_renders(roster, capsys):
+    """Issue #198: argparse expands `%` in help text, and the `--unit` list carries
+    the ratio unit `%`, so an unescaped one crashed every help/usage render here."""
+    with pytest.raises(SystemExit) as exc:
+        _run(roster, "person", "unit-pref", "set", "--help")
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "canonical unit:" in out
+    # `%%` in the source renders back as a single `%` - assert on the rendered text.
+    assert "%" in out and "%%" not in out
+    assert "lb" in out and "degC" in out
+    assert out.isascii()
+
+    # The usage-error path runs the same help formatter.
+    with pytest.raises(SystemExit) as exc:
+        _run(roster, "person", "unit-pref", "set", "jane")
+    assert exc.value.code == 2
+    assert "--key" in capsys.readouterr().err

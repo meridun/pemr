@@ -3362,9 +3362,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--key", required=True,
         help="measurement key or analyte, e.g. weight, temperature, A1c",
     )
+    # argparse's HelpFormatter._expand_help does `help % params`, so a literal `%`
+    # in help text must be doubled or any help/usage render raises (issue #198 - the
+    # ratio unit `%` is one of the ids this list interpolates).
+    _unit_ids = ", ".join(u.replace("%", "%%") for u in units.known_units())
     up_set.add_argument(
         "--unit", required=True,
-        help=f"canonical unit: {', '.join(units.known_units())}",
+        help=f"canonical unit: {_unit_ids}",
     )
     up_set.add_argument("--dictionary", help="synonym dictionary TOML (key resolution)")
     up_set.set_defaults(func=_cmd_person_unit_pref_set)
