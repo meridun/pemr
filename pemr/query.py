@@ -99,6 +99,23 @@ def _end_of_period(value: object) -> date | None:
         return None
 
 
+def med_end_is_renewal(row: sqlite3.Row | dict) -> bool:
+    """True when this row's ``ended_on`` closes an **authorization period**, not therapy.
+
+    The single reading of :data:`RENEWAL_MED_REASONS` in the codebase (issue #203). Both
+    read paths that care — :func:`med_is_current`, which keeps such a course on the
+    active list, and :func:`query_timeline`, which must not call it *stopped* — consult
+    this one predicate, so they cannot drift apart again: before #203 the timeline
+    derived ``med-stop`` from ``ended_on`` alone, and the same row read as current in one
+    view and stopped in the other.
+
+    The set stays **closed by design** (see its comment); #203 does not widen it. Access
+    goes through :func:`_row_get` so a pre-014 snapshot or a hand-built dict without the
+    column reads as "no reason" rather than raising.
+    """
+    return enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS
+
+
 def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> bool:
     """True when a medication is still current: the course hasn't ended and no terminal
     status ended it.
@@ -131,7 +148,7 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
     """
     status = str(_row_get(row, "status") or "").strip().lower()
     ended_on = _row_get(row, "ended_on")
-    if enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS:
+    if med_end_is_renewal(row):
         return True
     if ended_on:
         end = _end_of_period(ended_on)
@@ -245,6 +262,10 @@ def query_timeline(
     provenance. Medications contribute up to two events (start and, if ended, stop), and
     so do conditions (``onset_on`` -> ``condition``, ``resolved_on`` ->
     ``condition-resolved``); family-history rows contribute none.
+    A medication whose end date is a **renewal** (:func:`med_end_is_renewal`) emits
+    ``med-renewal`` instead of ``med-stop`` (issue #203): that date closes an
+    authorization period, so the one predicate :func:`med_is_current` reads decides here
+    too and the two views can no longer disagree about whether the drug was stopped.
     Events without a usable date are omitted (they cannot be placed on a timeline).
     ``since`` (a date) drops events strictly before it. Ordered oldest first.
 
@@ -335,7 +356,16 @@ def query_timeline(
     ).fetchall():
         dose = f" {r['dose']}" if r["dose"] else ""
         add(r["started_on"], "med-start", f"started {r['name']}{dose}", r, "medication")
-        add(r["ended_on"], "med-stop", f"stopped {r['name']}", r, "medication")
+        # A renewal's end date ends an authorization period, not the therapy (#159), so
+        # calling it a stop contradicts `med_is_current` on the very same row (#203).
+        # The date is still worth showing - a renewal chain is legible only if each
+        # link is visible - so it becomes a distinct, non-terminal event rather than
+        # nothing at all.
+        if med_end_is_renewal(r):
+            add(r["ended_on"], "med-renewal",
+                f"renewed {r['name']} (authorization period ended)", r, "medication")
+        else:
+            add(r["ended_on"], "med-stop", f"stopped {r['name']}", r, "medication")
 
     for r in conn.execute(
         "SELECT * FROM procedure WHERE person_id = ?", (person_id,)

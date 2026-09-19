@@ -193,6 +193,64 @@ def test_query_meds_active_drops_expired_course_labelled_active(ready, capsys):
     assert "Skyrizi" in names
 
 
+def test_query_meds_future_end_date_is_not_marked_renewed(ready, capsys):
+    """Issue #203's sibling drift: `(renewed)` used to key off `med_is_current`, so a
+    `status='active'` row approved *through* a future date printed as renewed although
+    nothing renewed. The marker keys off the renewal reason now."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": "Skyrizi", "dose": "150mg", "frequency": "q8w",
+                        "started_on": "2025-09-04", "ended_on": "2099-09-04",
+                        "status": "active"}],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    line = next(x for x in capsys.readouterr().out.splitlines() if "Skyrizi" in x)
+    assert "-> 2099-09-04" in line
+    assert "(renewed)" not in line
+    assert "[active]" in line
+
+
+def test_query_timeline_omits_the_stop_for_a_renewal(ready, capsys):
+    """Issue #203 at the CLI front door, text and `--json`: the renewed prescription
+    contributes a `med-renewal` on its end date and no `stopped` line; the completed
+    course beside it still stops."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "started_on": "2024-11-01",
+             "ended_on": "2024-11-11", "status": "discontinued",
+             "status_reason": "Therapy Completed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "stopped Levothyroxine" not in out
+    assert "renewed Levothyroxine (authorization period ended)" in out
+    assert "stopped Amoxicillin" in out
+    assert out.isascii()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    events = json.loads(capsys.readouterr().out)
+    levo = [e for e in events if "Levothyroxine" in e["summary"]]
+    assert {e["type"] for e in levo} == {"med-start", "med-renewal"}
+    renewal = next(e for e in levo if e["type"] == "med-renewal")
+    assert renewal["date"] == "2026-06-11"
+    # Additive only: the public event shape is untouched (issue #131's no-leak bar).
+    assert set(renewal) == {"date", "type", "summary", "document_id"}
+    assert any(e["type"] == "med-stop" and "Amoxicillin" in e["summary"] for e in events)
+
+
 def test_query_timeline_json(ready, capsys):
     assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
     events = json.loads(capsys.readouterr().out)

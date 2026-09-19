@@ -1162,6 +1162,35 @@ def test_journal_grouped_and_ordered_with_footnotes(seeded):
     assert "document #" in md
 
 
+def test_journal_does_not_stop_a_renewed_prescription(seeded):
+    """Issue #203 in the narrative a person reads before an appointment: a renewal's
+    authorization end date must not appear as "stopped". It appears as a `med-renewal`
+    bullet instead, so the renewal chain stays legible, and the completed course beside
+    it still stops."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "started_on": "2024-11-01",
+             "ended_on": "2024-11-11", "status": "discontinued",
+             "status_reason": "Therapy Completed"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    md = render.render_journal(seeded, "jane-doe")
+    assert "stopped Levothyroxine" not in md
+    assert "**med-renewal**" in md
+    assert "renewed Levothyroxine (authorization period ended)" in md
+    assert "stopped Amoxicillin" in md
+    assert md.isascii()
+    # The new event rides the same provenance path, so footnote definitions stay dense
+    # and ascending - a gap would mean the event skipped the footnote pass.
+    defs = [ln.split("]:")[0][2:] for ln in md.splitlines() if ln.startswith("[^")
+            and "]:" in ln]
+    assert defs == [str(i) for i in range(1, len(defs) + 1)]
+
+
 def test_journal_empty_is_friendly(seeded):
     persons.add_person(seeded, "ghost-town", "Ghost Town")
     md = render.render_journal(seeded, "ghost-town")
