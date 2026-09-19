@@ -740,3 +740,78 @@ def test_trends_converts_a_vitals_series_through_the_cli(ready, capsys):
                 *DICT_ARG, "--json") == 0
     t = json.loads(capsys.readouterr().out)
     assert t["count"] == 4 and t["unconverted_count"] == 1
+
+
+# --- trends applies the overlay before its statistics (issue #197) ------------
+#
+# `query labs` hides a superseded row behind a count; `trends` had no overlay at all, so
+# a row a clinician ruled out was counted and could be printed as the series' `latest`
+# -- and trends output feeds appointment briefs.
+
+
+def _rule_row(tmp_path, record_type, column, value, status="superseded"):
+    """Record a **row-scoped** verdict on one seeded row (the issue's exact shape)."""
+    conn = db.connect(tmp_path / "cli.db")
+    pk = f"{record_type}_id"
+    row_id = conn.execute(
+        f"SELECT {pk} FROM {record_type} WHERE {column} = ?", (value,)
+    ).fetchone()[pk]
+    curation.annotate_record(conn, record_type, str(row_id), status=status,
+                             note="clinician ruled", row=True, apply=True)
+    conn.close()
+    return row_id
+
+
+def test_cli_trends_hides_superseded_points_and_discloses_the_count(ready, capsys):
+    _rule_row(ready, "lab_result", "test_name", "A1c")   # the 2026 draw, the newest
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "(1 point(s))" in out                          # was 2
+    latest = next(line for line in out.splitlines() if "latest" in line)
+    assert "5.5" in latest and "2024-01-01" in latest     # not the 6.5 of 2026-01-01
+    assert "6.5" not in out                               # gone from min/max too
+    assert "(1 superseded/corrected point(s) excluded)" in out
+    assert out.isascii()                                  # cp1252/cp437 console
+    out.encode("cp437")
+
+
+def test_cli_trends_json_carries_the_filtered_numbers(ready, capsys):
+    """One contract, not a raw-vs-filtered split: `--json` is the same series the human
+    view describes."""
+    _rule_row(ready, "lab_result", "test_name", "A1c")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["count"] == 1 and t["suppressed_count"] == 1
+    assert t["latest"] == 5.5 and t["latest_at"] == "2024-01-01"
+    assert t["min"] == 5.5 and t["max"] == 5.5
+    assert t["slope_per_day"] is None                     # one surviving point
+
+
+def test_cli_trends_all_points_suppressed_still_discloses(ready, capsys):
+    """Silently shortening a clinical series to nothing is the one failure this must not
+    introduce: the empty branch still says how many points it excluded."""
+    _rule_row(ready, "lab_result", "test_name", "A1c")
+    _rule_row(ready, "lab_result", "test_name", "HbA1c")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "no numeric results" in out
+    assert "(2 superseded/corrected point(s) excluded)" in out
+
+
+def test_cli_trends_without_verdicts_is_unchanged(ready, capsys):
+    """Additive-only: an unannotated database prints exactly what it always did."""
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "(2 point(s))" in out
+    assert "excluded" not in out
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    assert json.loads(capsys.readouterr().out)["suppressed_count"] == 0

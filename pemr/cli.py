@@ -2947,6 +2947,20 @@ def _print_unit_notes(result: dict) -> None:
         )
 
 
+def _print_suppressed(result: dict) -> None:
+    """Disclose the points the curation overlay kept out of a `trends` series (#197).
+
+    A series `trends` silently shortened would be the failure the overlay exists to
+    prevent in the other direction, so the count is printed whenever anything was
+    excluded -- **including** when everything was, alongside the "no numeric results"
+    line. Same rule as :func:`_hidden_note` and :func:`_print_other_assays`; ASCII only,
+    because this reaches a cp1252/cp437 console."""
+    excluded = result.get("suppressed_count", 0)
+    if not excluded:
+        return
+    print(f"  ({excluded} superseded/corrected point(s) excluded)")
+
+
 def _cmd_trends(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
@@ -2956,10 +2970,14 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             return 0
         if result["count"] == 0:
             print(f"no numeric results for '{result['test']}'")
+            _print_suppressed(result)
             _print_other_assays(result)
             return 0
         unit = f" {result['unit']}" if result["unit"] else ""
         print(f"{result['test']}  ({result['count']} point(s))")
+        # Directly under the count it qualifies -- a shortened series must never read
+        # as the whole of it.
+        _print_suppressed(result)
         print(f"  min    {_fmt(result['min'])}{unit}")
         print(f"  max    {_fmt(result['max'])}{unit}")
         tie = result.get("latest_tie", 0)

@@ -19,7 +19,7 @@ import pytest
 
 from pemr import (
     __version__, attestations, curation, db, dedup, ingest, mcp_server, persons,
-    records, tombstones,
+    query, records, tombstones,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -929,3 +929,35 @@ def test_the_brief_opt_in_registers_no_new_tool(seeded):
     assert set(mcp_server.TOOL_NAMES) == set(
         mcp_server.READ_ONLY_TOOLS + mcp_server.WRITE_TOOLS
     )
+
+
+# --------------------------------------------------------------------------- #
+# The curation overlay reaches `trends` too (issue #197)
+# --------------------------------------------------------------------------- #
+#
+# The `query` tool deliberately suppresses nothing and hands every row's verdict to the
+# agent. `trends` cannot: a statistic carries no per-row verdict to disclose, so the
+# ruled-out row has to leave the series before the aggregation -- and the tool must
+# agree with `pemr trends` about which numbers those are.
+
+def test_trends_tool_matches_the_filtered_cli_series(seeded):
+    row_id = seeded.execute(
+        "SELECT lab_result_id FROM lab_result WHERE test_name = 'A1c'"
+    ).fetchone()["lab_result_id"]
+    curation.annotate_record(seeded, "lab_result", str(row_id), status="superseded",
+                             note="repeat draw supersedes this one", row=True,
+                             apply=True)
+
+    tool = mcp_server.trends(seeded, person="jane-doe", test="a1c")
+    engine = query.trends(seeded, "jane-doe", "a1c",
+                          dictionary=dedup.load_dictionary(DICT_PATH))
+    assert tool == engine                                  # one contract, both doors
+    assert tool["count"] == 1 and tool["suppressed_count"] == 1
+    assert tool["latest"] == 5.5 and tool["latest_at"] == "2024-01-01"
+
+
+def test_trends_tool_is_unchanged_without_verdicts(seeded):
+    """Additive-only: the payload an agent already parses gains one key that is 0."""
+    tr = mcp_server.trends(seeded, person="jane-doe", test="a1c")
+    assert tr["count"] == 2 and tr["latest"] == 6.5
+    assert tr["suppressed_count"] == 0

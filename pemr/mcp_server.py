@@ -490,6 +490,13 @@ def trends(conn: sqlite3.Connection, *, person: str, test: str) -> dict[str, Any
     ``pemr trends``.
 
     A ``test`` matching both a lab result and a vital is refused, not merged.
+
+    The series is **curation-filtered before its statistics** (issue #197): a row a
+    human ruled superseded/erroneous/merged-into is not counted and cannot be reported
+    as ``latest``. Deliberately unlike the ``query`` tool, which suppresses nothing and
+    hands every row's verdict to the caller — a statistic carries no per-row verdict to
+    disclose, so the filter has to run before the aggregation. How many points it
+    excluded comes back as ``suppressed_count``.
     """
     try:
         return _query.trends(conn, person, test, dictionary=_dictionary())
