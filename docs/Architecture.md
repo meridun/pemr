@@ -317,6 +317,10 @@ CREATE TABLE medication (
                                           -- (AGENTS.md §MUST-9; prn/ordered are not lifecycle);
                                           -- a discontinue reason belongs in status_reason
   status_reason TEXT,                     -- verbatim discontinue reason; NULL = none stated
+                                          -- a renewal reason (query.med_end_is_renewal) means
+                                          -- ended_on closes an authorization period, not therapy:
+                                          -- read paths keep the row current and emit
+                                          -- "med-renewal" rather than "med-stop" (#159/#203)
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
@@ -1341,9 +1345,17 @@ pemr query meds --person jane --active [--raw]           # --active = query.med_
                                                          # a CCDA's "Discontinued (Reorder)") - a
                                                          # renewed prescription's end date closes an
                                                          # authorization period, not the therapy, so
-                                                         # it stays current and prints "(renewed)".
+                                                         # it stays current and prints "(renewed)",
+                                                         # keyed off query.med_end_is_renewal.
                                                          # Every other reason still ends the course
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
+                                                         # a medication whose end date is a renewal
+                                                         # (query.med_end_is_renewal - the one
+                                                         # predicate --active reads too) emits
+                                                         # "med-renewal" on that date instead of
+                                                         # "med-stop", so the active list and the
+                                                         # chronology cannot disagree about whether
+                                                         # the drug stopped (issue #203)
                                                          # all three (issue #131): filtered at read
                                                          # time against the curation overlay, same
                                                          # rule §6 describes for render - a suppressed

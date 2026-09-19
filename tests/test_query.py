@@ -499,6 +499,110 @@ def test_timeline_default_shape_is_unchanged(seeded):
         assert set(e) == {"date", "type", "summary", "document_id"}
 
 
+def _commit_renewal_pair(conn):
+    """The #159 pair, committed: a renewed prescription and a completed course, both
+    with a past ``ended_on`` and a terminal ``status`` — same shape, opposite meanings."""
+    doc = _doc(conn, "jane-doe")
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "frequency": "daily",
+             "started_on": "2025-06-11", "ended_on": "2026-06-11",
+             "status": "discontinued", "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "frequency": "TID",
+             "started_on": "2024-11-01", "ended_on": "2024-11-11",
+             "status": "discontinued", "status_reason": "Therapy Completed"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    return doc
+
+
+def test_timeline_omits_med_stop_for_a_renewal(seeded):
+    """Issue #203: the renewal's end date closes an authorization period, so it emits a
+    non-terminal `med-renewal` instead of claiming the drug was stopped. The completed
+    course beside it is untouched."""
+    _commit_renewal_pair(seeded)
+    events = query.query_timeline(seeded, "jane-doe")
+    levo = [e for e in events if "Levothyroxine" in e["summary"]]
+    assert {e["type"] for e in levo} == {"med-start", "med-renewal"}
+    renewal = next(e for e in levo if e["type"] == "med-renewal")
+    assert renewal["date"] == "2026-06-11"
+    assert renewal["summary"] == "renewed Levothyroxine (authorization period ended)"
+    assert renewal["summary"].isascii()
+    # The terminal row still stops, byte-identically to before.
+    amox = [e for e in events if "Amoxicillin" in e["summary"]]
+    stop = next(e for e in amox if e["type"] == "med-stop")
+    assert stop["date"] == "2024-11-11"
+    assert stop["summary"] == "stopped Amoxicillin"
+    assert not any(e["type"] == "med-renewal" for e in amox)
+
+
+def test_timeline_med_stop_unchanged_without_a_reason(seeded):
+    """Issue #203 AC2: only a *renewal* reason changes the event. No reason at all, or an
+    unrecognized one, still produces `med-stop` exactly as today."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {
+        "medication": [
+            {"name": "Atorvastatin", "dose": "20mg", "started_on": "2025-01-01",
+             "ended_on": "2025-08-28", "status": "discontinued"},
+            {"name": "Lisinopril", "dose": "10mg", "started_on": "2024-01-01",
+             "ended_on": "2024-06-01", "status": "discontinued",
+             "status_reason": "Provider Discontinued"},
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+    events = query.query_timeline(seeded, "jane-doe")
+    assert not any(e["type"] == "med-renewal" for e in events)
+    by_summary = {e["summary"]: e for e in events if e["type"] == "med-stop"}
+    assert by_summary["stopped Atorvastatin"]["date"] == "2025-08-28"
+    assert by_summary["stopped Lisinopril"]["date"] == "2024-06-01"
+
+
+def test_timeline_agrees_with_med_is_current(seeded):
+    """Issue #203's drift guard, asserted directly: no row `med_is_current` calls current
+    may carry a `med-stop` event, and every non-current row with a past, parseable
+    `ended_on` still must. This is the invariant the two read paths broke."""
+    _commit_renewal_pair(seeded)
+    events = query.query_timeline(seeded, "jane-doe", with_identity=True)
+    stopped = {e["record_id"] for e in events
+               if e["type"] == "med-stop" and e["record_type"] == "medication"}
+    rows = seeded.execute("SELECT * FROM medication").fetchall()
+    assert rows, "fixture must carry medication rows for this guard to mean anything"
+    for r in rows:
+        med_id = r["medication_id"]
+        if query.med_is_current(r, now=NOW):
+            assert med_id not in stopped, f"{r['name']} is current but timeline stops it"
+        elif r["ended_on"] and query._end_of_period(r["ended_on"]) is not None:
+            assert med_id in stopped, f"{r['name']} ended but timeline never stops it"
+
+
+@pytest.mark.parametrize("row,expected", [
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Reorder"}, True),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "REORDER"}, True),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": " re-order "}, True),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Renewed"}, True),
+    ({"status": "discontinued", "ended_on": "2024-11-11",
+      "status_reason": "Therapy Completed"}, False),
+    ({"status": "discontinued", "ended_on": "2026-06-11",
+      "status_reason": "Provider Discontinued"}, False),
+    ({"status": "discontinued", "ended_on": "2025-08-28",
+      "status_reason": None}, False),
+    ({"status": "discontinued", "ended_on": "2025-08-28",
+      "status_reason": ""}, False),
+    # A pre-014 snapshot or hand-built dict has no such column at all (see
+    # test_med_is_current_tolerates_a_row_without_the_status_reason_column).
+    ({"status": "active", "ended_on": None}, False),
+])
+def test_med_end_is_renewal_is_the_single_renewal_predicate(row, expected):
+    """Issue #203: one predicate, mirroring the `med_is_current` table above — and a
+    renewal is always current, which is what keeps the two paths welded together."""
+    assert query.med_end_is_renewal(row) is expected
+    if expected:
+        assert query.med_is_current(row, now=NOW) is True
+
+
 def test_timeline_summaries_are_ascii_safe(seeded):
     """§4 cp1252/cp437 console lesson: human-table summaries must be ASCII-only, or
     they crash on a non-UTF-8 Windows console (regression for the em-dash bounce —
