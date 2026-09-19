@@ -457,6 +457,24 @@ def test_ingest_study_dir_size_guard(conn, tmp_path, sources, monkeypatch):
     assert result.status == "new"
 
 
+def test_ingest_study_dir_validates_doc_date(conn, tmp_path, sources):
+    """The study path validates `doc_date` at the same door as the file path (issue #200),
+    pre-pack: a refused flag never costs the archive, and padding is stripped rather than
+    stored. `metadata.study_date` needs no check - `study._iso_date` already yields
+    ISO-or-None."""
+    root = make_study(tmp_path / "disc")
+
+    with pytest.raises(ingest.IngestError, match="--doc-date"):
+        ingest.ingest_study_dir(conn, root, "jane-doe", sources, doc_date="10/29/2020")
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+    assert not sources.exists()  # refused pre-pack: nothing staged, nothing stored
+
+    result = ingest.ingest_study_dir(
+        conn, root, "jane-doe", sources, doc_date="2020-10-29\r"
+    )
+    assert result.document.doc_date == "2020-10-29"
+
+
 def test_ingest_study_dir_rejects_a_file(conn, tmp_path, sources):
     path = tmp_path / "scan.pdf"
     path.write_bytes(b"%PDF-1.4")

@@ -83,6 +83,33 @@ def test_ingest_missing_file_raises(conn, tmp_path, sources):
         ingest.ingest_document(conn, tmp_path / "nope.pdf", "jane-doe", sources)
 
 
+# --- doc_date validation (issue #200) ---------------------------------------
+
+
+@pytest.mark.parametrize("given", ["2020-10-29\r", " 2020-10-29 ", "2020-10-29\r\n"])
+def test_ingest_strips_padding_from_doc_date(conn, tmp_path, sources, given):
+    result = ingest.ingest_document(
+        conn, _make_file(tmp_path), "jane-doe", sources, doc_date=given
+    )
+    assert result.document.doc_date == "2020-10-29"
+    assert conn.execute(
+        "SELECT length(doc_date) AS n FROM document"
+    ).fetchone()["n"] == 10
+
+
+def test_ingest_refuses_a_non_iso_doc_date_before_any_side_effect(
+    conn, tmp_path, sources
+):
+    """The refusal is the first thing the function does - ahead of the hash and the blob
+    copy - so a bad flag leaves no `document` row and no orphan blob under sources/."""
+    with pytest.raises(ingest.IngestError, match="--doc-date"):
+        ingest.ingest_document(
+            conn, _make_file(tmp_path), "jane-doe", sources, doc_date="10/29/2020"
+        )
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 0
+    assert not sources.exists()
+
+
 def test_ingest_on_unmigrated_db_raises(tmp_path, sources):
     fresh = db.connect(tmp_path / "empty.db")
     try:

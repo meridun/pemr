@@ -474,6 +474,62 @@ def test_edit_does_not_move_dedup_keys(seeded):
     assert before == after
 
 
+# --- doc_date validation (issue #200) ---------------------------------------
+
+
+@pytest.mark.parametrize("given", ["2020-10-29\r", " 2020-10-29 ", "2020-10-29\r\n",
+                                   "\t2020-10-29"])
+def test_normalize_doc_date_strips_surrounding_whitespace(given):
+    assert documents.normalize_doc_date(given) == "2020-10-29"
+
+
+@pytest.mark.parametrize("given", [None, "", "   ", "\r\n"])
+def test_normalize_doc_date_treats_absence_and_whitespace_as_none(given):
+    assert documents.normalize_doc_date(given) is None
+
+
+@pytest.mark.parametrize("given", ["10/29/2020", "2020", "2020-10", "Oct 2020",
+                                   "20201029", "2020-10-29T00:00:00", "2020-13-01",
+                                   "2021-02-30"])
+def test_normalize_doc_date_refuses_anything_but_an_iso_calendar_date(given):
+    with pytest.raises(documents.InvalidDocDateError) as exc:
+        documents.normalize_doc_date(given)
+    assert "--doc-date" in str(exc.value)
+
+
+def test_normalize_doc_date_message_is_ascii_and_escapes_the_control_character():
+    """The values this exists to reject *contain* a bare CR, which would overwrite the
+    error line on a console; `ascii()` renders it as an escape (issue #23's cp437 rule)."""
+    with pytest.raises(documents.InvalidDocDateError) as exc:
+        documents.normalize_doc_date("10/29/2020\r")
+    message = str(exc.value)
+    message.encode("ascii")                  # raises if anything non-ASCII slipped in
+    assert "\r" not in message and "\\r" in message
+
+
+@pytest.mark.parametrize("given", ["2020-10-29\r", " 2020-10-29 "])
+def test_edit_strips_padding_from_doc_date(seeded, given):
+    view = documents.edit_document(seeded["conn"], seeded["doc"], doc_date=given)
+    assert view["doc_date"] == "2020-10-29"
+    assert len(view["doc_date"]) == 10
+
+
+def test_edit_refuses_a_non_iso_doc_date_and_writes_nothing(seeded):
+    conn = seeded["conn"]
+    with pytest.raises(documents.InvalidDocDateError):
+        documents.edit_document(conn, seeded["doc"], doc_date="10/29/2020",
+                                category="imaging")
+    row = conn.execute("SELECT * FROM document").fetchone()
+    assert row["doc_date"] == "2026-03-15"   # the fixture's value, unchanged
+    assert row["category"] == "labs"         # the same call's other field, also unwritten
+
+
+@pytest.mark.parametrize("given", ["", "   "])
+def test_edit_clears_doc_date_with_empty_or_whitespace(seeded, given):
+    view = documents.edit_document(seeded["conn"], seeded["doc"], doc_date=given)
+    assert view["doc_date"] is None
+
+
 # --- reassign ---------------------------------------------------------------
 
 
@@ -1252,6 +1308,32 @@ def test_cli_document_edit(cli_ready, capsys):
     assert "nothing to update" in capsys.readouterr().err
     assert _run(cli_ready, "document", "edit", "999", "--category", "labs") == 1
     assert "no document with id" in capsys.readouterr().err
+
+
+def test_cli_document_edit_validates_doc_date(cli_ready, capsys):
+    """Issue #200: the flag is validated at the engine layer, so the CLI gets the friendly
+    rc=1 for free - and the refusal names the flag on stderr in pure ASCII, even though the
+    offending value carries a bare CR."""
+    capsys.readouterr()
+    assert _run(cli_ready, "document", "edit", "1", "--doc-date", "2020-10-29\r") == 0
+    assert "2020-10-29" in capsys.readouterr().out
+
+    conn = db.connect(cli_ready / "cli.db")
+    try:
+        assert conn.execute(
+            "SELECT doc_date FROM document WHERE document_id = 1"
+        ).fetchone()["doc_date"] == "2020-10-29"
+    finally:
+        conn.close()
+
+    assert _run(cli_ready, "document", "edit", "1", "--doc-date", "10/29/2020") == 1
+    err = capsys.readouterr().err
+    assert "--doc-date" in err
+    err.encode("ascii")                      # console-safe: no raw CR, nothing non-ASCII
+    assert "\r" not in err
+
+    assert _run(cli_ready, "document", "edit", "1", "--doc-date", "") == 0
+    assert "-" in capsys.readouterr().out    # cleared, rendered as the empty placeholder
 
 
 def test_cli_document_reassign_dry_run_then_apply(cli_ready, capsys):
