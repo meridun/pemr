@@ -587,6 +587,19 @@ carries exist for exactly this population. A `--test` token matching numeric row
 silently interleaved lab-and-vital series is a wrong chart even when the tokens coincide.
 `pemr labs` remains lab-only.
 
+`trends` applies the **curation overlay before its statistics** (issue #197). A row a human
+ruled `superseded`/`erroneous-in-source`/`merged-into` leaves the series *before*
+`count`/`min`/`max`/`latest`/`latest_at`/`slope_per_day` are computed — it cannot be counted,
+cannot be reported as the current value, and cannot drag the slope. That is a harder rule than
+`query labs`', which stamps each row and lets each front door decide, and the reason is the
+return shape: `trends` returns aggregates, which carry no per-row verdict a programmatic caller
+could filter on, so the filter has to land in `query.trends()` itself where the CLI, `--json`
+and the MCP tool all inherit it. Suppression is disclosed, never silent — `suppressed_count`
+(and one CLI line) reports how many points left, the same disclose-don't-drop rule as
+`other_assays` and `unconverted_count`. The assay and unit disclosures are separate axes and
+are unaffected: `other_assays`/`other_assay_count` still count the suppressed sibling rows, so
+a ruled-out assay stays findable.
+
 **A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
 in the DB: layer-2 dedup misses it and the same fact lands twice. `pemr rekey` re-derives
@@ -1498,6 +1511,12 @@ regardless of suppression, so a programmatic caller can filter for itself. That 
 is now part of the `--json` **and MCP** read contract: its `dedup_base` is a breadcrumb (§2/§3),
 not a lookup key, since a dictionary `rekey` can move it out from under a stale reference — a
 consumer should key on `status`, not on it.
+
+`trends` is the fourth read verb on the overlay (issue #197), and the one that cannot offer
+that opt-out: a statistic has no per-row verdict to carry, so the appendix rows are filtered
+out inside `query.trends()` before any statistic sees them and every front door — CLI human
+output, `--json`, the MCP `trends` tool — reports the same filtered numbers plus a
+`suppressed_count` (§3).
 
 One consequence of the read-time join: if a dictionary-driven `rekey`
 (§3) has renamed a family since its verdict was recorded, a *family*-scoped verdict's join

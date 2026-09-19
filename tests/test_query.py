@@ -3,12 +3,12 @@ FTS backfill on migrate, trends math, dictionary normalization, and person isola
 
 import shutil
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from pemr import db, dedup, persons, query, units, verify
+from pemr import curation, db, dedup, persons, query, units, verify
 
 DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "dictionary.example.toml"
 
@@ -1128,3 +1128,184 @@ def test_trends_vitals_are_person_scoped(vital_temps):
     john = query.trends(vital_temps, "john-doe", "Temperature", dictionary=d)
     assert jane["count"] == 3 and john["count"] == 1
     assert john["latest"] == 36.0
+
+
+# --- trends: the curation overlay applies before the statistics (issue #197) ---
+#
+# `query labs` stamps each row and lets the front door decide; `trends` returns
+# aggregates, which carry no per-row verdict to disclose, so a ruled-out row has to
+# leave the series *before* count/min/max/latest/slope see it.
+
+def _rule(conn, record_type, row_id, status="superseded", *, row=True):
+    """Record a verdict on one seeded row (``row=False`` rules its whole family)."""
+    curation.annotate_record(
+        conn, record_type, str(row_id), status=status, note="clinician ruled",
+        row=row, apply=True,
+    )
+    return row_id
+
+
+def _lab_id(conn, test_name, collected_at):
+    return conn.execute(
+        "SELECT lab_result_id FROM lab_result WHERE test_name = ? AND collected_at = ?",
+        (test_name, collected_at),
+    ).fetchone()["lab_result_id"]
+
+
+def test_trends_excludes_a_row_scoped_superseded_point(seeded):
+    """The reported bug: the newest point is row-scoped superseded, so it must not be
+    counted and must not be reported as the series' latest value."""
+    d = dedup.load_dictionary(DICT_PATH)
+    _rule(seeded, "lab_result", _lab_id(seeded, "A1c", "2026-01-01"))
+
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 2                       # was 3
+    assert t["suppressed_count"] == 1            # disclosed, never silent
+    assert t["latest"] == 6.0 and t["latest_at"] == "2025-01-01"   # the survivor
+    assert t["min"] == 5.5 and t["max"] == 6.0   # 6.5 is gone from the stats too
+    assert t["test"] == "hba1c"
+
+
+def test_trends_excludes_a_family_scoped_superseded_series(seeded):
+    """Family scope resolves through the same `VerdictMap.for_row`, and a series with
+    nothing left must still return the full contract -- not look like "no data"."""
+    d = dedup.load_dictionary(DICT_PATH)
+    _rule(seeded, "lab_result", _lab_id(seeded, "LDL", "2025-01-01"), row=False)
+
+    t = query.trends(seeded, "jane-doe", "ldl", dictionary=d)
+    assert t["count"] == 0 and t["suppressed_count"] == 1
+    # The stored spelling is still echoed: a fully suppressed series would otherwise
+    # come back labelled with whatever the caller typed.
+    assert t["test"] == "ldl_cholesterol"
+    assert t["latest"] is None and t["latest_at"] is None
+    assert t["min"] is None and t["max"] is None and t["slope_per_day"] is None
+
+
+def test_trends_row_verdict_beats_family_verdict_in_the_series(seeded):
+    """Precedence is not restated here: it stays `VerdictMap.for_row`'s (issue #114)."""
+    d = dedup.load_dictionary(DICT_PATH)
+    newest = _lab_id(seeded, "A1c", "2026-01-01")
+    _rule(seeded, "lab_result", newest, row=False)                  # family: superseded
+    _rule(seeded, "lab_result", newest, status="confirmed")         # row: confirmed
+
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["suppressed_count"] == 0
+    assert t["latest"] == 6.5 and t["latest_at"] == "2026-01-01"
+
+
+def test_trends_disputed_point_still_counts(seeded):
+    """`disputed` is deliberately not an appendix status: a disputed reading that
+    vanished from a series would be worse than an unmarked one."""
+    d = dedup.load_dictionary(DICT_PATH)
+    _rule(seeded, "lab_result", _lab_id(seeded, "A1c", "2026-01-01"), status="disputed")
+
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["suppressed_count"] == 0
+    assert t["latest"] == 6.5
+
+
+def test_trends_slope_ignores_a_suppressed_folded_duplicate(seeded):
+    """The issue's second failure: a folded duplicate -- same value, small date offset --
+    counted twice drags the fit toward flat. Ruling one out must move the slope."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="two draws of one glucose, refiled")
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Glucose", "collected_at": "2026-01-01", "value_num": 5.0,
+         "unit": "mmol/L"},
+        {"test_name": "Glucose", "collected_at": "2026-01-02", "value_num": 5.0,
+         "unit": "mmol/L"},
+        {"test_name": "Glucose", "collected_at": "2026-03-02", "value_num": 6.0,
+         "unit": "mmol/L"},
+    ]}, d)
+    before = query.trends(seeded, "jane-doe", "glucose", dictionary=d)
+
+    _rule(seeded, "lab_result", _lab_id(seeded, "Glucose", "2026-01-02"))
+
+    t = query.trends(seeded, "jane-doe", "glucose", dictionary=d)
+    assert t["count"] == 2 and t["suppressed_count"] == 1
+    survivors = [
+        (date.fromisoformat("2026-01-01").toordinal(), 5.0),
+        (date.fromisoformat("2026-03-02").toordinal(), 6.0),
+    ]
+    assert t["slope_per_day"] == pytest.approx(query._slope_per_day(survivors))
+    assert t["slope_per_day"] != pytest.approx(before["slope_per_day"])
+
+
+def test_trends_other_assays_disclosure_is_unaffected_by_verdicts(albumin_assays):
+    """Curation and the assay split are two disclosure axes, not one: a ruled-out
+    sibling assay stays findable through `other_assays`."""
+    d = dedup.load_dictionary(DICT_PATH)
+    _rule(albumin_assays, "lab_result", _lab_id(
+        albumin_assays, "Albumin (SPEP)", "2025-01-01"))
+
+    t = query.trends(albumin_assays, "jane-doe", "albumin", dictionary=d)
+    assert t["count"] == 2 and t["suppressed_count"] == 0
+    assert t["other_assays"] == ["albumin (spep)"] and t["other_assay_count"] == 1
+
+
+def test_trends_vitals_series_honours_the_overlay(vital_temps):
+    """The `observation_id` / `record_type="observation"` wiring, not just the lab path:
+    a projection missing the row's own primary key degrades to family scope silently."""
+    d = dedup.load_dictionary(DICT_PATH)
+    row_id = vital_temps.execute(
+        "SELECT observation_id FROM observation WHERE observed_at = ? AND key = ?",
+        ("2026-02-01", "Temperature"),
+    ).fetchone()["observation_id"]
+    _rule(vital_temps, "observation", row_id)
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["count"] == 2 and t["suppressed_count"] == 1
+    assert t["latest"] == 37.5 and t["latest_at"] == "2026-01-15"
+    assert t["max"] == 98.6                      # 100.4 left with its row
+
+
+def test_trends_fully_suppressed_source_is_not_ambiguous(vital_temps):
+    """`AmbiguousTestError` refuses to merge two *live* series; a side with none left is
+    not a second series to merge."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(vital_temps, "jane-doe", ocr="specimen temperature")
+    dedup.commit_extraction(vital_temps, doc, {"lab_result": [
+        {"test_name": "Temperature", "collected_at": "2026-03-01", "value_num": 4.0,
+         "unit": "degC"},
+    ]}, d)
+    _rule(vital_temps, "lab_result", _lab_id(vital_temps, "Temperature", "2026-03-01"))
+
+    t = query.trends(vital_temps, "jane-doe", "Temperature", dictionary=d)
+    assert t["test"] == "temperature"            # spelling echoed from the dead side too
+    assert t["count"] == 3 and t["suppressed_count"] == 1
+    assert t["latest"] == 100.4                  # the vitals series, unmerged
+
+
+def test_trends_without_verdicts_is_unchanged(seeded):
+    """The no-verdicts fast path: `load_verdicts` is falsy, `annotate_rows`
+    short-circuits, and the numbers are today's to the digit."""
+    d = dedup.load_dictionary(DICT_PATH)
+    t = query.trends(seeded, "jane-doe", "hba1c", dictionary=d)
+    assert t["count"] == 3 and t["suppressed_count"] == 0
+    assert t["min"] == 5.5 and t["max"] == 6.5
+    assert t["latest"] == 6.5 and t["latest_at"] == "2026-01-01"
+
+
+def test_trends_reported_scenario_23_rows_7_superseded(seeded):
+    """The issue's scenario at its reported scale, not a scaled-down stand-in: 23 stored
+    points for one analyte, the 7 newest row-scoped `superseded`. The reported symptom
+    was `23 point(s)` with `latest` naming a row the chart deliberately hides."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="serial ferritin panel, partly re-filed")
+    dates = [f"{2024 + (7 + i) // 12:04d}-{(7 + i) % 12 + 1:02d}-16" for i in range(23)]
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Ferritin", "collected_at": at, "value_num": float(100 + 9 * i),
+         "unit": "ng/mL"}
+        for i, at in enumerate(dates)
+    ]}, d)
+    assert query.trends(seeded, "jane-doe", "ferritin", dictionary=d)["count"] == 23
+
+    for at in dates[16:]:                        # the 7 newest, row scope
+        _rule(seeded, "lab_result", _lab_id(seeded, "Ferritin", at))
+
+    t = query.trends(seeded, "jane-doe", "ferritin", dictionary=d)
+    assert t["count"] == 16 and t["suppressed_count"] == 7
+    # The surviving row's date, not the superseded newest one.
+    assert t["latest_at"] == dates[15] != dates[22]
+    assert t["latest"] == 100.0 + 9 * 15
+    assert t["min"] == 100.0 and t["max"] == 100.0 + 9 * 15
