@@ -34,6 +34,16 @@ dictionary is user-grown medical *vocabulary* and an identity lever (it feeds
 ``dedup_key``), whereas a unit table is fixed physics and a display lever. Mixing them
 would let a display edit move stored keys.
 
+The registry holds **two populations** (issue #202). The *convertible* vitals dimensions
+above - mass, length, temperature, pressure, rate, ratio - where two ids of one dimension
+convert into each other. And the *single-member* ``lab:<id>`` dimensions, one dimension
+per lab unit, which exist only so that two spellings of one unit compare equal: no lab
+unit is ever convertible to another, because :func:`convert` returns ``None`` across
+dimensions. That is a safety property, not a style: ``U/L`` equals ``IU/L`` and ``mEq/L``
+equals ``mmol/L`` only for particular analytes, and ``mg/dL`` to ``mmol/L`` needs a molar
+mass - none of which are registry facts. A shared "concentration" dimension with factors
+would be exactly the wrong chart this module exists to prevent.
+
 Canonical unit ids are ASCII (``degF``, never a degree sign) because they reach
 CLI/render output, which must survive a cp1252/cp437 console. The alias table *accepts*
 the non-ASCII spellings a document can carry, but never emits one.
@@ -60,6 +70,10 @@ UNITS: dict[str, tuple[str, float, float]] = {
     # mass (base kg)
     "kg": ("mass", 1.0, 0.0),
     "g": ("mass", 0.001, 0.0),
+    "mg": ("mass", 1e-6, 0.0),
+    "ug": ("mass", 1e-9, 0.0),
+    "ng": ("mass", 1e-12, 0.0),
+    "pg": ("mass", 1e-15, 0.0),
     "lb": ("mass", 0.45359237, 0.0),
     "oz": ("mass", 0.028349523125, 0.0),
     # length (base cm)
@@ -76,10 +90,59 @@ UNITS: dict[str, tuple[str, float, float]] = {
     "mmHg": ("pressure", 1.0, 0.0),
     "/min": ("rate", 1.0, 0.0),
     "%": ("ratio", 1.0, 0.0),
+    # --- lab units: single-member dimensions, never convertible (issue #202) ---
+    # One dimension each, so `convert()` returns None between any two of them. These
+    # exist to make two *spellings* of one unit compare equal, nothing more.
+    # mass / volume
+    "mg/dL": ("lab:mg/dL", 1.0, 0.0),
+    "g/dL": ("lab:g/dL", 1.0, 0.0),
+    "mg/L": ("lab:mg/L", 1.0, 0.0),
+    "g/L": ("lab:g/L", 1.0, 0.0),
+    "mg/mL": ("lab:mg/mL", 1.0, 0.0),
+    "ug/dL": ("lab:ug/dL", 1.0, 0.0),
+    "ug/L": ("lab:ug/L", 1.0, 0.0),
+    "ug/mL": ("lab:ug/mL", 1.0, 0.0),
+    "ng/dL": ("lab:ng/dL", 1.0, 0.0),
+    "ng/mL": ("lab:ng/mL", 1.0, 0.0),
+    "ng/L": ("lab:ng/L", 1.0, 0.0),
+    "pg/mL": ("lab:pg/mL", 1.0, 0.0),
+    # amount / volume
+    "mmol/L": ("lab:mmol/L", 1.0, 0.0),
+    "umol/L": ("lab:umol/L", 1.0, 0.0),
+    "nmol/L": ("lab:nmol/L", 1.0, 0.0),
+    "pmol/L": ("lab:pmol/L", 1.0, 0.0),
+    "mEq/L": ("lab:mEq/L", 1.0, 0.0),
+    "mOsm/kg": ("lab:mOsm/kg", 1.0, 0.0),
+    # activity
+    "U/L": ("lab:U/L", 1.0, 0.0),
+    "U/mL": ("lab:U/mL", 1.0, 0.0),
+    "IU/L": ("lab:IU/L", 1.0, 0.0),
+    "IU/mL": ("lab:IU/mL", 1.0, 0.0),
+    "mIU/L": ("lab:mIU/L", 1.0, 0.0),
+    "mIU/mL": ("lab:mIU/mL", 1.0, 0.0),
+    "uIU/mL": ("lab:uIU/mL", 1.0, 0.0),
+    "mU/L": ("lab:mU/L", 1.0, 0.0),
+    # counts
+    "K/uL": ("lab:K/uL", 1.0, 0.0),
+    "M/uL": ("lab:M/uL", 1.0, 0.0),
+    "/uL": ("lab:/uL", 1.0, 0.0),
+    "/HPF": ("lab:/HPF", 1.0, 0.0),
+    "/LPF": ("lab:/LPF", 1.0, 0.0),
+    # indices / other
+    "fL": ("lab:fL", 1.0, 0.0),
+    "mm/hr": ("lab:mm/hr", 1.0, 0.0),
+    "mL/min": ("lab:mL/min", 1.0, 0.0),
+    "mL/min/1.73m2": ("lab:mL/min/1.73m2", 1.0, 0.0),
+    "mg/g": ("lab:mg/g", 1.0, 0.0),
+    "sec": ("lab:sec", 1.0, 0.0),
 }
 
-#: ``str(text).strip().lower()`` -> canonical unit id. Seeded from the spellings the
-#: corpus actually carries (``lbs``, ``F``, ``breaths/min``) plus the obvious long
+#: Prefix of every single-member lab dimension. Membership of that population is read
+#: off the dimension, so no second list of lab ids has to be maintained anywhere.
+LAB_DIMENSION_PREFIX = "lab:"
+
+#: Lowercased, whitespace-collapsed spelling -> canonical unit id. Seeded from the
+#: spellings the corpus actually carries (``lbs``, ``F``, ``breaths/min``) plus the long
 #: forms. Every canonical id is its own alias, so a stored value already in canonical
 #: form resolves without a special case.
 _ALIASES: dict[str, str] = {
@@ -109,6 +172,67 @@ _ALIASES: dict[str, str] = {
     "breaths/min": "/min", "beats/min": "/min",
     # ratio
     "%": "%", "percent": "%", "pct": "%",
+    # --- lab units (issue #202) -------------------------------------------------
+    # Keys are lowercase with interior whitespace collapsed, so one entry covers a
+    # whole case-only group (`mg/dL` / `mg/dl` / `MG/DL`). The micro-sign spellings
+    # are *input* aliases only, the degF precedent: U+00B5 and U+03BC both resolve,
+    # and the id they resolve to stays ASCII.
+    #
+    # NEVER aliased to each other, whatever a document implies: `U/L` and `IU/L`,
+    # `mEq/L` and `mmol/L`, `uIU/mL` and `mIU/L` and `mU/L` - numerically equal for
+    # some analytes and wrong for others, so an equivalence is per-analyte and not a
+    # registry fact. Nor `mg/dL` and `mg/L`, `ng/dL` and `ng/mL`, `%` and `fL` -
+    # different scale or different measure. A truncated string (`x10`, `10`) stays
+    # unknown rather than being guessed at.
+    # mass / volume
+    "mg/dl": "mg/dL",
+    "g/dl": "g/dL", "gm/dl": "g/dL", "gms/dl": "g/dL", "grams/dl": "g/dL",
+    "mg/l": "mg/L", "g/l": "g/L", "mg/ml": "mg/mL",
+    "ug/dl": "ug/dL", "µg/dl": "ug/dL", "μg/dl": "ug/dL",
+    "ug/l": "ug/L", "µg/l": "ug/L", "μg/l": "ug/L",
+    "ug/ml": "ug/mL", "µg/ml": "ug/mL", "μg/ml": "ug/mL",
+    "ng/dl": "ng/dL", "ng/ml": "ng/mL", "ng/l": "ng/L", "pg/ml": "pg/mL",
+    # amount / volume
+    "mmol/l": "mmol/L",
+    "umol/l": "umol/L", "µmol/l": "umol/L", "μmol/l": "umol/L",
+    "nmol/l": "nmol/L", "pmol/l": "pmol/L",
+    "meq/l": "mEq/L", "mosm/kg": "mOsm/kg",
+    # activity
+    "u/l": "U/L", "u/ml": "U/mL", "iu/l": "IU/L", "iu/ml": "IU/mL",
+    "miu/l": "mIU/L", "miu/ml": "mIU/mL",
+    "uiu/ml": "uIU/mL", "µiu/ml": "uIU/mL", "μiu/ml": "uIU/mL",
+    "mu/l": "mU/L",
+    # counts. The notation variants below are one unit written many ways - folding
+    # them is the whole point of this section.
+    "k/ul": "K/uL", "k/µl": "K/uL", "k/μl": "K/uL", "k/mm3": "K/uL",
+    "k/cumm": "K/uL", "thousand/ul": "K/uL", "thousands/ul": "K/uL",
+    "x10e3/ul": "K/uL", "10e3/ul": "K/uL", "10^3/ul": "K/uL", "10*3/ul": "K/uL",
+    "10^3/mm^3": "K/uL", "10*3/mm3": "K/uL", "10e3/mm3": "K/uL",
+    "m/ul": "M/uL", "m/µl": "M/uL", "m/μl": "M/uL", "mil/ul": "M/uL",
+    "million/ul": "M/uL", "millions/ul": "M/uL", "x10e6/ul": "M/uL",
+    "10e6/ul": "M/uL", "10^6/ul": "M/uL", "10*6/ul": "M/uL", "m/mm3": "M/uL",
+    "10^6/mm^3": "M/uL",
+    "/ul": "/uL", "/µl": "/uL", "/μl": "/uL", "cells/ul": "/uL", "per ul": "/uL",
+    "/mm3": "/uL", "cells/mm3": "/uL", "/cumm": "/uL",
+    "/hpf": "/HPF", "/lpf": "/LPF",
+    # indices / other
+    "fl": "fL", "cu microns": "fL", "cu_microns": "fL", "cubic microns": "fL",
+    "um3": "fL", "um^3": "fL",
+    "mm/hr": "mm/hr", "mm/h": "mm/hr", "mm hr": "mm/hr", "mm/hour": "mm/hr",
+    "mm/1hr": "mm/hr",
+    "ml/min": "mL/min",
+    "ml/min/1.73": "mL/min/1.73m2", "ml/min/1.73m2": "mL/min/1.73m2",
+    "ml/min/1.73 m2": "mL/min/1.73m2", "ml/min/1.73m^2": "mL/min/1.73m2",
+    "ml/min/1.73sqm": "mL/min/1.73m2",
+    "mg/g": "mg/g",
+    "sec": "sec", "secs": "sec", "seconds": "sec",
+    # the sub-gram masses the lab units above are built from, now that they are
+    # spelled in the corpus (MCH is reported in pg). Genuinely convertible mass.
+    "mg": "mg", "milligram": "mg", "milligrams": "mg",
+    "ug": "ug", "µg": "ug", "μg": "ug", "microgram": "ug",
+    "micrograms": "ug",
+    "ng": "ng", "nanogram": "ng", "nanograms": "ng",
+    "pg": "pg", "picogram": "pg", "picograms": "pg",
 }
 
 #: Decimal places every converted display value is rounded to, once.
@@ -128,10 +252,13 @@ def canonical_unit(text: object) -> str | None:
 
     ``None`` for empty input and for any spelling the registry does not know - the
     caller's cue to leave the value exactly as stored rather than guess at its scale.
+
+    Letter case and whitespace are normalised (interior runs collapse to one space, so
+    ``"deg  f"`` resolves like ``"deg f"``); spelling is never guessed at.
     """
     if text is None:
         return None
-    return _ALIASES.get(str(text).strip().lower())
+    return _ALIASES.get(" ".join(str(text).split()).lower())
 
 
 def dimension_of(unit_id: str | None) -> str | None:
@@ -140,9 +267,23 @@ def dimension_of(unit_id: str | None) -> str | None:
     return spec[0] if spec is not None else None
 
 
-def known_units() -> tuple[str, ...]:
-    """Every canonical unit id, sorted - for CLI validation and its error text."""
-    return tuple(sorted(UNITS))
+def known_units(*, include_lab: bool = True) -> tuple[str, ...]:
+    """Every canonical unit id, sorted - for CLI validation and its error text.
+
+    ``include_lab=False`` drops the single-member ``lab:<id>`` dimensions, for the one
+    caller (argparse help) that wants a list short enough to read. The default keeps
+    every id, so the ``UnknownUnitError`` text stays the complete list - which is where
+    a user discovers a lab id in the first place.
+    """
+    if include_lab:
+        return tuple(sorted(UNITS))
+    return tuple(
+        sorted(
+            unit_id
+            for unit_id, (dimension, _, _) in UNITS.items()
+            if not dimension.startswith(LAB_DIMENSION_PREFIX)
+        )
+    )
 
 
 def convert(value: float, from_text: object, to_unit: str | None) -> float | None:

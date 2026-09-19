@@ -41,17 +41,67 @@ def dictionary():
     ("mm[Hg]", "mmHg"), ("mmhg", "mmHg"),
     ("breaths/min", "/min"), ("bpm", "/min"),
     ("percent", "%"),
+    # lab units (issue #202): case, whitespace and notation variants of one unit
+    ("mg/dl", "mg/dL"), ("MG/DL", "mg/dL"), ("gm/dL", "g/dL"),
+    ("Thousand/uL", "K/uL"), ("x10E3/uL", "K/uL"), ("k/mm3", "K/uL"),
+    ("MIL/uL", "M/uL"), ("cu_microns", "fL"), ("mm/h", "mm/hr"),
+    ("mL/min/1.73", "mL/min/1.73m2"), ("  U/L ", "U/L"),
 ])
 def test_canonical_unit_resolves_corpus_spellings(text, expected):
     assert units.canonical_unit(text) == expected
 
 
-@pytest.mark.parametrize("text", ["", "   ", None, "widgets", "mg/dL"])
+@pytest.mark.parametrize("text", ["", "   ", None, "widgets", "x10", "10"])
 def test_canonical_unit_is_none_for_unknown_or_empty(text):
-    """`None` is the caller's cue to leave the stored value alone. `mg/dL` is in the
-    corpus and deliberately *not* in the registry: it has no second spelling anyone
-    wants to convert to, and guessing at a scale is the one failure this cannot have."""
+    """`None` is the caller's cue to leave the stored value alone.
+
+    `mg/dL` used to sit in this list: #136 kept it out because it has no second
+    spelling anyone wants to *convert* to, and guessing at a scale is the one failure
+    this cannot have. #202 reverses that, and the reason the reversal is safe is that
+    resolving a lab unit no longer implies any conversion - `trends` compares canonical
+    ids to decide a *label*, and every lab id is its own dimension. A truncated string
+    such as `x10` still resolves to nothing: it is a data problem, not a spelling."""
     assert units.canonical_unit(text) is None
+
+
+def test_canonical_unit_collapses_interior_whitespace():
+    """One spacing accident should not cost a resolution (issue #202)."""
+    assert units.canonical_unit("deg  f") == "degF"
+    assert units.canonical_unit("mm  hg") == "mmHg"
+
+
+# --- registry: the lab population (issue #202) --------------------------------
+
+@pytest.mark.parametrize("a,b", [
+    ("mg/dL", "mg/L"),      # different scale
+    ("ng/dL", "ng/mL"),     # different scale
+    ("U/L", "IU/L"),        # equal per analyte, not globally
+    ("mEq/L", "mmol/L"),    # equal for monovalent ions only
+    ("uIU/mL", "mU/L"),     # equal per analyte, not globally
+    ("fL", "%"),            # different measure sharing a test name
+])
+def test_lab_units_never_fold_across_scales(a, b):
+    """Each lab unit is its own dimension, so folding two of them is structurally
+    impossible rather than merely unintended (issue #202)."""
+    assert units.convert(1.0, a, b) is None
+    assert units.convert(1.0, b, a) is None
+    assert units.dimension_of(a) != units.dimension_of(b)
+
+
+def test_every_alias_target_is_a_known_unit():
+    """The cheap guard over a ~150-row table: no alias points at a phantom id."""
+    for spelling, unit_id in units._ALIASES.items():
+        assert unit_id in units.UNITS, f"{spelling!r} -> {unit_id!r}"
+
+
+def test_known_units_can_exclude_lab_units():
+    """The CLI help needs a short list without a second hand-maintained one."""
+    every = units.known_units()
+    vitals_only = units.known_units(include_lab=False)
+    assert "mg/dL" in every and "mg/dL" not in vitals_only
+    assert "K/uL" in every and "K/uL" not in vitals_only
+    for unit_id in ("lb", "%", "degF", "mmHg"):
+        assert unit_id in every and unit_id in vitals_only
 
 
 def test_canonical_ids_are_ascii_and_self_resolving():
