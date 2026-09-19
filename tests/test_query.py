@@ -1284,3 +1284,28 @@ def test_trends_without_verdicts_is_unchanged(seeded):
     assert t["count"] == 3 and t["suppressed_count"] == 0
     assert t["min"] == 5.5 and t["max"] == 6.5
     assert t["latest"] == 6.5 and t["latest_at"] == "2026-01-01"
+
+
+def test_trends_reported_scenario_23_rows_7_superseded(seeded):
+    """The issue's scenario at its reported scale, not a scaled-down stand-in: 23 stored
+    points for one analyte, the 7 newest row-scoped `superseded`. The reported symptom
+    was `23 point(s)` with `latest` naming a row the chart deliberately hides."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(seeded, "jane-doe", ocr="serial ferritin panel, partly re-filed")
+    dates = [f"{2024 + (7 + i) // 12:04d}-{(7 + i) % 12 + 1:02d}-16" for i in range(23)]
+    dedup.commit_extraction(seeded, doc, {"lab_result": [
+        {"test_name": "Ferritin", "collected_at": at, "value_num": float(100 + 9 * i),
+         "unit": "ng/mL"}
+        for i, at in enumerate(dates)
+    ]}, d)
+    assert query.trends(seeded, "jane-doe", "ferritin", dictionary=d)["count"] == 23
+
+    for at in dates[16:]:                        # the 7 newest, row scope
+        _rule(seeded, "lab_result", _lab_id(seeded, "Ferritin", at))
+
+    t = query.trends(seeded, "jane-doe", "ferritin", dictionary=d)
+    assert t["count"] == 16 and t["suppressed_count"] == 7
+    # The surviving row's date, not the superseded newest one.
+    assert t["latest_at"] == dates[15] != dates[22]
+    assert t["latest"] == 100.0 + 9 * 15
+    assert t["min"] == 100.0 and t["max"] == 100.0 + 9 * 15
