@@ -93,7 +93,9 @@ CREATE TABLE document (
   document_id   INTEGER PRIMARY KEY,
   sha256        TEXT UNIQUE NOT NULL,     -- content hash → dedup layer 1
   person_id     INTEGER REFERENCES person(person_id),
-  doc_date      TEXT,                     -- date the doc pertains to
+  doc_date      TEXT,                     -- date the doc pertains to; validated YYYY-MM-DD at
+                                           -- write (ingest and `document edit`, #200) - trimmed
+                                           -- whitespace/CR, refused otherwise
   category      TEXT,                     -- labs|imaging|visit-note|rx|vaccine|referral|billing
   provider      TEXT,
   source_path   TEXT NOT NULL,            -- sources/<hash>.<ext>
@@ -1251,6 +1253,8 @@ pemr review-conflicts [--resolve <id> --keep existing|incoming|both|merge
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
+                                                         # --doc-date validated YYYY-MM-DD (trimmed
+                                                         # whitespace/CR, refused if not ISO; #200)
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
 pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--note ...]]
                                                          # delete a document + records; dry run by default
