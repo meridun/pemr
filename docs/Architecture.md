@@ -269,6 +269,15 @@ user-grown medical *vocabulary* and an identity lever (it feeds `dedup_key`), a 
 is fixed physics and a display lever. Correcting a genuinely mislabelled unit *in place*
 remains `record edit`'s job (above) — a different verb for a different problem.
 
+The registry holds **two populations** (issue #202). The convertible vitals dimensions
+(mass, length, temperature, pressure, rate, ratio), where two ids of one dimension convert
+into each other; and one **single-member `lab:<id>` dimension per lab unit** (`mg/dL`,
+`mmol/L`, `K/uL`, …), which exist only so that two *spellings* of one unit compare equal.
+No lab unit is ever convertible to another, and that is structural rather than a
+convention: `convert()` returns `None` across dimensions, so `U/L`→`IU/L`, `mEq/L`→`mmol/L`
+and `mg/dL`→`mg/L` cannot be folded by any future preference. Those equivalences are
+per-analyte facts (or need a molar mass), which a unit registry does not know.
+
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
 005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
 in §3, omitted from the DDL below to keep the shapes readable):
@@ -586,6 +595,15 @@ carries exist for exactly this population. A `--test` token matching numeric row
 *both* tables is **refused**, not merged: the same reasoning as the assay split, since a
 silently interleaved lab-and-vital series is a wrong chart even when the tokens coincide.
 `pemr labs` remains lab-only.
+
+With no preference set, the unit `trends` **reports** is the stored spelling when the
+series carries exactly one, and otherwise the shared canonical id when every spelling in
+the series resolves to the same one (issue #202) — so `mg/dL`/`mg/dl`/`MG/DL`, or `K/uL`
+and `Thousand/uL`, label as the one unit they are instead of reading as several. The
+comparison is on canonical ids, never on raw strings, and it is a **label** change only:
+no value is converted and `converted_count` stays 0. A series whose spellings resolve to
+different ids, or one carrying a spelling the registry cannot resolve, still reports no
+unit at all — a genuine scale mix must stay visibly unlabelled rather than be papered over.
 
 `trends` applies the **curation overlay before its statistics** (issue #197). A row a human
 ruled `superseded`/`erroneous-in-source`/`merged-into` leaves the series *before*

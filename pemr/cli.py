@@ -3383,10 +3383,15 @@ def build_parser() -> argparse.ArgumentParser:
     # argparse's HelpFormatter._expand_help does `help % params`, so a literal `%`
     # in help text must be doubled or any help/usage render raises (issue #198 - the
     # ratio unit `%` is one of the ids this list interpolates).
-    _unit_ids = ", ".join(u.replace("%", "%%") for u in units.known_units())
+    # Lab unit ids (issue #202) are excluded by name: the full list is ~4x longer than
+    # this help line should be, and an unknown `--unit` still prints every id.
+    _unit_ids = ", ".join(
+        u.replace("%", "%%") for u in units.known_units(include_lab=False)
+    )
     up_set.add_argument(
         "--unit", required=True,
-        help=f"canonical unit: {_unit_ids}",
+        help=f"canonical unit: {_unit_ids}; lab unit ids (mg/dL, mmol/L, K/uL, ...) "
+             "are accepted too - an unknown unit prints the full list",
     )
     up_set.add_argument("--dictionary", help="synonym dictionary TOML (key resolution)")
     up_set.set_defaults(func=_cmd_person_unit_pref_set)

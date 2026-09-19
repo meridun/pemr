@@ -608,6 +608,13 @@ def trends(
     ``result["unit"]`` then falls back rather than labelling the series with a unit some
     of it is not in.
 
+    With no preference in play the reported ``unit`` is the stored spelling when the
+    series carries exactly one, and otherwise the shared canonical id when every
+    spelling resolves to the same one (issue #202) - so ``mg/dL``, ``mg/dl`` and
+    ``MG/DL`` label as one unit, and so do ``K/uL`` and ``Thousand/uL``. A genuine scale
+    mix (``mg/dL`` with ``mg/L``), or any spelling the registry cannot resolve, still
+    reports ``None``: no number moves either way, only the label.
+
     The **curation overlay** applies to the series too (issue #197), and applies
     *before* any statistic is computed: a row a human ruled superseded, erroneous or
     merged-into (:data:`curation.APPENDIX_STATUSES`, resolved per row through
@@ -705,9 +712,21 @@ def trends(
         result["unit"] = canonical
     else:
         # Today's rule, over the units actually displayed (identical to the stored ones
-        # whenever no preference applied).
+        # whenever no preference applied): one spelling, report it verbatim.
         seen = {d.unit for d in shown if d.unit}
-        result["unit"] = next(iter(seen)) if len(seen) == 1 else None
+        if len(seen) == 1:
+            result["unit"] = next(iter(seen))
+        else:
+            # Several spellings (issue #202): they may still be one unit. Compare
+            # canonical ids, never the raw strings. A spelling the registry cannot
+            # resolve anywhere in the series forces `None` -- a genuine scale mix
+            # (`mg/dL` with `mg/L`) must keep rendering unlabelled rather than be
+            # papered over, and lab ids are single-member dimensions precisely so that
+            # no two of them can ever collapse into one id here.
+            ids = {units.canonical_unit(u) for u in seen}
+            result["unit"] = (
+                next(iter(ids)) if len(ids) == 1 and None not in ids else None
+            )
     result["min"] = min(values)
     result["max"] = max(values)
     latest = matched[-1]  # rows came back ORDER BY <timestamp>, <row id>

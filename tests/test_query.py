@@ -870,6 +870,67 @@ def test_trends_ignores_a_cross_dimension_preference(mixed_weights):
     assert t["min"] == 90.0 and t["max"] == 196.0 and t["unit"] is None
 
 
+# --- trends: several spellings of one unit (issue #202) -----------------------
+#
+# A read-side label fix only: the series is compared by canonical id instead of by raw
+# string, so `mg/dL`/`mg/dl`/`MG/DL` stop reading as three units. No number moves, and a
+# genuine scale mix still refuses to label itself.
+
+def _lab_series(conn, units_used, *, test_name="Creatinine", slug="jane-doe"):
+    """One person, one test name, one row per unit spelling - values kept distinct so a
+    dropped or reordered point would show up in the stats."""
+    d = dedup.load_dictionary(DICT_PATH)
+    doc = _doc(conn, slug, ocr="chemistry panel")
+    dedup.commit_extraction(conn, doc, {"lab_result": [
+        {"test_name": test_name, "collected_at": f"2026-03-{index + 1:02d}",
+         "value_num": 1.0 + index, "unit": unit}
+        for index, unit in enumerate(units_used)
+    ]}, d)
+    return query.trends(conn, slug, test_name, dictionary=d)
+
+
+def test_trends_labels_a_series_whose_spellings_share_one_canonical_id(seeded):
+    t = _lab_series(seeded, ["mg/dL", "mg/dl", "MG/DL"])
+    assert t["unit"] == "mg/dL"
+    assert t["count"] == 3
+    # Nothing was converted: the label moved, the numbers did not.
+    assert t["canonical_unit"] is None
+    assert t["converted_count"] == 0 and t["unconverted_count"] == 0
+    assert t["min"] == 1.0 and t["max"] == 3.0 and t["latest"] == 3.0
+
+
+def test_trends_labels_a_count_series_across_notation_variants(seeded):
+    t = _lab_series(seeded, ["K/uL", "Thousand/uL", "x10E3/uL"], test_name="WBC")
+    assert t["unit"] == "K/uL" and t["count"] == 3
+    assert t["converted_count"] == 0
+
+
+def test_trends_keeps_no_unit_for_a_genuine_scale_mix(seeded):
+    """`mg/dL` and `mg/L` differ by 10x. Labelling that series at all would be the
+    wrong chart -- the harm #136 exists to prevent."""
+    t = _lab_series(seeded, ["mg/dL", "mg/L"])
+    assert t["unit"] is None and t["count"] == 2
+
+
+def test_trends_keeps_no_unit_when_one_spelling_is_unknown(seeded):
+    """An unresolvable spelling is a data problem, not a licence to label the rest."""
+    t = _lab_series(seeded, ["mg/dL", "x10"])
+    assert t["unit"] is None and t["count"] == 2
+
+
+def test_trends_reports_a_single_stored_spelling_verbatim(seeded):
+    """The decision recorded on #202: canonicalise a *mixed* series only. A series that
+    reads correctly today must not be relabelled."""
+    t = _lab_series(seeded, ["mg/dl", "mg/dl"])
+    assert t["unit"] == "mg/dl"
+
+
+def test_trends_renders_an_unknown_unit_exactly_as_before(seeded):
+    """Acceptance 4: a stored row with an unknown unit string is untouched."""
+    t = _lab_series(seeded, ["x10", "x10"])
+    assert t["unit"] == "x10" and t["count"] == 2
+
+
 def test_trends_preference_is_person_scoped(mixed_weights):
     """john-doe's HbA1c must not move because jane-doe set a preference."""
     d = dedup.load_dictionary(DICT_PATH)
