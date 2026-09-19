@@ -251,6 +251,41 @@ def test_query_timeline_omits_the_stop_for_a_renewal(ready, capsys):
     assert any(e["type"] == "med-stop" and "Amoxicillin" in e["summary"] for e in events)
 
 
+def test_query_timeline_renewal_chain_never_reads_as_a_stop(ready, capsys):
+    """Issue #203's reported symptom, end to end: back-to-back authorizations (each
+    ending the day the next begins) used to print a stop and a start of the same drug on
+    the same date, repeatedly, for a therapy that never paused. The chain now reads as a
+    renewal plus a start, and contributes no `med-stop` at any link."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2023-01-01",
+             "ended_on": "2024-01-01", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Levothyroxine", "dose": "75mcg", "started_on": "2024-01-01",
+             "ended_on": "2025-01-01", "status": "discontinued",
+             "status_reason": "Re-Order"},
+            {"name": "Levothyroxine", "dose": "88mcg", "started_on": "2025-01-01",
+             "ended_on": "2026-01-01", "status": "discontinued",
+             "status_reason": "Renewed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    levo = [e for e in json.loads(capsys.readouterr().out)
+            if "Levothyroxine" in e["summary"]]
+    assert not any(e["type"] == "med-stop" for e in levo)
+    assert [(e["date"], e["type"]) for e in levo] == [
+        ("2023-01-01", "med-start"),
+        ("2024-01-01", "med-renewal"), ("2024-01-01", "med-start"),
+        ("2025-01-01", "med-renewal"), ("2025-01-01", "med-start"),
+        ("2026-01-01", "med-renewal"),
+    ]
+
+
 def test_query_timeline_json(ready, capsys):
     assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
     events = json.loads(capsys.readouterr().out)
@@ -568,6 +603,35 @@ def test_query_timeline_suppression_and_no_identity_leak(curated, capsys):
     # an internal column, and this is the only DB state where the keys exist at all.
     for key in ("record_type", "dedup_base", "record_id"):
         assert all(key not in e for e in events)
+
+
+def test_query_timeline_curation_hides_a_renewal_like_a_stop(ready, capsys):
+    """Issue #203's overlay seam: `med-renewal` resolves through the same
+    record_type/record_id/dedup_base keys `med-stop` did, so a verdict that hid the old
+    stop hides the new event too (issues #114/#131) -- and --raw still shows it, marked."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+        ],
+    }, d)
+    conn.close()
+    _annotate(ready, "medication", "name", "Levothyroxine", status="superseded",
+              note="a duplicate authorization record")
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "Levothyroxine" not in out                    # start and renewal both go
+    assert "superseded/corrected events hidden; --raw to include" in out
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--raw") == 0
+    raw = capsys.readouterr().out
+    assert "renewed Levothyroxine (authorization period ended)" in raw
+    assert "[superseded - a duplicate authorization record]" in raw
 
 
 def test_query_with_no_verdicts_is_unchanged(ready, capsys):
