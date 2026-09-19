@@ -1,0 +1,53 @@
+-- 017_document_doc_date_trim: strip the whitespace off the `document.doc_date` values
+-- that were stored before the write path validated them (issue #200).
+--
+-- `ingest --doc-date` and `document edit --doc-date` used to pass the flag straight to
+-- the INSERT/UPDATE. One 2026-08 batch - almost certainly a Windows script reading dates
+-- from a CRLF file and handing each line to the flag - left 147 of 907 rows in the live
+-- database holding an ISO date followed by a bare CR (`'2020-10-29' || char(13)`).
+--
+-- The damage is quiet rather than loud, which is why it survived: `ORDER BY doc_date`
+-- still sorts those rows correctly by accident (CR sorts after every digit), so nothing
+-- looked wrong. But `doc_date = '2020-10-29'` misses them, `--json` carries a literal
+-- \r, `date.fromisoformat` raises on them, and a hash-keyed cross-check against an
+-- external index reported 148 false disagreements. Python now refuses such a value at
+-- both write doors (`documents.normalize_doc_date`, the single definition `documents`
+-- and `ingest` share); this migration repairs what is already on disk.
+--
+-- DATA-ONLY, and no CHECK. SQLite's ALTER TABLE can add neither a CHECK nor a
+-- constraint to an existing table, so the invariant lives in Python - the standing
+-- choice of 013, 015 and 016. No column is added, no table rebuilt: purely an UPDATE,
+-- safe under foreign_keys=ON, and a restored pre-017 snapshot is schema-identical
+-- (it is `db.is_migrated`-clean, it just still holds the dirty values).
+--
+-- KEY NEUTRALITY. `doc_date` does not appear in `pemr/dedup.py` at all: it is a
+-- document-level column, absent from FIELD_SPECS and from every dedup_key/dedup_base
+-- derivation. So dedup keys, occurrence families and curation verdicts are bit-identical
+-- before and after this migration - by construction, not by a denylist. This is the same
+-- reasoning that makes `document edit --doc-date` a key-neutral metadata UPDATE
+-- (`documents._EDITABLE_FIELDS`).
+--
+-- THE `WHERE` CLAUSE IS LOAD-BEARING, for two reasons:
+--
+--   * Migration 003's `record_fts` AFTER UPDATE trigger on `document` deletes and
+--     re-inserts the row's FTS entry from `ocr_text`. That is idempotent and is exactly
+--     what `document edit` does today, so it is safe - but restricting the UPDATE to
+--     genuinely dirty rows means migrating a clean database re-indexes nothing instead
+--     of re-indexing every document it has.
+--   * Re-running the statement on an already-repaired table therefore matches no rows
+--     and fires no trigger: a no-op, not just an idempotent write.
+--
+-- A value that is STILL not `YYYY-MM-DD` after trimming (`'Oct 2020'`, `'2020'`) is
+-- deliberately LEFT ALONE rather than nulled or re-parsed. Silently destroying a date a
+-- human recorded is worse than keeping a legacy one; the write path refuses new ones from
+-- now on, and the leftover stays visible to the issue's own audit query
+-- (`SELECT count(*) FROM document WHERE doc_date IS NOT NULL AND length(doc_date) <> 10`).
+--
+-- An all-whitespace `doc_date` trims to the empty string, which is the same absence NULL
+-- already means for this column (`documents.edit_document` maps `''` to NULL), hence the
+-- NULLIF: the repair must not leave a second spelling of "no date" behind.
+
+UPDATE document
+   SET doc_date = NULLIF(TRIM(doc_date, char(13, 10, 9, 32)), '')
+ WHERE doc_date IS NOT NULL
+   AND doc_date <> TRIM(doc_date, char(13, 10, 9, 32));
