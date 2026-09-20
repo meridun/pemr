@@ -1046,6 +1046,94 @@ def test_ccda_results_table_keeps_both_date_columns_in_order(
     assert "Collected\tResulted\tPanel\tTest\tValue\tUnit\tReference Range" in text
 
 
+# The Epic shape #196's convention (AGENTS.md §10) rests on, and the flattening mechanic
+# that §10 *attributes* it to. Epic nests its per-specimen table inside `<list><item>`,
+# and `_ccda_narrative` routes an `<item>` and its whole subtree to `_ccda_flat`, so the
+# header run and the data run abut - while the same table at top level still renders as
+# tab-delimited rows. §10 tells the agent to read the two timestamps positionally against
+# that header run, which is only sound if this stays true, so both halves are pinned here
+# (the first verify pass of #196 read the abutting as table-cell concatenation and built a
+# top-level-`<table>` fixture, which rendered tabs and looked like a doc bug).
+_CCDA_EPIC_SPECIMEN_TABLE = (
+    "<table>"
+    "<thead><tr><th>Specimen (Source)</th>"
+    "<th>Anatomical Location / Laterality</th>"
+    "<th>Collection Method / Volume</th>"
+    "<th>Collection Time</th><th>Received Time</th></tr></thead>"
+    "<tbody><tr><td>Blood specimen (specimen)</td><td>VENOUS BLOOD / Unknown</td>"
+    "<td></td><td>03/10/2024 9:15 AM EDT</td><td>03/10/2024</td></tr></tbody>"
+    "</table>"
+)
+_CCDA_EPIC = (
+    # Epic: `<list><item>` wrapping the specimen table, then the result-date line. The
+    # result-block header carries the *collection* time despite "Final result" (§10's trap).
+    "<section><title>Results</title><text>"
+    "<paragraph>TSH - Final result (03/10/2024 9:15 AM EDT)</paragraph>"
+    f"<list><item>{_CCDA_EPIC_SPECIMEN_TABLE}"
+    "Narrative<content> ACMELAB - 03/18/2024 4:02 PM EDT</content></item></list>"
+    "</text>"
+    # The structured collection date the engine deliberately never mines (#189 boundary).
+    "<entry><organizer classCode='BATTERY' moodCode='EVN'>"
+    "<effectiveTime value='20240318160200+0000'/>"
+    "<component><procedure classCode='PROC' moodCode='EVN'>"
+    "<code code='17636008' codeSystem='2.16.840.1.113883.6.96'"
+    " displayName='Specimen collection (procedure)'/>"
+    "<effectiveTime value='20240310091500+0000'/>"
+    "</procedure></component></organizer></entry>"
+    "</section>",
+    # The control: the identical table outside any `<item>`.
+    "<section><title>Results Reprint</title><text>"
+    f"{_CCDA_EPIC_SPECIMEN_TABLE}"
+    "</text></section>",
+)
+
+
+def test_ccda_item_nested_specimen_table_abuts_but_top_level_keeps_tabs(
+    conn, tmp_path, sources
+):
+    """Issue #196: the `<item>`-nested specimen table reaches `ocr_text` as one
+    separator-free run, so §10's positional rule (first timestamp after the header run is
+    the collection time, second is the received date) is readable - while the same table
+    at top level still yields tab rows, which is why §10 attributes the abutting to the
+    nesting and not to how tables render. The structured SNOMED 17636008 collection entry
+    stays unparsed, so the narrative really is the only reachable source."""
+    src = _make_ccda(tmp_path, name="DOC0196.XML", sections=_CCDA_EPIC)
+    text = ingest.ingest_document(
+        conn, src, "jane-doe", sources, ocr=True
+    ).document.ocr_text
+    # the `<item>` run, verbatim as AGENTS.md §10 quotes it
+    run = next(
+        line for line in text.splitlines() if line.startswith("Specimen (Source)")
+    )
+    assert "\t" not in run
+    assert (
+        "Collection TimeReceived TimeBlood specimen (specimen)"
+        "VENOUS BLOOD / Unknown03/10/2024 9:15 AM EDT03/10/2024"
+    ) in run
+    # positional rule: collection time first, received date second, nothing between the
+    # header run and the collection time but the (often empty) specimen/location cells
+    after = run.split("Received Time", 1)[1]
+    assert after.index("03/10/2024 9:15 AM EDT") < after.rindex("03/10/2024")
+    assert after.split("03/10/2024", 1)[0] == (
+        "Blood specimen (specimen)VENOUS BLOOD / Unknown"
+    )
+    # the result date is the `Narrative <lab> - <datetime>` line, not `collected_at`
+    assert "Narrative ACMELAB - 03/18/2024 4:02 PM EDT" in run
+    # the trap: "Final result" header states the collection time
+    assert "TSH - Final result (03/10/2024 9:15 AM EDT)" in text
+    # the control - same table, no `<item>`: tab-delimited rows, one per `<tr>`
+    assert (
+        "Specimen (Source)\tAnatomical Location / Laterality\t"
+        "Collection Method / Volume\tCollection Time\tReceived Time"
+    ) in text
+    assert "Blood specimen (specimen)\tVENOUS BLOOD / Unknown\t\t" in text
+    # #189 boundary: no structured-entry mining, so neither the SNOMED code nor the raw
+    # `effectiveTime` values reach `ocr_text`
+    assert "17636008" not in text
+    assert "20240310091500" not in text
+    assert "20240318160200" not in text
+
+
 def test_ccda_never_shells_out(conn, tmp_path, sources, monkeypatch):
     def boom(path):  # pragma: no cover - the assertion is that this never runs
         raise AssertionError(f"run_ocr must not be called for {path}")
