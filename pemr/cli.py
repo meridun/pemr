@@ -2771,6 +2771,20 @@ def _verdict_suffix(carrier: dict, *, raw: bool = False) -> str:
     return ""
 
 
+def _med_status_suffix(row: dict) -> str:
+    """The ``[status: reason]`` bracket a listed medication line carries.
+
+    One named suffix builder beside :func:`_verdict_suffix`, for the same reason: the
+    format is written once (issue #203). ``[discontinued: Reorder]`` when the row stores
+    a reason (issue #159 put the CCDA discontinue reason in ``status_reason``, and a line
+    that prints an ``ended_on`` has to disclose when that date only closes an
+    authorization period); ``[discontinued]`` with a status alone; and ``""`` when
+    neither is present — no empty bracket, no stray separator.
+    """
+    bits = [str(b) for b in (row["status"], row.get("status_reason")) if b]
+    return f"  [{': '.join(bits)}]" if bits else ""
+
+
 def _visible(carriers: list[dict], *, raw: bool) -> list[dict]:
     """The carriers a human-readable listing prints: everything under ``--raw``, else
     everything the curation overlay has not sent to the appendix."""
@@ -2842,15 +2856,17 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
             if r["ended_on"]:
                 # A renewal's end date closes an authorization period, not the therapy
                 # (issue #159) - mark it, so a row that appears under --active does not
-                # read as flatly ended.
-                end = f" -> {r['ended_on']}" + (" (renewed)" if current else "")
+                # read as flatly ended. Keyed off the renewal predicate itself, not off
+                # `current` (issue #203): a status='active' row with a future ended_on
+                # is current too, but nothing about it was renewed.
+                renewed = " (renewed)" if query.med_end_is_renewal(r) else ""
+                end = f" -> {r['ended_on']}{renewed}"
             elif current:
                 end = " -> (current)"
             else:  # terminal status but no explicit end date (issue #21)
                 end = " -> (ended)"
             span = _fmt(r["started_on"]) + end
-            bits = [str(b) for b in (r["status"], r.get("status_reason")) if b]
-            status = f"  [{': '.join(bits)}]" if bits else ""
+            status = _med_status_suffix(r)
             print(f"{r['name']:24}{dose}{freq}  {span}{status}"
                   f"{_verdict_suffix(r, raw=args.raw)}")
         if hidden:
