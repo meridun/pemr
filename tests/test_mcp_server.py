@@ -786,7 +786,8 @@ def test_agents_md_documents_the_epic_narrative_lab_table():
     pins the general collect-vs-result rule and the repair ladder, and would stay
     green if the whole Epic sub-block were dropped. This pins the vendor-specific
     strings the positional reading depends on: the specimen table's header cells,
-    the `Narrative <lab> - <datetime>` result line, the "Final result" header trap,
+    the `<list><item>` nesting the abutted flattening is owed to, the
+    `Narrative <lab> - <datetime>` result line, the "Final result" header trap,
     and the SNOMED code naming what the engine deliberately does not parse."""
     text = AGENTS.read_text(encoding="utf-8")
     assert "### 10. Lab result dates" in text
@@ -795,6 +796,7 @@ def test_agents_md_documents_the_epic_narrative_lab_table():
         "Specimen (Source)",   # the header row the positional rule is read against
         "Collection Time",     # first timestamp after the header run -> collected_at
         "Received Time",       # second one -> neither collected_at nor a result date
+        "<list><item>",        # why the runs abut: item nesting, not table rendering
         "Narrative",           # the `Narrative <lab> - <datetime>` result-date line
         "Final result",        # the header trap: carries the *collection* time
         "17636008",            # structured entry the flattener deliberately ignores

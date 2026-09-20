@@ -514,8 +514,13 @@ results/orders column layout. Each result block ends with its own specimen table
 Specimen (Source) | Anatomical Location / Laterality | Collection Method / Volume | Collection Time | Received Time
 ```
 
-The narrative flattener (`_ccda_narrative`, `pemr/ingest.py`) concatenates table cells with **no
-separators**, so in `document.ocr_text` the header run and the data run abut (synthetic):
+Epic nests that table inside a `<list><item>`, and the narrative flattener (`_ccda_narrative`,
+`pemr/ingest.py`) routes an `<item>` and everything under it to `_ccda_flat`, which concatenates
+the whole subtree's text with **no separators** between cells. A *top-level* `<table>` would
+instead render as one tab-delimited line per row, so this abutting is a property of the `<item>`
+nesting, not of how tables render. In `document.ocr_text` the header run and the data run
+therefore abut, and because the specimen/location/method cells are often empty the first timestamp
+may follow `Received Time` directly (synthetic):
 
 ```
 ...Collection TimeReceived TimeBlood specimen (specimen)VENOUS BLOOD / Unknown03/10/2024 9:15 AM EDT03/10/2024Narrative...
@@ -525,13 +530,14 @@ Read it positionally against that header: the **first** timestamp after the head
 **collection time** — that is `collected_at`. The **second** is the **received** date, the moment
 the lab took delivery; it is neither `collected_at` nor a result date, and is never committed.
 Keep the header in view while reading, per *Read the header; don't index blindly* above — the
-positional rule is only safe because the header row names the two columns in order.
+positional rule is only safe because the header row names the two columns in order, and empty
+cells leave nothing between the header run and the collection timestamp to anchor on.
 
 **The `Narrative <lab> - <datetime>` line is a result date.** The line that follows the specimen
-table (synthetic: `NarrativeACMELAB - 03/18/2024 4:02 PM EDT`) is when the lab resulted the test —
-this is the value that has been mis-transcribed into `collected_at`. It may reach `collected_at`
-only through the fallback above, with the disclosure that fallback requires, and never while the
-specimen table's collection time is present.
+table (synthetic: `Narrative ACMELAB - 03/18/2024 4:02 PM EDT`) is when the lab resulted the
+test — this is the value that has been mis-transcribed into `collected_at`. It may reach
+`collected_at` only through the fallback above, with the disclosure that fallback requires, and
+never while the specimen table's collection time is present.
 
 **Trap — "Final result" headers can carry the collection time.** A result-block header such as
 `TSH - Final result (03/10/2024 9:15 AM EDT)` states the *collection* time despite the wording. Do
