@@ -37,9 +37,11 @@ detect multi-document attestation and does not pretend to.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 from . import curation, db, dedup, tombstones
@@ -67,6 +69,15 @@ DictionaryDriftError = dedup.DictionaryDriftError
 
 class OcrTextPresentError(ValueError):
     """`set-text` refused: the document already has ``ocr_text`` and ``force`` was off."""
+
+
+class InvalidDocDateError(ValueError):
+    """``--doc-date`` was not an ISO ``YYYY-MM-DD`` calendar date (issue #200).
+
+    A ``ValueError`` so every existing handler already maps it to a friendly rc=1:
+    `cli._with_document_conn`'s catch-all, and `ingest`'s re-raise as
+    :class:`pemr.ingest.IngestError`.
+    """
 
 
 # `document.text_source` — which write path produced the current ``ocr_text``
@@ -137,6 +148,53 @@ def normalize_document_text(text: str | None) -> str:
     while end > start and _is_invisible(value[end - 1]):
         end -= 1
     return value[start:end]
+
+
+# `document.doc_date` is date-only by contract, so the pattern is deliberately
+# narrower than `dedup._is_iso_date` (which also accepts `YYYY-MM`, `YYYY` and a time
+# component for row-level dates, and is private to the key machinery). `fullmatch`
+# plus `date.fromisoformat` together mean shape *and* calendar: `date.fromisoformat`
+# alone accepts `20201029` and other ISO 8601 spellings on Python 3.11+.
+_DOC_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def normalize_doc_date(value: str | None) -> str | None:
+    """The engine's single answer to "what may ``document.doc_date`` hold?" (issue #200).
+
+    Both write doors (`ingest` and `document edit`) route their ``--doc-date`` through
+    this, so the column holds a clean 10-character ISO date or NULL and nothing else.
+    It exists because they used to pass the flag straight to the INSERT: one batch of
+    CRLF-terminated values left 147 rows storing ``'2020-10-29\\r'``, which sorts
+    correctly by accident but fails every equality test, carries a literal ``\\r`` into
+    ``--json``, and raises in any consumer that parses the date strictly.
+
+    Surrounding whitespace (CR, LF, tab, space) is stripped; an empty or
+    whitespace-only value normalises to ``None``, which keeps `document edit`'s
+    "an explicit empty string clears the column" contract and treats ``"   "`` as the
+    same intent rather than as an error. Anything else that is not a real
+    ``YYYY-MM-DD`` calendar date raises :class:`InvalidDocDateError`.
+
+    The message renders the offending value through :func:`ascii`, not ``{!r}``:
+    the values this exists to reject *contain* a bare CR, which would otherwise
+    overwrite the error line on a console, and a non-ASCII byte would break the cp437
+    console rule (issue #23, `tests/test_cli_ascii.py`).
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if not _DOC_DATE_RE.fullmatch(stripped):
+        raise InvalidDocDateError(_bad_doc_date_message(value))
+    try:
+        date.fromisoformat(stripped)
+    except ValueError as exc:      # right shape, impossible calendar date
+        raise InvalidDocDateError(_bad_doc_date_message(value)) from exc
+    return stripped
+
+
+def _bad_doc_date_message(value: str) -> str:
+    return f"--doc-date must be an ISO date YYYY-MM-DD; got {ascii(value)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -458,8 +516,9 @@ def edit_document(
     half of misfiling. Only the fields passed change; an explicit empty string clears
     the column to NULL. No ``dedup_key`` is affected (see :data:`_EDITABLE_FIELDS`).
 
-    Raises :class:`DocumentNotFoundError` for an unknown id and ``ValueError`` for an
-    unknown field or no fields to update.
+    Raises :class:`DocumentNotFoundError` for an unknown id, :class:`InvalidDocDateError`
+    for a ``doc_date`` that is not ``YYYY-MM-DD``, and ``ValueError`` for an unknown field
+    or no fields to update.
     """
     db.require_migrated(conn)
     unknown = set(fields) - set(_EDITABLE_FIELDS)
@@ -467,6 +526,11 @@ def edit_document(
         raise ValueError(f"cannot edit field(s): {', '.join(sorted(unknown))}")
     if not fields:
         raise ValueError("nothing to update - pass at least one field to change")
+
+    if "doc_date" in fields:
+        # Pre-write, and before `updates` is built: a refused date writes nothing at
+        # all, not even the other fields of the same call (issue #200).
+        fields = {**fields, "doc_date": normalize_doc_date(fields["doc_date"])}
 
     updates = {
         name: (value if value not in (None, "") else None)

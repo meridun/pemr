@@ -193,6 +193,99 @@ def test_query_meds_active_drops_expired_course_labelled_active(ready, capsys):
     assert "Skyrizi" in names
 
 
+def test_query_meds_future_end_date_is_not_marked_renewed(ready, capsys):
+    """Issue #203's sibling drift: `(renewed)` used to key off `med_is_current`, so a
+    `status='active'` row approved *through* a future date printed as renewed although
+    nothing renewed. The marker keys off the renewal reason now."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [{"name": "Skyrizi", "dose": "150mg", "frequency": "q8w",
+                        "started_on": "2025-09-04", "ended_on": "2099-09-04",
+                        "status": "active"}],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "meds", "--person", "jane-doe") == 0
+    line = next(x for x in capsys.readouterr().out.splitlines() if "Skyrizi" in x)
+    assert "-> 2099-09-04" in line
+    assert "(renewed)" not in line
+    assert "[active]" in line
+
+
+def test_query_timeline_omits_the_stop_for_a_renewal(ready, capsys):
+    """Issue #203 at the CLI front door, text and `--json`: the renewed prescription
+    contributes a `med-renewal` on its end date and no `stopped` line; the completed
+    course beside it still stops."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Amoxicillin", "dose": "500mg", "started_on": "2024-11-01",
+             "ended_on": "2024-11-11", "status": "discontinued",
+             "status_reason": "Therapy Completed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "stopped Levothyroxine" not in out
+    assert "renewed Levothyroxine (authorization period ended)" in out
+    assert "stopped Amoxicillin" in out
+    assert out.isascii()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    events = json.loads(capsys.readouterr().out)
+    levo = [e for e in events if "Levothyroxine" in e["summary"]]
+    assert {e["type"] for e in levo} == {"med-start", "med-renewal"}
+    renewal = next(e for e in levo if e["type"] == "med-renewal")
+    assert renewal["date"] == "2026-06-11"
+    # Additive only: the public event shape is untouched (issue #131's no-leak bar).
+    assert set(renewal) == {"date", "type", "summary", "document_id"}
+    assert any(e["type"] == "med-stop" and "Amoxicillin" in e["summary"] for e in events)
+
+
+def test_query_timeline_renewal_chain_never_reads_as_a_stop(ready, capsys):
+    """Issue #203's reported symptom, end to end: back-to-back authorizations (each
+    ending the day the next begins) used to print a stop and a start of the same drug on
+    the same date, repeatedly, for a therapy that never paused. The chain now reads as a
+    renewal plus a start, and contributes no `med-stop` at any link."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2023-01-01",
+             "ended_on": "2024-01-01", "status": "discontinued",
+             "status_reason": "Reorder"},
+            {"name": "Levothyroxine", "dose": "75mcg", "started_on": "2024-01-01",
+             "ended_on": "2025-01-01", "status": "discontinued",
+             "status_reason": "Re-Order"},
+            {"name": "Levothyroxine", "dose": "88mcg", "started_on": "2025-01-01",
+             "ended_on": "2026-01-01", "status": "discontinued",
+             "status_reason": "Renewed"},
+        ],
+    }, d)
+    conn.close()
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
+    levo = [e for e in json.loads(capsys.readouterr().out)
+            if "Levothyroxine" in e["summary"]]
+    assert not any(e["type"] == "med-stop" for e in levo)
+    assert [(e["date"], e["type"]) for e in levo] == [
+        ("2023-01-01", "med-start"),
+        ("2024-01-01", "med-renewal"), ("2024-01-01", "med-start"),
+        ("2025-01-01", "med-renewal"), ("2025-01-01", "med-start"),
+        ("2026-01-01", "med-renewal"),
+    ]
+
+
 def test_query_timeline_json(ready, capsys):
     assert _run(ready, "query", "timeline", "--person", "jane-doe", "--json") == 0
     events = json.loads(capsys.readouterr().out)
@@ -512,6 +605,35 @@ def test_query_timeline_suppression_and_no_identity_leak(curated, capsys):
         assert all(key not in e for e in events)
 
 
+def test_query_timeline_curation_hides_a_renewal_like_a_stop(ready, capsys):
+    """Issue #203's overlay seam: `med-renewal` resolves through the same
+    record_type/record_id/dedup_base keys `med-stop` did, so a verdict that hid the old
+    stop hides the new event too (issues #114/#131) -- and --raw still shows it, marked."""
+    conn = db.connect(ready / "cli.db")
+    d = dedup.load_dictionary(DICT_ARG[1])
+    doc = conn.execute("SELECT document_id FROM document LIMIT 1").fetchone()["document_id"]
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "Levothyroxine", "dose": "50mcg", "started_on": "2025-06-11",
+             "ended_on": "2026-06-11", "status": "discontinued",
+             "status_reason": "Reorder"},
+        ],
+    }, d)
+    conn.close()
+    _annotate(ready, "medication", "name", "Levothyroxine", status="superseded",
+              note="a duplicate authorization record")
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe") == 0
+    out = capsys.readouterr().out
+    assert "Levothyroxine" not in out                    # start and renewal both go
+    assert "superseded/corrected events hidden; --raw to include" in out
+
+    assert _run(ready, "query", "timeline", "--person", "jane-doe", "--raw") == 0
+    raw = capsys.readouterr().out
+    assert "renewed Levothyroxine (authorization period ended)" in raw
+    assert "[superseded - a duplicate authorization record]" in raw
+
+
 def test_query_with_no_verdicts_is_unchanged(ready, capsys):
     """The additive-only guard: an unannotated database sees the exact output it saw
     before the overlay reached `query` -- no marker, no note, --raw a no-op."""
@@ -740,3 +862,78 @@ def test_trends_converts_a_vitals_series_through_the_cli(ready, capsys):
                 *DICT_ARG, "--json") == 0
     t = json.loads(capsys.readouterr().out)
     assert t["count"] == 4 and t["unconverted_count"] == 1
+
+
+# --- trends applies the overlay before its statistics (issue #197) ------------
+#
+# `query labs` hides a superseded row behind a count; `trends` had no overlay at all, so
+# a row a clinician ruled out was counted and could be printed as the series' `latest`
+# -- and trends output feeds appointment briefs.
+
+
+def _rule_row(tmp_path, record_type, column, value, status="superseded"):
+    """Record a **row-scoped** verdict on one seeded row (the issue's exact shape)."""
+    conn = db.connect(tmp_path / "cli.db")
+    pk = f"{record_type}_id"
+    row_id = conn.execute(
+        f"SELECT {pk} FROM {record_type} WHERE {column} = ?", (value,)
+    ).fetchone()[pk]
+    curation.annotate_record(conn, record_type, str(row_id), status=status,
+                             note="clinician ruled", row=True, apply=True)
+    conn.close()
+    return row_id
+
+
+def test_cli_trends_hides_superseded_points_and_discloses_the_count(ready, capsys):
+    _rule_row(ready, "lab_result", "test_name", "A1c")   # the 2026 draw, the newest
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "(1 point(s))" in out                          # was 2
+    latest = next(line for line in out.splitlines() if "latest" in line)
+    assert "5.5" in latest and "2024-01-01" in latest     # not the 6.5 of 2026-01-01
+    assert "6.5" not in out                               # gone from min/max too
+    assert "(1 superseded/corrected point(s) excluded)" in out
+    assert out.isascii()                                  # cp1252/cp437 console
+    out.encode("cp437")
+
+
+def test_cli_trends_json_carries_the_filtered_numbers(ready, capsys):
+    """One contract, not a raw-vs-filtered split: `--json` is the same series the human
+    view describes."""
+    _rule_row(ready, "lab_result", "test_name", "A1c")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    t = json.loads(capsys.readouterr().out)
+    assert t["count"] == 1 and t["suppressed_count"] == 1
+    assert t["latest"] == 5.5 and t["latest_at"] == "2024-01-01"
+    assert t["min"] == 5.5 and t["max"] == 5.5
+    assert t["slope_per_day"] is None                     # one surviving point
+
+
+def test_cli_trends_all_points_suppressed_still_discloses(ready, capsys):
+    """Silently shortening a clinical series to nothing is the one failure this must not
+    introduce: the empty branch still says how many points it excluded."""
+    _rule_row(ready, "lab_result", "test_name", "A1c")
+    _rule_row(ready, "lab_result", "test_name", "HbA1c")
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "no numeric results" in out
+    assert "(2 superseded/corrected point(s) excluded)" in out
+
+
+def test_cli_trends_without_verdicts_is_unchanged(ready, capsys):
+    """Additive-only: an unannotated database prints exactly what it always did."""
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG) == 0
+    out = capsys.readouterr().out
+    assert "(2 point(s))" in out
+    assert "excluded" not in out
+
+    assert _run(ready, "trends", "--person", "jane-doe", "--test", "hba1c",
+                *DICT_ARG, "--json") == 0
+    assert json.loads(capsys.readouterr().out)["suppressed_count"] == 0

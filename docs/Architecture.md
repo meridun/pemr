@@ -93,7 +93,9 @@ CREATE TABLE document (
   document_id   INTEGER PRIMARY KEY,
   sha256        TEXT UNIQUE NOT NULL,     -- content hash → dedup layer 1
   person_id     INTEGER REFERENCES person(person_id),
-  doc_date      TEXT,                     -- date the doc pertains to
+  doc_date      TEXT,                     -- date the doc pertains to; validated YYYY-MM-DD at
+                                           -- write (ingest and `document edit`, #200) - trimmed
+                                           -- whitespace/CR, refused otherwise
   category      TEXT,                     -- labs|imaging|visit-note|rx|vaccine|referral|billing
   provider      TEXT,
   source_path   TEXT NOT NULL,            -- sources/<hash>.<ext>
@@ -269,6 +271,15 @@ user-grown medical *vocabulary* and an identity lever (it feeds `dedup_key`), a 
 is fixed physics and a display lever. Correcting a genuinely mislabelled unit *in place*
 remains `record edit`'s job (above) — a different verb for a different problem.
 
+The registry holds **two populations** (issue #202). The convertible vitals dimensions
+(mass, length, temperature, pressure, rate, ratio), where two ids of one dimension convert
+into each other; and one **single-member `lab:<id>` dimension per lab unit** (`mg/dL`,
+`mmol/L`, `K/uL`, …), which exist only so that two *spellings* of one unit compare equal.
+No lab unit is ever convertible to another, and that is structural rather than a
+convention: `convert()` returns `None` across dimensions, so `U/L`→`IU/L`, `mEq/L`→`mmol/L`
+and `mg/dL`→`mg/L` cannot be folded by any future preference. Those equivalences are
+per-analyte facts (or need a molar mass), which a unit registry does not know.
+
 High-value typed tables (each carries `document_id` provenance + a `dedup_key`; migration
 005 added `dedup_base`/`dedup_occurrence` to every one of them — see the occurrence model
 in §3, omitted from the DDL below to keep the shapes readable):
@@ -306,6 +317,10 @@ CREATE TABLE medication (
                                           -- (AGENTS.md §MUST-9; prn/ordered are not lifecycle);
                                           -- a discontinue reason belongs in status_reason
   status_reason TEXT,                     -- verbatim discontinue reason; NULL = none stated
+                                          -- a renewal reason (query.med_end_is_renewal) means
+                                          -- ended_on closes an authorization period, not therapy:
+                                          -- read paths keep the row current and emit
+                                          -- "med-renewal" rather than "med-stop" (#159/#203)
   dedup_key     TEXT NOT NULL,
   UNIQUE(dedup_key)
 );
@@ -586,6 +601,28 @@ carries exist for exactly this population. A `--test` token matching numeric row
 *both* tables is **refused**, not merged: the same reasoning as the assay split, since a
 silently interleaved lab-and-vital series is a wrong chart even when the tokens coincide.
 `pemr labs` remains lab-only.
+
+With no preference set, the unit `trends` **reports** is the stored spelling when the
+series carries exactly one, and otherwise the shared canonical id when every spelling in
+the series resolves to the same one (issue #202) — so `mg/dL`/`mg/dl`/`MG/DL`, or `K/uL`
+and `Thousand/uL`, label as the one unit they are instead of reading as several. The
+comparison is on canonical ids, never on raw strings, and it is a **label** change only:
+no value is converted and `converted_count` stays 0. A series whose spellings resolve to
+different ids, or one carrying a spelling the registry cannot resolve, still reports no
+unit at all — a genuine scale mix must stay visibly unlabelled rather than be papered over.
+
+`trends` applies the **curation overlay before its statistics** (issue #197). A row a human
+ruled `superseded`/`erroneous-in-source`/`merged-into` leaves the series *before*
+`count`/`min`/`max`/`latest`/`latest_at`/`slope_per_day` are computed — it cannot be counted,
+cannot be reported as the current value, and cannot drag the slope. That is a harder rule than
+`query labs`', which stamps each row and lets each front door decide, and the reason is the
+return shape: `trends` returns aggregates, which carry no per-row verdict a programmatic caller
+could filter on, so the filter has to land in `query.trends()` itself where the CLI, `--json`
+and the MCP tool all inherit it. Suppression is disclosed, never silent — `suppressed_count`
+(and one CLI line) reports how many points left, the same disclose-don't-drop rule as
+`other_assays` and `unconverted_count`. The assay and unit disclosures are separate axes and
+are unaffected: `other_assays`/`other_assay_count` still count the suppressed sibling rows, so
+a ruled-out assay stays findable.
 
 **A dictionary edit is retroactive only if you make it so.** Stored keys are frozen at
 commit time, so a new synonym changes the key a *future* commit derives for a fact already
@@ -1238,6 +1275,8 @@ pemr review-conflicts [--resolve <id> --keep existing|incoming|both|merge
 pemr document list [--person <slug>]                     # newest first; omit --person for everyone
 pemr document show <id> [--json | --text]                # one document's detail; --text dumps stored ocr_text
 pemr document edit <id> [--doc-date|--category|--provider ...]   # partial update; "" clears a field
+                                                         # --doc-date validated YYYY-MM-DD (trimmed
+                                                         # whitespace/CR, refused if not ISO; #200)
 pemr document reassign <id> --person <slug> [--apply]    # move a misfiled document + records; dry run by default
 pemr document rm <id> [--apply] [--purge-blob] [--tombstone [--reason ...] [--note ...]]
                                                          # delete a document + records; dry run by default
@@ -1306,9 +1345,17 @@ pemr query meds --person jane --active [--raw]           # --active = query.med_
                                                          # a CCDA's "Discontinued (Reorder)") - a
                                                          # renewed prescription's end date closes an
                                                          # authorization period, not the therapy, so
-                                                         # it stays current and prints "(renewed)".
+                                                         # it stays current and prints "(renewed)",
+                                                         # keyed off query.med_end_is_renewal.
                                                          # Every other reason still ends the course
 pemr query timeline --person jane --since 2024-01-01 [--raw] # merged event stream
+                                                         # a medication whose end date is a renewal
+                                                         # (query.med_end_is_renewal - the one
+                                                         # predicate --active reads too) emits
+                                                         # "med-renewal" on that date instead of
+                                                         # "med-stop", so the active list and the
+                                                         # chronology cannot disagree about whether
+                                                         # the drug stopped (issue #203)
                                                          # all three (issue #131): filtered at read
                                                          # time against the curation overlay, same
                                                          # rule §6 describes for render - a suppressed
@@ -1352,6 +1399,12 @@ Invoke as `pemr <cmd>` (console script) or `python -m pemr <cmd>` (`pemr/__main_
 delegating to `cli.main`) — the latter is the portable fallback when the console-script
 launcher isn't generated (e.g. a system Python whose `Scripts`/launcher dir isn't writable
 under a PEP 660 editable install); see issue #22.
+
+Any argparse `help=` (or `usage=`) string built by interpolating data must double a literal
+`%` — `HelpFormatter._expand_help` (and `_format_usage`) treats the whole string as a
+`%`-format spec, so a bare `%` (e.g. the `%` ratio unit) raises `ValueError` at render time.
+`tests/test_cli_ascii.py::test_every_subparser_help_renders_and_is_console_safe` renders
+every subparser's help and guards against a repeat (issue #198).
 
 ### MCP tools (thin wrappers, same verbs) — implemented phase 5
 
@@ -1492,6 +1545,12 @@ regardless of suppression, so a programmatic caller can filter for itself. That 
 is now part of the `--json` **and MCP** read contract: its `dedup_base` is a breadcrumb (§2/§3),
 not a lookup key, since a dictionary `rekey` can move it out from under a stale reference — a
 consumer should key on `status`, not on it.
+
+`trends` is the fourth read verb on the overlay (issue #197), and the one that cannot offer
+that opt-out: a statistic has no per-row verdict to carry, so the appendix rows are filtered
+out inside `query.trends()` before any statistic sees them and every front door — CLI human
+output, `--json`, the MCP `trends` tool — reports the same filtered numbers plus a
+`suppressed_count` (§3).
 
 One consequence of the read-time join: if a dictionary-driven `rekey`
 (§3) has renamed a family since its verdict was recorded, a *family*-scoped verdict's join

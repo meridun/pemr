@@ -12,7 +12,7 @@
     "setup:hooks": "node scripts/setup-hooks.mjs",
     "check:hooks": "node scripts/setup-hooks.mjs --check",
     "prepare": "node scripts/setup-hooks.mjs",
-    "sdlc": "node scripts/sdlc.mjs",
+    "sdlc": "node sdlc/bindings/gh-issue/sdlc.mjs",
     "test": "node --test"
   }
 }

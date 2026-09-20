@@ -68,6 +68,7 @@ from . import db, study as _study, tombstones as _tombstones
 from .documents import (
     TEXT_SOURCE_ATTACHED,
     TEXT_SOURCE_ENGINE,
+    normalize_doc_date,
     normalize_document_text,
     set_document_text,
 )
@@ -1518,8 +1519,20 @@ def ingest_document(
     written, so a refused ingest is a clean no-op and ``force=True`` is the whole
     recovery. The verdict rides back on :attr:`IngestResult.owner_check` so callers
     report it without a second pass.
+
+    ``doc_date`` is normalised (and refused if it is not ``YYYY-MM-DD``) before the file
+    is hashed or copied, so a bad flag leaves no blob and no row — issue #200.
     """
     db.require_migrated(conn)
+
+    # First thing, ahead of every side effect: `documents.normalize_doc_date` is the
+    # single definition of what `document.doc_date` may hold, and a refusal here costs
+    # nothing. Re-raised as IngestError so `cli._cmd_ingest` and the MCP surface map it
+    # the way they map every other ingest refusal.
+    try:
+        doc_date = normalize_doc_date(doc_date)
+    except ValueError as exc:
+        raise IngestError(str(exc)) from exc
 
     src = Path(file_path)
     if src.is_dir():
@@ -1679,8 +1692,17 @@ def ingest_study_dir(
     ``StudyDescription`` like "PATIENT POSITIONING" tripped the identity anchor —
     a spurious refusal of a study nobody could fix without ``force``. The refusal
     point is pre-write **and** pre-pack, so a refused study costs nothing.
+
+    ``doc_date`` is normalised as on the file path (issue #200) — pre-pack, so a bad
+    flag never costs the archive. The derived ``metadata.study_date`` fallback needs no
+    check: `study._iso_date` already yields an ISO date or None.
     """
     db.require_migrated(conn)
+
+    try:
+        doc_date = normalize_doc_date(doc_date)
+    except ValueError as exc:
+        raise IngestError(str(exc)) from exc
 
     if study not in _study.STUDY_KINDS:
         raise IngestError(

@@ -30,7 +30,7 @@ import re
 import sqlite3
 from datetime import date, datetime
 
-from . import db, units
+from . import curation, db, units
 from .dedup import OBS_VITAL, enum_token, key_token, norm
 
 # Word tokens for a safe FTS5 query: strips punctuation/operators so raw user input
@@ -99,6 +99,23 @@ def _end_of_period(value: object) -> date | None:
         return None
 
 
+def med_end_is_renewal(row: sqlite3.Row | dict) -> bool:
+    """True when this row's ``ended_on`` closes an **authorization period**, not therapy.
+
+    The single reading of :data:`RENEWAL_MED_REASONS` in the codebase (issue #203). Both
+    read paths that care — :func:`med_is_current`, which keeps such a course on the
+    active list, and :func:`query_timeline`, which must not call it *stopped* — consult
+    this one predicate, so they cannot drift apart again: before #203 the timeline
+    derived ``med-stop`` from ``ended_on`` alone, and the same row read as current in one
+    view and stopped in the other.
+
+    The set stays **closed by design** (see its comment); #203 does not widen it. Access
+    goes through :func:`_row_get` so a pre-014 snapshot or a hand-built dict without the
+    column reads as "no reason" rather than raising.
+    """
+    return enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS
+
+
 def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> bool:
     """True when a medication is still current: the course hasn't ended and no terminal
     status ended it.
@@ -131,7 +148,7 @@ def med_is_current(row: sqlite3.Row | dict, *, now: datetime | None = None) -> b
     """
     status = str(_row_get(row, "status") or "").strip().lower()
     ended_on = _row_get(row, "ended_on")
-    if enum_token(_row_get(row, "status_reason")) in RENEWAL_MED_REASONS:
+    if med_end_is_renewal(row):
         return True
     if ended_on:
         end = _end_of_period(ended_on)
@@ -245,6 +262,10 @@ def query_timeline(
     provenance. Medications contribute up to two events (start and, if ended, stop), and
     so do conditions (``onset_on`` -> ``condition``, ``resolved_on`` ->
     ``condition-resolved``); family-history rows contribute none.
+    A medication whose end date is a **renewal** (:func:`med_end_is_renewal`) emits
+    ``med-renewal`` instead of ``med-stop`` (issue #203): that date closes an
+    authorization period, so the one predicate :func:`med_is_current` reads decides here
+    too and the two views can no longer disagree about whether the drug was stopped.
     Events without a usable date are omitted (they cannot be placed on a timeline).
     ``since`` (a date) drops events strictly before it. Ordered oldest first.
 
@@ -335,7 +356,16 @@ def query_timeline(
     ).fetchall():
         dose = f" {r['dose']}" if r["dose"] else ""
         add(r["started_on"], "med-start", f"started {r['name']}{dose}", r, "medication")
-        add(r["ended_on"], "med-stop", f"stopped {r['name']}", r, "medication")
+        # A renewal's end date ends an authorization period, not the therapy (#159), so
+        # calling it a stop contradicts `med_is_current` on the very same row (#203).
+        # The date is still worth showing - a renewal chain is legible only if each
+        # link is visible - so it becomes a distinct, non-terminal event rather than
+        # nothing at all.
+        if med_end_is_renewal(r):
+            add(r["ended_on"], "med-renewal",
+                f"renewed {r['name']} (authorization period ended)", r, "medication")
+        else:
+            add(r["ended_on"], "med-stop", f"stopped {r['name']}", r, "medication")
 
     for r in conn.execute(
         "SELECT * FROM procedure WHERE person_id = ?", (person_id,)
@@ -463,48 +493,80 @@ def _ordinal(value: object) -> int | None:
 
 def _series_candidates(
     conn: sqlite3.Connection, person_id: int
-) -> list[tuple[str, list[sqlite3.Row]]]:
+) -> list[tuple[str, list[dict]]]:
     """Every numeric measurement of one person, per source, in one row shape.
 
-    Returns ``[("lab_result", rows), ("observation", rows)]``. Both SELECTs alias their
-    table into ``(row_id, value_num, unit, at, label)`` — ``observed_at`` standing in for
-    ``collected_at`` and ``key`` for ``test_name`` — so the matching, the ``other_assays``
-    disclosure and every statistic below read a vital exactly like a lab result, with no
-    per-source branch (issue #176).
+    Returns ``[("lab_result", rows), ("observation", rows)]``, each row a plain ``dict``
+    so the curation overlay can stamp it (:func:`curation.annotate_rows` needs ``.get()``
+    and a mutable carrier). The source tag doubles as the curation ``record_type``.
+
+    Both SELECTs alias their table into ``(row_id, value_num, unit, at, label)`` —
+    ``observed_at`` standing in for ``collected_at`` and ``key`` for ``test_name`` — so
+    the matching, the ``other_assays`` disclosure and every statistic below read a vital
+    exactly like a lab result, with no per-source branch (issue #176). They also carry
+    ``dedup_base`` and the source's own primary key under its real name, which is what
+    :meth:`curation.VerdictMap.for_row` resolves a row-scoped verdict through: a
+    projection missing either would silently degrade to family scope (issue #197).
 
     Ordering is load-bearing: ``matched[-1]`` is the latest point and ties break on the
     greatest row id (most-recently-ingested wins), which holds for vitals only because
     the vitals SELECT sorts the same way.
     """
     labs = conn.execute(
-        "SELECT lab_result_id AS row_id, value_num, unit, collected_at AS at, "
+        "SELECT lab_result_id AS row_id, lab_result_id, dedup_base, "
+        "value_num, unit, collected_at AS at, "
         "test_name AS label FROM lab_result "
         "WHERE person_id = ? AND value_num IS NOT NULL "
         "ORDER BY collected_at, lab_result_id",
         (person_id,),
     ).fetchall()
     vitals = conn.execute(
-        "SELECT observation_id AS row_id, value_num, unit, observed_at AS at, "
+        "SELECT observation_id AS row_id, observation_id, dedup_base, "
+        "value_num, unit, observed_at AS at, "
         "key AS label FROM observation "
         "WHERE person_id = ? AND obs_type = ? AND value_num IS NOT NULL "
         "ORDER BY observed_at, observation_id",
         (person_id, OBS_VITAL),
     ).fetchall()
-    return [("lab_result", labs), ("observation", vitals)]
+    return [
+        ("lab_result", [dict(r) for r in labs]),
+        ("observation", [dict(r) for r in vitals]),
+    ]
+
+
+def _live_series(
+    rows: list[dict], record_type: str, verdicts: curation.VerdictMap
+) -> tuple[list[dict], int]:
+    """Split a matched series into ``(survivors, suppressed_count)`` via the overlay.
+
+    ``trends`` returns aggregate statistics rather than rows, so there is no per-row
+    disclosure channel a programmatic caller could filter for itself — a suppressed row
+    has to be gone *before* the aggregation, exactly as ``render._apply_curation`` drops
+    one before any latest-wins or grouping logic (issue #197). The count comes back so
+    the suppression is disclosed, never silent.
+
+    Owns no verdict-resolution logic of its own: precedence stays in
+    :meth:`curation.VerdictMap.for_row` and the appendix vocabulary stays in
+    :data:`curation.APPENDIX_STATUSES`. Relative order is preserved, which is what keeps
+    the SELECTs' latest-wins ordering valid afterwards.
+    """
+    curation.annotate_rows(rows, record_type, verdicts)
+    survivors = [r for r in rows if not curation.is_appendix(r)]
+    return survivors, len(rows) - len(survivors)
 
 
 def _match_series(
-    rows: list[sqlite3.Row],
+    rows: list[dict],
     target: str,
     family: str,
     dictionary: dict[str, str] | None,
-) -> tuple[list[sqlite3.Row], str, dict[str, int]]:
+) -> tuple[list[dict], str, dict[str, int]]:
     """Split one source's candidate rows into ``(matched, matched_token, others)``.
 
     ``matched`` is the key-token series; ``others`` counts the same-family rows a
     differing qualifier excluded, which are disclosed rather than dropped (issue #71).
     """
-    matched: list[sqlite3.Row] = []
+    matched: list[dict] = []
     others: dict[str, int] = {}
     matched_token = ""
     for r in rows:
@@ -545,13 +607,13 @@ def trends(
 
     Returns ``{test, count, unit, min, max, latest, latest_at, latest_tie,
     slope_per_day, other_assays, other_assay_count, canonical_unit, converted_count,
-    unconverted_count}`` — one contract, no source field and no vitals branch, so a
-    vitals series is shape-identical to a lab one. ``count`` is the number of
-    numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two distinct
-    dates. ``latest`` is the row with the greatest timestamp (``collected_at`` for a lab,
-    ``observed_at`` for a vital, which is nullable by design and sorts first), ties broken
-    by the greatest row id (most-recently-ingested wins); ``latest_tie`` counts how many
-    matched rows share that exact timestamp.
+    unconverted_count, suppressed_count}`` — one contract, no source field and no vitals
+    branch, so a vitals series is shape-identical to a lab one. ``count`` is the number
+    of numeric points; ``slope_per_day`` degrades to ``None`` with fewer than two
+    distinct dates. ``latest`` is the row with the greatest timestamp (``collected_at``
+    for a lab, ``observed_at`` for a vital, which is nullable by design and sorts first),
+    ties broken by the greatest row id (most-recently-ingested wins); ``latest_tie``
+    counts how many matched rows share that exact timestamp.
 
     A key token matching numeric rows in **both** tables raises
     :class:`AmbiguousTestError` rather than merging them: same #71 reasoning as the assay
@@ -575,6 +637,25 @@ def trends(
     via ``unconverted_count``, never dropped — the ``other_assays`` rule — and
     ``result["unit"]`` then falls back rather than labelling the series with a unit some
     of it is not in.
+
+    With no preference in play the reported ``unit`` is the stored spelling when the
+    series carries exactly one, and otherwise the shared canonical id when every
+    spelling resolves to the same one (issue #202) - so ``mg/dL``, ``mg/dl`` and
+    ``MG/DL`` label as one unit, and so do ``K/uL`` and ``Thousand/uL``. A genuine scale
+    mix (``mg/dL`` with ``mg/L``), or any spelling the registry cannot resolve, still
+    reports ``None``: no number moves either way, only the label.
+
+    The **curation overlay** applies to the series too (issue #197), and applies
+    *before* any statistic is computed: a row a human ruled superseded, erroneous or
+    merged-into (:data:`curation.APPENDIX_STATUSES`, resolved per row through
+    :meth:`curation.VerdictMap.for_row`, so a row verdict beats its family's) is not
+    counted, cannot win ``latest``/``latest_at`` and cannot drag ``slope_per_day``.
+    ``query labs`` stamps each row and lets its front doors decide, because a row can
+    carry its own verdict; a statistic cannot, which is why the filter lands here rather
+    than at the callers. Nothing is silently shortened: ``suppressed_count`` reports how
+    many matched points left the series — the ``other_assays`` disclose-don't-drop rule.
+    ``other_assays``/``other_assay_count`` are a different disclosure axis and are
+    computed over the unfiltered rows, so a suppressed sibling assay stays findable.
     """
     person_id = resolve_person_id(conn, slug)
     target = _loose(key_token(test, dictionary))
@@ -584,22 +665,34 @@ def trends(
     canonical = {_loose(k): v for k, v in units.load_prefs(conn, person_id).items()}.get(
         target
     )
-    matched: list[sqlite3.Row] = []
+    verdicts = curation.load_verdicts(conn)
+    matched: list[dict] = []
     others: dict[str, int] = {}
     matched_token = ""
+    suppressed = 0
     hits: dict[str, int] = {}
     for source, rows in _series_candidates(conn, person_id):
         source_matched, source_token, source_others = _match_series(
             rows, target, family, dictionary
         )
+        # The curation overlay, before any statistic sees the series (issue #197).
+        # `others` stays computed over the unfiltered candidates on purpose: the
+        # same-analyte-different-assay disclosure is a separate axis from curation.
+        source_matched, source_suppressed = _live_series(
+            source_matched, source, verdicts
+        )
+        suppressed += source_suppressed
         # One disclosure rule, not a per-source branch: a same-family sibling is reported
         # wherever it lives, and its token pastes back as `--test` and finds it.
         for token, count in source_others.items():
             others[token] = others.get(token, 0) + count
+        # Hoisted above the `if`: a series whose every point is suppressed still echoes
+        # its stored spelling. Inert otherwise -- `source_token` is "" when nothing
+        # matched at all.
+        matched_token = matched_token or source_token
         if source_matched:
             hits[source] = len(source_matched)
             matched = source_matched
-            matched_token = matched_token or source_token
     if len(hits) > 1:
         # ASCII only: this reaches a cp1252/cp437 console (see `units` on the same rule).
         raise AmbiguousTestError(
@@ -627,6 +720,9 @@ def trends(
         "canonical_unit": canonical,
         "converted_count": 0,
         "unconverted_count": 0,
+        # Curation disclosure (issue #197): how many matched points the overlay sent to
+        # the appendix. 0 for an unannotated database, which is every pre-008 caller.
+        "suppressed_count": suppressed,
     }
     if not matched:
         return result
@@ -646,9 +742,21 @@ def trends(
         result["unit"] = canonical
     else:
         # Today's rule, over the units actually displayed (identical to the stored ones
-        # whenever no preference applied).
+        # whenever no preference applied): one spelling, report it verbatim.
         seen = {d.unit for d in shown if d.unit}
-        result["unit"] = next(iter(seen)) if len(seen) == 1 else None
+        if len(seen) == 1:
+            result["unit"] = next(iter(seen))
+        else:
+            # Several spellings (issue #202): they may still be one unit. Compare
+            # canonical ids, never the raw strings. A spelling the registry cannot
+            # resolve anywhere in the series forces `None` -- a genuine scale mix
+            # (`mg/dL` with `mg/L`) must keep rendering unlabelled rather than be
+            # papered over, and lab ids are single-member dimensions precisely so that
+            # no two of them can ever collapse into one id here.
+            ids = {units.canonical_unit(u) for u in seen}
+            result["unit"] = (
+                next(iter(ids)) if len(ids) == 1 and None not in ids else None
+            )
     result["min"] = min(values)
     result["max"] = max(values)
     latest = matched[-1]  # rows came back ORDER BY <timestamp>, <row id>

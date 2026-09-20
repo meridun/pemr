@@ -4,6 +4,7 @@ or crashes with UnicodeEncodeError. Mirrors the phase-4 lesson guarded by
 ``test_query.py::test_timeline_summaries_are_ascii_safe`` for query output.
 """
 
+import argparse
 import json
 
 import pytest
@@ -315,3 +316,32 @@ def test_render_journal_help_is_console_safe(ready, capsys):
     assert "--include-self-reported" in out
     assert "excluded by default" in out
     _assert_console_safe(out)
+
+
+def _walk_parsers(parser, path=()):
+    """Every node of the parser tree, as ``(command path, parser)`` pairs."""
+    yield path, parser
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, sub in action.choices.items():
+                yield from _walk_parsers(sub, (*path, name))
+
+
+def test_every_subparser_help_renders_and_is_console_safe():
+    """Issue #198: a literal `%` in an argparse `help=` string crashes every
+    help/usage render of that parser (``HelpFormatter._expand_help`` does
+    ``help % params``). Sweeping the whole tree also extends the issue #23 cp437
+    guarantee to help text nobody calls `--help` on in a test."""
+    failures = []
+    for path, parser in _walk_parsers(cli.build_parser()):
+        command = " ".join(("pemr", *path))
+        try:
+            rendered = parser.format_help()
+        except Exception as exc:  # noqa: BLE001 - report every offender at once
+            failures.append(f"{command}: {type(exc).__name__}: {exc}")
+            continue
+        try:
+            _assert_console_safe(rendered)
+        except (AssertionError, UnicodeEncodeError) as exc:
+            failures.append(f"{command}: not console-safe: {exc}")
+    assert not failures, "help render failures:\n" + "\n".join(failures)

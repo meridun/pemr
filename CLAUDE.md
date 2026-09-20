@@ -27,5 +27,5 @@ reads once `graphify-out/graph.json` exists.
 
 ## Token wrappers
 
-If you wire up `vtk` (see `docs/Development_TokenTools.md`), document the routing rule here so
-Claude Code bash sessions know which commands are wrapped and which to prefix explicitly.
+The routing rule lives in the `## Token wrappers` section of the shared instructions above; if
+this machine has no `vtk` on `PATH` (or `vtk hooks verify` fails), commands simply run unwrapped.

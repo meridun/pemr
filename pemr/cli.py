@@ -2771,6 +2771,20 @@ def _verdict_suffix(carrier: dict, *, raw: bool = False) -> str:
     return ""
 
 
+def _med_status_suffix(row: dict) -> str:
+    """The ``[status: reason]`` bracket a listed medication line carries.
+
+    One named suffix builder beside :func:`_verdict_suffix`, for the same reason: the
+    format is written once (issue #203). ``[discontinued: Reorder]`` when the row stores
+    a reason (issue #159 put the CCDA discontinue reason in ``status_reason``, and a line
+    that prints an ``ended_on`` has to disclose when that date only closes an
+    authorization period); ``[discontinued]`` with a status alone; and ``""`` when
+    neither is present — no empty bracket, no stray separator.
+    """
+    bits = [str(b) for b in (row["status"], row.get("status_reason")) if b]
+    return f"  [{': '.join(bits)}]" if bits else ""
+
+
 def _visible(carriers: list[dict], *, raw: bool) -> list[dict]:
     """The carriers a human-readable listing prints: everything under ``--raw``, else
     everything the curation overlay has not sent to the appendix."""
@@ -2842,15 +2856,17 @@ def _cmd_query_meds(args: argparse.Namespace) -> int:
             if r["ended_on"]:
                 # A renewal's end date closes an authorization period, not the therapy
                 # (issue #159) - mark it, so a row that appears under --active does not
-                # read as flatly ended.
-                end = f" -> {r['ended_on']}" + (" (renewed)" if current else "")
+                # read as flatly ended. Keyed off the renewal predicate itself, not off
+                # `current` (issue #203): a status='active' row with a future ended_on
+                # is current too, but nothing about it was renewed.
+                renewed = " (renewed)" if query.med_end_is_renewal(r) else ""
+                end = f" -> {r['ended_on']}{renewed}"
             elif current:
                 end = " -> (current)"
             else:  # terminal status but no explicit end date (issue #21)
                 end = " -> (ended)"
             span = _fmt(r["started_on"]) + end
-            bits = [str(b) for b in (r["status"], r.get("status_reason")) if b]
-            status = f"  [{': '.join(bits)}]" if bits else ""
+            status = _med_status_suffix(r)
             print(f"{r['name']:24}{dose}{freq}  {span}{status}"
                   f"{_verdict_suffix(r, raw=args.raw)}")
         if hidden:
@@ -2947,6 +2963,20 @@ def _print_unit_notes(result: dict) -> None:
         )
 
 
+def _print_suppressed(result: dict) -> None:
+    """Disclose the points the curation overlay kept out of a `trends` series (#197).
+
+    A series `trends` silently shortened would be the failure the overlay exists to
+    prevent in the other direction, so the count is printed whenever anything was
+    excluded -- **including** when everything was, alongside the "no numeric results"
+    line. Same rule as :func:`_hidden_note` and :func:`_print_other_assays`; ASCII only,
+    because this reaches a cp1252/cp437 console."""
+    excluded = result.get("suppressed_count", 0)
+    if not excluded:
+        return
+    print(f"  ({excluded} superseded/corrected point(s) excluded)")
+
+
 def _cmd_trends(args: argparse.Namespace) -> int:
     def work(conn):
         dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
@@ -2956,10 +2986,14 @@ def _cmd_trends(args: argparse.Namespace) -> int:
             return 0
         if result["count"] == 0:
             print(f"no numeric results for '{result['test']}'")
+            _print_suppressed(result)
             _print_other_assays(result)
             return 0
         unit = f" {result['unit']}" if result["unit"] else ""
         print(f"{result['test']}  ({result['count']} point(s))")
+        # Directly under the count it qualifies -- a shortened series must never read
+        # as the whole of it.
+        _print_suppressed(result)
         print(f"  min    {_fmt(result['min'])}{unit}")
         print(f"  max    {_fmt(result['max'])}{unit}")
         tie = result.get("latest_tie", 0)
@@ -3362,9 +3396,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--key", required=True,
         help="measurement key or analyte, e.g. weight, temperature, A1c",
     )
+    # argparse's HelpFormatter._expand_help does `help % params`, so a literal `%`
+    # in help text must be doubled or any help/usage render raises (issue #198 - the
+    # ratio unit `%` is one of the ids this list interpolates).
+    # Lab unit ids (issue #202) are excluded by name: the full list is ~4x longer than
+    # this help line should be, and an unknown `--unit` still prints every id.
+    _unit_ids = ", ".join(
+        u.replace("%", "%%") for u in units.known_units(include_lab=False)
+    )
     up_set.add_argument(
         "--unit", required=True,
-        help=f"canonical unit: {', '.join(units.known_units())}",
+        help=f"canonical unit: {_unit_ids}; lab unit ids (mg/dL, mmol/L, K/uL, ...) "
+             "are accepted too - an unknown unit prints the full list",
     )
     up_set.add_argument("--dictionary", help="synonym dictionary TOML (key resolution)")
     up_set.set_defaults(func=_cmd_person_unit_pref_set)

@@ -336,6 +336,16 @@ def test_cli_unit_pref_unknown_unit_names_the_known_ones_and_writes_nothing(
     assert "no display units set" in capsys.readouterr().out
 
 
+def test_cli_unit_pref_set_accepts_a_lab_unit(roster, capsys):
+    """Issue #202: a lab unit id is a legal preference, not just a vitals one."""
+    assert _run(roster, "person", "unit-pref", "set", "jane", "--key", "creatinine",
+                "--unit", "mg/dL") == 0
+    capsys.readouterr()
+    assert _run(roster, "person", "unit-pref", "list", "jane", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [(r["key"], r["unit"]) for r in payload] == [("creatinine", "mg/dL")]
+
+
 def test_cli_unit_pref_unknown_slug_fails(roster, capsys):
     assert _run(roster, "person", "unit-pref", "set", "nobody", "--key", "weight",
                 "--unit", "lb") == 1
@@ -347,3 +357,27 @@ def test_cli_unit_pref_unknown_slug_fails(roster, capsys):
 def test_cli_unit_pref_clear_of_an_unset_key_is_not_an_error(roster, capsys):
     assert _run(roster, "person", "unit-pref", "clear", "jane", "--key", "weight") == 0
     assert "no display unit was set for weight" in capsys.readouterr().out
+
+
+def test_cli_unit_pref_set_help_renders(roster, capsys):
+    """Issue #198: argparse expands `%` in help text, and the `--unit` list carries
+    the ratio unit `%`, so an unescaped one crashed every help/usage render here."""
+    with pytest.raises(SystemExit) as exc:
+        _run(roster, "person", "unit-pref", "set", "--help")
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "canonical unit:" in out
+    # `%%` in the source renders back as a single `%` - assert on the rendered text.
+    assert "%" in out and "%%" not in out
+    assert "lb" in out and "degC" in out
+    assert out.isascii()
+    # Issue #202: the ~40 lab ids stay out of the enumerated list (it would be
+    # unreadable), and the help says so rather than pretending they are illegal.
+    assert "mOsm/kg" not in out and "uIU/mL" not in out
+    assert "lab unit ids" in out
+
+    # The usage-error path runs the same help formatter.
+    with pytest.raises(SystemExit) as exc:
+        _run(roster, "person", "unit-pref", "set", "jane")
+    assert exc.value.code == 2
+    assert "--key" in capsys.readouterr().err

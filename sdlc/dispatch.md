@@ -4,13 +4,15 @@
 (reap stale locks only), machine-locked git + worktree maintenance, then one `<WORKER_AGENT>`
 subagent per non-empty lane. It never works an issue itself. There is **no dispatcher singleton**:
 any number of dispatch runs — different machines, or overlapping scheduled/manual runs on one
-machine — may execute concurrently. Locking is per-issue (claim comments, see
-[`README.md`](README.md)) plus a per-machine maintenance lock; every GitHub-side write here is
+machine — may execute concurrently. Locking is per-issue (the binding's claim record, see
+[`README.md`](README.md)) plus a per-machine maintenance lock; every tracker-side write here is
 idempotent. A fresh per-issue lock only removes that one issue from eligibility, never aborts the
 run.
 
 This file is the canonical, reviewable copy; the scheduled task is a thin pointer that reads it and
-executes one pass.
+executes one pass. Tracker and code-host operations are named in backticks (`snapshot`,
+`lock-age`, `reap`, …) and performed per `bindings/<BINDING>/BINDING.md`; the git-side steps are
+runtime, not binding, and are spelled out here.
 
 > **Session orchestration layers.** If the session carries a user-level orchestration policy (e.g.
 > pilotfish's `## Orchestration` block in `~/.claude/CLAUDE.md`), this prompt's topology and model
@@ -33,17 +35,19 @@ You are the SDLC pipeline dispatcher for the `<PROJECT>` project.
 Repository (local working directory): `<REPO_PATH>`
 
 Run ONE dispatch cycle: machine maintenance lock, per-issue wip gate (reap stale locks), git +
-worktree maintenance, a stage-label integrity check, then each stage worker at most once — intake,
+worktree maintenance, a stage-marker integrity check, then each stage worker at most once — intake,
 design, build, verify, audit, ship
 (`stage:queued` has no worker; it is the human throttle). Each worker runs as an ISOLATED subagent
 (Agent tool, `subagent_type: <WORKER_AGENT>` — deliberately has no Agent tool, so workers cannot
-delegate): workers share no context with you or with each other; the GitHub issue thread is the only
-state that carries between stages. Never work an issue yourself.
+delegate): workers share no context with you or with each other; the issue's evidence record is
+the only state that carries between stages. Never work an issue yourself. Read `PROFILE.md` and
+`bindings/<BINDING>/BINDING.md` first — they resolve every `<KEY>` and every backticked operation
+below.
 
 Mint a **run-id** for this cycle (e.g. `dispatch-<yyyymmdd-hhmm>-<4 random hex>`) and pass it to
-every worker; workers use it in their claim comments.
+every worker; workers use it in their claims.
 
-> If `<TOKEN_TOOL>` is set for this project, prefix every git/gh command with it (it compacts output
+> If `<TOKEN_TOOL>` is set for this project, prefix every git/tracker command with it (it compacts output
 > when it has a matching filter and passes through unchanged otherwise). Otherwise ignore.
 
 ### Step -1 — Concurrency model + machine maintenance lock
@@ -51,11 +55,10 @@ every worker; workers use it in their claim comments.
 There is **no dispatcher singleton and no global lock.** Concurrent dispatch runs are expected and
 safe under three rules:
 
-1. **Per-issue state is optimistically locked** by worker claims (README universal loop, CLAIM
-   step 3) — this works identically across machines because the issue tracker is the shared store.
-2. **Every GitHub-side write in this prompt is idempotent and verify-before-write.** Label changes
-   converge (labels are sets — applying the same change twice yields the same state); comments are
-   run-id-tagged (a duplicate is attributable noise, never damage); and any write whose
+1. **Per-issue state is optimistically locked** by worker claims (README universal loop, CLAIM) — this works identically across machines because the issue tracker is the shared store.
+2. **Every tracker-side write in this prompt is idempotent and verify-before-write.** Marker
+   changes converge (the binding guarantees set semantics — applying the same change twice yields
+   the same state); comments are run-id-tagged (a duplicate is attributable noise, never damage); and any write whose
    precondition came from the Step 0 snapshot re-checks that precondition against live data
    immediately before writing. Losing a race is never an error — record it and move on.
 3. **Machine-local maintenance (Step 0a) is serialized per machine** by a filesystem lock. Two runs
@@ -82,14 +85,13 @@ safe under three rules:
 - **Never abort the cycle over this lock.** Whatever its outcome, proceed to Step 0 and per-lane
   dispatch; only Step 0a is conditional on holding it.
 
-If your repo carries the reference CLI (`scripts/sdlc.mjs`, see `docs/Development_SdlcAdoption.md`), the protocol is
-one command each way: `node scripts/sdlc.mjs maint-lock <run-id>` (exit 1 = held; skip Step 0a) and
-`node scripts/sdlc.mjs maint-release <run-id>`.
+Where the binding's deterministic core provides it (gh-issue: `sdlc maint-lock <run-id>`, exit 1
+= held; `sdlc maint-release <run-id>`), the protocol is one command each way.
 
-**`cycle-prep` — the whole pre-dispatch sequence in one shot.** Where the reference CLI provides
+**`cycle-prep` — the whole pre-dispatch sequence in one shot.** Where the binding's core provides
 it, the fixed, zero-judgment sequence of Steps -1/0/0a (mint → maint-lock → lanes → gate --reap →
-sweep → git-maint → worktree-sweep → conflict-scan → maint-release) collapses into **one
-command**: `node scripts/sdlc.mjs cycle-prep --apply`. It mints the run-id internally and prints it
+deps → sweep → git-maint → worktree-sweep → conflict-scan → maint-release) collapses into **one
+command** (gh-issue: `sdlc cycle-prep --apply`). It mints the run-id internally and prints it
 verbatim on a `run-id: <id>` line — capture that line as the cycle's **single source of truth** —
 plus a `started: <iso>` line for the digest's wall-clock duration, and emits one delimited,
 sectioned report (`=== <section> ===` headers). **Read Steps 0/0a's results from that report;
@@ -105,33 +107,59 @@ checkout.
 
 ### Step 0 — Snapshot + per-issue wip gate
 
-Take ONE issue snapshot that serves the whole cycle:
-`gh issue list --state open --json number,labels,createdAt --limit 200`
-From it compute locally: `sdlc:wip` items, per-lane depths, the `sdlc:needs-human` / `sdlc:hold`
-lists, each lane's candidate list for the worker prompts (per-lane dispatch step 2 — `createdAt`
-is what workers FIFO-order candidates by), and each open issue's `stage:*` label count (Step 0b).
-With the reference CLI, the `=== lanes ===` section of the `cycle-prep` report carries all of
-this: per-lane depths, CLAIM-ordered eligibility (with a `(hold N, needs-human N, wip N)`
-ineligibility breakdown when a lane's depth exceeds its eligible count — so a snapshot bug is
-distinguishable from expected ineligibility), and the ≠1-stage-label list.
+Take ONE `snapshot` that serves the whole cycle. From it compute locally: `sdlc:wip` items,
+per-lane depths, the `sdlc:needs-human` / `sdlc:hold` lists, each lane's candidate list for the
+worker prompts (per-lane dispatch step 2 — created-at is what workers FIFO-order candidates by),
+and each open issue's `stage:*` marker count (Step 0b). With the binding's core, one report
+carries all of this (gh-issue: the `=== lanes ===` section of `cycle-prep`): per-lane depths,
+CLAIM-ordered eligibility (with a `(hold N, needs-human N, wip N, blocked N)` ineligibility
+breakdown when a lane's depth exceeds its eligible count — so a snapshot bug is distinguishable
+from expected ineligibility), a `blocked (open blockers): #c ← #a, #b` line naming each blocked
+item's open blockers, and the ≠1-stage-marker list.
 
-For each `sdlc:wip` item, fetch its most recent `sdlc:claim` comment (that comment's timestamp and
-run-id are the lock's age and owner — do NOT use `updatedAt`, which any comment resets):
+**Blocking is read from the tracker's dependency edges (`dep-read`), never from markers or
+prose.** An issue with any **OPEN** blocker is ineligible in every lane this cycle — leave it out
+of the candidate list exactly like a wip or parked item. The check is re-evaluated from live edge
+state every cycle, so a blocker whose PR merged (or that a human closed) unblocks its dependents
+on the next cycle automatically; no sweep, window or ack is involved in gating. If the edge query
+fails (the binding's report says so — gh-issue: `deps: edge query FAILED … blocked gate NOT
+applied`), the cycle degrades to the marker-only gate: record it in the digest and don't spawn
+`stage:build`+ workers for items whose record names an unmerged blocker until the next cycle can
+read edges again.
+
+**Prose declarations → edges, every cycle (`dep-migrate`, optional).** Where the binding's core
+offers it (gh-issue: `sdlc deps --migrate --apply`, part of `cycle-prep --apply` as the
+`=== deps-migrate ===` section; dry run without `--apply`), this op converts line-leading
+`Depends on #n` / `Blocked by #n` / `**Dependencies:** …` lines in open-issue records into
+blocked-by edges, so an issue filed between cycles with prose dependencies is gated from its
+first cycle rather than waiting for intake to convert it. Idempotent (an existing edge is
+skipped); a reference the tracker can't resolve is logged as `skipped` and stays prose. It runs
+*before* `readiness-derive` so a freshly created edge gets its `blocked` marker the same cycle.
+
+**Derived readiness markers + lint (`readiness-derive`, optional).** Where the binding keeps
+`blocked` / `ready` markers, this op rewrites them *from* edge state each cycle — open blocker →
+`blocked`; edges all closed → `ready` — so humans keep a readable readiness column the machine
+never trusts. Its `LINT` lines go in the digest verbatim: `label-only-blocked` (a `blocked`
+marker with no edge — a stale marker or an unlinkable block that must be `sdlc:hold` + prose; a
+human picks) and `cycle` (a dependency cycle among open issues — nothing in it can ever become
+eligible until a human cuts an edge). Auto-repair covers only the unambiguous marker cases; the
+lint is never repaired by automation.
+
+For each `sdlc:wip` item, `lock-age` gives the lock's owner and age from **server-side
+evidence** (the binding says which — never a whole-item modified stamp, which any edit resets):
 
 - **Claim younger than 2 hours → live worker.** Leave it; the issue is simply ineligible this cycle.
   Do not abort the run.
-- **Bare label with no claim comment:** age is the `labeled` event timestamp from the issue
-  timeline (`gh api repos/<owner>/<repo>/issues/<n>/timeline`), NOT the snapshot's `updatedAt`. If
-  the event can't be found, leave the item and record it — never reap on unprovable age.
-- **Claim (or bare label) older than 2 hours → reap, verify-before-write.** The snapshot may be
-  stale under concurrent dispatchers: another run may have already reaped this issue and a new
-  worker claimed it since. So immediately before writing, re-fetch the issue's newest `sdlc:claim`
-  comment and recompute the age. Still ≥2h → remove `sdlc:wip`, leave every other label untouched
-  (the item re-enters its lane), and comment:
-  `sdlc-dispatch: reaped stale sdlc:wip lock owned by <run-id or "unknown"> (no activity ≥2h —
-  worker presumed dead). Item re-enters its lane.` Fresh claim appeared → leave it, record
-  `reap skipped — fresh claim by <run-id>`. Leave the issue's worktree in place — the next worker
-  reuses it (build's CONTINUE case depends on this).
+- **Unprovable age** (the binding can find no server-side record of when the lock was taken) →
+  leave the item and record it — never reap on unprovable age.
+- **Claim older than 2 hours → `reap`, verify-before-write.** The snapshot may be stale under
+  concurrent dispatchers: another run may have already reaped this issue and a new worker claimed
+  it since. So immediately before writing, re-run `lock-age` against live data. Still ≥2h →
+  remove `sdlc:wip`, leave every other marker untouched (the item re-enters its lane), and record
+  the reap on the issue in the binding's form (owner run-id or "unknown", the ≥2h finding, "item
+  re-enters its lane"). Fresh claim appeared → leave it, record `reap skipped — fresh claim by
+  <run-id>`. Leave the issue's worktree in place — the next worker reuses it (build's CONTINUE
+  case depends on this).
 - Never touch `sdlc:needs-human`, `sdlc:hold`, or any human-set state.
 - Record reaps for the digest.
 
@@ -174,15 +202,14 @@ that refusal as "in use — leave it", never force.
    `git branch --merged <DEFAULT_BRANCH>` except `<DEFAULT_BRANCH>`, `<PROD_BRANCH>`, and any branch
    checked out in a worktree — confirm `git merge-base --is-ancestor <branch> <DEFAULT_BRANCH>`, then
    `git branch -D <branch>`. Squash-merged branches (won't appear in `--merged`) may be deleted ONLY
-   if all three hold: upstream shows `[gone]` in `git branch -vv`, `gh pr view <branch>` reports
-   `MERGED`, and the local tip SHA equals the PR's `headRefOid`. Any check ambiguous → leave it,
+   if all three hold: upstream shows `[gone]` in `git branch -vv`, `pr-state <branch>` reports
+   merged, and the local tip SHA equals the PR's head SHA. Any check ambiguous → leave it,
    record it.
-6. PR snapshot: `gh pr list --state open --json
-   number,title,headRefName,mergeable,reviewDecision,isDraft`. For each PR whose `mergeable` is
-   `CONFLICTING` and whose linked issue is not `sdlc:wip`/`sdlc:needs-human`/`sdlc:hold`: comment on
-   the issue `sdlc-dispatch: branch <name> conflicts with <DEFAULT_BRANCH> — needs a merge`, and if
-   the issue sits in `stage:verify`/`stage:audit`/`stage:ship`, swap it back to `stage:build`
-   (conflict resolution is build's lane). Verify-before-write: re-read the issue's labels
+6. PR snapshot: `pr-list`. For each PR that is **conflicting** with `<DEFAULT_BRANCH>` and whose
+   linked issue is not `sdlc:wip`/`sdlc:needs-human`/`sdlc:hold`: `comment` on the issue
+   `sdlc-dispatch: branch <name> conflicts with <DEFAULT_BRANCH> — needs a merge`, and if the
+   issue sits in `stage:verify`/`stage:audit`/`stage:ship`, `advance` it back to `stage:build`
+   (conflict resolution is build's lane). Verify-before-write: re-read the issue's markers
    immediately before the swap (already `stage:build` or now `sdlc:wip` → skip). **Re-nudge
    suppression is a watermark compare, not a dedup set:** post the comment only when the issue's
    newest `sdlc-dispatch:` conflict comment predates the most recent `<DEFAULT_BRANCH>` update
@@ -190,36 +217,37 @@ that refusal as "in use — leave it", never force.
    `<DEFAULT_BRANCH>` advance, not every cycle, a concurrent run's duplicate nudge is suppressed,
    and a resolved-then-reopened conflict still gets flagged. Record for the digest.
 
-### Step 0b — Stage-label integrity (you do this yourself)
+### Step 0b — Stage-marker integrity (you do this yourself)
 
-Every open issue must carry **exactly one** `stage:*` label (see `docs/Development_SdlcLabels.md`). Zero makes it
-invisible to every lane forever (a triage escapee that will never be built or closed); two makes
-it eligible in two lanes at once — two workers could claim it in one cycle. From the Step 0
-snapshot (no new query — the labels are already in hand), count each open issue's `stage:*` labels
-and act on every issue where the count ≠ 1:
+Every open issue must carry **exactly one** `stage:*` marker. Zero makes it invisible to every
+lane forever (a triage escapee that will never be built or closed); two makes it eligible in two
+lanes at once — two workers could claim it in one cycle. From the Step 0 snapshot (no new query —
+the markers are already in hand), count each open issue's `stage:*` markers and act on every
+issue where the count ≠ 1:
 
-- **Zero `stage:*` labels → auto-repair:** `gh issue edit <n> --add-label stage:intake` so the
+- **Zero `stage:*` markers → auto-repair:** `stage-repair <issue>` sets `stage:intake` so the
   item re-enters the pipeline at the front, and record it for the digest. Intake is the safe
   re-entry — it re-routes (or reconciles already-shipped work) from there. Verify-before-write:
-  re-read the issue's labels immediately before the edit — another dispatch run may have repaired
-  it already (then skip and record).
-- **Two or more `stage:*` labels → park, don't guess:** the correct stage depends on branch/PR
-  state a snapshot can't adjudicate. Add `sdlc:needs-human`, leave the stage labels untouched,
-  comment `sdlc-dispatch: multiple stage:* labels (<list>) — pipeline can't pick one; parked for
-  human review.` (skip the comment if the issue's newest `sdlc-dispatch:` comment already says
+  re-read the issue's markers immediately before the edit — another dispatch run may have
+  repaired it already (then skip and record).
+- **Two or more `stage:*` markers → park, don't guess:** the correct stage depends on branch/PR
+  state a snapshot can't adjudicate. `park` it (`sdlc:needs-human`, stage markers untouched,
+  comment `sdlc-dispatch: multiple stage:* markers (<list>) — pipeline can't pick one; parked for
+  human review.` — skip the comment if the issue's newest `sdlc-dispatch:` comment already says
   this), and record it for the digest.
-- This is a **hand-edit backstop**: the reference CLI's transition validation never creates a
-  zero/dual-stage state, but labels edited by hand or by tooling outside the CLI still can — so
-  the check stays.
+- This is a **hand-edit backstop**: a deterministic core's transition validation never creates a
+  zero/dual-stage state, but markers edited by hand or by tooling outside it still can — so the
+  check stays.
 
 ### Per-lane dispatch
 
 For each lane (intake, design, build, verify, audit, ship — `stage:queued` has no worker; it is
 the human throttle):
 
-1. Eligible = open, `stage:<lane>`, not `sdlc:wip` / `sdlc:needs-human` / `sdlc:hold`. Decide from
-   the Step 0 snapshot; re-query the lane fresh ONLY if an earlier worker this cycle ADVANCEd an item
-   into it. Zero eligible → skip the lane; record `<LANE>: skipped (empty)`.
+1. Eligible = open, `stage:<lane>`, not `sdlc:wip` / `sdlc:needs-human` / `sdlc:hold`, no open
+   blocker. Decide from the Step 0 snapshot; re-query the lane fresh ONLY if an earlier worker
+   this cycle ADVANCEd an item into it. Zero eligible → skip the lane; record `<LANE>: skipped
+   (empty)`.
 2. Otherwise spawn ONE subagent, `subagent_type: <WORKER_AGENT>`, **with the lane's `model` set
    explicitly — never let a worker inherit the dispatcher's model** (the dispatcher itself may be
    downsized). Route volume work to the cheapest model that reliably does it:
@@ -242,11 +270,13 @@ the human throttle):
    Escalate a lane one tier only after its worker BOUNCEs the same issue twice for
    capability-shaped reasons (not genuinely-broken code). Prompt (substitute the lane, run-id, and
    candidate list): "You are an autonomous SDLC pipeline worker for the `<PROJECT>` project.
-   Repository (local working directory): `<REPO_PATH>`. Your run-id is `<run-id>-<lane>`. Read
-   prompts/sdlc/README.md — its universal worker loop and invariants are binding. Then execute the
-   lane prompt at prompts/sdlc/<lane>.md. Candidate snapshot for your lane (from this cycle's
-   Step 0 snapshot — seeds selection only; claim per the README against live data):
-   <for each eligible item: `#<number> labels=[<label,...>] createdAt=<createdAt>`>. If no
+   Repository (local working directory): `<REPO_PATH>`. Your run-id is `<run-id>-<lane>`. Read,
+   in order, sdlc/README.md (its universal worker loop and invariants are binding),
+   sdlc/PROFILE.md (resolves every `<KEY>`), and sdlc/bindings/<BINDING>/BINDING.md (resolves
+   every backticked operation). Then execute the lane prompt at sdlc/lanes/<lane>.md. Candidate
+   snapshot for your lane (from this cycle's Step 0 snapshot — seeds selection only; claim per
+   the README against live data):
+   <for each eligible item: `#<id> markers=[<marker,...>] createdAt=<createdAt>`>. If no
    candidate can be claimed, report idle. Return your one-line result plus any PARK/BOUNCE
    specifics, ending with the fenced JSON result block per the README STOP contract." Build the
    candidate list from the same Step 0 snapshot as step 1 (the lane's eligible items only, all
@@ -258,31 +288,31 @@ the human throttle):
    after it returns — a worker mid-test-suite or mid-push would be cut off. Each worker's final
    message is its deliverable; pull it when the batch completes — never re-spawn a finished worker
    to "resend" a result. Exception: run
-   intake before the batch when its merge sweep has pending merges to process — check the sweep
-   state **read-only** (the `cycle-prep` report's `=== sweep ===` section, or
-   `node scripts/sdlc.mjs sweep`): anything other than `sweep: clear` means pending, and peeking
-   never consumes the work-list — only the intake worker's post-processing `sweep --ack` marks
-   merges swept. Also run a lane serially
+   intake before the batch when its close sweep has pending closes to process — check the sweep
+   state **read-only** (`closed-since`; gh-issue: the `cycle-prep` report's `=== sweep ===`
+   section, or `sdlc sweep`): anything other than `sweep: clear` means pending, and peeking
+   never consumes the work-list — only the intake worker's post-processing `sweep-ack` marks
+   closes swept. Also run a lane serially
    after the batch if it only became non-empty via an ADVANCE this cycle. Never spawn two workers for
-   the same lane in one cycle. The intake-first exception is load-bearing: intake's merge sweep is the
-   only thing that processes merged PRs, so skipping intake because its lane looks empty would skip the
-   merge sweep entirely — run it whenever merges are pending, even with zero `stage:intake` items.
+   the same lane in one cycle. The intake-first exception is still worth keeping: the eligibility
+   gate (Step 0) already unblocks dependents from edge state without intake, so a skipped sweep no
+   longer lets a blocked item be claimed — but intake's close sweep is the only thing that posts
+   the "blocker landed" comments and updates the human mirrors (body strikethrough, roadmap lines),
+   so run it whenever closes are pending, even with zero `stage:intake` items.
    Other dispatch runs may have live workers in the same lanes right now — that's expected: workers
-   deconflict per issue (CLAIM step 3), and a worker that loses a claim race just moves to the next
+   deconflict per issue (README CLAIM), and a worker that loses a claim race just moves to the next
    eligible item. A lost race is never an error.
 4. **Self-heal check (after each worker finishes):** read the worker's fenced JSON result block
    (README STOP contract: `{issue, outcome, next_stage, notes}`, or an array of those for a
    multi-item pass) — it is the authoritative record of what was claimed and how it ended. Block
    missing or malformed → fall back to parsing the prose one-liner and record the contract
-   violation for the digest. With the reference CLI, `node scripts/sdlc.mjs heal <lane>` with **no
-   issue** auto-discovers every open `stage:<lane>` + `sdlc:wip` issue and reports STALLED per
+   violation for the digest. With the binding's core (gh-issue: `sdlc heal <lane>` with **no
+   issue**), auto-discover every open `stage:<lane>` + `sdlc:wip` issue and report STALLED per
    issue (or `<lane> OK`) — so stragglers surface even when parsing a worker's freeform output
-   would have missed one; without it, for each non-IDLE result: `gh issue view <n> --json labels`
-   plus its
-   latest `sdlc:claim` comment. If a stalled issue still carries `sdlc:wip` AND the claim's run-id
-   belongs to
-   this cycle (`<run-id>-<lane>`): resume that worker ONCE via SendMessage — complete the EMIT step
-   now. Still locked after the resume → remove `sdlc:wip`, add `sdlc:needs-human`, comment
+   would have missed one; without it, for each non-IDLE result: `lock-age <issue>`. If a stalled
+   issue still carries `sdlc:wip` AND the claim's run-id belongs to this cycle
+   (`<run-id>-<lane>`): resume that worker ONCE via SendMessage — complete the EMIT step now.
+   Still locked after the resume → `reap` it, then `park` it with
    `sdlc-dispatch: worker stalled twice without emitting an outcome; parked for human review.` A
    claim owned by a different run-id is another live worker — leave it alone.
 
@@ -301,13 +331,13 @@ Finish with:
 - Git + worktree maintenance: `<DEFAULT_BRANCH>` updated, artifact rebuilt/kept, branches
   pruned/left (with reasons), worktrees removed/left, conflicted PRs flagged (and any stage
   swaps), skipped ops, open-PR state.
-- Stage-label integrity: 0-label issues auto-routed to intake (numbers), multi-stage issues parked
-  (numbers + label lists), or `stage labels: all clean`.
+- Stage-marker integrity: 0-marker issues auto-routed to intake (ids), multi-stage issues parked
+  (ids + marker lists), or `stage markers: all clean`.
 - One line per lane, derived from each worker's JSON result block (issue, outcome, next_stage —
   note any worker whose block was missing/malformed and required prose fallback, and any self-heal
   resumes/parks).
-- Queue depths after the cycle, parked items and holds by issue number — with the reference CLI,
-  `node scripts/sdlc.mjs digest` prints depths, parked/hold lists, and the **arrivals/departures
-  delta vs the last cycle** from one fresh snapshot.
+- Queue depths after the cycle, parked items and holds by issue id — with the binding's core
+  (gh-issue: `sdlc digest`), depths, parked/hold lists, and the **arrivals/departures delta vs
+  the last cycle** come from one fresh snapshot.
 - Token cost per lane plus cycle total — the trend line for spotting cost regressions across
   cycles.

@@ -1,4 +1,4 @@
-// Tests for scripts/sdlc.mjs — zero-dependency, node's built-in runner:
+// Tests for sdlc/bindings/gh-issue/sdlc.mjs — zero-dependency, node's built-in runner:
 //   node --test              (default discovery finds test/*.test.mjs)
 //   node --test "test/*.test.mjs"
 // (On Node ≥22 the positional arg is a glob, so a bare directory like
@@ -34,28 +34,76 @@ import {
   parseWorktrees,
   planWorktreeSweep,
   unlinkWorktreeRootLinks,
+  linkWorktreeNodeModules,
   classifyStatusForSweep,
   computeDigest,
   computeSweep,
   computeSweepAck,
+  normalizeEdges,
+  openBlockers,
+  findDependencyCycles,
+  computeDeps,
+  parseProseDependencies,
+  planDependencyMigration,
+  BLOCKED_LABEL,
+  READY_LABEL,
   planConflictScan,
   conflictCommentBody,
   CONFLICT_BOUNCE_STAGES,
   dupTokens,
   dupQueryTerms,
   scoreDupCandidates,
-} from '../scripts/sdlc.mjs';
+} from '../sdlc/bindings/gh-issue/sdlc.mjs';
 
-/** Build a fake gh/git executor that records calls and returns canned output. */
+/**
+ * Build a fake gh/git executor that records calls and returns canned output.
+ * A GraphQL call (`gh api graphql -f query=… -f states=OPEN …`) carries the
+ * whole query text, so it is keyed by the short form `api graphql states=<S>`
+ * instead (see `graphqlKey`); a canned page never claims `hasNextPage`.
+ */
 function fakeExec(responses = {}) {
   const calls = [];
   const fn = (args) => {
     calls.push(args);
     const key = args.join(' ');
-    return responses[key] ?? '';
+    if (key in responses) return responses[key];
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      const states = args.find((a) => /^states=/.test(a)) ?? '';
+      return responses[`api graphql ${states}`] ?? '';
+    }
+    return '';
   };
   fn.calls = calls;
   return fn;
+}
+
+/** The fakeExec key for the issue-graph GraphQL query in a given state. */
+const graphqlKey = (states) => `api graphql states=${states}`;
+
+/** A canned issue-graph GraphQL page (the shape `fetchIssueGraph` parses). */
+function graphqlPage(nodes) {
+  return JSON.stringify({
+    data: {
+      repository: {
+        issues: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: nodes.map((n) => ({
+            number: n.number,
+            databaseId: n.id ?? n.number * 1000,
+            title: n.title ?? '',
+            state: n.state ?? 'OPEN',
+            closedAt: n.closedAt ?? null,
+            createdAt: n.createdAt ?? null,
+            updatedAt: n.updatedAt ?? n.closedAt ?? n.createdAt ?? null,
+            body: n.body ?? '',
+            labels: { nodes: (n.labels ?? []).map((name) => ({ name })) },
+            blockedBy: { nodes: n.blockedBy ?? [] },
+            blocking: { nodes: n.blocking ?? [] },
+          })),
+        },
+      },
+    },
+  });
 }
 
 /** assert.throws with an SdlcError class + message-regex check. */
@@ -490,18 +538,90 @@ describe('computeLanes', () => {
   it('buckets ineligible items by hold/needs-human/wip, summing to depth − eligible', () => {
     const { lanes } = computeLanes(issues);
     // build depth 5, eligible [11,10,14] → 2 ineligible: #12 wip, #13 hold.
-    assert.deepEqual(lanes.build.ineligible, { hold: 1, 'needs-human': 0, wip: 1 });
+    assert.deepEqual(lanes.build.ineligible, { hold: 1, 'needs-human': 0, wip: 1, blocked: 0 });
     const b = lanes.build;
-    const inelig = b.ineligible.hold + b.ineligible['needs-human'] + b.ineligible.wip;
+    const inelig = b.ineligible.hold + b.ineligible['needs-human'] + b.ineligible.wip + b.ineligible.blocked;
     assert.equal(inelig, b.depth - b.eligible.length);
   });
 
-  it('buckets each ineligible item once, hold › needs-human › wip precedence', () => {
+  it('buckets each ineligible item once, hold › needs-human › wip › blocked precedence', () => {
     const { lanes } = computeLanes([
       { number: 20, createdAt: '2026-07-01T00:00:00Z', labels: ['stage:audit', 'sdlc:hold', WIP_LABEL] },
       { number: 21, createdAt: '2026-07-02T00:00:00Z', labels: ['stage:audit', 'sdlc:needs-human', WIP_LABEL] },
+      { number: 22, createdAt: '2026-07-03T00:00:00Z', labels: ['stage:audit', WIP_LABEL], blockedBy: [{ number: 1, state: 'OPEN' }] },
     ]);
-    assert.deepEqual(lanes.audit.ineligible, { hold: 1, 'needs-human': 1, wip: 0 });
+    assert.deepEqual(lanes.audit.ineligible, { hold: 1, 'needs-human': 1, wip: 1, blocked: 0 });
+    assert.deepEqual(lanes.audit.blocked, []);
+  });
+
+  describe('native dependency gate (#27)', () => {
+    const at = (d) => `2026-07-0${d}T00:00:00Z`;
+
+    it('never returns an issue with an OPEN native blocker as eligible', () => {
+      const { lanes } = computeLanes([
+        { number: 30, createdAt: at(1), labels: ['stage:build', 'priority:critical'], blockedBy: [{ number: 29, state: 'OPEN' }] },
+        { number: 31, createdAt: at(2), labels: ['stage:build'] },
+      ]);
+      assert.deepEqual(lanes.build.eligible, [31]);
+      assert.equal(lanes.build.ineligible.blocked, 1);
+      assert.deepEqual(lanes.build.blocked, [{ number: 30, blockers: [29] }]);
+    });
+
+    it('a CLOSED blocker is history — the dependent is eligible', () => {
+      const { lanes } = computeLanes([
+        { number: 30, createdAt: at(1), labels: ['stage:build'], blockedBy: [{ number: 29, state: 'CLOSED' }] },
+      ]);
+      assert.deepEqual(lanes.build.eligible, [30]);
+      assert.equal(lanes.build.ineligible.blocked, 0);
+    });
+
+    it('mixed blockers: one still OPEN keeps the dependent blocked, listing only the open ones', () => {
+      const { lanes } = computeLanes([
+        {
+          number: 30, createdAt: at(1), labels: ['stage:build'],
+          blockedBy: [{ number: 28, state: 'CLOSED' }, { number: 29, state: 'OPEN' }, { number: 27, state: 'OPEN' }],
+        },
+      ]);
+      assert.deepEqual(lanes.build.eligible, []);
+      assert.deepEqual(lanes.build.blocked, [{ number: 30, blockers: [27, 29] }]);
+    });
+
+    it('the blocked/ready labels are NOT consulted — only edges gate', () => {
+      const { lanes } = computeLanes([
+        // `ready` label but an open edge → blocked (label drift can't unblock).
+        { number: 40, createdAt: at(1), labels: ['stage:build', READY_LABEL], blockedBy: [{ number: 1, state: 'OPEN' }] },
+        // `blocked` label but no edge → eligible (label drift can't block).
+        { number: 41, createdAt: at(2), labels: ['stage:build', BLOCKED_LABEL] },
+      ]);
+      assert.deepEqual(lanes.build.eligible, [41]);
+      assert.deepEqual(lanes.build.blocked, [{ number: 40, blockers: [1] }]);
+    });
+
+    it('accepts the raw GraphQL connection shape and a snapshot without edges', () => {
+      const { lanes } = computeLanes([
+        { number: 50, createdAt: at(1), labels: ['stage:verify'], blockedBy: { nodes: [{ number: 2, state: 'OPEN' }] } },
+        { number: 51, createdAt: at(2), labels: ['stage:verify'] },
+      ]);
+      assert.deepEqual(lanes.verify.eligible, [51]);
+      assert.equal(lanes.verify.ineligible.blocked, 1);
+    });
+  });
+});
+
+describe('dependency edge helpers', () => {
+  it('normalizeEdges accepts a connection, a node array, or nothing', () => {
+    assert.deepEqual(normalizeEdges({ nodes: [{ number: 3, state: 'open' }] }), [{ number: 3, state: 'OPEN' }]);
+    assert.deepEqual(normalizeEdges([{ number: '4' }]), [{ number: 4, state: 'OPEN' }]);
+    assert.deepEqual(normalizeEdges(null), []);
+    assert.deepEqual(normalizeEdges({ nodes: [null, {}] }), []);
+  });
+
+  it('openBlockers returns only OPEN blockers, ascending', () => {
+    assert.deepEqual(
+      openBlockers([{ number: 9, state: 'OPEN' }, { number: 4, state: 'CLOSED' }, { number: 2, state: 'OPEN' }]),
+      [2, 9],
+    );
+    assert.deepEqual(openBlockers(undefined), []);
   });
 });
 
@@ -512,6 +632,10 @@ describe('laneIneligibilityBreakdown', () => {
       '(hold 12, needs-human 4)',
     );
     assert.equal(laneIneligibilityBreakdown({ ineligible: { hold: 0, 'needs-human': 0, wip: 1 } }), '(wip 1)');
+    assert.equal(
+      laneIneligibilityBreakdown({ ineligible: { hold: 0, 'needs-human': 0, wip: 1, blocked: 2 } }),
+      '(wip 1, blocked 2)',
+    );
   });
 
   it('returns empty string for a fully-eligible lane (all buckets zero)', () => {
@@ -631,6 +755,40 @@ describe('runSdlc claim --next', () => {
 
     assert.ok(logs.join('\n').includes('LOST race on #20'));
     assert.ok(logs.join('\n').includes('claimed #21'));
+  });
+
+  it('skips an issue with an OPEN native blocker even when it ranks first (#27)', () => {
+    const gh = fakeExec({
+      [LANES_KEY]: JSON.stringify([
+        { number: 30, labels: [{ name: 'stage:build' }, { name: 'priority:critical' }], createdAt: '2026-07-01T00:00:00Z' },
+        { number: 31, labels: [{ name: 'stage:build' }], createdAt: '2026-07-02T00:00:00Z' },
+      ]),
+      [graphqlKey('OPEN')]: graphqlPage([
+        { number: 30, blockedBy: [{ number: 29, state: 'OPEN' }] },
+        { number: 31 },
+      ]),
+      [commentsKey(31)]: JSON.stringify([{ body: 'sdlc:claim run-a build', createdAt: '2026-07-09T12:00:00Z' }]),
+    });
+    const git = fakeExec({ 'rev-parse --abbrev-ref HEAD': 'feat/31\n' });
+    const logs = [];
+    runSdlc(['claim', '--next', 'build', 'run-a'], { gh, git, log: (m) => logs.push(m) });
+    assert.equal(gh.calls.some((c) => c[0] === 'issue' && c[1] === 'edit' && c[2] === '30'), false);
+    assert.ok(logs.join('\n').includes('claimed #31'));
+  });
+
+  it('degrades to the label-only gate, loudly, when the edge query fails', () => {
+    const gh = fakeExec({
+      [LANES_KEY]: JSON.stringify([
+        { number: 30, labels: [{ name: 'stage:build' }], createdAt: '2026-07-01T00:00:00Z' },
+      ]),
+      // no graphql response → JSON parse failure → degrade
+      [commentsKey(30)]: JSON.stringify([{ body: 'sdlc:claim run-a build', createdAt: '2026-07-09T12:00:00Z' }]),
+    });
+    const git = fakeExec({ 'rev-parse --abbrev-ref HEAD': 'feat/30\n' });
+    const logs = [];
+    runSdlc(['claim', '--next', 'build', 'run-a'], { gh, git, log: (m) => logs.push(m) });
+    assert.ok(logs.join('\n').includes('deps: edge query FAILED'));
+    assert.ok(logs.join('\n').includes('claimed #30'));
   });
 
   it('exits 1 with idle on an empty lane', () => {
@@ -790,6 +948,89 @@ describe('unlinkWorktreeRootLinks (#723 — junction-safe sweep)', () => {
 
   it('returns [] for a missing tree path', () => {
     assert.deepEqual(unlinkWorktreeRootLinks(path.join(os.tmpdir(), 'sdlc-no-such-tree-xyz')), []);
+  });
+});
+
+describe('linkWorktreeNodeModules (#17 — creation half of the junction convention)', () => {
+  function makeScratch({ withSource = true } = {}) {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-wt-link-'));
+    const root = path.join(base, 'main');
+    fs.mkdirSync(root);
+    if (withSource) {
+      fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'node_modules', 'canary.txt'), 'canary');
+    }
+    const tree = path.join(base, 'wt');
+    fs.mkdirSync(tree);
+    return { base, root, tree };
+  }
+
+  it('links node_modules to the main checkout install and reports linked', () => {
+    const { base, root, tree } = makeScratch();
+    try {
+      const logs = [];
+      assert.equal(linkWorktreeNodeModules(root, tree, (m) => logs.push(m)), 'linked');
+      const link = path.join(tree, 'node_modules');
+      assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(path.join(link, 'canary.txt'), 'utf8'), 'canary');
+      assert.ok(logs.some((m) => m.includes('junction ->')));
+      // Round-trip with the teardown twin: unlink removes the link, not the target.
+      assert.deepEqual(unlinkWorktreeRootLinks(tree), ['node_modules']);
+      assert.equal(fs.existsSync(path.join(root, 'node_modules', 'canary.txt')), true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('reports no-source (and creates nothing) when the main checkout has no node_modules', () => {
+    const { base, root, tree } = makeScratch({ withSource: false });
+    try {
+      assert.equal(linkWorktreeNodeModules(root, tree), 'no-source');
+      assert.throws(() => fs.lstatSync(path.join(tree, 'node_modules')));
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a real node_modules directory alone and reports exists', () => {
+    const { base, root, tree } = makeScratch();
+    try {
+      fs.mkdirSync(path.join(tree, 'node_modules'));
+      fs.writeFileSync(path.join(tree, 'node_modules', 'own.txt'), 'own');
+      assert.equal(linkWorktreeNodeModules(root, tree), 'exists');
+      assert.equal(fs.lstatSync(path.join(tree, 'node_modules')).isSymbolicLink(), false);
+      assert.equal(fs.existsSync(path.join(tree, 'node_modules', 'own.txt')), true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('regression: a dangling junction counts as present (lstat, not existsSync)', () => {
+    const { base, root, tree } = makeScratch();
+    try {
+      const gone = path.join(base, 'deleted-install');
+      fs.mkdirSync(gone);
+      fs.symlinkSync(gone, path.join(tree, 'node_modules'), 'junction');
+      fs.rmSync(gone, { recursive: true, force: true });
+      assert.equal(fs.existsSync(path.join(tree, 'node_modules')), false); // the trap
+      // Must not throw EEXIST and must not replace the dangling link.
+      assert.equal(linkWorktreeNodeModules(root, tree), 'exists');
+      assert.equal(fs.lstatSync(path.join(tree, 'node_modules')).isSymbolicLink(), true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('reports error without throwing when the link cannot be created', () => {
+    const { base, root } = makeScratch();
+    try {
+      const missingTree = path.join(base, 'no-such-wt');
+      const logs = [];
+      assert.equal(linkWorktreeNodeModules(root, missingTree, (m) => logs.push(m)), 'error');
+      assert.ok(logs.some((m) => m.includes('could not link')));
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1019,96 +1260,331 @@ describe('computeDigest', () => {
   });
 });
 
-describe('computeSweep', () => {
-  const openIssues = [
-    { number: 30, title: 'dependent, blocked', labels: ['blocked'], body: 'blocked on #10' },
-    { number: 31, title: 'dependent, ready', labels: ['ready'], body: 'follows #10 nicely' },
-    { number: 32, title: 'unrelated', labels: [], body: 'mentions #100 not the closed one' },
-    { number: 33, title: 'near-miss', labels: [], body: 'refs #101, a different issue entirely' },
+describe('computeSweep (edge-based, #27)', () => {
+  // The issue's demo graph: B←A, C←A, C←B. Prose in bodies is deliberately
+  // misleading and must be ignored.
+  const A = 10;
+  const B = 30;
+  const C = 31;
+  const openAfterA = [
+    { number: B, title: 'B', labels: [BLOCKED_LABEL], blockedBy: [{ number: A, state: 'CLOSED' }] },
+    { number: C, title: 'C', labels: [BLOCKED_LABEL], blockedBy: [{ number: A, state: 'CLOSED' }, { number: B, state: 'OPEN' }] },
+    { number: 32, title: 'unrelated', labels: [], body: 'None depends on #10' },
   ];
-  const mergedPrs = [
-    { number: 500, mergedAt: '2026-07-10T00:00:00Z', title: 'feat: thing', closes: [10] },
+  const closedA = [
+    { number: A, closedAt: '2026-07-10T00:00:00Z', title: 'A', blocking: [{ number: B, state: 'OPEN' }, { number: C, state: 'OPEN' }] },
   ];
 
-  it('maps a merged PR → closed issue → its dependents, flagging blocked ones', () => {
-    const { items, closedIssues, empty } = computeSweep(mergedPrs, openIssues);
+  it('closed issue → its OPEN blocking targets; flips only those with no remaining open blocker', () => {
+    const { items, closedIssues, empty } = computeSweep(closedA, openAfterA);
     assert.equal(empty, false);
-    assert.deepEqual(closedIssues, [10]);
+    assert.deepEqual(closedIssues, [A]);
     assert.equal(items.length, 1);
-    const closed = items[0].closes[0];
-    assert.equal(closed.number, 10);
+    assert.equal(items[0].number, A);
     assert.deepEqual(
-      closed.dependents.map((d) => ({ number: d.number, blocked: d.blocked })),
+      items[0].dependents.map((d) => ({ number: d.number, blocked: d.blocked, flip: d.flip, remaining: d.remainingBlockers })),
       [
-        { number: 30, blocked: true },
-        { number: 31, blocked: false },
+        { number: B, blocked: true, flip: true, remaining: [] },
+        { number: C, blocked: true, flip: false, remaining: [B] },
       ],
     );
+    // #32 mentions #10 in prose — no edge, so it is not a dependent.
+    assert.ok(!items[0].dependents.some((d) => d.number === 32));
   });
 
-  it('word-boundaries references so #10 never matches #101 or #100', () => {
-    const { items } = computeSweep(mergedPrs, openIssues);
-    const depNums = items[0].closes[0].dependents.map((d) => d.number);
-    assert.ok(!depNums.includes(32)); // #100
-    assert.ok(!depNums.includes(33)); // #101
+  it('cascades: closing B then flips C', () => {
+    const closedB = [{ number: B, closedAt: '2026-07-11T00:00:00Z', title: 'B', blocking: [{ number: C, state: 'OPEN' }] }];
+    const openAfterB = [
+      { number: C, title: 'C', labels: [BLOCKED_LABEL], blockedBy: [{ number: A, state: 'CLOSED' }, { number: B, state: 'CLOSED' }] },
+    ];
+    const { items } = computeSweep(closedB, openAfterB);
+    assert.deepEqual(items[0].dependents.map((d) => [d.number, d.flip]), [[C, true]]);
   });
 
-  it('is clear when no merged PR closed an issue', () => {
-    const noClose = [{ number: 501, mergedAt: '2026-07-10T00:00:00Z', title: 'chore', closes: [] }];
-    const r = computeSweep(noClose, openIssues);
+  it('a hand-closed issue cascades the same as a PR-closed one (no PR involved)', () => {
+    const { items } = computeSweep(
+      [{ number: 5, closedAt: '2026-07-10T00:00:00Z', blocking: [{ number: 6, state: 'OPEN' }] }],
+      [{ number: 6, blockedBy: [{ number: 5, state: 'CLOSED' }] }],
+    );
+    assert.deepEqual(items[0].dependents.map((d) => [d.number, d.flip]), [[6, true]]);
+  });
+
+  it('is clear when the closed issues blocked nothing open', () => {
+    const r = computeSweep(
+      [{ number: 7, closedAt: '2026-07-10T00:00:00Z', blocking: [{ number: 8, state: 'CLOSED' }] }],
+      [],
+    );
     assert.equal(r.empty, true);
     assert.deepEqual(r.items, []);
   });
 
-  it('skips PRs already in sweptPrs (idempotent)', () => {
-    assert.equal(computeSweep(mergedPrs, openIssues, { sweptPrs: [500] }).empty, true);
+  it('ignores a blocking target missing from the open snapshot (closed since)', () => {
+    const r = computeSweep(closedA, [openAfterA[1]]); // only C in the snapshot
+    assert.deepEqual(r.items[0].dependents.map((d) => d.number), [C]);
   });
 
-  it('skips PRs merged at/before the sinceMs cutoff (bounded window)', () => {
+  it('skips issues already in sweptIssues (idempotent)', () => {
+    assert.equal(computeSweep(closedA, openAfterA, { sweptIssues: [A] }).empty, true);
+  });
+
+  it('skips issues closed at/before the sinceMs cutoff (bounded window)', () => {
     const cutoff = new Date('2026-07-10T12:00:00Z').getTime();
-    assert.equal(computeSweep(mergedPrs, openIssues, { sinceMs: cutoff }).empty, true);
+    assert.equal(computeSweep(closedA, openAfterA, { sinceMs: cutoff }).empty, true);
     const earlier = new Date('2026-07-09T00:00:00Z').getTime();
-    assert.equal(computeSweep(mergedPrs, openIssues, { sinceMs: earlier }).empty, false);
+    assert.equal(computeSweep(closedA, openAfterA, { sinceMs: earlier }).empty, false);
   });
 
-  it('accepts object-form labels and tolerates missing bodies', () => {
-    const issues = [{ number: 40, title: 'x', labels: [{ name: 'blocked' }], body: 'needs #10' }];
-    const { items } = computeSweep(mergedPrs, issues);
-    assert.deepEqual(items[0].closes[0].dependents, [{ number: 40, title: 'x', blocked: true }]);
-    const noDeps = computeSweep(mergedPrs, [{ number: 41, body: '' }]);
-    assert.deepEqual(noDeps.items[0].closes[0].dependents, []);
+  it('accepts object-form labels and raw GraphQL connections', () => {
+    const { items } = computeSweep(
+      [{ number: A, closedAt: '2026-07-10T00:00:00Z', blocking: { nodes: [{ number: 40, state: 'OPEN' }] } }],
+      [{ number: 40, title: 'x', labels: [{ name: BLOCKED_LABEL }], blockedBy: { nodes: [{ number: A, state: 'CLOSED' }] } }],
+    );
+    assert.deepEqual(items[0].dependents, [{ number: 40, title: 'x', blocked: true, remainingBlockers: [], flip: true }]);
   });
 });
 
 describe('computeSweepAck', () => {
-  const mergedPrs = [
-    { number: 500, mergedAt: '2026-07-10T00:00:00Z' },
-    { number: 501, mergedAt: '2026-07-08T00:00:00Z' },
+  const closed = [
+    { number: 500, closedAt: '2026-07-10T00:00:00Z' },
+    { number: 501, closedAt: '2026-07-08T00:00:00Z' },
   ];
 
-  it('marks all in-window merges and reports the newly-acked ones', () => {
-    const { nextSwept, newlyAcked } = computeSweepAck(mergedPrs, { sweptPrs: [500] });
+  it('marks all in-window closes and reports the newly-acked ones', () => {
+    const { nextSwept, newlyAcked } = computeSweepAck(closed, { sweptIssues: [500] });
     assert.deepEqual([...nextSwept].sort(), [500, 501]);
     assert.deepEqual(newlyAcked, [501]);
   });
 
-  it('excludes merges at/before the sinceMs cutoff from the marker', () => {
+  it('excludes closes at/before the sinceMs cutoff from the marker', () => {
     const cutoff = new Date('2026-07-09T00:00:00Z').getTime();
-    const { nextSwept, newlyAcked } = computeSweepAck(mergedPrs, { sinceMs: cutoff });
+    const { nextSwept, newlyAcked } = computeSweepAck(closed, { sinceMs: cutoff });
     assert.deepEqual(nextSwept, [500]);
     assert.deepEqual(newlyAcked, [500]);
   });
 
-  it('drops prior swept PRs no longer in the fetched list (bounded marker)', () => {
-    const { nextSwept } = computeSweepAck(mergedPrs, { sweptPrs: [400, 500] });
+  it('drops prior swept issues no longer in the fetched list (bounded marker)', () => {
+    const { nextSwept } = computeSweepAck(closed, { sweptIssues: [400, 500] });
     assert.ok(!nextSwept.includes(400));
     assert.deepEqual([...nextSwept].sort(), [500, 501]);
   });
 
   it('is a no-op ack when everything in the window is already swept', () => {
-    const { nextSwept, newlyAcked } = computeSweepAck(mergedPrs, { sweptPrs: [500, 501] });
+    const { nextSwept, newlyAcked } = computeSweepAck(closed, { sweptIssues: [500, 501] });
     assert.deepEqual([...nextSwept].sort(), [500, 501]);
     assert.deepEqual(newlyAcked, []);
+  });
+});
+
+describe('findDependencyCycles', () => {
+  it('finds each cycle once, from its lowest member, ignoring closed blockers', () => {
+    const cycles = findDependencyCycles([
+      { number: 3, blockedBy: [{ number: 9, state: 'OPEN' }] },
+      { number: 5, blockedBy: [{ number: 3, state: 'OPEN' }] },
+      { number: 9, blockedBy: [{ number: 5, state: 'OPEN' }, { number: 1, state: 'CLOSED' }] },
+      { number: 11, blockedBy: [{ number: 11, state: 'OPEN' }] }, // self-loop
+      { number: 12, blockedBy: [{ number: 3, state: 'OPEN' }] }, // hangs off the cycle, not in it
+    ]);
+    assert.deepEqual(cycles, [[3, 9, 5], [11]]);
+  });
+
+  it('is empty for a DAG and for blockers outside the snapshot', () => {
+    assert.deepEqual(
+      findDependencyCycles([
+        { number: 1, blockedBy: [] },
+        { number: 2, blockedBy: [{ number: 1, state: 'OPEN' }, { number: 99, state: 'OPEN' }] },
+      ]),
+      [],
+    );
+  });
+});
+
+describe('computeDeps (derived readiness labels + lint)', () => {
+  it('derives blocked/ready from edge state and plans only the needed label edits', () => {
+    const { edits, findings, blocked, ready } = computeDeps([
+      { number: 1, labels: [], blockedBy: [{ number: 9, state: 'OPEN' }] },                  // +blocked
+      { number: 2, labels: [READY_LABEL], blockedBy: [{ number: 9, state: 'OPEN' }] },       // +blocked -ready
+      { number: 3, labels: [BLOCKED_LABEL], blockedBy: [{ number: 9, state: 'OPEN' }] },     // already right
+      { number: 4, labels: [BLOCKED_LABEL], blockedBy: [{ number: 8, state: 'CLOSED' }] },   // +ready -blocked
+      { number: 5, labels: [READY_LABEL], blockedBy: [{ number: 8, state: 'CLOSED' }] },     // already right
+      { number: 6, labels: [], blockedBy: [] },                                              // no edges: nothing
+    ]);
+    assert.deepEqual(blocked, [1, 2, 3]);
+    assert.deepEqual(ready, [4, 5]);
+    assert.deepEqual(
+      edits.map((e) => [e.number, e.add, e.remove]),
+      [
+        [1, [BLOCKED_LABEL], []],
+        [2, [BLOCKED_LABEL], [READY_LABEL]],
+        [4, [READY_LABEL], [BLOCKED_LABEL]],
+      ],
+    );
+    assert.deepEqual(findings, []);
+  });
+
+  it('a blocked label with no edge is ambiguous — lint, never auto-repaired', () => {
+    const { edits, findings } = computeDeps([{ number: 7, labels: [BLOCKED_LABEL], blockedBy: [] }]);
+    assert.deepEqual(edits, []);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].kind, 'label-only-blocked');
+    assert.equal(findings[0].number, 7);
+  });
+
+  it('reports dependency cycles', () => {
+    const { findings } = computeDeps([
+      { number: 1, labels: [], blockedBy: [{ number: 2, state: 'OPEN' }] },
+      { number: 2, labels: [], blockedBy: [{ number: 1, state: 'OPEN' }] },
+    ]);
+    assert.deepEqual(findings.map((f) => f.kind), ['cycle']);
+    assert.match(findings[0].detail, /#1 ← #2 ← #1/);
+  });
+});
+
+describe('parseProseDependencies (migration parser)', () => {
+  it('matches only line-leading declarations, with list/emphasis/colon decoration', () => {
+    const body = [
+      'Depends on #12',
+      '- Blocked by: #13, #14 and #15',
+      '* **Requires** #16',
+      '1. after #17 lands',
+      '> depends on #18', // blockquote — not a declaration
+      'None depends on #1337',
+      'This does not depend on #1161 at all.',
+      'Requires #12 again (dup)',
+      'Blocked by #99 — self',
+      '**Dependencies:** Depends on K.3b #19', // roadmap-identifier form
+      '**Dependencies:** ~~Depends on K.3a #20~~ ✅ K.3a complete', // struck through — still an edge (closed blocker)
+    ].join('\n');
+    assert.deepEqual(parseProseDependencies(body, 99), [12, 13, 14, 15, 16, 17, 19, 20]);
+  });
+
+  it('takes only the leading run of references on a line', () => {
+    assert.deepEqual(parseProseDependencies('Depends on #3 and the API rework in #4'), [3]);
+    assert.deepEqual(parseProseDependencies('Blocked by #3 / #4'), [3, 4]);
+  });
+
+  it('is empty for no body or no declarations', () => {
+    assert.deepEqual(parseProseDependencies(null), []);
+    assert.deepEqual(parseProseDependencies('see #5 for context'), []);
+  });
+});
+
+describe('planDependencyMigration', () => {
+  it('proposes edges for known blockers not already native; skips unknown numbers', () => {
+    const { proposals, skipped } = planDependencyMigration(
+      [
+        { number: 20, body: 'Depends on #10, #11, #12', blockedBy: [{ number: 11, state: 'OPEN' }] },
+        { number: 21, body: 'Blocked by #500', blockedBy: [] },
+      ],
+      { 10: { id: 1000, state: 'CLOSED' }, 11: { id: 1100, state: 'OPEN' }, 12: { id: 1200, state: 'OPEN' } },
+    );
+    assert.deepEqual(proposals, [
+      { number: 20, blocker: 10, blockerState: 'CLOSED', blockerId: 1000 },
+      { number: 20, blocker: 12, blockerState: 'OPEN', blockerId: 1200 },
+    ]);
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0].blocker, 500);
+  });
+});
+
+describe('runSdlc deps', () => {
+  const openGraph = () => graphqlPage([
+    { number: 1, labels: ['stage:build'], blockedBy: [{ number: 9, state: 'OPEN' }] },
+    { number: 4, labels: ['stage:queued', BLOCKED_LABEL], blockedBy: [{ number: 8, state: 'CLOSED' }] },
+    { number: 7, labels: ['stage:queued', BLOCKED_LABEL], blockedBy: [] },
+    { number: 9, labels: ['stage:build'] },
+  ]);
+
+  it('previews derived-label edits + lint without writing', () => {
+    const gh = fakeExec({ [graphqlKey('OPEN')]: openGraph() });
+    const logs = [];
+    runSdlc(['deps'], { gh, git: fakeExec(), log: (m) => logs.push(m) });
+    const out = logs.join('\n');
+    assert.ok(out.includes('deps: 1 blocked (#1), 1 ready (#4)'));
+    assert.ok(out.includes(`would relabel #1 +${BLOCKED_LABEL}`));
+    assert.ok(out.includes(`would relabel #4 +${READY_LABEL} -${BLOCKED_LABEL}`));
+    assert.ok(out.includes('LINT label-only-blocked #7'));
+    assert.equal(gh.calls.some((c) => c[0] === 'issue' && c[1] === 'edit'), false);
+  });
+
+  it('--apply writes exactly the planned label edits', () => {
+    const gh = fakeExec({ [graphqlKey('OPEN')]: openGraph() });
+    runSdlc(['deps', '--apply'], { gh, git: fakeExec(), log: () => {} });
+    const edits = gh.calls.filter((c) => c[0] === 'issue' && c[1] === 'edit').map((c) => c.join(' '));
+    assert.deepEqual(edits, [
+      `issue edit 1 --add-label ${BLOCKED_LABEL}`,
+      `issue edit 4 --remove-label ${BLOCKED_LABEL} --add-label ${READY_LABEL}`,
+    ]);
+  });
+
+  it('--migrate proposes edges from prose (dry run) and --apply POSTs them by databaseId', () => {
+    const gh = fakeExec({
+      [graphqlKey('OPEN')]: graphqlPage([
+        { number: 20, id: 2000, body: 'Depends on #10 and #21\nBlocked by #1337\nNone depends on #4242', blockedBy: [] },
+        { number: 21, id: 2100, body: '' },
+      ]),
+      // A closed blocker is resolved by one REST lookup, not by paging the closed backlog.
+      'api repos/{owner}/{repo}/issues/10 --jq {id: .id, state: .state, pull_request: (.pull_request != null)}':
+        JSON.stringify({ id: 1000, state: 'closed', pull_request: false }),
+      // #1337 gets no canned response → parse failure → unknown → skipped.
+    });
+    const logs = [];
+    runSdlc(['deps', '--migrate'], { gh, git: fakeExec(), log: (m) => logs.push(m) });
+    const out = logs.join('\n');
+    // Bodies are requested only by the migration; the OPEN query for it carries `body`.
+    const graphqlCalls = gh.calls.filter((c) => c[0] === 'api' && c[1] === 'graphql');
+    assert.ok(graphqlCalls.every((c) => c.some((a) => /^query=/.test(a) && a.includes(' body'))));
+    assert.ok(!gh.calls.some((c) => c.includes('states=CLOSED')));
+    assert.ok(out.includes('#20 blocked_by #10 (CLOSED)'));
+    assert.ok(out.includes('#20 blocked_by #21 (OPEN)'));
+    assert.ok(out.includes('skipped #20 → #1337'));
+    assert.ok(!out.includes('4242')); // narrative mention — not a declaration, not even a skip
+    assert.ok(out.includes('dry run'));
+    assert.equal(gh.calls.some((c) => c.includes('POST')), false);
+
+    runSdlc(['deps', '--migrate', '--apply'], { gh, git: fakeExec(), log: () => {} });
+    const posts = gh.calls.filter((c) => c.includes('POST')).map((c) => c.join(' '));
+    assert.deepEqual(posts, [
+      'api -X POST repos/{owner}/{repo}/issues/20/dependencies/blocked_by -F issue_id=1000',
+      'api -X POST repos/{owner}/{repo}/issues/20/dependencies/blocked_by -F issue_id=2100',
+    ]);
+  });
+});
+
+describe('runSdlc sweep (edge-based)', () => {
+  const closedGraph = graphqlPage([
+    { number: 10, title: 'A', state: 'CLOSED', closedAt: '2026-07-10T00:00:00Z', blocking: [{ number: 30, state: 'OPEN' }, { number: 31, state: 'OPEN' }] },
+  ]);
+  const openGraph = graphqlPage([
+    { number: 30, title: 'B', labels: [BLOCKED_LABEL], blockedBy: [{ number: 10, state: 'CLOSED' }] },
+    { number: 31, title: 'C', labels: [BLOCKED_LABEL], blockedBy: [{ number: 10, state: 'CLOSED' }, { number: 30, state: 'OPEN' }] },
+  ]);
+
+  it('lists closed issues → dependents with flip/still-blocked verdicts; --ack persists by issue number', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-sweep-test-'));
+    const statePath = path.join(dir, 'last-sweep.json');
+    try {
+      const gh = fakeExec({ [graphqlKey('CLOSED')]: closedGraph, [graphqlKey('OPEN')]: openGraph });
+      const logs = [];
+      // No window: the canned close is in the past.
+      runSdlc(['sweep', '--state', statePath, '--window', 'x'], { gh, git: fakeExec(), log: (m) => logs.push(m) });
+      const out = logs.join('\n');
+      assert.ok(out.includes('closed #10 (2026-07-10T00:00:00Z) A'));
+      assert.ok(out.includes('dependent #30 [unblocked — blocked → ready] B'));
+      assert.ok(out.includes('dependent #31 [still blocked by #30] C'));
+      // Read-only: no issue writes; and no bodies requested (a closed backlog's bodies run to MBs).
+      assert.equal(gh.calls.some((c) => c[0] === 'issue'), false);
+      assert.ok(!gh.calls.some((c) => c.some((a) => /^query=/.test(a) && a.includes(' body'))));
+
+      runSdlc(['sweep', '--ack', '--state', statePath, '--window', 'x'], { gh, git: fakeExec(), log: (m) => logs.push(m) });
+      assert.deepEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')).sweptIssues, [10]);
+      assert.ok(logs.join('\n').includes('sweep: acked 1 close (#10)'));
+
+      const again = [];
+      runSdlc(['sweep', '--state', statePath, '--window', 'x'], { gh, git: fakeExec(), log: (m) => again.push(m) });
+      assert.deepEqual(again, ['sweep: clear']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1300,8 +1776,8 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
   const idleGh = (extra = {}) => fakeExec({
     'issue list --state open --json number,labels,createdAt,title --limit 200': '[]',
     'issue list --state open --json number,labels,updatedAt --limit 200': '[]',
-    [`pr list --state merged --base ${DEFAULT_BRANCH} --json number,mergedAt,title,closingIssuesReferences --limit 50`]: '[]',
-    'issue list --state open --json number,title,labels,body --limit 200': '[]',
+    [graphqlKey('OPEN')]: graphqlPage([]),
+    [graphqlKey('CLOSED')]: graphqlPage([]),
     'pr list --state open --json number,title,headRefName,mergeable,reviewDecision,isDraft': '[]',
     [`pr list --state open --base ${DEFAULT_BRANCH} --json number,headRefName,baseRefName,mergeable,closingIssuesReferences --limit 200`]: '[]',
     ...extra,
@@ -1327,13 +1803,15 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
       // Every section, clearly delimited, in order.
       const sections = logs.filter((l) => l.startsWith('\n=== ')).map((l) => l.replace(/[\n= ]/g, ''));
       assert.deepEqual(sections, [
-        'maint-lock', 'lanes', 'gate', 'sweep',
+        'maint-lock', 'lanes', 'gate', 'deps-migrate', 'deps', 'sweep',
         'git-maint', 'worktree-sweep', 'conflict-scan', 'maint-release', 'summary',
       ]);
+      assert.ok(out.includes('deps --migrate: no prose dependency declarations to migrate.'));
       // Identical semantics to the individual commands.
       assert.ok(out.includes('maint-lock: ACQUIRED'));
       assert.ok(out.includes('intake: depth 0'));
       assert.ok(out.includes('gate: CLEAR'));
+      assert.ok(out.includes('deps: labels match edges; lint clean'));
       assert.ok(out.includes('sweep: clear'));
       assert.ok(out.includes('worktree-sweep: no issue-scoped worktrees.'));
       assert.ok(out.includes(`conflict-scan: no conflicting PRs into ${DEFAULT_BRANCH}.`));
@@ -1341,6 +1819,33 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
       assert.ok(out.includes('maintenance previewed'));
       // Lock released at the end of the maintenance section.
       assert.equal(fs.existsSync(lockDir(root)), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('converts prose dependency declarations to native edges every cycle — proposed on a dry run, POSTed under --apply', () => {
+    const root = makeRoot();
+    try {
+      // #20 was filed between cycles with a prose dependency and no edge yet.
+      const gh = idleGh({
+        [graphqlKey('OPEN')]: graphqlPage([
+          { number: 20, id: 2000, body: 'Depends on #21', labels: ['stage:intake'], blockedBy: [] },
+          { number: 21, id: 2100, body: '', labels: ['stage:queued'] },
+        ]),
+      });
+      const logs = [];
+      runSdlc(['cycle-prep'], { gh, git: idleGit(), log: (m) => logs.push(m), root });
+      const out = logs.join('\n');
+      assert.ok(out.includes('deps --migrate: #20 blocked_by #21 (OPEN)'));
+      assert.ok(out.includes('dry run'));
+      assert.equal(gh.calls.some((c) => c.includes('POST')), false);
+      // deps-migrate runs before the derived-label pass, so a new edge is labelled the same cycle.
+      assert.ok(out.indexOf('=== deps-migrate ===') < out.indexOf('=== deps ==='));
+
+      runSdlc(['cycle-prep', '--apply'], { gh, git: idleGit(), log: () => {}, root });
+      const posts = gh.calls.filter((c) => c.includes('POST')).map((c) => c.join(' '));
+      assert.deepEqual(posts, ['api -X POST repos/{owner}/{repo}/issues/20/dependencies/blocked_by -F issue_id=2100']);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

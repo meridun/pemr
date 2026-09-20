@@ -53,6 +53,7 @@ ALL_MIGRATIONS = [
     "014_medication_status_reason.sql",
     "015_document_text_source.sql",
     "016_record_correction_mark.sql",
+    "017_document_doc_date_trim.sql",
 ]
 
 # Every record table carries the occurrence-family columns (migration 005; 006's two
@@ -145,6 +146,7 @@ def test_migration_015_applies_on_a_014_era_database_without_backfilling(
 
     assert db.migrate(conn) == [
         "015_document_text_source.sql", "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     row = conn.execute("SELECT * FROM document").fetchone()
@@ -205,7 +207,9 @@ def test_migration_016_backfills_the_newest_ledger_entry_per_row(conn, tmp_path)
     _seed_ledger(conn, 2, "base-b", "unit", "2026-01-15T00:00:00+00:00", None)
     conn.commit()
 
-    assert db.migrate(conn) == ["016_record_correction_mark.sql"]
+    assert db.migrate(conn) == [
+        "016_record_correction_mark.sql", "017_document_doc_date_trim.sql",
+    ]
 
     marks = {
         row["lab_result_id"]: (row["edited_at"], row["edited_by"])
@@ -249,6 +253,66 @@ def test_a_pre016_snapshot_renders_and_queries_without_the_columns(conn, tmp_pat
     assert "corrected" not in md
     events = query.query_timeline(conn, "jane")
     assert all("edited_at" not in e for e in events)
+
+
+def _migrate_through_016(conn, tmp_path):
+    """Apply every migration up to 016, leaving 017 pending (a 016-era database)."""
+    import shutil
+
+    staged = tmp_path / "pre017"
+    staged.mkdir()
+    for path in sorted(db.DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if path.name < "017":
+            shutil.copy(path, staged / path.name)
+    db.migrate(conn, staged)
+    return staged
+
+
+def _seed_pre017_document(conn, sha, doc_date):
+    conn.execute(
+        "INSERT INTO document (sha256, person_id, doc_date, source_path, ingested_at) "
+        "VALUES (?, 1, ?, ?, '2026-03-16T00:00:00')",
+        (sha, doc_date, f"{sha[:2]}/{sha}.pdf"),
+    )
+
+
+def test_migration_017_trims_the_padded_doc_dates(conn, tmp_path):
+    """Migration 017 (issue #200): the 147 rows ingested with a CRLF-terminated
+    `--doc-date` are repaired in place. A clean date is untouched, an all-whitespace one
+    becomes NULL (the column's existing spelling of "no date"), and a value that is still
+    not `YYYY-MM-DD` after trimming is deliberately left alone rather than destroyed."""
+    _migrate_through_016(conn, tmp_path)
+    conn.execute("INSERT INTO person (slug, full_name) VALUES ('jane', 'Jane')")
+    _seed_pre017_document(conn, "aa11", "2020-10-29\r")
+    _seed_pre017_document(conn, "bb22", "2020-10-29")
+    _seed_pre017_document(conn, "cc33", "   ")
+    _seed_pre017_document(conn, "dd44", " 2021-01-02\r\n")
+    _seed_pre017_document(conn, "ee55", None)
+    _seed_pre017_document(conn, "ff66", "Oct 2020")
+    conn.commit()
+
+    assert db.migrate(conn) == ["017_document_doc_date_trim.sql"]
+
+    dates = {
+        row["sha256"]: row["doc_date"]
+        for row in conn.execute("SELECT sha256, doc_date FROM document").fetchall()
+    }
+    assert dates["aa11"] == "2020-10-29"
+    assert dates["bb22"] == "2020-10-29"    # already clean, untouched
+    assert dates["cc33"] is None            # whitespace-only == no date
+    assert dates["dd44"] == "2021-01-02"
+    assert dates["ee55"] is None
+    assert dates["ff66"] == "Oct 2020"      # non-ISO legacy value kept, not nulled
+
+    # The issue's own audit query, in-repo: every remaining non-NULL date is 10 chars
+    # except the legacy free-text one, which is why it is excluded rather than repaired.
+    assert conn.execute(
+        "SELECT count(*) AS n FROM document "
+        "WHERE doc_date IS NOT NULL AND length(doc_date) <> 10 "
+        "  AND doc_date <> 'Oct 2020'"
+    ).fetchone()["n"] == 0
+
+    assert db.migrate(conn) == []           # second run: nothing pending, nothing rewritten
 
 
 def test_person_has_deactivated_at_column(conn):
@@ -312,6 +376,7 @@ def test_migration_006_moves_condition_and_allergy_observations(conn, tmp_path):
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
         "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     a = conn.execute("SELECT * FROM allergy").fetchone()
@@ -448,6 +513,7 @@ def test_migration_008_applies_on_a_007_era_database(conn, tmp_path):
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
         "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     assert curation.has_table(conn) is True
@@ -503,6 +569,7 @@ def test_migration_009_applies_on_an_008_era_database(conn, tmp_path):
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
         "015_document_text_source.sql",
         "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     assert attestations.has_columns(conn) is True
@@ -556,6 +623,7 @@ def test_migration_010_rebuilds_curation_and_preserves_every_verdict(conn, tmp_p
         "012_record_edit.sql", "013_person_unit_pref.sql",
         "014_medication_status_reason.sql", "015_document_text_source.sql",
         "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     after = [dict(r) for r in conn.execute(
@@ -643,6 +711,7 @@ def test_migration_011_widens_the_status_check_and_preserves_every_verdict(
         "013_person_unit_pref.sql", "014_medication_status_reason.sql",
         "015_document_text_source.sql",
         "016_record_correction_mark.sql",
+        "017_document_doc_date_trim.sql",
     ]
 
     after = [dict(r) for r in conn.execute(

@@ -292,6 +292,38 @@ def test_ingest_duplicate_reports_cleanly(ready, capsys):
     assert "duplicate" in capsys.readouterr().out
 
 
+def test_ingest_doc_date_is_stripped_and_validated(ready, capsys):
+    """Issue #200: a CRLF-terminated `--doc-date` (a Windows batch script feeding lines
+    from a file) stores a clean 10-character date, and a non-ISO one is a clean rc=1 with
+    no `document` row and no blob left behind."""
+    tmp_path = ready
+    scan = tmp_path / "padded.txt"
+    scan.write_bytes(b"lab report bytes")
+    sources = tmp_path / "sources"
+
+    capsys.readouterr()
+    assert _run(tmp_path, "ingest", str(scan), "--person", "jane-doe",
+                "--sources", str(sources), "--doc-date", "2020-10-29\r") == 0
+    conn = db.connect(tmp_path / "cli.db")
+    try:
+        row = conn.execute("SELECT doc_date FROM document").fetchone()
+    finally:
+        conn.close()
+    assert row["doc_date"] == "2020-10-29" and len(row["doc_date"]) == 10
+
+    bad = tmp_path / "bad-date.txt"
+    bad.write_bytes(b"different bytes")
+    capsys.readouterr()
+    assert _run(tmp_path, "ingest", str(bad), "--person", "jane-doe",
+                "--sources", str(sources), "--doc-date", "10/29/2020") == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "--doc-date" in err
+    assert err.isascii() and "\r" not in err     # console-safe: the CR renders escaped
+    # Pre-hash, pre-copy refusal: only the first document's row and blob exist.
+    assert len(_document_id(tmp_path)) == 1
+    assert len(list(sources.rglob("*.txt"))) == 1
+
+
 def test_ingest_on_unmigrated_db_is_friendly(tmp_path, capsys, unmigrated_db):
     # A DB file that exists but has no schema. Issue #55 made this distinct from "no DB
     # file at all", which the missing-database gate refuses earlier and differently.
