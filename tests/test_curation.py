@@ -2705,8 +2705,9 @@ def _orphaning_rekey_batch(tmp_path, capsys):
     """Rule on all four seeded families, then move all four with one dictionary edit.
 
     Returns ``({name: (old base, new base)}, map file path)``. Also leaves a row-scoped
-    verdict on the Glucose row (a stale breadcrumb after the rekey, never an orphan) and a
-    ``confirmed`` family verdict on HbA1c that the batch must carry across verbatim.
+    verdict on the HbA1c row (a stale breadcrumb after the rekey, never an orphan - the
+    report's ``row_breadcrumbs``, issue #210) and a ``confirmed`` family verdict on HbA1c
+    that the batch must carry across verbatim.
     """
     bases = {n: _cli_base(tmp_path, rt, col, n) for rt, col, n in (
         ("lab_result", "test_name", "HbA1c"),
@@ -2776,6 +2777,12 @@ def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
          (curation.ORPHAN_NO_FAMILY, curation.ORPHAN_DANGLING_MERGE)),
     }
     assert all(e["scope"] == "family" for e in payload["orphans"])
+    # ... and the row verdict is named apart, as a notice with its successor (#210).
+    hba1c_row = _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")
+    assert [(e["record_id"], e["dedup_base"], e["successor_base"], e["kinds"])
+            for e in payload["row_breadcrumbs"]] == [
+        (hba1c_row, moved["HbA1c"][0], moved["HbA1c"][1],
+         [curation.NOTICE_STALE_BREADCRUMB])]
 
     # The dry run is a dry run at batch scale too, in both dispositions.
     before = _cli_curation_rows(cli_ready)
@@ -2787,13 +2794,15 @@ def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
 
     capsys.readouterr()
     assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
-    assert "re-annotated 4 verdict(s)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "re-annotated 4 verdict(s)" in out
+    assert "refreshed 1 breadcrumb(s)" in out
 
     # Every ruling landed on its successor, verbatim - and each merge verdict now points at
     # its target's *new* base, which is the half a per-verdict remedy gets wrong.
     stored = {(r["record_type"], r["dedup_base"], r["record_id"]): r
               for r in _cli_curation_rows(cli_ready)}
-    assert len(stored) == 5   # four re-pointed families + the untouched row verdict
+    assert len(stored) == 5   # four re-pointed families + the refreshed row verdict
     assert [(r["status"], r["note"], r["attributed_to"], r["merged_into_base"]) for r in (
         stored[("lab_result", moved["HbA1c"][1], 0)],
         stored[("lab_result", moved["Glucose"][1], 0)],
@@ -2806,16 +2815,17 @@ def test_cli_reaffirm_carries_a_whole_batch_onto_the_new_identities(
         ("merged-into", "progressed, one condition", "Dr Who",
          moved["Type 2 Diabetes"][1]),
     ]
-    # The row verdict was left exactly where it was: not this batch's business.
-    assert ("lab_result", moved["HbA1c"][0],
-            _cli_row_id(cli_ready, "lab_result", "test_name", "HbA1c")) in stored
+    # The row verdict stays on its row, its ruling untouched - only its breadcrumb now
+    # names the family the row actually sits in (issue #210).
+    row_verdict = stored[("lab_result", moved["HbA1c"][1], hba1c_row)]
+    assert (row_verdict["status"], row_verdict["note"]) == ("disputed", "this draw only")
 
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
     out = capsys.readouterr().out
     assert "has no live family" not in out and "merges into" not in out
-    assert "warnings       1" in out            # only the row-scope breadcrumb, by design
-    assert "but the row now sits in" in out
+    assert "but the row now sits in" not in out
+    assert not any(line.startswith("warnings") for line in out.splitlines())
 
     capsys.readouterr()
     assert _run(cli_ready, "render", "curation", "--person", "jane-doe") == 0
@@ -2874,16 +2884,307 @@ def test_cli_reaffirm_mixed_batch_lands_what_it_can_and_names_the_rest(
     assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 1
     out = capsys.readouterr().out
     assert "re-annotated 1 verdict(s)" in out
+    assert "refreshed 1 breadcrumb(s)" in out     # the full map names it (#210)
     assert "already carries its own verdict" in out
     after = {(r["record_type"], r["dedup_base"], r["record_id"]) for r in
              _cli_curation_rows(cli_ready)}
     assert ("condition", moved["Type 2 Diabetes"][1], 0) in after
     assert ("lab_result", moved["HbA1c"][0], 0) in after   # still the operator's call
 
-    # Only the deliberately-refused verdict and the row breadcrumb are still reported.
+    # Only the deliberately-refused verdict is still reported; the full map refreshed the
+    # row breadcrumb (#210).
     capsys.readouterr()
     assert _run(cli_ready, "verify") == 0
-    assert "warnings       2" in capsys.readouterr().out
+    assert "warnings       1" in capsys.readouterr().out
+
+
+# --- row-scoped breadcrumbs a rekey moves (issue #210) ------------------------
+#
+# #126 made a rekey's *orphans* visible at apply time and bulk-fixable. A row-scoped
+# verdict is never an orphan - it resolves by row id - but the rekey still leaves its
+# stored base stale, and before #210 the operator learned of it one row at a time on the
+# next `verify`. These pin the apply-time notice and the bulk breadcrumb refresh.
+
+
+def test_stale_breadcrumbs_reports_a_row_verdict_whose_row_moved(seeded):
+    conn = seeded["conn"]
+    glucose_id = _row_id(conn, "lab_result", "test_name", "Glucose")
+    old = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="superseded",
+                            note="one assay", row=True, apply=True)
+
+    found = curation.stale_breadcrumbs(conn, "lab_result", {glucose_id: "f" * 64})
+
+    assert [(v.record_id, v.dedup_base, v.kinds, v.scope) for v in found] == [
+        (glucose_id, old, [curation.NOTICE_STALE_BREADCRUMB], "row")]
+    assert found[0].label == "Glucose" and found[0].family_size == 1
+    # A notice, never an orphan: the shared orphan detector stays blind to it.
+    assert curation.NOTICE_STALE_BREADCRUMB not in curation.ORPHAN_KINDS
+    assert curation.list_orphans(conn) == []
+
+
+def test_stale_breadcrumbs_ignores_current_family_and_unmoved_verdicts(seeded):
+    conn = seeded["conn"]
+    glucose_id = _row_id(conn, "lab_result", "test_name", "Glucose")
+    hba1c_id = _row_id(conn, "lab_result", "test_name", "HbA1c")
+    glucose = _base(conn, "lab_result", "test_name", "Glucose")
+    hba1c = _base(conn, "lab_result", "test_name", "HbA1c")
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="disputed",
+                            note="row", row=True, apply=True)
+    curation.annotate_record(conn, "lab_result", hba1c, status="disputed",
+                            note="family", apply=True)
+
+    # Breadcrumb already current; a family verdict; a row the map does not name.
+    assert curation.stale_breadcrumbs(conn, "lab_result", {glucose_id: glucose}) == []
+    assert curation.stale_breadcrumbs(conn, "lab_result", {hba1c_id: "f" * 64}) == []
+    assert curation.stale_breadcrumbs(conn, "lab_result", {}) == []
+
+
+def test_refresh_breadcrumb_rewrites_only_the_breadcrumb(seeded):
+    conn = seeded["conn"]
+    glucose_id = _row_id(conn, "lab_result", "test_name", "Glucose")
+    hba1c = _base(conn, "lab_result", "test_name", "HbA1c")
+    old = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="merged-into",
+                            merged_into_base=hba1c, note="same draw",
+                            attributed_to="Dr Who", now="2026-01-01T00:00:00+00:00",
+                            row=True, apply=True)
+    dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+    new = _base(conn, "lab_result", "test_name", "Glucose")
+    before = curation.get_verdict(conn, "lab_result", "", record_id=glucose_id)
+    assert before["dedup_base"] == old != new
+
+    # Dry run: reports the live base, writes nothing.
+    assert curation.refresh_breadcrumb(conn, "lab_result", glucose_id, old) == new
+    assert curation.get_verdict(
+        conn, "lab_result", "", record_id=glucose_id) == before
+
+    assert curation.refresh_breadcrumb(
+        conn, "lab_result", glucose_id, old, apply=True) == new
+    after = curation.get_verdict(conn, "lab_result", "", record_id=glucose_id)
+    assert after == {**before, "dedup_base": new}     # created_at included, untouched
+    assert _curation_count(conn) == 1
+
+    # Already current: refused rather than silently "succeeding".
+    with pytest.raises(ValueError, match="already current"):
+        curation.refresh_breadcrumb(conn, "lab_result", glucose_id, new, apply=True)
+
+
+def test_refresh_breadcrumb_refuses_a_missing_row_and_a_lost_race(seeded):
+    conn = seeded["conn"]
+    glucose_id = _row_id(conn, "lab_result", "test_name", "Glucose")
+    old = _base(conn, "lab_result", "test_name", "Glucose")
+    curation.annotate_record(conn, "lab_result", str(glucose_id), status="disputed",
+                            note="row", row=True, apply=True)
+    dedup.rekey(conn, {"glucose": "blood-sugar"}, apply=True)
+
+    # Compare-and-swap miss: the breadcrumb is not the one the caller saw.
+    with pytest.raises(curation.CurationNotFoundError):
+        curation.refresh_breadcrumb(conn, "lab_result", glucose_id, "0" * 64,
+                                    apply=True)
+    assert curation.get_verdict(
+        conn, "lab_result", "", record_id=glucose_id)["dedup_base"] == old
+
+    with pytest.raises(ValueError, match="row id"):
+        curation.refresh_breadcrumb(conn, "lab_result", 0, old)
+    conn.execute("DELETE FROM lab_result WHERE lab_result_id = ?", (glucose_id,))
+    conn.commit()
+    with pytest.raises(curation.RowNotFoundError):
+        curation.refresh_breadcrumb(conn, "lab_result", glucose_id, old, apply=True)
+
+
+def _breadcrumb_rekey(tmp_path, capsys):
+    """The #210 repro shape: a `--row` verdict on a row a synonym fold moves.
+
+    Returns ``(row id, old base, new base, path of this run's `rekey --apply --json`)``.
+    """
+    row_id = _cli_row_id(tmp_path, "lab_result", "test_name", "Glucose")
+    old = _cli_base(tmp_path, "lab_result", "test_name", "Glucose")
+    assert _run(tmp_path, "record", "annotate", "lab_result", str(row_id), "--row",
+                "--status", "superseded", "--note", "restated in the addendum",
+                "--attributed-to", "Dr Who", "--apply") == 0
+    dictionary = _cli_dict(tmp_path, "fold.toml", '"glucose" = "blood-sugar"\n')
+    capsys.readouterr()
+    assert _run(tmp_path, "rekey", "--dictionary", dictionary, "--apply", "--json") == 0
+    report = tmp_path / "fold-rekey.json"
+    report.write_text(capsys.readouterr().out, encoding="utf-8")
+    return row_id, old, _cli_base(tmp_path, "lab_result", "test_name", "Glucose"), \
+        str(report)
+
+
+def test_cli_rekey_dry_run_notes_a_row_breadcrumb_it_would_move(cli_ready, capsys):
+    row_id = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
+    old = _cli_base(cli_ready, "lab_result", "test_name", "Glucose")
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(row_id), "--row",
+                "--status", "disputed", "--note", "this draw only", "--apply") == 0
+    dictionary = _cli_dict(cli_ready, "fold.toml", '"glucose" = "blood-sugar"\n')
+    capsys.readouterr()
+
+    assert _run(cli_ready, "rekey", "--dictionary", dictionary) == 0
+    out = capsys.readouterr().out
+    assert "note: 1 row-scoped verdict(s) would sit in a different family" in out
+    assert f"lab_result row #{row_id}  {old[:12]}... -> " in out
+    assert "pemr record reaffirm --map-file" in out
+
+    assert _run(cli_ready, "rekey", "--dictionary", dictionary, "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["orphans"] == []                       # dry run: still apply-only
+    assert [e["record_id"] for e in payload["row_breadcrumbs"]] == [row_id]
+    assert _cli_base(cli_ready, "lab_result", "test_name", "Glucose") == old
+
+
+def test_cli_breadcrumb_drill_refreshes_the_row_verdict_and_quiets_verify(
+    cli_ready, capsys
+):
+    """The issue's repro end to end: rekey --apply --json reports 0 orphans but names the
+    row verdict; reaffirm --map-file previews then refreshes it; verify goes quiet; and
+    the ruling itself - row id, status, note, attribution, timestamp - is untouched."""
+    row_id, old, new, report = _breadcrumb_rekey(cli_ready, capsys)
+    assert old != new
+    payload = json.loads(open(report, encoding="utf-8").read())
+    assert payload["orphans"] == []
+    [entry] = payload["row_breadcrumbs"]
+    assert (entry["record_type"], entry["record_id"], entry["scope"], entry["dedup_base"],
+            entry["successor_base"], entry["narrowed"], entry["kinds"]) == (
+        "lab_result", row_id, "row", old, new, False, [curation.NOTICE_STALE_BREADCRUMB])
+    assert (entry["status"], entry["note"], entry["attributed_to"]) == (
+        "superseded", "restated in the addendum", "Dr Who")
+    before = _cli_curation_rows(cli_ready)
+
+    capsys.readouterr()
+    assert _run(cli_ready, "verify") == 0
+    assert "a rekey moved it" in capsys.readouterr().out      # the gap being closed
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report) == 0
+    out = capsys.readouterr().out
+    assert "refresh" in out and f"-> {new[:12]} (Glucose, 1 row(s))" in out
+    assert "dry run: nothing was written" in out
+    assert _cli_curation_rows(cli_ready) == before
+
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    out = capsys.readouterr().out
+    assert "re-annotated 0 verdict(s)" in out and "refreshed 1 breadcrumb(s)" in out
+    assert _cli_curation_rows(cli_ready) == [{**before[0], "dedup_base": new}]
+
+    assert _run(cli_ready, "verify") == 0
+    out = capsys.readouterr().out
+    assert "a rekey moved it" not in out
+    assert not any(line.startswith("warnings") for line in out.splitlines())
+
+    # Idempotent: the same map again is a clean no-op.
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--apply") == 0
+    out = capsys.readouterr().out
+    assert "already-handled" in out and "breadcrumb already current" in out
+    assert _cli_curation_rows(cli_ready) == [{**before[0], "dedup_base": new}]
+
+
+def test_cli_breadcrumb_reaffirm_json_names_the_refresh_action(cli_ready, capsys):
+    row_id, old, new, report = _breadcrumb_rekey(cli_ready, capsys)
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", report, "--json") == 0
+    [entry] = json.loads(capsys.readouterr().out)
+    assert (entry["action"], entry["record_id"], entry["dedup_base"], entry["to_base"],
+            entry["applied"]) == ("refresh", row_id, old, new, False)
+
+
+def test_cli_breadcrumb_refresh_follows_live_state_not_the_map(cli_ready, capsys):
+    """Each way the world can move after the map was captured: re-annotated by hand
+    (already handled), row moved again (refused), breadcrumb changed (refused), row gone
+    (refused, rc 1, with the `--clear --row` remedy)."""
+    row_id, old, new, report = _breadcrumb_rekey(cli_ready, capsys)
+    entry = json.loads(open(report, encoding="utf-8").read())["row_breadcrumbs"][0]
+
+    def run_map(name, **override):
+        path = cli_ready / name
+        path.write_text(json.dumps({"row_breadcrumbs": [{**entry, **override}]}),
+                        encoding="utf-8")
+        capsys.readouterr()
+        rc = _run(cli_ready, "record", "reaffirm", "--map-file", str(path), "--apply")
+        return rc, capsys.readouterr().out
+
+    before = _cli_curation_rows(cli_ready)
+    rc, out = run_map("moved-again.json", successor_base="1" * 64)
+    assert rc == 1 and "the row moved again since this map" in out
+    rc, out = run_map("stale-crumb.json", dedup_base="2" * 64)
+    assert rc == 1 and "breadcrumb changed since this map" in out
+    assert _cli_curation_rows(cli_ready) == before
+
+    # Re-annotating the row collapses the breadcrumb, so the map has nothing left to do.
+    assert _run(cli_ready, "record", "annotate", "lab_result", str(row_id), "--row",
+                "--status", "disputed", "--note", "re-ruled", "--apply") == 0
+    rc, out = run_map("handled.json")
+    assert rc == 0 and "already-handled" in out
+
+    # Straight to the table: the write paths would retire the verdict with the row.
+    conn = _cli_conn(cli_ready)
+    try:
+        conn.execute("UPDATE curation SET dedup_base = ?", (old,))
+        conn.execute("DELETE FROM lab_result WHERE lab_result_id = ?", (row_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    rc, out = run_map("gone.json")
+    assert rc == 1 and "the annotated row is gone" in out and "--clear --row" in out
+
+
+def test_cli_breadcrumbs_skip_blocked_tables_and_unmoved_rows(cli_ready, capsys):
+    """A blocked table's changes were withheld, so its row verdicts are not reported; a
+    row verdict on a row this run did not move is neither reported nor touched."""
+    glucose_id = _cli_row_id(cli_ready, "lab_result", "test_name", "Glucose")
+    pre_id = _cli_row_id(cli_ready, "condition", "name", "Prediabetes")
+    t2_id = _cli_row_id(cli_ready, "condition", "name", "Type 2 Diabetes")
+    for table, rid in (("lab_result", glucose_id), ("condition", pre_id),
+                       ("condition", t2_id)):
+        assert _run(cli_ready, "record", "annotate", table, str(rid), "--row",
+                    "--status", "disputed", "--note", "row ruling", "--apply") == 0
+    # glucose -> hba1c fuses the two labs (unresolved: blocks lab_result).
+    dictionary = _cli_dict(cli_ready, "mixed.toml",
+                           '"glucose" = "hba1c"\n'
+                           '"prediabetes" = "impaired glucose tolerance"\n')
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "rekey", "--dictionary", dictionary, "--apply", "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["skipped"] == ["lab_result"]
+    assert [(e["record_type"], e["record_id"]) for e in payload["row_breadcrumbs"]] == [
+        ("condition", pre_id)]
+    assert _cli_curation_rows(cli_ready) == before
+
+
+def test_cli_breadcrumbs_stay_out_of_listing_clear_and_old_maps(cli_ready, capsys):
+    """A stale breadcrumb is a healthy verdict: the bare listing and `--clear` never see
+    it, and a map without `row_breadcrumbs` (a pre-#210 report) refreshes nothing."""
+    _row_id_, _old, new, report = _breadcrumb_rekey(cli_ready, capsys)
+    before = _cli_curation_rows(cli_ready)
+    capsys.readouterr()
+
+    assert _run(cli_ready, "record", "reaffirm") == 0
+    assert "no orphaned curation verdicts" in capsys.readouterr().out
+    assert _run(cli_ready, "record", "reaffirm", "--clear", "--apply") == 0
+    assert _cli_curation_rows(cli_ready) == before
+
+    full = json.loads(open(report, encoding="utf-8").read())
+    old_shape = cli_ready / "old-shape.json"
+    old_shape.write_text(json.dumps(
+        {k: v for k, v in full.items() if k != "row_breadcrumbs"}), encoding="utf-8")
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(old_shape),
+                "--apply") == 0
+    assert _cli_curation_rows(cli_ready) == before
+
+    # The table filter applies to breadcrumbs too.
+    assert _run(cli_ready, "record", "reaffirm", "condition", "--map-file", report,
+                "--apply") == 0
+    assert _cli_curation_rows(cli_ready) == before
+
+    # A bare array of breadcrumb entries is routed by its `kinds`.
+    bare = cli_ready / "bare.json"
+    bare.write_text(json.dumps(full["row_breadcrumbs"]), encoding="utf-8")
+    capsys.readouterr()
+    assert _run(cli_ready, "record", "reaffirm", "--map-file", str(bare),
+                "--apply") == 0
+    assert "refreshed 1 breadcrumb(s)" in capsys.readouterr().out
+    assert [r["dedup_base"] for r in _cli_curation_rows(cli_ready)] == [new]
 
 
 # --- smoke: the cross-person merge accident, end to end through the CLI ------

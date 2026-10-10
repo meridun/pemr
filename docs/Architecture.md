@@ -129,7 +129,8 @@ CREATE TABLE document_tombstone (
 -- wins over family for its own row. Like 007 the table carries no FK to what it
 -- annotates, and `pemr verify` warns (never fails) on a verdict whose family - or row -
 -- is gone. Written only by `record annotate` and `record reaffirm` (the bulk remedy for
--- that orphaning, issue #126); read at render time by every generated document.
+-- that orphaning, issue #126, which also refreshes a stale row breadcrumb from a rekey's
+-- report, issue #210); read at render time by every generated document.
 CREATE TABLE curation (
   record_type      TEXT NOT NULL,   -- one of dedup.KNOWN_TYPES; validated in Python
   dedup_base       TEXT NOT NULL,   -- family identity; a breadcrumb when record_id <> 0
@@ -756,7 +757,8 @@ the warning it answers would re-annotate the wrong rows. It owns exactly two cla
 `no-live-family` (a family-scoped verdict whose `dedup_base` names no live family) and
 `dangling-merge-target` (either scope, `merged_into_base` names no live family). The
 row-scoped **stale breadcrumb** is deliberately not one of them — that verdict still
-resolves by row id, so nothing may re-point it — nor is the removed-row case, whose remedy
+resolves by row id, so its ruling is never re-pointed (a map-named breadcrumb refresh,
+below, is metadata only) — nor is the removed-row case, whose remedy
 is `--clear --row` and which the removal write paths already retire. Nor is the
 cross-person merge target (#169): its family is *live*, just the wrong person's, and
 neither `record reaffirm` nor `rekey --apply` has a remedy for that — making it a kind
@@ -781,6 +783,31 @@ failing, so re-running the same file is a clean no-op. Writes reuse `annotate_re
 `clear_curation` per row — annotate **before** clear, so a failure between the two leaves
 the ruling duplicated (recoverable) rather than destroyed. `record reaffirm` is CLI-only,
 absent from `WRITE_TOOLS` for the same reason `record annotate` is.
+
+**Row-scoped breadcrumbs a rekey moves ride the same file** (issue #210). Without them a
+run that moved a `--row` verdict's row reported `orphans: 0`, and the operator learned of
+it only from `pemr verify`, one row at a time. They stay a third, separate class —
+`stale-breadcrumb` (`curation.NOTICE_STALE_BREADCRUMB`), never in `ORPHAN_KINDS`, so
+`verify`, the bare listing and `--clear` are unchanged:
+
+- `rekey` (dry run **and** `--apply`) prints a `note:` block naming each row verdict whose
+  row this run moves into a family other than its stored breadcrumb, with the successor;
+  `--json` carries them as `row_breadcrumbs` (appended, always present, `[]` when none;
+  each entry is the `orphans` entry shape plus `successor_base` and `narrowed` — true for
+  a verdict this very run narrowed to row scope, #116). Detection is **per row** off
+  `RekeyReport.changes`, not off `base_maps`, because a dictionary edit that splits a
+  family sends its rows to different successors. Blocked tables are excluded; a row
+  verdict already in `orphans` (a dangling merge target) is left to that re-point.
+  Informational: the exit code is unchanged.
+- `record reaffirm --map-file` plans each entry as `refresh` against live state — only
+  when the verdict still carries the recorded breadcrumb *and* the row still sits in the
+  named successor; a breadcrumb already current is `already handled`, anything else is
+  skipped with a reason. The write (`curation.refresh_breadcrumb`) is one compare-and-swap
+  `UPDATE` of `dedup_base` alone: status, note, attribution and `created_at` are untouched,
+  because nothing was re-ruled. `--apply` adds `refreshed N breadcrumb(s)` only when N > 0.
+
+Breadcrumbs left stale by a rekey run whose report predates `row_breadcrumbs` keep the
+per-row remedy (`record annotate --row`).
 
 **Ingesting against drifted keys is refused, not silently forked.** Until the rekey is
 applied, a stored row's frozen key is invisible to layer-2 dedup, so re-filing that same
@@ -1319,7 +1346,9 @@ pemr record reaffirm [<table>] (--map-file <file> | --clear) [--apply] [--json]
                                                          # bulk remedy (§3): --map-file takes `rekey --apply --json`'s
                                                          # payload and re-points each verdict onto its successor
                                                          # family; --clear lifts them instead. Dry run by default;
-                                                         # a successor already carrying its own verdict is skipped
+                                                         # a successor already carrying its own verdict is skipped.
+                                                         # --map-file also refreshes the payload's row_breadcrumbs
+                                                         # (stale row-scope breadcrumbs; ruling untouched, #210)
 pemr record assert <table> --person <slug> --attributed-to <who> --date <iso>
                    --field NAME=VALUE [--field ...] [--apply]
                                                          # commit a fact attested by a PERSON, with no
@@ -1387,7 +1416,9 @@ pemr migrate [--create]                                  # apply pending migrati
 pemr rekey [--apply]                                     # re-derive dedup keys after a dictionary edit
                                                          # --apply also reports the curation verdicts THIS run
                                                          # orphaned; `--json` carries them as `orphans`, which is
-                                                         # the map file `record reaffirm` reads (§3)
+                                                         # the map file `record reaffirm` reads (§3). Both modes
+                                                         # also note row verdicts whose breadcrumb the run moves
+                                                         # (`row_breadcrumbs` in --json, issue #210)
 ```
 
 Every line above is implemented and parses today **except** the one flagged `NOT IMPLEMENTED`.

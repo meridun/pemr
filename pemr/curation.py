@@ -21,6 +21,8 @@ write it.
     retire_row_verdicts  -- ... and drop them, for the row-removal write paths
     orphan_kinds         -- why (if at all) one verdict points at nothing live
     list_orphans         -- ... over the whole table, for `verify` and `record reaffirm`
+    stale_breadcrumbs    -- the row verdicts a rekey moved out of their ruled family
+    refresh_breadcrumb   -- ... and rewrite one's breadcrumb, for `record reaffirm`
 
 **Pure overlay.** No record row is ever written. `render` stays a pure function of DB
 state: it just reads two tables per section instead of one, and re-rendering after a
@@ -59,7 +61,10 @@ resolution: every reader re-reads the live base off the row. A stale breadcrumb 
 an error, but it *is* reported: `pemr verify` notices that a rekey moved the row out of
 the family the ruling was made in, so the human can re-affirm (re-annotating collapses
 the breadcrumb) or re-rule. That notice is what makes a collision-resolving narrowing
-loud rather than silent.
+loud rather than silent. `pemr rekey` names the breadcrumbs *its own run* moves, and
+`pemr record reaffirm --map-file` refreshes them in bulk from that run's report (issue
+#210, :func:`stale_breadcrumbs`, :func:`refresh_breadcrumb`) — a metadata-only rewrite of
+the breadcrumb that leaves the ruling itself untouched.
 
 **Removing the row retires the verdict.** A ``dedup_base`` is content-derived, so a
 family verdict re-attaching to a re-ingested identical fact is correct. A row id is not:
@@ -188,13 +193,21 @@ SCOPE_ROW = "row"
 #: Deliberately **not** an orphan kind, and this exclusion is load-bearing: the
 #: *row-scoped stale breadcrumb* — a row verdict whose stored ``dedup_base`` a rekey left
 #: behind. That verdict still resolves, by ``record_id``; the stale base is never consulted
-#: (see the module docstring). `verify` keeps reporting it as its own notice, and nothing
-#: here may re-annotate it.
+#: (see the module docstring). `verify` keeps reporting it as its own notice. The ruling
+#: is never re-pointed: only an explicit :func:`refresh_breadcrumb` call (`pemr record
+#: reaffirm --map-file`, issue #210) may rewrite the breadcrumb, and nothing else.
 ORPHAN_NO_FAMILY = "no-live-family"
 ORPHAN_DANGLING_MERGE = "dangling-merge-target"
 
 #: Every orphan kind, in the order :func:`orphan_kinds` reports them.
 ORPHAN_KINDS: tuple[str, ...] = (ORPHAN_NO_FAMILY, ORPHAN_DANGLING_MERGE)
+
+#: The *stale breadcrumb* notice (issue #210) — a row-scoped verdict whose row a rekey
+#: moved into a different family than the one its stored ``dedup_base`` names. Spoken in
+#: the ``kinds`` field of `pemr rekey`'s ``row_breadcrumbs`` entries. Deliberately **not**
+#: in :data:`ORPHAN_KINDS`: the verdict still resolves by row id, so `verify`, the bare
+#: `record reaffirm` listing and `--clear` must never treat it as an orphan.
+NOTICE_STALE_BREADCRUMB = "stale-breadcrumb"
 
 
 class CurationNotFoundError(ValueError):
@@ -1072,6 +1085,99 @@ def list_orphans(
             family_size=verdict["family_size"],
         ))
     return out
+
+
+def stale_breadcrumbs(
+    conn: sqlite3.Connection, record_type: str, new_bases: dict[int, str]
+) -> list[OrphanVerdict]:
+    """The row-scoped verdicts whose row now sits in a family other than their breadcrumb.
+
+    ``new_bases`` maps ``row_id -> new dedup_base`` — the rows a rekey moved and where they
+    went. Per row rather than per old base on purpose (issue #210): a dictionary edit that
+    splits one family sends its rows to different successors, which a ``{old: new}`` base
+    map cannot express.
+
+    Returned as :class:`OrphanVerdict` carriers with ``kinds=[NOTICE_STALE_BREADCRUMB]`` so
+    the ``--json`` entry shape is the one `orphans` and `record reaffirm` already speak — but
+    these are notices, never orphans. ``label``/``family_size`` describe the row's live
+    family. ``[]`` when `curation` is absent.
+    """
+    _require_type(record_type)
+    wanted = {int(rid): str(base) for rid, base in new_bases.items() if int(rid)}
+    if not wanted:
+        return []
+    out: list[OrphanVerdict] = []
+    for verdict in row_verdicts_for(conn, record_type, wanted):
+        if verdict["dedup_base"] == wanted[verdict["record_id"]]:
+            continue
+        label, _live_base, size = row_label(conn, record_type, verdict["record_id"])
+        out.append(OrphanVerdict(
+            record_type=verdict["record_type"],
+            dedup_base=verdict["dedup_base"],
+            record_id=verdict["record_id"],
+            scope=verdict["scope"],
+            status=verdict["status"],
+            note=verdict["note"],
+            attributed_to=verdict["attributed_to"],
+            merged_into_base=verdict["merged_into_base"],
+            created_at=verdict["created_at"],
+            kinds=[NOTICE_STALE_BREADCRUMB],
+            label=label,
+            family_size=size,
+        ))
+    return out
+
+
+def refresh_breadcrumb(
+    conn: sqlite3.Connection,
+    record_type: str,
+    record_id: int,
+    from_base: str,
+    *,
+    apply: bool = False,
+) -> str:
+    """Rewrite one row verdict's breadcrumb to its row's live base; return that base.
+
+    A **metadata refresh, not a new ruling** (issue #210): only ``dedup_base`` changes —
+    ``status``, ``note``, ``attributed_to``, ``merged_into_base`` and ``created_at`` are
+    all preserved, which is why this never goes through :func:`annotate_record` (that would
+    re-stamp ``created_at`` and re-run the merge validation on a ruling nobody changed).
+
+    One compare-and-swap ``UPDATE`` guarded on ``dedup_base = from_base``, so a concurrent
+    `record annotate` (or a second refresh) is detected rather than overwritten.
+
+    Raises :class:`RowNotFoundError` when the row is gone (its remedy is ``--clear --row``),
+    :class:`ValueError` for a family-scope id or a breadcrumb that is already current, and
+    :class:`CurationNotFoundError` when no row verdict still carries ``from_base``.
+    """
+    db.require_migrated(conn)
+    _require_type(record_type)
+    record_id = int(record_id or 0)
+    if not record_id:
+        raise ValueError("refresh_breadcrumb needs a row id - family verdicts have none")
+    _label, live, _size = row_label(conn, record_type, record_id)
+    if not live:
+        raise RowNotFoundError(
+            f"{record_type} row #{record_id} is gone - lift its verdict with "
+            "`pemr record annotate --clear --row`"
+        )
+    if live == from_base:
+        raise ValueError(
+            f"{record_type} row #{record_id}'s breadcrumb is already current"
+        )
+    if apply:
+        with conn:
+            cur = conn.execute(
+                "UPDATE curation SET dedup_base = ? "
+                "WHERE record_type = ? AND record_id = ? AND dedup_base = ?",
+                (live, record_type, record_id, from_base),
+            )
+            if cur.rowcount == 0:
+                raise CurationNotFoundError(
+                    f"no row-scoped curation verdict for {record_type} row #{record_id} "
+                    f"still recorded in {str(from_base)[:12]}... - it changed since the map"
+                )
+    return live
 
 
 def clear_curation(

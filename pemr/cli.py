@@ -1484,10 +1484,14 @@ class _ReaffirmAction:
     * ``"reaffirm"`` — re-record the same ruling against ``to_base`` (a family
       ``dedup_base``, or the row id at row scope).
     * ``"clear"`` — lift the verdict (``--clear``).
+    * ``"refresh"`` — rewrite only the stale *breadcrumb* of a row-scoped verdict to
+      ``to_base``, its row's live family (issue #210). Not a new ruling: status, note,
+      attribution and ``created_at`` are untouched.
     * ``"skip"`` — refused, with ``reason``: nothing in the map names it, no successor
       family for a kind that needs one, or the successor already carries its own ruling.
-    * ``"already-handled"`` — a map entry that matches no live orphan, so an earlier run
-      already dealt with it. Not an error; re-running the same file is a clean no-op.
+    * ``"already-handled"`` — a map entry that matches no live orphan (or a breadcrumb
+      that is already current), so an earlier run already dealt with it. Not an error;
+      re-running the same file is a clean no-op.
     """
 
     orphan: "curation.OrphanVerdict"
@@ -1518,25 +1522,42 @@ class _ReaffirmAction:
 _REAFFIRM_REFUSALS = ("skip",)
 
 
-def _load_reaffirm_map(path: str) -> list[dict]:
-    """Read a ``--map-file`` into the list of orphan entries it carries.
+def _load_reaffirm_map(path: str) -> tuple[list[dict], list[dict]]:
+    """Read a ``--map-file`` into ``(orphan entries, stale-breadcrumb entries)``.
 
-    Accepts either the object `pemr rekey --apply --json` emits (its ``orphans`` array is
-    taken) or a bare array of the same entries, so the composed pipeline is one
-    redirection: ``pemr rekey --apply --json > f`` then
+    Accepts either the object `pemr rekey --apply --json` emits (its ``orphans`` and
+    ``row_breadcrumbs`` arrays are taken) or a bare array of the same entries, so the
+    composed pipeline is one redirection: ``pemr rekey --apply --json > f`` then
     ``pemr record reaffirm --map-file f``. Unknown keys are ignored — the rekey payload
     carries much more than this command needs, and a consumer must not have to trim it.
+
+    Backward compatible (issue #210): a report from before ``row_breadcrumbs`` existed
+    loads with no breadcrumbs, and a bare array is orphans only — except an entry whose
+    ``kinds`` names :data:`curation.NOTICE_STALE_BREADCRUMB`, which is routed to the
+    breadcrumbs it came from.
     """
     with open(path, "rb") as fh:
         payload = json.load(fh)
+    orphans: object = None
+    breadcrumbs: object = None
     if isinstance(payload, dict):
-        payload = payload.get("orphans", [])
-    if not isinstance(payload, list):
+        orphans = payload.get("orphans", [])
+        breadcrumbs = payload.get("row_breadcrumbs", [])
+    elif isinstance(payload, list):
+        entries = [entry for entry in payload if isinstance(entry, dict)]
+        orphans, breadcrumbs = [], []
+        for entry in entries:
+            crumb = curation.NOTICE_STALE_BREADCRUMB in (entry.get("kinds") or [])
+            (breadcrumbs if crumb else orphans).append(entry)
+    if not isinstance(orphans, list) or not isinstance(breadcrumbs, list):
         raise ValueError(
             f"{path} is not a rekey report: expected an object with an 'orphans' array, "
             "or a bare array of orphan entries"
         )
-    return [entry for entry in payload if isinstance(entry, dict)]
+    return (
+        [entry for entry in orphans if isinstance(entry, dict)],
+        [entry for entry in breadcrumbs if isinstance(entry, dict)],
+    )
 
 
 def _reaffirm_map_key(record_type: object, record_id: object, base: object) -> tuple:
@@ -1592,8 +1613,13 @@ def _plan_reaffirm(
     orphans: list["curation.OrphanVerdict"],
     mapping: list[dict] | None,
     clear: bool,
+    breadcrumbs: list[dict] | None = None,
 ) -> list[_ReaffirmAction]:
     """Decide what to do about every live orphan — the whole batch, before any write.
+
+    ``breadcrumbs`` are a map file's ``row_breadcrumbs`` entries (issue #210), planned in
+    map mode only: the listing and ``--clear`` never see them, because a stale breadcrumb
+    is a healthy verdict and ``--clear`` must never lift one.
 
     ``mapping=None`` and ``clear=False`` is the pure listing mode: no disposition was
     supplied, so nothing is planned and nothing is refused.
@@ -1659,7 +1685,73 @@ def _plan_reaffirm(
             orphan=_orphan_from_entry(entry), action="already-handled",
             reason="no longer orphaned",
         ))
+
+    # Breadcrumb refreshes go last, so `_apply_reaffirm` writes every re-point before any
+    # refresh. Their own key space: a row orphan and a breadcrumb share the
+    # `(record_type, record_id)` key shape, and one dict would let one clobber the other.
+    if mapping is not None and not clear:
+        crumbs: dict[tuple, dict] = {}
+        for entry in breadcrumbs or []:
+            crumbs[_reaffirm_map_key(
+                entry.get("record_type"), entry.get("record_id"), entry.get("dedup_base")
+            )] = entry
+        for entry in crumbs.values():
+            plan.append(_plan_one_refresh(conn, entry))
     return plan
+
+
+def _plan_one_refresh(conn, entry: dict) -> _ReaffirmAction:
+    """Plan the breadcrumb refresh of one ``row_breadcrumbs`` map entry (issue #210).
+
+    The live table is the authority, never the entry: the refresh happens only when the
+    row verdict still carries the breadcrumb the map recorded *and* the row still sits in
+    the successor the map names. Anything else means the world moved since the map was
+    captured, and is either already handled or refused with a reason.
+    """
+    carrier = _orphan_from_entry(entry)
+    record_type, record_id = carrier.record_type, carrier.record_id
+
+    def result(action: str, reason: str, orphan=None) -> _ReaffirmAction:
+        return _ReaffirmAction(orphan=orphan or carrier, action=action, reason=reason)
+
+    if record_type not in dedup.FIELD_SPECS or not record_id:
+        return result(
+            "skip", "not a row-scoped breadcrumb entry (hand-edited map?) - nothing to "
+            "refresh"
+        )
+    live = curation.get_verdict(conn, record_type, "", record_id=record_id)
+    if live is None:
+        return result("already-handled", "no row verdict left on that row")
+    label, live_base, size = curation.row_label(conn, record_type, record_id)
+    current = curation.OrphanVerdict(
+        record_type=record_type, dedup_base=live["dedup_base"], record_id=record_id,
+        scope=live["scope"], status=live["status"], note=live["note"],
+        attributed_to=live["attributed_to"], merged_into_base=live["merged_into_base"],
+        created_at=live["created_at"], kinds=[curation.NOTICE_STALE_BREADCRUMB],
+        label=label, family_size=size,
+    )
+    if not live_base:
+        return result(
+            "skip", "the annotated row is gone - lift the verdict with `--clear --row`",
+            current,
+        )
+    if live["dedup_base"] == live_base:
+        return result("already-handled", "breadcrumb already current", current)
+    if live["dedup_base"] != carrier.dedup_base:
+        return result(
+            "skip", "the verdict's breadcrumb changed since this map - the map is stale; "
+            "re-run `pemr rekey --apply --json`", current,
+        )
+    if str(entry.get("successor_base") or "") != live_base:
+        return result(
+            "skip", f"the row moved again since this map (now in {live_base[:12]}...) - "
+            "re-run `pemr rekey --apply --json`, or re-affirm it with "
+            f"`pemr record annotate --row {record_type} {record_id}`", current,
+        )
+    return _ReaffirmAction(
+        orphan=current, action="refresh", to_base=live_base,
+        target_label=label, target_family_size=size,
+    )
 
 
 def _plan_one_reaffirm(
@@ -1808,6 +1900,13 @@ def _apply_reaffirm(conn, plan: list[_ReaffirmAction]) -> str:
                     curation.clear_curation(
                         conn, orphan.record_type, orphan.dedup_base, apply=True
                     )
+            elif action.action == "refresh":
+                # Metadata only (issue #210): never `annotate_record`, which would
+                # re-stamp the ruling and re-run its validation.
+                curation.refresh_breadcrumb(
+                    conn, orphan.record_type, orphan.record_id, orphan.dedup_base,
+                    apply=True,
+                )
             else:
                 continue
         except (ValueError, curation.CurationNotFoundError) as exc:
@@ -1824,7 +1923,7 @@ def _reaffirm_line(action: _ReaffirmAction) -> str:
         f"row #{orphan.record_id}" if orphan.record_id
         else str(orphan.dedup_base)[:12]
     )
-    if action.action == "reaffirm":
+    if action.action in ("reaffirm", "refresh"):
         target = f" -> {str(action.to_base)[:12]}"
         if action.target_label:
             target += f" ({action.target_label}, {action.target_family_size} row(s))"
@@ -1854,9 +1953,10 @@ def _cmd_record_reaffirm(args: argparse.Namespace) -> int:
     its own disposition flags belongs on its own usage line.
     """
     mapping: list[dict] | None = None
+    breadcrumbs: list[dict] = []
     if args.map_file:
         try:
-            mapping = _load_reaffirm_map(args.map_file)
+            mapping, breadcrumbs = _load_reaffirm_map(args.map_file)
         except OSError as exc:
             print(f"error: cannot read {args.map_file}: {exc}", file=sys.stderr)
             return 1
@@ -1866,10 +1966,14 @@ def _cmd_record_reaffirm(args: argparse.Namespace) -> int:
 
     def work(conn):
         plan = _plan_reaffirm(
-            conn, curation.list_orphans(conn, args.table), mapping, args.clear
+            conn, curation.list_orphans(conn, args.table), mapping, args.clear,
+            [b for b in breadcrumbs
+             if args.table is None or b.get("record_type") == args.table],
         )
         failure = ""
-        if args.apply and any(a.action in ("reaffirm", "clear") for a in plan):
+        if args.apply and any(
+            a.action in ("reaffirm", "clear", "refresh") for a in plan
+        ):
             failure = _apply_reaffirm(conn, plan)
         refused = [a for a in plan if a.action in _REAFFIRM_REFUSALS]
         rc = 1 if (refused or failure) else 0
@@ -1895,7 +1999,12 @@ def _cmd_record_reaffirm(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         elif args.apply:
-            print(f"re-annotated {written} verdict(s)")
+            refreshed = sum(1 for a in plan if a.applied and a.action == "refresh")
+            print(f"re-annotated {written - refreshed} verdict(s)")
+            # Only when it happened, so a breadcrumb-free run's output is byte-identical
+            # to #126's (the additive-only rule).
+            if refreshed:
+                print(f"refreshed {refreshed} breadcrumb(s)")
         elif mapping is None and not args.clear:
             print(
                 "listing only: pass --map-file <file> (from `pemr rekey --apply --json`) "
@@ -2363,6 +2472,82 @@ def _rekey_orphans(
     return out
 
 
+def _rekey_breadcrumbs(
+    conn,
+    report: "dedup.RekeyReport",
+    orphans: list[tuple["curation.OrphanVerdict", str | None, str | None]],
+) -> list[tuple["curation.OrphanVerdict", str, bool]]:
+    """The row-scoped verdicts whose breadcrumb *this* rekey run moves (issue #210).
+
+    :func:`_rekey_orphans`' sibling for the class it deliberately excludes: a row verdict
+    still resolves by row id, so it is never an orphan — but its stored ``dedup_base`` goes
+    stale, and `pemr verify` would report it one row at a time on the next run.
+
+    Detected **per row** from :attr:`dedup.RekeyReport.changes` rather than from
+    ``base_maps``: a dictionary edit that splits a family sends its rows to different
+    successors, and ``changes`` (computed before the write) carries each row's own new
+    base — so a dry run reports the same set an ``--apply`` would. Tables in
+    :attr:`dedup.RekeyReport.blocked` are excluded (their changes were withheld), and so is
+    any row verdict already in ``orphans``: its re-point collapses the breadcrumb anyway,
+    and two map entries on one ``(record_type, record_id)`` would clobber each other.
+
+    Returns ``(verdict, successor_base, narrowed)`` per entry; ``narrowed`` marks a verdict
+    this very run narrowed to row scope to resolve a collision (#116).
+    """
+    blocked = set(report.blocked)
+    new_bases: dict[str, dict[int, str]] = {}
+    for change in report.changes:
+        if change.record_type in blocked or not change.new_base:
+            continue
+        new_bases.setdefault(change.record_type, {})[int(change.row_id)] = change.new_base
+    if not new_bases:
+        return []
+    taken = {(o.record_type, o.record_id) for o, _s, _m in orphans if o.record_id}
+    narrowed = {
+        (r.record_type, int(rid))
+        for r in report.resolved if r.verdict_action == "narrowed"
+        for rid in r.narrowed_row_ids
+    }
+    out: list[tuple["curation.OrphanVerdict", str, bool]] = []
+    for record_type, bases in new_bases.items():
+        for verdict in curation.stale_breadcrumbs(conn, record_type, bases):
+            key = (record_type, verdict.record_id)
+            if key in taken:
+                continue
+            out.append((verdict, bases[verdict.record_id], key in narrowed))
+    return out
+
+
+def _print_rekey_breadcrumbs(
+    entries: list[tuple["curation.OrphanVerdict", str, bool]], applied: bool
+) -> None:
+    """The stale-breadcrumb notice block (issue #210) — a ``note:``, not a warning.
+
+    The verdicts still apply by row id, so nothing is broken and `rekey`'s exit code is
+    unchanged; the block exists so the operator learns of this run's fallout now, with
+    the bulk remedy, instead of one row at a time on the next `pemr verify`.
+    """
+    if not entries:
+        return
+    verb = "now sit" if applied else "would sit"
+    print(
+        f"note: {len(entries)} row-scoped verdict(s) {verb} in a different family than "
+        "the one they were ruled in"
+    )
+    for verdict, successor, narrowed in entries:
+        suffix = " (narrowed by this run)" if narrowed else ""
+        print(
+            f"  {verdict.record_type} row #{verdict.record_id}  "
+            f"{str(verdict.dedup_base)[:12]}... -> {str(successor)[:12]}...  "
+            f"[{curation.describe(verdict.as_dict())}]{suffix}"
+        )
+    print(
+        "  they still apply (by row id); refresh their breadcrumbs in one reviewed batch\n"
+        "  with `pemr record reaffirm --map-file <file>` (dry run), then --apply - where\n"
+        "  <file> is this run's own report: `pemr rekey --apply --json > <file>`."
+    )
+
+
 def _print_rekey_orphans(
     orphans: list[tuple["curation.OrphanVerdict", str | None, str | None]]
 ) -> None:
@@ -2424,6 +2609,10 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
         # from (predicting it would mean simulating the post-write database - out of
         # scope, issue #126).
         orphans = _rekey_orphans(conn, report) if args.apply else []
+        # Unlike orphans, on the dry run too: the per-row successor is known before the
+        # write (issue #210). On --apply it is read after the write, so a verdict this
+        # run narrowed to row scope (#116) is included.
+        breadcrumbs = _rekey_breadcrumbs(conn, report, orphans)
     finally:
         conn.close()
 
@@ -2519,6 +2708,18 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
                 }
                 for orphan, successor, successor_merge in orphans
             ],
+            # Appended (issue #210): the row-scoped verdicts whose breadcrumb this run
+            # moves - notices, not orphans, kept out of `orphans` because #126 consumers
+            # treat every entry there as one. Always present, `[]` when there are none;
+            # `pemr record reaffirm --map-file` refreshes them from this same payload.
+            "row_breadcrumbs": [
+                {
+                    **verdict.as_dict(),
+                    "successor_base": successor,
+                    "narrowed": narrowed,
+                }
+                for verdict, successor, narrowed in breadcrumbs
+            ],
         })
         return rc
 
@@ -2556,6 +2757,7 @@ def _cmd_rekey(args: argparse.Namespace) -> int:
             f"({merged} as one fact, {distinct} as distinct facts)"
         )
 
+    _print_rekey_breadcrumbs(breadcrumbs, report.applied)
     _print_rekey_orphans(orphans)
 
     for collision in report.collisions:
@@ -3740,7 +3942,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--map-file", dest="map_file", metavar="FILE",
         help="old->new base mapping from `pemr rekey --apply --json` (that payload, or a "
              "bare array of its 'orphans' entries); required to re-point anything, since "
-             "the mapping cannot be re-derived once the rekey is over",
+             "the mapping cannot be re-derived once the rekey is over. Its "
+             "'row_breadcrumbs' entries are refreshed too: a row-scoped verdict's stale "
+             "breadcrumb is rewritten to its row's live family, the ruling untouched",
     )
     r_reaffirm_how.add_argument(
         "--clear", action="store_true",

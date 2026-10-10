@@ -550,6 +550,8 @@ def test_rekey_json_output(ready, capsys, tmp_path):
     assert payload["scanned"]["lab_result"] == 1
     change = payload["changed"][0]
     assert change["label"] == "ZZT" and change["old_key"] != change["new_key"]
+    # Appended by issue #210: always present, empty when no row verdict's breadcrumb moves.
+    assert payload["row_breadcrumbs"] == []
 
 
 def _seed_fusing_lab_and_movable_condition(ready, capsys, tmp_path, old):
@@ -948,6 +950,10 @@ def test_rekey_reports_no_orphans_for_a_verdict_resolved_collision(
     payload = json.loads(capsys.readouterr().out)
     assert [r["verdict_action"] for r in payload["resolved"]] == ["narrowed"]
     assert payload["orphans"] == []
+    # The narrowed verdict's breadcrumb still names the pre-rekey family, so it is named
+    # as a stale breadcrumb, flagged as narrowed by this very run (issue #210).
+    assert [(e["record_id"], e["narrowed"]) for e in payload["row_breadcrumbs"]] == [
+        (alb_id, True)]
 
 
 # --- intake formats at the CLI (issue #66) ------------------------------------
