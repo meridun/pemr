@@ -75,6 +75,12 @@ def _routine_procedures() -> tuple[str, ...]:
     return _dedup.load_routine_procedures(cli._resolve_dictionary_path(_ARGS))
 
 
+def _medication_display() -> dict[str, str]:
+    """The render-only ``[medication_display]`` override map (issue #209), from the same
+    file :func:`_dictionary` reads -- so both front doors case medication names alike."""
+    return _dedup.load_medication_display(cli._resolve_dictionary_path(_ARGS))
+
+
 def _connect() -> sqlite3.Connection:
     """Same missing-database gate the CLI applies, raised as a tool error (issue #55).
 
@@ -518,6 +524,7 @@ def render_summary(conn: sqlite3.Connection, *, person: str) -> dict[str, str]:
             person,
             dictionary=_dictionary(),
             routine_procedures=_routine_procedures(),
+            medication_display=_medication_display(),
         )
     except (db.NotMigratedError, _query.PersonNotFoundError) as exc:
         raise _friendly(exc) from exc
@@ -546,6 +553,7 @@ def render_brief(
             appointment,
             dictionary=_dictionary(),
             include_self_reported=include_self_reported,
+            medication_display=_medication_display(),
         )
     except (db.NotMigratedError, _render.AppointmentNotFoundError) as exc:
         raise _friendly(exc) from exc

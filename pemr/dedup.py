@@ -382,6 +382,40 @@ def load_routine_procedures(path: str | Path | None) -> tuple[str, ...]:
     return tuple(out)
 
 
+def load_medication_display(path: str | Path | None) -> dict[str, str]:
+    """Load the per-medication display overrides (``[medication_display]``) from the same
+    TOML file :func:`load_dictionary` reads (issue #209).
+
+    Maps a medication's canonical token to the exact display form ``render summary`` and
+    ``render brief`` print in place of the casing rule (:func:`pemr.names.display_name`),
+    for names that rule cases wrongly (a brand written ``ZorbaPen``). Keys are
+    :func:`norm`-normalized without the synonym dictionary -- the key *is* the canonical
+    token, so it is written in that form; values are stripped and blanks dropped.
+    ``None``, a missing file and an absent table all give ``{}``: no overrides, the rule
+    alone.
+
+    **Render-only.** These entries never reach :func:`dedup_key`/:func:`key_token`, no
+    stored row depends on them, and `pemr rekey` must ignore this table entirely.
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    with p.open("rb") as fh:
+        data = tomllib.load(fh)
+    table = data.get("medication_display", {})
+    if not isinstance(table, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in table.items():
+        token = norm(key)
+        shown = str(value).strip() if value is not None else ""
+        if token and shown:
+            out[token] = shown
+    return out
+
+
 def _collapse(value: str) -> str:
     """Case/whitespace-normalized spelling of a free-text name.
 

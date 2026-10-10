@@ -119,6 +119,16 @@ still decided on stored values, and a person with no preference renders byte-ide
 to what they did before the overlay existed. Like curation, this is still a pure function
 of DB state: the preference *is* DB state.
 
+**Medication display names** (issue #209). Sources print medication names in ALL CAPS
+(pharmacy labels) or tall-man lettering (EHR exports). The summary's and the brief's
+medication lines show them through :func:`pemr.names.display_name` -- source casing
+discarded, house style applied, fixed-form tokens (``HCl``, ``ER``, ``mg``) kept -- or
+through a per-name ``[medication_display]`` override from ``dictionary.toml``
+(:func:`dedup.load_medication_display`), keyed by the medication's canonical
+:func:`norm` token. Display-only: the row dict, the stored ``name``, dedup keys and
+``query --json`` all keep the source text; journal, timeline and curation renders are
+unchanged.
+
 Output is **ASCII-only** (the cp1252/cp437 Windows-console lesson from phases 2-3):
 plain hyphens, never em-dashes -- a non-ASCII byte crashes a non-UTF-8 console.
 
@@ -134,10 +144,10 @@ from __future__ import annotations
 import calendar
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 
-from . import curation, db, dedup, query, units
+from . import curation, db, dedup, names, query, units
 from .dedup import (
     OBS_SYMPTOM,
     OBS_VITAL,
@@ -1332,12 +1342,27 @@ def _section(title: str, lines: list[str], *, empty: str = "_none recorded_") ->
 # Master summary (Architecture.md §6)
 # --------------------------------------------------------------------------- #
 
+def _med_display_name(
+    m: dict,
+    overrides: Mapping[str, str] | None,
+    dictionary: dict[str, str] | None,
+) -> object:
+    """A medication row's display name (issue #209, module docstring): its
+    ``[medication_display]`` override when one is keyed on the row's canonical token,
+    otherwise the :func:`names.display_name` casing rule. Reads ``m``; never mutates it."""
+    override = None
+    if overrides:
+        override = overrides.get(norm(m.get("name"), dictionary))
+    return names.display_name(m.get("name"), override=override)
+
+
 def render_summary(
     conn: sqlite3.Connection,
     slug: str,
     *,
     dictionary: dict[str, str] | None = None,
     routine_procedures: Sequence[str] | None = None,
+    medication_display: Mapping[str, str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """Markdown master summary for a person: active meds, active problems, past medical
@@ -1359,6 +1384,9 @@ def render_summary(
     nothing -- so every caller that does not pass one gets default-show behavior for free.
     A section that filtered anything says so; a section that filtered *everything* says
     that too, rather than the false ``_none recorded_``.
+
+    ``medication_display`` is the render-only ``[medication_display]`` override map
+    (issue #209); ``None`` leaves medication names on the casing rule alone.
 
     Raises :class:`query.PersonNotFoundError` for an unknown slug (friendly rc=1)."""
     person_id = query.resolve_person_id(conn, slug)
@@ -1396,7 +1424,7 @@ def render_summary(
         freq = f" {m['frequency']}" if m["frequency"] else ""
         since = f" (since {m['started_on']})" if m["started_on"] else ""
         med_lines.append(
-            f"- {m['name']}{dose}{freq}{since}"
+            f"- {_med_display_name(m, medication_display, dictionary)}{dose}{freq}{since}"
             f"{_dispute_suffix(m)}{_attest_suffix(m)}{_correction_suffix(m)}"
         )
 
@@ -1510,6 +1538,7 @@ def render_brief(
     dictionary: dict[str, str] | None = None,
     recent_labs: int = _BRIEF_RECENT_LABS,
     include_self_reported: bool = False,
+    medication_display: Mapping[str, str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """Markdown walk-in brief for one appointment: the appointment header, current meds,
@@ -1534,6 +1563,9 @@ def render_brief(
     failure than the one being fixed. The rows stay reachable unfiltered through
     ``pemr query timeline``, and the summary's collapsed ``## Self-Reported Symptoms``
     section remains the useful reading of them.
+
+    ``medication_display`` is the render-only ``[medication_display]`` override map
+    (issue #209), as in :func:`render_summary`.
 
     Raises :class:`AppointmentNotFoundError` for an unknown id (friendly rc=1)."""
     db.require_migrated(conn)
@@ -1568,7 +1600,8 @@ def render_brief(
         dose = f" {m['dose']}" if m["dose"] else ""
         freq = f" {m['frequency']}" if m["frequency"] else ""
         med_lines.append(
-            f"- {m['name']}{dose}{freq}{_dispute_suffix(m)}{_attest_suffix(m)}{_correction_suffix(m)}"
+            f"- {_med_display_name(m, medication_display, dictionary)}{dose}{freq}"
+            f"{_dispute_suffix(m)}{_attest_suffix(m)}{_correction_suffix(m)}"
         )
 
     # Recency stays the primary axis, but a single draw can carry a 50+ analyte panel —

@@ -183,6 +183,40 @@ def test_render_summary_routine_procedures_come_from_the_dictionary(ready, capsy
     assert out.isascii()          # cp1252/cp437 console contract
 
 
+def test_render_medication_display_comes_from_the_dictionary(ready, capsys):
+    """Issue #209 at the command boundary: `--dictionary` feeds the render-only
+    `[medication_display]` table to both summary and brief, the casing rule covers every
+    other name, and `query meds --json` keeps the source text. Names are made up."""
+    tmp_path, aid = ready
+    conn = db.connect(tmp_path / "cli.db")
+    pid = conn.execute(
+        "SELECT person_id FROM person WHERE slug='jane-doe'"
+    ).fetchone()["person_id"]
+    cur = conn.execute(
+        "INSERT INTO document (sha256, person_id, source_path, ingested_at) "
+        "VALUES ('sha-meds', ?, 'aa/x.pdf', '2026-01-01T00:00:00')", (pid,)
+    )
+    conn.commit()
+    dedup.commit_extraction(conn, cur.lastrowid, {"medication": [
+        {"name": "ZORBAPEN", "started_on": "2025-01-01"},
+        {"name": "zorBAFen HCL", "started_on": "2025-01-01"},
+    ]}, {})
+    conn.close()
+    d = tmp_path / "dict.toml"
+    d.write_text('[medication_display]\n"zorbapen" = "ZorbaPen"\n', encoding="utf-8")
+    capsys.readouterr()
+
+    for argv in (("summary", "--person", "jane-doe"), ("brief", "--appointment", str(aid))):
+        assert _run(tmp_path, "render", *argv, "--dictionary", str(d)) == 0
+        out = capsys.readouterr().out
+        assert "- ZorbaPen" in out and "- Zorbafen HCl" in out
+        assert "ZORBAPEN" not in out and "zorBAFen" not in out
+
+    assert _run(tmp_path, "query", "meds", "--person", "jane-doe", "--json") == 0
+    names = {m["name"] for m in json.loads(capsys.readouterr().out)}
+    assert {"ZORBAPEN", "zorBAFen HCL"} <= names
+
+
 def test_render_summary_default_dictionary_applies_the_starter_list(ready, capsys):
     """With no `--dictionary` the CLI falls back to the shipped
     `data/dictionary.example.toml`, exactly as it already does for `[synonyms]` -- so the
