@@ -68,6 +68,10 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
   different machines — deconflict via per-issue claims, a per-machine maintenance lock, and
   idempotent tracker writes. The dispatcher's own prompt is [`dispatch.md`](dispatch.md) — the
   canonical copy; the scheduled task is a thin pointer to it.
+- **Focused (manual, on request):** [`focus.md`](focus.md) runs one normal dispatch cycle with
+  lane eligibility filtered to a single issue, so the dispatcher's serial-rerun-after-ADVANCE rule
+  carries that issue lane by lane until a PARK, BOUNCE, CONTINUE, or human gate (`stage:queued`,
+  PR merge).
 - **Manual:** paste this README, the profile, the binding, and a lane file's body into an agent
   session. Identical behavior — the prompt doesn't know what fired it. Mint your own run-id for the
   claim. Manual and scheduled runs coexist safely: claims deconflict per-issue.
@@ -76,8 +80,9 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
 
 1. **CLAIM** — eligible = open issues at `stage:<lane>` that carry **none** of `sdlc:wip`,
    `sdlc:needs-human`, or `sdlc:hold`, and have **no open blocker** (`dep-read`). If the invoking
-   message supplies a **candidate snapshot** for the lane (issue, markers, created-at — the
-   dispatcher inlines one from its Step 0 `snapshot`), select from that list instead of
+   message supplies a **candidate snapshot** for the lane (issue ids, already in CLAIM order;
+   markers and created-at appear only if the binding's report carries them — the dispatcher
+   inlines one from its Step 0 `snapshot`), select from that list instead of
    re-querying; without one (e.g. a manual run), self-query with `snapshot`. The snapshot only
    seeds candidate selection, never ownership — the claim race always runs against live tracker
    data, so a stale entry (closed, re-staged, or claimed since the snapshot) just loses the claim;
@@ -109,14 +114,26 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
      done; do not redo. Schedulers fire on a clock, not on need — a re-run must be a safe no-op. The
      same applies to items a human rewound to an earlier stage or reopened after close: investigate
      what already exists before doing any work. Evidence hierarchy: merged code / branch state / PR
-     status › recorded reports for the current HEAD › the issue's comments › markers — cite what you
-     relied on when you no-op. Presume an existing valid artifact good unless the human's rewind
-     comment gives a reason to distrust it or your own check finds something significant; then redo
-     exactly the invalidated part. Keep the check cheap — dig deeper only when evidence conflicts,
-     and PARK if it stays ambiguous rather than burn the pass. For partial work, post a short
-     reconciliation note (what's already done + evidence, what remains) before continuing, then do
-     only the gap. If the item is conclusively shipped already, PARK with the evidence (PR, commit,
-     observed behavior) for a human to close — don't march it through the remaining lanes.
+     status › recorded reports for the current HEAD › the issue's comments › markers.
+
+     **Existing work is evidence, not proof.** If this stage's artifacts already exist, in full or
+     in part — the stage already ran, fully or partly — don't skip the stage and don't start over:
+     try to refute the prior work first, keep what survives, and redo only what fails. A human's
+     rewind comment focuses the check but doesn't bound it. "Checked, no problems" is a valid
+     result, but each confirmation must cite evidence (a test run, a code reference, the current
+     HEAD) — don't manufacture findings to justify the pass. Put a short **Prior-work check** in
+     your emit body: what you checked, what you kept, what you changed. What counts as a check
+     depends on the lane:
+     - **Intake and design:** work out your own answer from the author text, requirements, and
+       code **before** re-reading the existing sections, then compare the two.
+     - **Build:** re-run the targeted tests and read the diff against each acceptance criterion.
+     - **Verify, audit, ship:** the check is the stage itself, so run it again.
+
+     Overwrite amended body sections in place; the body holds only the current version (the
+     tracker keeps its edit history). A defect you find in another lane's section is handled at
+     EMIT (below), not worked around. If the item is conclusively shipped already, PARK with the
+     evidence (PR, commit, observed behavior) for a human to close — don't march it through the
+     remaining lanes.
 
      Prior work need not come from the pipeline: a local or `origin` branch whose name reasonably
      matches the issue or a child of it, work already fully or partially merged to
@@ -133,7 +150,7 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
      fails because the branch is checked out elsewhere, treat it as a lost claim race — release the
      lock (an EMIT is not owed; just drop `sdlc:wip` per the binding) and move on. Do all
      git/build/test work inside the worktree; never stash, discard, or overwrite files in the main
-     tree.
+     tree. Read-only lanes (intake, audit) may skip the worktree.
    - **Shared dependency install — never `npm install` (or the ecosystem equivalent) inside a
      worktree.** The reference CLI's `worktree` command junctions the new tree's root
      `node_modules` to the main checkout's install, so `<TEST_CMD>` and `<LINT_CMD>` work
@@ -143,7 +160,11 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
      `Remove-Item` on the link itself — never recursive-delete *through* it, which empties the
      shared target), install for real in the tree, and say so in your emit body. CLI-less forks:
      create the junction by hand (`mklink /J` / `ln -s`) or install per tree — but the
-     unlink-before-install rule is the same.
+     unlink-before-install rule is the same. The dispatcher keeps that shared install in step with
+     the lockfile each cycle (Step 0a; gh-issue: `=== node-modules ===`), so a version-shaped
+     failure — an installed package older than the manifest declares — is something you
+     **report** (or fix with `sdlc node-modules --apply`, which targets the main checkout by
+     construction), never something you install by hand from inside a worktree.
    - **Refresh from `<DEFAULT_BRANCH>` (staleness rule).** On entering the worktree:
      `git fetch origin`. If `git diff --name-only HEAD...origin/<DEFAULT_BRANCH>` (upstream side)
      intersects the paths this branch touches, `git merge origin/<DEFAULT_BRANCH>` (merge, never
@@ -159,9 +180,18 @@ for *missing inputs* mid-phase: parked items beg for an answer; queued items sit
 3. **EMIT exactly one outcome** — ADVANCE, BOUNCE, or PARK (build also defines CONTINUE, intake
    CLOSE) — never silent. **Every outcome releases the lock** (`sdlc:wip` off) on the way out.
 
+   **Upstream defects bounce, even over a PARK.** If a body section another lane owns is
+   factually wrong — a wrong file:line, an acceptance criterion contradicted by the code, a
+   requirement that misstates the author text — BOUNCE to the owning lane, even if you would
+   otherwise PARK for a human answer. Don't carry it as a note or a workaround. Put the defect
+   (with evidence) and any question you would have parked on in the bounce body, so the owning
+   lane fixes the one and the question isn't lost. The bounce cap below still applies.
+
    **Bounce cap (bounded loops).** Before EMITting a BOUNCE, read the issue's outcome history
    (`history`) for this lane's prior BOUNCEs to the same target lane for the same class of
-   failure. Two already there → PARK instead (`sdlc:needs-human`), summarizing the loop history
+   failure. Where the binding's core offers it, don't tally by hand: `sdlc context <issue>` prints
+   the per-pair counts on its `bounces:` line. The counts are machine-computed; judging the *class*
+   stays yours — the CLI can't. Two already there → PARK instead (`sdlc:needs-human`), summarizing the loop history
    (each bounce's reason and what the fixing lane did) so the human sees why it isn't converging.
    Two full round-trips that didn't converge won't converge on the third automated attempt. A
    bounce for a *different* failure class (e.g. earlier bounces were red tests, this one is a
@@ -248,8 +278,9 @@ body, Feature description, PBI description) is the binding's `read` / `write-sec
 | File | Stage | Notes |
 |---|---|---|
 | [`PROFILE.md`](PROFILE.md) | — | **the one file adoption fills**: binding choice, every `<KEY>`, variation points, deviations |
-| [`bindings/`](bindings/README.md) | — | the operation contract + one directory per substrate (`gh-issue` here; `ado-feature` / `ado-pbi` upstream only) |
+| [`bindings/`](bindings/README.md) | — | the operation contract + one directory per substrate (`gh-issue` here; `ado-feature` / `ado-pbi` in model-repo only) |
 | [`dispatch.md`](dispatch.md) | *(dispatcher — runs every lane)* | scheduled task; git/worktree maintenance + per-lane fan-out |
+| [`focus.md`](focus.md) | *(dispatcher — one cycle filtered to one issue)* | manual, on request; a thin delta over `dispatch.md` |
 | [`lanes/intake.md`](lanes/intake.md) | `stage:intake` → `stage:design` *(or `stage:verify`, already-built floor)* | triage, dedup, dependency edges, requirements + AC authoring, decision debates + close sweep |
 | [`lanes/design.md`](lanes/design.md) | `stage:design` → `stage:queued` | standard phase: implementation plan (spec track) for every item; optional UX track |
 | [`lanes/build.md`](lanes/build.md) | `stage:build` → `stage:verify` | execute the reviewed plan → implement + targeted tests |

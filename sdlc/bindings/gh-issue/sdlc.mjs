@@ -31,10 +31,13 @@
  *   sdlc maint-lock    <run-id>       acquire the per-machine maintenance lock (.git/sdlc-maint.lock);
  *                                     exit 1 = held: skip Step 0a, never abort the cycle
  *   sdlc maint-release <run-id>       release the maintenance lock (idempotent)
- *   sdlc lanes                        per-lane depth + eligibility + the ≠1 stage-label check;
- *                                     an issue with an OPEN native blocker is never eligible
+ *   sdlc lanes [--issue <N>]          per-lane depth + eligibility + the ≠1 stage-label check;
+ *                                     an issue with an OPEN native blocker is never eligible;
+ *                                     --issue filters eligible/blocked to one issue + prints a `focus #N:` verdict
  *   sdlc heal     [<lane>] [<issue>]  post-worker self-heal: did the worker clear its lock? (lane-only = auto-discover)
  *   sdlc git-maint                    fetch, ff default branch, prune ancestry/squash-merged branches, PR state
+ *   sdlc node-modules [--apply]       sync the main checkout's shared node_modules to package-lock.json
+ *                                     (drift-gated by a lockfile hash stamp; never inside a worktree, never npm ci)
  *   sdlc worktree-sweep [--apply]     remove clean issue-scoped worktrees whose branch is gone/merged or issue closed
  *   sdlc conflict-scan [--apply]      comment + bounce-to-build issues whose open PR conflicts with the default branch
  *   sdlc deps     [--apply]           readiness labels (blocked/ready) DERIVED from native dependency edges, + lint;
@@ -42,9 +45,10 @@
  *   sdlc sweep    [--state <file>]    read-only close-sweep work-list for intake step 0:
  *                                     closed issues → open issues they were blocking (native edges); `sweep: clear`
  *                                     if none; writes nothing — `sweep --ack` (run after processing) marks closes swept
- *   sdlc cycle-prep [--apply]         the whole pre-dispatch sequence (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→
- *                                     sweep→git-maint→worktree-sweep→conflict-scan→maint-release) in one
- *                                     delimited, machine-readable report
+ *   sdlc cycle-prep [--apply] [--issue <N>]  the whole pre-dispatch sequence (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→
+ *                                     sweep→git-maint→node-modules→worktree-sweep→conflict-scan→maint-release) in one
+ *                                     delimited, machine-readable report; --issue focuses the cycle: only the
+ *                                     lanes section's eligibility is filtered to <N>, every other section stays global
  *   sdlc digest   [--state <file>]    queue depths, parked/hold lists, arrivals-diff vs last cycle
  *
  * The stage graph (forward pipeline edges + the documented bounces):
@@ -62,7 +66,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -327,6 +331,41 @@ export function planEmit(labelNames, outcome, toStage) {
 }
 
 /**
+ * Count an issue's prior BOUNCE emits per lane pair — the deterministic half of
+ * the core's bounce cap (`sdlc/README.md` EMIT step). The *class* of a failure
+ * is not machine-decidable, so this only supplies the counts; the worker decides
+ * whether two priors were the same class and PARKs instead.
+ *
+ * Input is the shape `fetchLockComments()` returns (`[{body, createdAt}]`).
+ * Only a comment's **first line** is matched: emit bodies quote prior outcomes
+ * in prose, and a loose match would double-count. `from` is the run-id's
+ * trailing `-<lane>` segment (that is how the dispatcher mints them), `'?'`
+ * when it names no stage; `to` is the marker's target stage, `'?'` when absent.
+ * Returns `[{from, to, count}]` sorted count-desc then from/to. Pure.
+ */
+export function summarizeBounces(comments) {
+  const MARKER = /^sdlc:emit\s+(\S+)\s+BOUNCE(?:\s+(?:→|->)\s*stage:(\S+))?/;
+  const pairs = new Map();
+  for (const c of comments ?? []) {
+    const firstLine = String(c?.body ?? '').split('\n')[0];
+    const m = firstLine.match(MARKER);
+    if (!m) continue;
+    const lane = m[1].split('-').pop();
+    const from = STAGES.includes(lane) ? lane : '?';
+    const to = m[2] ?? '?';
+    const key = `${from} -> ${to}`;
+    const seen = pairs.get(key);
+    if (seen) seen.count += 1;
+    else pairs.set(key, { from, to, count: 1 });
+  }
+  return [...pairs.values()].sort((a, b) => (
+    b.count - a.count
+    || (a.from < b.from ? -1 : a.from > b.from ? 1 : 0)
+    || (a.to < b.to ? -1 : a.to > b.to ? 1 : 0)
+  ));
+}
+
+/**
  * The most recent time `label` was added, from GitHub issue timeline events.
  * Returns an ISO string or null. Pure over the parsed `/timeline` payload.
  */
@@ -476,6 +515,92 @@ export function computeLanes(issues) {
   }
 
   return { lanes, integrity };
+}
+
+/**
+ * A focused cycle's lane view: `computeLanes` over the FULL snapshot (depths,
+ * ineligible breakdowns and `integrity` stay global), with each lane's
+ * `eligible` and `blocked` lists filtered to the one focus issue, plus a
+ * `focus` verdict explaining where that issue stands. Pure.
+ *
+ * `focus` is `{ number, verdict, lane?, reasons?, blockers?, stages? }` with
+ * `verdict` one of:
+ *   - `eligible`     — runnable in `lane`;
+ *   - `ineligible`   — in `lane` but `reasons` (every one that applies, in the
+ *                      computeLanes precedence order hold › needs-human › wip ›
+ *                      blocked; `blockers` lists the open native blockers);
+ *   - `queued`       — sole stage is `queued`: a human gate, never runnable;
+ *   - `no-stage`     — open but carries no stage label;
+ *   - `multi-stage`  — `stages` lists the ≥2 stage labels (integrity violation);
+ *   - `unknown-stage`— a single stage label that is not a pipeline stage;
+ *   - `not-open`     — absent from the open-issue snapshot (closed or nonexistent).
+ */
+export function focusLanes(issues, issueNumber) {
+  const number = Number(issueNumber);
+  const { lanes, integrity } = computeLanes(issues);
+  for (const lane of Object.keys(lanes)) {
+    lanes[lane].eligible = lanes[lane].eligible.filter((n) => n === number);
+    lanes[lane].blocked = lanes[lane].blocked.filter((b) => b.number === number);
+  }
+
+  const raw = (issues ?? []).find((i) => Number(i.number) === number);
+  let focus;
+  if (!raw) {
+    focus = { number, verdict: 'not-open' };
+  } else {
+    const labels = (raw.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name));
+    const stages = stagesOf(labels);
+    if (stages.length === 0) {
+      focus = { number, verdict: 'no-stage' };
+    } else if (stages.length > 1) {
+      focus = { number, verdict: 'multi-stage', stages };
+    } else if (stages[0] === 'queued') {
+      focus = { number, verdict: 'queued', lane: 'queued' };
+    } else if (!lanes[stages[0]]) {
+      focus = { number, verdict: 'unknown-stage', stages };
+    } else {
+      const lane = stages[0];
+      const blockers = openBlockers(raw.blockedBy);
+      const reasons = [];
+      if (labels.includes('sdlc:hold')) reasons.push('hold');
+      if (labels.includes('sdlc:needs-human')) reasons.push('needs-human');
+      if (labels.includes(WIP_LABEL)) reasons.push('wip');
+      if (blockers.length) reasons.push('blocked');
+      focus = reasons.length
+        ? { number, verdict: 'ineligible', lane, reasons, blockers }
+        : { number, verdict: 'eligible', lane };
+    }
+  }
+  return { lanes, integrity, focus };
+}
+
+/**
+ * The one stable, grep-able `focus #N: …` line for a `focusLanes` verdict. Pure.
+ * e.g. `focus #12: eligible in build`, `focus #12: ineligible in verify (needs-human)`,
+ * `focus #12: ineligible in build (wip, blocked by #3, #4)`.
+ */
+export function formatFocusLine(focus) {
+  const head = `focus #${focus.number}:`;
+  switch (focus.verdict) {
+    case 'eligible':
+      return `${head} eligible in ${focus.lane}`;
+    case 'ineligible': {
+      const why = focus.reasons.map((r) =>
+        r === 'blocked' ? `blocked by ${focus.blockers.map((n) => `#${n}`).join(', ')}` : r,
+      );
+      return `${head} ineligible in ${focus.lane} (${why.join(', ')})`;
+    }
+    case 'queued':
+      return `${head} queued (human gate)`;
+    case 'no-stage':
+      return `${head} no stage label`;
+    case 'multi-stage':
+      return `${head} multiple stage labels (${focus.stages.join(', ')})`;
+    case 'unknown-stage':
+      return `${head} unknown stage label (${focus.stages.join(', ')})`;
+    default:
+      return `${head} not open (closed or nonexistent)`;
+  }
 }
 
 /**
@@ -1272,6 +1397,26 @@ const defaultGh = (args) => {
   return execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 };
 const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8' });
+/**
+ * npm's own CLI entrypoint next to the running node, when it is there. Running
+ * `node <npm-cli.js>` needs no shell at all — which matters on Windows, where
+ * Node refuses to `execFileSync` a `.cmd` shim without `shell: true`
+ * (EINVAL, the CVE-2024-27980 hardening). Null when npm is installed elsewhere.
+ */
+function npmCliEntry() {
+  const candidate = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+// Prefer the shell-free `node npm-cli.js` form; fall back to the platform shim.
+// The fallback's argv is a fixed literal array with no interpolation, so
+// `shell: true` adds no quoting surface — only a way to run the `.cmd`.
+const defaultNpm = (args, opts = {}) => {
+  const cli = npmCliEntry();
+  if (cli) return execFileSync(process.execPath, [cli, ...args], { encoding: 'utf8', ...opts });
+  const win = process.platform === 'win32';
+  return execFileSync(win ? 'npm.cmd' : 'npm', args, { encoding: 'utf8', shell: win, ...opts });
+};
 
 /** Fetch an issue's label names via gh. */
 function fetchLabelNames(gh, issue) {
@@ -1287,6 +1432,12 @@ function requireIssue(issue) {
     throw new SdlcError(`expected an issue number, got "${issue ?? ''}"`);
   }
   return String(issue).replace(/^#/, '');
+}
+
+/** The validated `--issue <N>` focus filter from args, or null when absent. */
+function parseFocusIssue(args) {
+  const idx = args.indexOf('--issue');
+  return idx >= 0 ? requireIssue(args[idx + 1]) : null;
 }
 
 /** One open-issue snapshot that serves a whole cycle (Step 0). */
@@ -1623,6 +1774,15 @@ function cmdContext(args, { gh, git, log }) {
   } else {
     log(`prs (head ${branch}): none`);
   }
+  // Advisory only (core bounce cap): never fail a worker's context step over it.
+  try {
+    const bounces = summarizeBounces(fetchLockComments(gh, issue));
+    log(bounces.length
+      ? `bounces: ${bounces.map((b) => `${b.from}→${b.to} ×${b.count}`).join(', ')}`
+      : 'bounces: none');
+  } catch {
+    log('bounces: unavailable');
+  }
 }
 
 function cmdWorktree(args, { git, log }, root) {
@@ -1841,8 +2001,11 @@ function cmdMaintRelease(args, { log }, root) {
 }
 
 function cmdLanes(args, { gh, log }) {
+  const focusIssue = parseFocusIssue(args);
   const snapshot = snapshotOpenIssuesWithDeps(gh, log);
-  const { lanes, integrity } = computeLanes(snapshot);
+  const { lanes, integrity, focus } = focusIssue
+    ? focusLanes(snapshot, focusIssue)
+    : computeLanes(snapshot);
   for (const lane of WORKER_LANES.concat('queued')) {
     const l = lanes[lane];
     const elig = l.eligible.length ? l.eligible.map((n) => `#${n}`).join(', ') : '—';
@@ -1857,6 +2020,7 @@ function cmdLanes(args, { gh, log }) {
         .join('; ')}`,
     );
   }
+  if (focus) log(formatFocusLine(focus));
   if (integrity.length) {
     log('integrity (corrupt stage-label state — needs human):');
     for (const v of integrity) {
@@ -1913,6 +2077,188 @@ function cmdHeal(args, { gh, log }) {
   for (const number of stalled) {
     log(`heal: #${number} (${lane}) STALLED — still carries ${WIP_LABEL}; worker did not emit an outcome.`);
   }
+}
+
+/**
+ * Where the last shared-`node_modules` install's lockfile hash is recorded.
+ * Deliberately INSIDE `node_modules`: it reaches every issue worktree through
+ * the same junction as the install it describes, a wipe invalidates it, and it
+ * is never committed.
+ */
+export const INSTALL_STAMP_PATH = ['node_modules', '.sdlc-install-stamp'];
+
+/**
+ * Drift-gated plan for refreshing the main checkout's shared `node_modules`
+ * (dispatch Step 0a). Pure — the caller does the hashing and the `git status`,
+ * this only decides.
+ *
+ * Hosts that share one install across worktrees (the `worktree` command
+ * junctions the main checkout's `node_modules` into every issue worktree)
+ * otherwise keep running the OLD tree after a dependency-changing merge on the
+ * default branch, until some worker triages a version-shaped red test — and a
+ * security bump stays un-installed in the code actually executing.
+ *
+ * The probe is the lockfile's own sha256 against the stamp the last install
+ * wrote — exact, and free next to an `npm ls` walk. Installing unconditionally
+ * would mutate the shared tree every cycle for a file that changes a few times
+ * a month.
+ *
+ *   `lockHash`       sha256 of the MAIN checkout's `package-lock.json` (null = unreadable)
+ *   `stampHash`      the hash recorded by the last install (null = never installed / wiped)
+ *   `dirtyDepFiles`  porcelain-dirty dependency files in the MAIN checkout
+ *   `apply`          false = preview only, like every other mutator here
+ *
+ * Returns `{ action: 'skip' | 'none' | 'install' | 'plan', reason, drift, message }`.
+ */
+export function planNodeModulesRefresh({ lockHash = null, stampHash = null, dirtyDepFiles = [], apply = false } = {}) {
+  const short = (h) => (h ? String(h).slice(0, 8) : 'none');
+  // Human dependency WIP in the main checkout is never installed over: an
+  // uncommitted lockfile is a state a human is mid-edit on, not drift to heal.
+  if (dirtyDepFiles.length) {
+    return {
+      action: 'skip',
+      reason: 'dirty',
+      drift: null,
+      message: `node-modules: skipped (${dirtyDepFiles.join(', ')} dirty in main checkout)`,
+    };
+  }
+  if (!lockHash) {
+    return {
+      action: 'skip',
+      reason: 'no-lockfile',
+      drift: null,
+      message: 'node-modules: skipped (no readable package-lock.json in main checkout)',
+    };
+  }
+  if (lockHash === stampHash) {
+    return { action: 'none', reason: 'current', drift: null, message: `node-modules: current (lock ${short(lockHash)})` };
+  }
+  const drift = `drift ${short(stampHash)} → ${short(lockHash)}`;
+  return {
+    action: apply ? 'install' : 'plan',
+    reason: 'drift',
+    drift,
+    message: apply ? `node-modules: ${drift} — installing` : `node-modules: ${drift} — would install (dry run)`,
+  };
+}
+
+/**
+ * The MAIN checkout's root, even when this runs from an issue worktree (where
+ * `root` is the worktree and its `node_modules` is a junction into the main
+ * tree). Installing through that junction either corrupts the shared install or
+ * replaces it with a real directory, so resolving this ourselves — rather than
+ * trusting `root` — is the guard that makes the command worktree-safe.
+ */
+export function mainCheckoutRoot(git, root) {
+  try {
+    const abs = git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
+    if (abs) return path.dirname(abs);
+  } catch {
+    // git too old for --path-format — fall through to the relative form.
+  }
+  try {
+    const rel = git(['rev-parse', '--git-common-dir']).trim();
+    if (rel) return path.resolve(root, rel, '..');
+  } catch {
+    // not a repo / git unavailable — the caller's root is the best we have.
+  }
+  return root;
+}
+
+/** sha256 of a file's bytes; null when unreadable (missing lockfile, races). */
+function hashFile(p) {
+  try {
+    return createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/** The last install's lockfile hash; null when missing, unreadable or corrupt (never throws). */
+function readInstallStamp(mainRoot) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(mainRoot, ...INSTALL_STAMP_PATH), 'utf8'));
+    return typeof parsed?.lockHash === 'string' ? parsed.lockHash : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record the installed lockfile hash; a failure to stamp is reported, never fatal. */
+function writeInstallStamp(mainRoot, lockHash) {
+  try {
+    fs.writeFileSync(
+      path.join(mainRoot, ...INSTALL_STAMP_PATH),
+      `${JSON.stringify({ lockHash, installedAt: new Date().toISOString() }, null, 2)}\n`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Porcelain status lines to the paths they name (` M package-lock.json` yields `package-lock.json`). */
+function parsePorcelainPaths(out) {
+  return String(out ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => l.replace(/^\S+\s+/, '').replace(/^.*\s->\s/, ''));
+}
+
+/**
+ * Keep the shared `node_modules` in step with `package-lock.json` (dispatch
+ * Step 0a). Always targets the MAIN checkout — safe to run from a worktree,
+ * which is why it resolves the root itself.
+ *
+ * Plain `npm install` only: `npm ci` recursive-deletes `node_modules`, and a
+ * recursive delete next to junctioned worktrees can empty the shared install
+ * (the same damage class `unlinkWorktreeRootLinks` guards the sweep against).
+ */
+function cmdNodeModules(args, { git, npm, log }, root) {
+  const apply = args.includes('--apply');
+  const mainRoot = mainCheckoutRoot(git, root);
+
+  let dirtyDepFiles = [];
+  try {
+    dirtyDepFiles = parsePorcelainPaths(
+      git(['-C', mainRoot, 'status', '--porcelain', '--', 'package.json', 'package-lock.json']),
+    );
+  } catch (err) {
+    log(`node-modules: skipped (status unavailable: ${String(err.message).split('\n')[0]})`);
+    return { action: 'skip', reason: 'status-unavailable' };
+  }
+
+  const lockHash = hashFile(path.join(mainRoot, 'package-lock.json'));
+  const plan = planNodeModulesRefresh({ lockHash, stampHash: readInstallStamp(mainRoot), dirtyDepFiles, apply });
+  if (plan.action !== 'install') {
+    log(plan.message);
+    return plan;
+  }
+
+  const startedAt = Date.now();
+  try {
+    npm(['install', '--no-audit', '--no-fund'], { cwd: mainRoot });
+  } catch (err) {
+    // Never fatal: one line the dispatcher can grep, and the next cycle retries.
+    log(`node-modules: install FAILED (${String(err.message).split('\n')[0]})`);
+    return { ...plan, action: 'failed' };
+  }
+  const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+  log(`node-modules: ${plan.drift} — installed (${seconds}s)`);
+  if (!writeInstallStamp(mainRoot, lockHash)) {
+    log('node-modules: stamp not written — the next cycle will reinstall');
+  }
+  // npm may rewrite the lockfile (a declared range resolving to a newer tree).
+  // Dependency commits are a human's call, so say so and leave it uncommitted.
+  try {
+    if (git(['-C', mainRoot, 'status', '--porcelain', '--', 'package-lock.json']).trim()) {
+      log('node-modules: install rewrote package-lock.json — left uncommitted for a human');
+    }
+  } catch {
+    // status is best-effort here; the install already succeeded.
+  }
+  return plan;
 }
 
 function cmdGitMaint(args, { git, gh, log }) {
@@ -2436,6 +2782,10 @@ function cmdDeps(args, { gh, log }) {
 function cmdCyclePrep(args, deps, root) {
   const { log } = deps;
   const apply = args.includes('--apply');
+  // `--issue <N>` focuses the cycle: it filters ONLY the lanes section's
+  // eligibility to that issue — every other section stays global. Validated
+  // before the run-id is minted so a bad value has no side effects.
+  const focusIssue = parseFocusIssue(args);
   const runId = mintRunId();
   const startedAt = new Date().toISOString();
 
@@ -2444,6 +2794,7 @@ function cmdCyclePrep(args, deps, root) {
   // cycle start so digest can compute wall-clock duration.
   log(`run-id: ${runId}`);
   log(`started: ${startedAt}`);
+  if (focusIssue) log(`focus: #${focusIssue}`);
 
   const section = (name) => log(`\n=== ${name} ===`);
 
@@ -2460,7 +2811,7 @@ function cmdCyclePrep(args, deps, root) {
     // Snapshot + per-issue wip gate + deps + close-sweep peek (dispatch Step 0) — run
     // every cycle whether or not we hold the maintenance lock.
     section('lanes');
-    cmdLanes([], deps, root);
+    cmdLanes(focusIssue ? ['--issue', focusIssue] : [], deps, root);
 
     section('gate');
     cmdGate(['--reap'], deps, root);
@@ -2500,6 +2851,16 @@ function cmdCyclePrep(args, deps, root) {
       section('git-maint');
       cmdGitMaint([], deps, root);
 
+      // Shared-node_modules freshness (dispatch Step 0a) — AFTER git-maint,
+      // which is what brings a merged lockfile into the main tree, and BEFORE
+      // this cycle's workers spawn. Never fails the cycle.
+      section('node-modules');
+      try {
+        cmdNodeModules(apply ? ['--apply'] : [], deps, root);
+      } catch (err) {
+        log(`node-modules: skipped (${String(err.message).split('\n')[0]})`);
+      }
+
       section('worktree-sweep');
       cmdWorktreeSweep(apply ? ['--apply'] : [], deps, root);
 
@@ -2520,7 +2881,8 @@ function cmdCyclePrep(args, deps, root) {
 
   section('summary');
   const maintNote = weHoldLock ? (apply ? 'applied' : 'previewed') : 'skipped';
-  log(`cycle-prep: run-id ${runId}, started ${startedAt}, maintenance ${maintNote}.`);
+  const focusNote = focusIssue ? `, focus #${focusIssue}` : '';
+  log(`cycle-prep: run-id ${runId}, started ${startedAt}, maintenance ${maintNote}${focusNote}.`);
 }
 
 const USAGE = `sdlc — deterministic SDLC pipeline one-shots (reference implementation)
@@ -2541,16 +2903,17 @@ const USAGE = `sdlc — deterministic SDLC pipeline one-shots (reference impleme
   sdlc mint                         coin + print this cycle's run-id
   sdlc maint-lock    <run-id>       acquire the per-machine maintenance lock (exit 1 = held: skip Step 0a, never abort)
   sdlc maint-release <run-id>       release the maintenance lock (idempotent)
-  sdlc lanes                        per-lane depth + eligibility + stage-label integrity
+  sdlc lanes    [--issue <N>]       per-lane depth + eligibility + stage-label integrity; --issue filters eligibility to <N> + prints a focus verdict
   sdlc heal     [<lane>] [<issue>]  post-worker self-heal check (still locked?); lane-only auto-discovers stalled wip issues
   sdlc git-maint                    fetch, ff ${DEFAULT_BRANCH}, prune merged branches, PR state
+  sdlc node-modules [--apply]       sync the main checkout's shared node_modules to package-lock.json (drift-gated)
   sdlc worktree-sweep [--apply]     remove clean issue-scoped worktrees whose branch is gone/merged or issue closed
   sdlc conflict-scan [--apply]      nudge + bounce-to-build issues whose open PR conflicts with ${DEFAULT_BRANCH}
   sdlc deps     [--apply]           readiness labels (blocked/ready) derived from native issue dependencies + lint (label-only blocked, cycles)
   sdlc deps --migrate [--apply]     prose "Depends on #n" lines → native blocked_by edges (dry run unless --apply)
   sdlc sweep    [--state <file>] [--window <hours>]  closed issues → the open issues they were blocking (native edges; read-only)
   sdlc sweep --ack [--state <file>] [--window <hours>]  mark the window's closes swept (run AFTER processing the work-list)
-  sdlc cycle-prep [--apply]         the whole pre-dispatch sequence in one shot (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→sweep→git-maint→worktree-sweep→conflict-scan→maint-release), one delimited report
+  sdlc cycle-prep [--apply] [--issue <N>]  the whole pre-dispatch sequence in one shot (mint→maint-lock→lanes→gate --reap→deps-migrate→deps→sweep→git-maint→node-modules→worktree-sweep→conflict-scan→maint-release), one delimited report; --issue focuses only the lanes section on <N>
   sdlc digest   [--state <file>]    depths, parked/hold, arrivals-diff vs last cycle
 
 Stages: ${STAGES.join(' → ')}`;
@@ -2570,6 +2933,7 @@ const COMMANDS = {
   lanes: cmdLanes,
   heal: cmdHeal,
   'git-maint': cmdGitMaint,
+  'node-modules': cmdNodeModules,
   'worktree-sweep': cmdWorktreeSweep,
   'conflict-scan': cmdConflictScan,
   deps: cmdDeps,
@@ -2587,6 +2951,7 @@ export function runSdlc(argv, deps = {}) {
   const {
     gh = defaultGh,
     git = defaultGit,
+    npm = defaultNpm,
     log = (msg) => console.log(msg),
     root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..'),
     statSize,
@@ -2600,7 +2965,7 @@ export function runSdlc(argv, deps = {}) {
   if (!handler) {
     throw new SdlcError(`unknown command "${command}"\n\n${USAGE}`);
   }
-  handler(rest, { gh, git, log, statSize }, root);
+  handler(rest, { gh, git, npm, log, statSize }, root);
 }
 
 // Only run when invoked directly, so tests can import the pure helpers.

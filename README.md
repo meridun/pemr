@@ -79,15 +79,15 @@ prefix has been renamed from the template default to `pemr-`.
 ## Shared config
 
 Adoption record for [meridun/model-repo](https://github.com/meridun/model-repo) components (see
-`.github/skills/pemr-upstream-sync/SKILL.md`). Last pull: model-repo **72ceda9** (2026-09-05).
+`.github/skills/pemr-upstream-sync/SKILL.md`). Last pull: model-repo **21c127c** (2026-10-10).
 Declined rows are deliberate and revisitable.
 
 | Component | Status | Pin | Notes |
 |---|---|---|---|
-| Doc-tier system (L1/L2/L3) | adopted | 72ceda9 | prefix `pemr-`; L1 local trims: no `## Tone`, no template placeholder prose, graphify section is a two-line pointer, Token wrappers describes the shell-wrapper mode only |
-| Config sync + meta-drift guard | adopted | 72ceda9 | local: `pemr-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
-| Caveman mode hook | adopted | 72ceda9 | L1 canonical; hook drift-checked |
-| graphify nudge hook + vtk notes | adopted | 72ceda9 (vtk fc4b1a5) | vtk in transparent-wrapper mode |
-| Role-based model routing | adopted | pilotfish v1.1.2 via 72ceda9 | pin in `docs/Development_ModelRouting.md` |
-| Agentic SDLC pipeline | partial | 72ceda9 | core + `gh-issue` binding + CLI adopted; `sdlc/tools/` lint ratchet **declined** (ESLint-only, Python repo); ADO bindings declined; deviations in `sdlc/PROFILE.md` |
-| Upstream sync procedure | adopted | 72ceda9 | `pemr-upstream-sync` |
+| Doc-tier system (L1/L2/L3) | adopted | 21c127c | prefix `pemr-`; L1 local trims: no `## Tone`, no template placeholder prose, graphify section is a two-line pointer, Token wrappers describes the shell-wrapper mode only. Doc-issue-refs guard adopted 2026-10-10 (`check:doc-issue-refs` in CI, `superseded` label created) |
+| Config sync + meta-drift guard | adopted | 21c127c | local: `pemr-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
+| Caveman mode hook | adopted | 21c127c | L1 canonical; hook drift-checked |
+| graphify nudge hook + vtk notes | adopted | 21c127c (vtk fc4b1a5) | vtk in transparent-wrapper mode |
+| Role-based model routing | adopted | pilotfish v1.1.2 via 21c127c | pin in `docs/Development_ModelRouting.md` |
+| Agentic SDLC pipeline | partial | 21c127c | core + `gh-issue` binding + CLI adopted, incl. focused dispatch (`focus.md`, `--issue`) and the shared `node_modules` refresh (2026-10-10); `sdlc/tools/` lint ratchet **declined** (ESLint-only; no lint command bound — revisit with a ruff-based `LINT_CMD`); ADO bindings + ADO profile examples **declined** (no Azure DevOps); `DEP_AUDIT_CMD` unbound; deviations in `sdlc/PROFILE.md` |
+| Upstream sync procedure | adopted | 21c127c | `pemr-upstream-sync` |

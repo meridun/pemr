@@ -13,10 +13,12 @@ import fs from 'fs';
 
 import {
   DEFAULT_BRANCH,
+  PROD_BRANCH,
   STAGES,
   STAGE_GRAPH,
   WIP_LABEL,
   WIP_STALE_MS,
+  MAINT_STALE_MS,
   SdlcError,
   isValidStage,
   isValidTransition,
@@ -24,13 +26,24 @@ import {
   planAdvance,
   planEmit,
   EMIT_OUTCOMES,
+  summarizeBounces,
   runSdlc,
+  stagesOf,
+  priorityRank,
+  planGate,
+  planMaintLock,
   planClaimVerify,
+  lastLabeledAt,
   lastUnlabeledAt,
   computeLanes,
+  focusLanes,
+  formatFocusLine,
   laneIneligibilityBreakdown,
+  planHeal,
   planHealLane,
   mintRunId,
+  planBranchPrune,
+  parseGoneBranches,
   parseWorktrees,
   planWorktreeSweep,
   unlinkWorktreeRootLinks,
@@ -53,6 +66,9 @@ import {
   dupTokens,
   dupQueryTerms,
   scoreDupCandidates,
+  planNodeModulesRefresh,
+  mainCheckoutRoot,
+  INSTALL_STAMP_PATH,
 } from '../sdlc/bindings/gh-issue/sdlc.mjs';
 
 /**
@@ -274,6 +290,171 @@ describe('planEmit', () => {
   });
 });
 
+describe('summarizeBounces (bounce cap)', () => {
+  const bounce = (runId, to, createdAt) => ({
+    body: `sdlc:emit ${runId} BOUNCE → stage:${to}`,
+    createdAt,
+  });
+
+  it('returns nothing for empty or missing input', () => {
+    assert.deepEqual(summarizeBounces([]), []);
+    assert.deepEqual(summarizeBounces(null), []);
+  });
+
+  it('counts same-pair bounces, deriving the source lane from the run-id', () => {
+    const comments = [
+      bounce('dispatch-20260823-1707-ce23-verify', 'build', '2026-08-23T10:00:00Z'),
+      bounce('dispatch-20260823-1807-aa11-verify', 'build', '2026-08-23T12:00:00Z'),
+    ];
+    assert.deepEqual(summarizeBounces(comments), [{ from: 'verify', to: 'build', count: 2 }]);
+  });
+
+  it('ignores non-BOUNCE markers and prose that merely mentions a bounce', () => {
+    const comments = [
+      { body: 'sdlc:emit run-a ADVANCE → stage:verify', createdAt: '2026-08-23T10:00:00Z' },
+      { body: 'sdlc:emit run-b PARK', createdAt: '2026-08-23T10:05:00Z' },
+      { body: 'sdlc:emit run-c CONTINUE', createdAt: '2026-08-23T10:10:00Z' },
+      {
+        body: 'sdlc:emit run-d ADVANCE → stage:audit\n\nprior sdlc:emit run-x BOUNCE → stage:build was fixed',
+        createdAt: '2026-08-23T10:15:00Z',
+      },
+      { body: 'sdlc:claim run-e build', createdAt: '2026-08-23T10:20:00Z' },
+    ];
+    assert.deepEqual(summarizeBounces(comments), []);
+  });
+
+  it('marks an unrecognizable lane or a missing target as ?', () => {
+    const comments = [
+      bounce('handrolled', 'design', '2026-08-23T10:00:00Z'),
+      { body: 'sdlc:emit dispatch-20260823-1707-ce23-audit BOUNCE', createdAt: '2026-08-23T11:00:00Z' },
+    ];
+    assert.deepEqual(summarizeBounces(comments), [
+      { from: '?', to: 'design', count: 1 },
+      { from: 'audit', to: '?', count: 1 },
+    ]);
+  });
+
+  it('accepts the ASCII arrow fallback alongside the Unicode arrow cmdEmit writes', () => {
+    const comments = [
+      { body: 'sdlc:emit run-a-verify BOUNCE -> stage:build', createdAt: '2026-08-23T10:00:00Z' },
+      bounce('run-b-verify', 'build', '2026-08-23T11:00:00Z'),
+    ];
+    assert.deepEqual(summarizeBounces(comments), [{ from: 'verify', to: 'build', count: 2 }]);
+  });
+
+  it('orders pairs by count desc, then from, then to', () => {
+    const comments = [
+      bounce('r1-audit', 'build', '2026-08-23T10:00:00Z'),
+      bounce('r2-verify', 'build', '2026-08-23T11:00:00Z'),
+      bounce('r3-verify', 'build', '2026-08-23T12:00:00Z'),
+      bounce('r4-build', 'design', '2026-08-23T13:00:00Z'),
+    ];
+    assert.deepEqual(summarizeBounces(comments), [
+      { from: 'verify', to: 'build', count: 2 },
+      { from: 'audit', to: 'build', count: 1 },
+      { from: 'build', to: 'design', count: 1 },
+    ]);
+  });
+});
+
+describe('runSdlc context (bounce advisory)', () => {
+  const COMMENTS_KEY = 'issue view 7 --json comments --jq [.comments[] | {body: .body, createdAt: .createdAt}]';
+  const contextGh = (comments) => {
+    const responses = {
+      'issue view 7 --json number,title,state,labels':
+        JSON.stringify({ number: 7, title: 'T', state: 'OPEN', labels: [{ name: 'stage:build' }] }),
+      'pr list --head feat/7 --json number,title,state': '[]',
+    };
+    if (comments !== undefined) responses[COMMENTS_KEY] = comments;
+    return fakeExec(responses);
+  };
+  const git = fakeExec({ 'rev-parse --abbrev-ref HEAD': 'feat/7\n', 'status --short': '' });
+
+  it('reports the per-pair bounce counts', () => {
+    const gh = contextGh(JSON.stringify([
+      { body: 'sdlc:emit r1-verify BOUNCE → stage:build', createdAt: '2026-08-23T10:00:00Z' },
+      { body: 'sdlc:emit r2-verify BOUNCE → stage:build', createdAt: '2026-08-23T11:00:00Z' },
+    ]));
+    const logs = [];
+    runSdlc(['context', '7'], { gh, git, log: (m) => logs.push(m) });
+    assert.ok(logs.includes('bounces: verify→build ×2'), logs.join('\n'));
+  });
+
+  it('reports none when the issue never bounced', () => {
+    const logs = [];
+    runSdlc(['context', '7'], { gh: contextGh('[]'), git, log: (m) => logs.push(m) });
+    assert.ok(logs.includes('bounces: none'), logs.join('\n'));
+  });
+
+  it('degrades to "unavailable" instead of throwing when the comment fetch fails', () => {
+    const gh = contextGh();
+    const wrapped = (args) => {
+      if (args.join(' ') === COMMENTS_KEY) throw new Error('gh exploded');
+      return gh(args);
+    };
+    const logs = [];
+    assert.doesNotThrow(() => runSdlc(['context', '7'], { gh: wrapped, git, log: (m) => logs.push(m) }));
+    assert.ok(logs.includes('bounces: unavailable'), logs.join('\n'));
+  });
+});
+
+describe('stagesOf / priorityRank', () => {
+  it('extracts every stage suffix', () => {
+    assert.deepEqual(stagesOf(['bug', 'stage:build', 'stage:verify']), ['build', 'verify']);
+    assert.deepEqual(stagesOf(['bug']), []);
+  });
+
+  // pemr deviation (sdlc/PROFILE.md): priority:medium is retired; unlabeled is the
+  // default tier and sorts between critical and future.
+  it('ranks critical < unlabeled < future (priority:medium is not a tier)', () => {
+    assert.equal(priorityRank(['priority:critical']), 0);
+    assert.equal(priorityRank(['bug']), 1);
+    assert.equal(priorityRank(['priority:medium']), 1);
+    assert.equal(priorityRank(['priority:future']), 2);
+  });
+});
+
+describe('planGate', () => {
+  it('treats a fresh lock as a live worker, never an abort', () => {
+    const plan = planGate([{ number: 1, ageMs: WIP_STALE_MS + 1 }, { number: 2, ageMs: 5 }]);
+    assert.equal(plan.decision, 'reap');
+    assert.deepEqual(plan.live.map((i) => i.number), [2]);
+    assert.deepEqual(plan.reap.map((i) => i.number), [1]);
+  });
+
+  it('reports live when only fresh locks exist', () => {
+    const plan = planGate([{ number: 2, ageMs: 5 }]);
+    assert.equal(plan.decision, 'live');
+    assert.deepEqual(plan.reap, []);
+  });
+
+  it('reaps every lock at/over the threshold', () => {
+    const plan = planGate([{ number: 3, ageMs: WIP_STALE_MS }, { number: 4, ageMs: WIP_STALE_MS * 2 }]);
+    assert.equal(plan.decision, 'reap');
+    assert.deepEqual(plan.reap.map((i) => i.number), [3, 4]);
+  });
+
+  it('is clear with no locks', () => {
+    assert.equal(planGate([]).decision, 'clear');
+  });
+});
+
+describe('planMaintLock', () => {
+  it('acquires when no lock exists', () => {
+    assert.equal(planMaintLock({ exists: false }).action, 'acquire');
+    assert.equal(planMaintLock(null).action, 'acquire');
+  });
+
+  it('skips (never aborts) while a live run holds the lock', () => {
+    assert.equal(planMaintLock({ exists: true, ageMs: MAINT_STALE_MS - 1 }).action, 'skip');
+  });
+
+  it('reaps a stale lock (holder presumed dead at the threshold)', () => {
+    assert.equal(planMaintLock({ exists: true, ageMs: MAINT_STALE_MS }).action, 'reap');
+    assert.equal(planMaintLock({ exists: true, ageMs: MAINT_STALE_MS * 4 }).action, 'reap');
+  });
+});
+
 describe('runSdlc emit', () => {
   const COMMENTS_KEY = 'issue view 609 --json comments --jq [.comments[] | {body: .body, createdAt: .createdAt}]';
   const LABELS_KEY = 'issue view 609 --json labels --jq .labels[].name';
@@ -468,6 +649,21 @@ describe('planClaimVerify', () => {
   });
 });
 
+describe('lastLabeledAt', () => {
+  it('returns the most recent matching labeled event', () => {
+    const events = [
+      { event: 'labeled', label: { name: WIP_LABEL }, created_at: '2026-07-08T01:00:00Z' },
+      { event: 'labeled', label: { name: 'bug' }, created_at: '2026-07-08T05:00:00Z' },
+      { event: 'labeled', label: { name: WIP_LABEL }, created_at: '2026-07-08T03:00:00Z' },
+    ];
+    assert.equal(lastLabeledAt(events, WIP_LABEL), '2026-07-08T03:00:00Z');
+  });
+
+  it('returns null when the label was never added', () => {
+    assert.equal(lastLabeledAt([{ event: 'commented' }], WIP_LABEL), null);
+  });
+});
+
 describe('lastUnlabeledAt', () => {
   it('returns the most recent matching unlabeled event (the claim boundary)', () => {
     const events = [
@@ -641,6 +837,156 @@ describe('laneIneligibilityBreakdown', () => {
   it('returns empty string for a fully-eligible lane (all buckets zero)', () => {
     assert.equal(laneIneligibilityBreakdown({ ineligible: { hold: 0, 'needs-human': 0, wip: 0 } }), '');
     assert.equal(laneIneligibilityBreakdown({}), '');
+  });
+});
+
+describe('focusLanes / formatFocusLine (focused cycle --issue)', () => {
+  const at = (d) => `2026-07-0${d}T00:00:00Z`;
+  const snapshot = [
+    { number: 1, createdAt: at(1), labels: ['stage:build', 'priority:critical'] },
+    { number: 2, createdAt: at(2), labels: ['stage:build'] },
+    { number: 3, createdAt: at(3), labels: ['stage:verify', 'sdlc:needs-human'] },
+    { number: 4, createdAt: at(4), labels: ['stage:build', WIP_LABEL], blockedBy: [{ number: 9, state: 'OPEN' }] },
+    { number: 5, createdAt: at(5), labels: ['stage:audit'], blockedBy: [{ number: 8, state: 'OPEN' }, { number: 7, state: 'OPEN' }] },
+    { number: 6, createdAt: at(6), labels: ['stage:queued'] },
+    { number: 7, createdAt: at(7), labels: ['bug'] },
+    { number: 8, createdAt: at(8), labels: ['stage:build', 'stage:verify'] },
+    { number: 10, createdAt: at(9), labels: ['stage:build', 'sdlc:hold', 'sdlc:needs-human'] },
+    { number: 11, createdAt: at(9), labels: ['stage:shipping'] },
+  ];
+  const line = (n) => formatFocusLine(focusLanes(snapshot, n).focus);
+
+  it('filters eligible/blocked to the focus issue while depths, breakdowns and integrity stay global', () => {
+    const full = computeLanes(snapshot);
+    const { lanes, integrity, focus } = focusLanes(snapshot, 2);
+    assert.deepEqual(full.lanes.build.eligible, [1, 2, 8]);
+    assert.deepEqual(lanes.build.eligible, [2]);
+    assert.deepEqual(lanes.verify.eligible, []);
+    assert.deepEqual(lanes.audit.blocked, []);
+    for (const lane of Object.keys(full.lanes)) {
+      assert.equal(lanes[lane].depth, full.lanes[lane].depth);
+      assert.deepEqual(lanes[lane].ineligible, full.lanes[lane].ineligible);
+    }
+    assert.deepEqual(integrity, full.integrity);
+    assert.deepEqual(focus, { number: 2, verdict: 'eligible', lane: 'build' });
+  });
+
+  it('keeps the focus issue in its lane blocked list', () => {
+    assert.deepEqual(focusLanes(snapshot, 5).lanes.audit.blocked, [{ number: 5, blockers: [7, 8] }]);
+  });
+
+  it('accepts a string issue number (as requireIssue returns)', () => {
+    assert.deepEqual(focusLanes(snapshot, '2').lanes.build.eligible, [2]);
+  });
+
+  it('verdict: eligible', () => {
+    assert.equal(line(1), 'focus #1: eligible in build');
+  });
+
+  it('verdict: ineligible (needs-human)', () => {
+    assert.equal(line(3), 'focus #3: ineligible in verify (needs-human)');
+  });
+
+  it('verdict: ineligible lists every reason in hold › needs-human › wip › blocked order', () => {
+    assert.equal(line(4), 'focus #4: ineligible in build (wip, blocked by #9)');
+    assert.equal(line(10), 'focus #10: ineligible in build (hold, needs-human)');
+    assert.deepEqual(focusLanes(snapshot, 4).focus, {
+      number: 4, verdict: 'ineligible', lane: 'build', reasons: ['wip', 'blocked'], blockers: [9],
+    });
+  });
+
+  it('verdict: ineligible (blocked by several open blockers, ascending)', () => {
+    assert.equal(line(5), 'focus #5: ineligible in audit (blocked by #7, #8)');
+  });
+
+  it('verdict: queued is a human gate even when unflagged', () => {
+    assert.equal(line(6), 'focus #6: queued (human gate)');
+  });
+
+  it('verdict: no stage label', () => {
+    assert.equal(line(7), 'focus #7: no stage label');
+  });
+
+  it('verdict: multiple stage labels', () => {
+    assert.equal(line(8), 'focus #8: multiple stage labels (build, verify)');
+  });
+
+  it('verdict: unknown stage label', () => {
+    assert.equal(line(11), 'focus #11: unknown stage label (shipping)');
+  });
+
+  it('verdict: not open (absent from the open snapshot)', () => {
+    const { lanes, focus } = focusLanes(snapshot, 999);
+    assert.equal(formatFocusLine(focus), 'focus #999: not open (closed or nonexistent)');
+    assert.equal(Object.values(lanes).every((l) => l.eligible.length === 0), true);
+  });
+});
+
+describe('runSdlc lanes --issue (focused cycle)', () => {
+  const snapshotKey = 'issue list --state open --json number,labels,createdAt,title --limit 200';
+  const makeGh = () => fakeExec({
+    [snapshotKey]: JSON.stringify([
+      { number: 1, createdAt: '2026-07-01T00:00:00Z', labels: [{ name: 'stage:build' }] },
+      { number: 2, createdAt: '2026-07-02T00:00:00Z', labels: [{ name: 'stage:build' }] },
+      { number: 3, createdAt: '2026-07-03T00:00:00Z', labels: [{ name: 'bug' }, { name: WIP_LABEL }] },
+    ]),
+    [graphqlKey('OPEN')]: graphqlPage([
+      { number: 1 }, { number: 2, blockedBy: [{ number: 3, state: 'OPEN' }] }, { number: 3 },
+    ]),
+  });
+  const run = (argv) => {
+    const logs = [];
+    runSdlc(argv, { gh: makeGh(), log: (m) => logs.push(m) });
+    return logs;
+  };
+
+  it('without --issue the output is unchanged (no focus line, global eligibility)', () => {
+    assert.deepEqual(run(['lanes']), [
+      'intake: depth 0, eligible —',
+      'design: depth 0, eligible —',
+      'build: depth 2, eligible #1 (blocked 1)',
+      'verify: depth 0, eligible —',
+      'audit: depth 0, eligible —',
+      'ship: depth 0, eligible —',
+      'queued: depth 0, eligible —',
+      'blocked (open native blockers): #2 ← #3',
+      'integrity (corrupt stage-label state — needs human):',
+      '  #3: no stage label (but wip/needs-human)',
+    ]);
+  });
+
+  it('filters eligible/blocked to the focus issue, keeps depth + integrity global, prints the verdict', () => {
+    assert.deepEqual(run(['lanes', '--issue', '2']), [
+      'intake: depth 0, eligible —',
+      'design: depth 0, eligible —',
+      'build: depth 2, eligible — (blocked 1)',
+      'verify: depth 0, eligible —',
+      'audit: depth 0, eligible —',
+      'ship: depth 0, eligible —',
+      'queued: depth 0, eligible —',
+      'blocked (open native blockers): #2 ← #3',
+      'focus #2: ineligible in build (blocked by #3)',
+      'integrity (corrupt stage-label state — needs human):',
+      '  #3: no stage label (but wip/needs-human)',
+    ]);
+    const other = run(['lanes', '--issue', '#1']);
+    assert.ok(other.includes('build: depth 2, eligible #1 (blocked 1)'));
+    assert.equal(other.some((l) => l.startsWith('blocked (open native blockers)')), false);
+    assert.ok(other.includes('focus #1: eligible in build'));
+  });
+
+  it('rejects an invalid or missing --issue value before fetching anything', () => {
+    const gh = makeGh();
+    throwsSdlc(() => runSdlc(['lanes', '--issue', 'abc'], { gh, log: () => {} }), /expected an issue number/);
+    throwsSdlc(() => runSdlc(['lanes', '--issue'], { gh, log: () => {} }), /expected an issue number/);
+    assert.deepEqual(gh.calls, []);
+  });
+});
+
+describe('planHeal', () => {
+  it('reports still-locked when sdlc:wip remains', () => {
+    assert.equal(planHeal(['stage:verify', WIP_LABEL]).stillLocked, true);
+    assert.equal(planHeal(['stage:verify']).stillLocked, false);
   });
 });
 
@@ -827,6 +1173,39 @@ describe('mintRunId', () => {
 
   it('mints a 4-hex-char suffix by default', () => {
     assert.match(mintRunId(new Date(Date.UTC(2026, 6, 10, 1, 22))), /^dispatch-20260710-0122-[0-9a-f]{4}$/);
+  });
+});
+
+describe('branch-prune helpers', () => {
+  it('planBranchPrune excludes the default branch, the prod branch, and current', () => {
+    const merged = [`  ${DEFAULT_BRANCH}`, '* feat/615-x', '  feat/600-done', `  ${PROD_BRANCH}`, '  chore/1'];
+    assert.deepEqual(planBranchPrune(merged, 'feat/615-x'), ['feat/600-done', 'chore/1']);
+  });
+
+  it('planBranchPrune excludes `+ ` worktree-held branches, never captures the marker', () => {
+    // `git branch` prefixes a linked-worktree branch with `+ ` — off-limits to
+    // `git branch -D`, and the marker must not leak into the branch name.
+    const merged = [`  ${DEFAULT_BRANCH}`, '* feat/615-x', '+ docs/held-elsewhere', '  feat/600-done'];
+    assert.deepEqual(planBranchPrune(merged, 'feat/615-x'), ['feat/600-done']);
+  });
+
+  it('parseGoneBranches finds [gone] upstreams, skipping current/default/prod', () => {
+    const out = [
+      '* feat/615-x   abc1234 [origin/feat/615-x] wip',
+      '  feat/600-done def5678 [origin/feat/600-done: gone] done',
+      `  ${DEFAULT_BRANCH}          aaa1111 [origin/${DEFAULT_BRANCH}] base`,
+      `  ${PROD_BRANCH}       bbb2222 [origin/${PROD_BRANCH}: gone] x`,
+    ].join('\n');
+    assert.deepEqual(parseGoneBranches(out, 'feat/615-x'), ['feat/600-done']);
+  });
+
+  it('parseGoneBranches skips `+ ` worktree-held branches even when upstream is gone', () => {
+    const out = [
+      '* feat/615-x            abc1234 [origin/feat/615-x] wip',
+      '+ docs/held-elsewhere   ccc3333 [origin/docs/held-elsewhere: gone] wt',
+      '  feat/600-done         def5678 [origin/feat/600-done: gone] done',
+    ].join('\n');
+    assert.deepEqual(parseGoneBranches(out, 'feat/615-x'), ['feat/600-done']);
   });
 });
 
@@ -1763,6 +2142,81 @@ describe('sdlc dup-check command', () => {
   });
 });
 
+describe('maint-lock / maint-release (filesystem machine lock)', () => {
+  /** A throwaway repo root with a .git dir for the lock to live in. */
+  const makeRoot = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-maint-test-'));
+    fs.mkdirSync(path.join(root, '.git'));
+    return root;
+  };
+  const lockDir = (root) => path.join(root, '.git', 'sdlc-maint.lock');
+
+  it('acquires when free, then a second contender is HELD (exit 1)', () => {
+    const root = makeRoot();
+    try {
+      const logs = [];
+      runSdlc(['maint-lock', 'run-a'], { gh: fakeExec(), log: (m) => logs.push(m), root });
+      assert.ok(logs.join('\n').includes('maint-lock: ACQUIRED run-a'));
+      assert.equal(fs.existsSync(lockDir(root)), true);
+
+      const prevExit = process.exitCode;
+      const logs2 = [];
+      runSdlc(['maint-lock', 'run-b'], { gh: fakeExec(), log: (m) => logs2.push(m), root });
+      assert.ok(logs2.join('\n').includes('HELD by run-a'));
+      assert.equal(process.exitCode, 1);
+      process.exitCode = prevExit; // don't fail the test run itself
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reaps a stale lock (owner stamp past the threshold) and acquires', () => {
+    const root = makeRoot();
+    try {
+      fs.mkdirSync(lockDir(root));
+      const old = new Date(Date.now() - MAINT_STALE_MS - 60_000).toISOString();
+      fs.writeFileSync(path.join(lockDir(root), 'owner.txt'), `run-dead ${old}\n`);
+
+      const logs = [];
+      runSdlc(['maint-lock', 'run-b'], { gh: fakeExec(), log: (m) => logs.push(m), root });
+      const out = logs.join('\n');
+      assert.ok(out.includes('REAPED stale lock from run-dead'), out);
+      assert.ok(out.includes('ACQUIRED run-b'), out);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('release is idempotent and owner-checked', () => {
+    const root = makeRoot();
+    try {
+      // Releasing a never-taken lock is a successful no-op.
+      const logs0 = [];
+      runSdlc(['maint-release', 'run-a'], { gh: fakeExec(), log: (m) => logs0.push(m), root });
+      assert.ok(logs0.join('\n').includes('already clear'));
+
+      runSdlc(['maint-lock', 'run-a'], { gh: fakeExec(), log: () => {}, root });
+
+      // A different run-id must not release it.
+      const prevExit = process.exitCode;
+      const logs1 = [];
+      runSdlc(['maint-release', 'run-b'], { gh: fakeExec(), log: (m) => logs1.push(m), root });
+      assert.ok(logs1.join('\n').includes('NOT OWNER'));
+      assert.equal(fs.existsSync(lockDir(root)), true);
+      assert.equal(process.exitCode, 1);
+      process.exitCode = prevExit;
+
+      // The owner releases cleanly.
+      const logs2 = [];
+      runSdlc(['maint-release', 'run-a'], { gh: fakeExec(), log: (m) => logs2.push(m), root });
+      assert.ok(logs2.join('\n').includes('RELEASED run-a'));
+      assert.equal(fs.existsSync(lockDir(root)), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
   /** A throwaway repo root with a .git dir for the maintenance lock. */
   const makeRoot = () => {
@@ -1804,9 +2258,11 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
       const sections = logs.filter((l) => l.startsWith('\n=== ')).map((l) => l.replace(/[\n= ]/g, ''));
       assert.deepEqual(sections, [
         'maint-lock', 'lanes', 'gate', 'deps-migrate', 'deps', 'sweep',
-        'git-maint', 'worktree-sweep', 'conflict-scan', 'maint-release', 'summary',
+        'git-maint', 'node-modules', 'worktree-sweep', 'conflict-scan', 'maint-release', 'summary',
       ]);
       assert.ok(out.includes('deps --migrate: no prose dependency declarations to migrate.'));
+      // No lockfile in the throwaway root → a skip line, never an install.
+      assert.ok(out.includes('node-modules: skipped (no readable package-lock.json in main checkout)'));
       // Identical semantics to the individual commands.
       assert.ok(out.includes('maint-lock: ACQUIRED'));
       assert.ok(out.includes('intake: depth 0'));
@@ -1869,6 +2325,7 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
       // ...but the maintenance trio does not.
       assert.ok(out.includes('maintenance: skipped (lock held by run-live'));
       assert.ok(!out.includes('=== git-maint ==='));
+      assert.ok(!out.includes('=== node-modules ==='));
       assert.equal(git.calls.some((c) => c[0] === 'fetch'), false);
       // A held lock is a normal outcome, never a cycle-prep failure...
       assert.equal(process.exitCode ?? undefined, prevExit ?? undefined);
@@ -1877,6 +2334,67 @@ describe('cycle-prep (one-shot pre-dispatch sequence)', () => {
       assert.ok(!out.includes('maint-release'));
     } finally {
       process.exitCode = undefined;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('--issue focuses only the lanes section: header + summary name the focus, every global section still runs', () => {
+    const root = makeRoot();
+    try {
+      const gh = idleGh({
+        'issue list --state open --json number,labels,createdAt,title --limit 200': JSON.stringify([
+          { number: 41, createdAt: '2026-07-01T00:00:00Z', labels: [{ name: 'stage:build' }] },
+          { number: 42, createdAt: '2026-07-02T00:00:00Z', labels: [{ name: 'stage:build' }] },
+        ]),
+      });
+      const logs = [];
+      runSdlc(['cycle-prep', '--issue', '42'], { gh, git: idleGit(), log: (m) => logs.push(m), root });
+      const out = logs.join('\n');
+      assert.match(logs[0], /^run-id: dispatch-\d{8}-\d{4}-[0-9a-f]{4}$/);
+      assert.match(logs[1], /^started: \d{4}-\d{2}-\d{2}T/);
+      assert.equal(logs[2], 'focus: #42');
+      const sections = logs.filter((l) => l.startsWith('\n=== ')).map((l) => l.replace(/[\n= ]/g, ''));
+      assert.deepEqual(sections, [
+        'maint-lock', 'lanes', 'gate', 'deps-migrate', 'deps', 'sweep',
+        'git-maint', 'node-modules', 'worktree-sweep', 'conflict-scan', 'maint-release', 'summary',
+      ]);
+      assert.ok(logs.includes('build: depth 2, eligible #42'));
+      assert.ok(out.includes('focus #42: eligible in build'));
+      assert.ok(out.includes('gate: CLEAR'));
+      assert.ok(out.includes('sweep: clear'));
+      assert.ok(out.includes(`conflict-scan: no conflicting PRs into ${DEFAULT_BRANCH}.`));
+      assert.ok(out.includes('maint-release: RELEASED'));
+      assert.match(logs[logs.length - 1], /^cycle-prep: run-id \S+, started \S+, maintenance previewed, focus #42\.$/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('without --issue the header and summary carry no focus', () => {
+    const root = makeRoot();
+    try {
+      const logs = [];
+      runSdlc(['cycle-prep'], { gh: idleGh(), git: idleGit(), log: (m) => logs.push(m), root });
+      assert.equal(logs.some((l) => /focus/.test(l)), false);
+      assert.match(logs[logs.length - 1], /maintenance previewed\.$/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an invalid --issue before minting, locking or fetching', () => {
+    const root = makeRoot();
+    try {
+      const gh = idleGh();
+      const logs = [];
+      throwsSdlc(
+        () => runSdlc(['cycle-prep', '--issue', 'x1'], { gh, git: idleGit(), log: (m) => logs.push(m), root }),
+        /expected an issue number/,
+      );
+      assert.deepEqual(logs, []);
+      assert.deepEqual(gh.calls, []);
+      assert.equal(fs.existsSync(lockDir(root)), false);
+    } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1928,6 +2446,172 @@ describe('runSdlc gate --reap verify-before-write', () => {
     runSdlc(['gate', '--reap'], { gh, log: (m) => logs.push(m) });
     assert.ok(logs.join('\n').includes('reap skipped — fresh claim'));
     assert.equal(gh.calls.some((c) => c[0] === 'issue' && c[1] === 'edit'), false);
+  });
+});
+
+describe('planNodeModulesRefresh / node-modules (shared install drift)', () => {
+  it('no drift: the lockfile hash matches the stamp, so no install churn', () => {
+    const plan = planNodeModulesRefresh({ lockHash: 'a'.repeat(64), stampHash: 'a'.repeat(64), apply: true });
+    assert.equal(plan.action, 'none');
+    assert.equal(plan.reason, 'current');
+    assert.ok(plan.message.includes('node-modules: current (lock aaaaaaaa)'));
+  });
+
+  it('drift with --apply: installs', () => {
+    const plan = planNodeModulesRefresh({ lockHash: 'b'.repeat(64), stampHash: 'a'.repeat(64), apply: true });
+    assert.equal(plan.action, 'install');
+    assert.equal(plan.reason, 'drift');
+    assert.ok(plan.drift.includes('aaaaaaaa'));
+    assert.ok(plan.drift.includes('bbbbbbbb'));
+  });
+
+  it('a missing stamp counts as drift — the one-time self-heal on a fresh or wiped node_modules', () => {
+    const plan = planNodeModulesRefresh({ lockHash: 'b'.repeat(64), stampHash: null, apply: true });
+    assert.equal(plan.action, 'install');
+    assert.ok(plan.drift.includes('none'));
+  });
+
+  it('never installs over human dependency WIP in the main checkout', () => {
+    const plan = planNodeModulesRefresh({
+      lockHash: 'b'.repeat(64),
+      stampHash: 'a'.repeat(64),
+      dirtyDepFiles: ['package-lock.json'],
+      apply: true,
+    });
+    assert.equal(plan.action, 'skip');
+    assert.equal(plan.reason, 'dirty');
+    assert.ok(plan.message.includes('package-lock.json dirty in main checkout'));
+  });
+
+  it('drift without --apply previews, like every other mutator', () => {
+    const plan = planNodeModulesRefresh({ lockHash: 'b'.repeat(64), stampHash: 'a'.repeat(64) });
+    assert.equal(plan.action, 'plan');
+    assert.ok(plan.message.includes('would install'));
+    assert.ok(plan.message.includes('dry run'));
+  });
+
+  it('an unreadable lockfile is a skip, not a guessed install', () => {
+    const plan = planNodeModulesRefresh({ lockHash: null, apply: true });
+    assert.equal(plan.action, 'skip');
+    assert.equal(plan.reason, 'no-lockfile');
+  });
+
+  describe('runSdlc node-modules', () => {
+    /** A throwaway main checkout: .git dir, a lockfile, and an empty node_modules. */
+    const makeMain = (lockBody = '{"lockfileVersion":3}') => {
+      const main = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-node-modules-test-'));
+      fs.mkdirSync(path.join(main, '.git'));
+      fs.mkdirSync(path.join(main, 'node_modules'));
+      fs.writeFileSync(path.join(main, 'package-lock.json'), lockBody);
+      return main;
+    };
+    /** git fake answering the common-dir probe for `main`, from a worktree `root`. */
+    const gitFor = (main, extra = {}) => fakeExec({
+      'rev-parse --path-format=absolute --git-common-dir': `${path.join(main, '.git')}\n`,
+      [`-C ${main} status --porcelain -- package.json package-lock.json`]: '',
+      [`-C ${main} status --porcelain -- package-lock.json`]: '',
+      ...extra,
+    });
+    /** npm fake recording argv AND the cwd it was told to install in. */
+    const fakeNpm = () => {
+      const calls = [];
+      const fn = (args, opts) => {
+        calls.push({ args, opts });
+        return '';
+      };
+      fn.calls = calls;
+      return fn;
+    };
+    const worktreeRoot = path.join(os.tmpdir(), 'acme-wt-12');
+
+    it('installs in the MAIN checkout (not the worktree it was run from), then stamps the lock hash', () => {
+      const main = makeMain();
+      try {
+        const npm = fakeNpm();
+        const logs = [];
+        // `root` is an issue worktree whose node_modules is a junction into `main`.
+        runSdlc(['node-modules', '--apply'], { git: gitFor(main), npm, log: (m) => logs.push(m), root: worktreeRoot });
+
+        assert.equal(npm.calls.length, 1);
+        assert.deepEqual(npm.calls[0].args, ['install', '--no-audit', '--no-fund']);
+        assert.equal(npm.calls[0].opts.cwd, main);
+        assert.ok(logs.join('\n').includes('installed'));
+        // Stamp written next to the install it describes.
+        const stamp = JSON.parse(fs.readFileSync(path.join(main, ...INSTALL_STAMP_PATH), 'utf8'));
+        assert.equal(typeof stamp.lockHash, 'string');
+        assert.equal(stamp.lockHash.length, 64);
+        assert.match(stamp.installedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+        // Second run: the stamp now matches, so npm is not called again.
+        const npm2 = fakeNpm();
+        const logs2 = [];
+        runSdlc(['node-modules', '--apply'], { git: gitFor(main), npm: npm2, log: (m) => logs2.push(m), root: worktreeRoot });
+        assert.equal(npm2.calls.length, 0);
+        assert.ok(logs2.join('\n').includes('node-modules: current'));
+      } finally {
+        fs.rmSync(main, { recursive: true, force: true });
+      }
+    });
+
+    it('a dirty main-checkout lockfile skips the install entirely', () => {
+      const main = makeMain();
+      try {
+        const git = gitFor(main, {
+          [`-C ${main} status --porcelain -- package.json package-lock.json`]: ' M package-lock.json\n',
+        });
+        const npm = fakeNpm();
+        const logs = [];
+        runSdlc(['node-modules', '--apply'], { git, npm, log: (m) => logs.push(m), root: main });
+        assert.equal(npm.calls.length, 0);
+        assert.ok(logs.join('\n').includes('node-modules: skipped (package-lock.json dirty in main checkout)'));
+      } finally {
+        fs.rmSync(main, { recursive: true, force: true });
+      }
+    });
+
+    it('a failed install is one greppable line, never a throw — the next cycle retries', () => {
+      const main = makeMain();
+      try {
+        const npm = () => {
+          throw new Error('npm ERR! code ENOENT\nmore noise');
+        };
+        const logs = [];
+        assert.doesNotThrow(() =>
+          runSdlc(['node-modules', '--apply'], { git: gitFor(main), npm, log: (m) => logs.push(m), root: main }),
+        );
+        assert.ok(logs.join('\n').includes('node-modules: install FAILED (npm ERR! code ENOENT)'));
+        // No stamp: the drift is still live, so the next cycle tries again.
+        assert.equal(fs.existsSync(path.join(main, ...INSTALL_STAMP_PATH)), false);
+      } finally {
+        fs.rmSync(main, { recursive: true, force: true });
+      }
+    });
+
+    it('reports a lockfile the install rewrote instead of committing it', () => {
+      const main = makeMain();
+      try {
+        const git = gitFor(main, {
+          [`-C ${main} status --porcelain -- package-lock.json`]: ' M package-lock.json\n',
+        });
+        const logs = [];
+        runSdlc(['node-modules', '--apply'], { git, npm: fakeNpm(), log: (m) => logs.push(m), root: main });
+        assert.ok(logs.join('\n').includes('install rewrote package-lock.json — left uncommitted for a human'));
+        assert.equal(git.calls.some((c) => c[0] === 'commit' || c.includes('add')), false);
+      } finally {
+        fs.rmSync(main, { recursive: true, force: true });
+      }
+    });
+
+    it('falls back to the relative --git-common-dir on a git that rejects --path-format', () => {
+      const main = makeMain();
+      try {
+        const git = fakeExec({ 'rev-parse --git-common-dir': '.git\n' });
+        // --path-format returns '' here (unanswered key), so the fallback resolves against root.
+        assert.equal(mainCheckoutRoot(git, main), path.resolve(main, '.git', '..'));
+      } finally {
+        fs.rmSync(main, { recursive: true, force: true });
+      }
+    });
   });
 });
 

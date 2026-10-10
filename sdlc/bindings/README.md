@@ -8,8 +8,8 @@ one (`<BINDING>` in `PROFILE.md`) and declares any deviation from it in the prof
 | Binding | Tracker | Unit of work ("issue") | Topology | Lineage |
 |---|---|---|---|---|
 | [`gh-issue`](gh-issue/BINDING.md) | GitHub issues + PRs | the issue | single repo, flat | the template default; three production adoptions; ships the reference CLI |
-| [`ado-feature`](https://github.com/meridun/agentic-sdlc/tree/34b769e/sdlc/bindings/ado-feature/BINDING.md) *(upstream only — not carried here)* | Azure DevOps work items + ADO PRs | the **Feature** (child PBIs per repo, stage Tasks per stage) | multi-repo | one production adoption (read-only consumer) |
-| [`ado-pbi`](https://github.com/meridun/agentic-sdlc/tree/34b769e/sdlc/bindings/ado-pbi/BINDING.md) *(upstream only — not carried here)* | Azure DevOps work items + ADO PRs | the **PBI** (stage Tasks per stage) | single repo / mono-repo | **proposed** — the single-repo degenerate form of `ado-feature`; no production lineage yet |
+| [`ado-feature`](https://github.com/meridun/model-repo/blob/21c127c/sdlc/bindings/ado-feature/BINDING.md) *(model-repo only — not carried here)* | Azure DevOps work items + ADO PRs | the **Feature** (child PBIs per repo, stage Tasks per stage) | multi-repo | one production adoption (read-only consumer) |
+| [`ado-pbi`](https://github.com/meridun/model-repo/blob/21c127c/sdlc/bindings/ado-pbi/BINDING.md) *(model-repo only — not carried here)* | Azure DevOps work items + ADO PRs | the **PBI** (stage Tasks per stage) | single repo / mono-repo | **proposed** — the single-repo degenerate form of `ado-feature`; no production lineage yet |
 
 A new binding is a new directory with a `BINDING.md` that fills every row below. Nothing in the
 core changes.
