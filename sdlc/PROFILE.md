@@ -5,7 +5,7 @@ below. The core (`README.md`, `lanes/`, `dispatch.md`) and the `gh-issue` bindin
 verbatim and are never edited here; every project-specific decision is a row in this file or a
 declared deviation at the bottom.
 
-> **Upstream pin:** `meridun/model-repo` **72ceda9** (2026-09-05; agentic-sdlc `34b769e`). To
+> **Upstream pin:** `meridun/model-repo` **21c127c** (2026-10-10). To
 > re-sync, diff model-repo's `sdlc/`, `test/sdlc.test.mjs`, `.github/agents/sdlc-worker.agent.md`
 > against ours, then bump this pin and the one in `docs/Development_AgenticSDLC.md`. Local
 > adaptations to preserve: listed under **Known deviations from spec** below.
@@ -18,7 +18,7 @@ Required:
 |---|---|---|
 | `BINDING` | `gh-issue` | `bindings/gh-issue/BINDING.md` |
 | `SDLC_CLI` | `node sdlc/bindings/gh-issue/sdlc.mjs` (`npm run sdlc <cmd>`) | the deterministic core (`sdlc …` in any prompt means this) |
-| `SPEC_VERSION` | `34b769e` | agentic-sdlc sha this profile tracks, via model-repo `72ceda9` |
+| `SPEC_VERSION` | `21c127c` | model-repo sha this profile tracks (model-repo is the canonical spec; agentic-sdlc `34b769e` retired) |
 | `PROJECT` | pemr | |
 | `REPO_PATH` | `C:\Claude\pemr` | |
 | `WORKER_AGENT` | `sdlc-worker` | `.github/agents/sdlc-worker.agent.md` (no Agent tool); dispatcher sets `model` explicitly |
@@ -62,7 +62,9 @@ Optional — an unbound key means the lane step it gates is **skipped, not impro
   **disabled**; re-enable after binding `LINT_CMD`/`SMOKE_CMD`). No dispatcher singleton:
   concurrent runs deconflict via per-issue claims, the per-machine maintenance lock
   (`.git/sdlc-maint.lock`), and idempotent GitHub writes. Workers spawn in the background with
-  concrete model tiers; keep Fable-class models off the audit lane.
+  concrete model tiers; keep Fable-class models off the audit lane. Focused dispatch:
+  `focus.md` on request (`sdlc cycle-prep --apply --issue <N>`). Shared dependency install: one
+  `node_modules` junctioned across worktrees, refreshed by Step 0a's `sdlc node-modules --apply`.
 - **VP5 quality bars:** the commands above; lint gate form is `clean` once bound (no ratchet —
   see deviations).
 - **Deterministic core:** `SDLC_CLI` above owns every operation in the binding's table.

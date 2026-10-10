@@ -19,8 +19,9 @@ stop.
 Per the README universal loop — lane `stage:verify`, idle reply `VERIFY: idle`.
 
 ### 2. WORK
-Idempotency first: a green verify report for the **current branch HEAD** (no new commits since it was
-written) → skip to **ADVANCE**. New commits invalidate a prior report — re-verify. Otherwise:
+Prior work first: a verify report that already exists — even a green one for the current HEAD — is
+evidence, not a pass. Run the verification again (README WORK, *Existing work is evidence, not
+proof*) and note in the emit body where the new result agrees or disagrees with it. Then:
 
 Apply the `verifier` role's adversarial stance **inline** (you are fresh context relative to the
 build worker — that's the point; see `.github/agents/verifier.agent.md` for the checklist). Never
@@ -72,7 +73,11 @@ spawn it.
   - **Schema drift:** `<SCHEMA_DUMP>` must be regenerated and committed in the same diff — after
     applying, confirm `git status` shows no uncommitted change to it. A committed dump that
     doesn't match the migration chain is a BOUNCE (the branch must carry the regenerated file,
-    not a hand-edit).
+    not a hand-edit). **Known hazard:** running the migration tool's regeneration against a
+    disposable or differently-seeded DB can *clobber* the committed `<SCHEMA_DUMP>` with an
+    unrelated dump. Back the file up before any `<MIGRATE_DOWN_CMD>`/`<MIGRATE_UP_CMD>` cycle,
+    restore it afterwards, and confirm the resulting diff contains **only** this issue's intended
+    schema change before you judge drift either way.
 - **Check the diff against the issue body's `## Implementation plan`** — the reviewed plan is the
   spec; an unexplained deviation (files touched outside the plan with no ADVANCE-comment
   rationale) is a BOUNCE.
@@ -86,7 +91,8 @@ spawn it.
   Swap `stage:verify` → `stage:build`, remove `sdlc:wip`, comment the **specific** failure (test name
   + output, or the AC with observed-vs-expected). Build fixes on the same branch (idempotent continue).
   Apply the README **bounce cap**: two prior verify→build bounces on this issue for the same failure
-  class → PARK with the loop history instead of a third bounce.
+  class (the `bounces:` line of `sdlc context <issue>` gives the pair counts; the class is your call)
+  → PARK with the loop history instead of a third bounce.
   **Verify validates; it does not fix** — don't patch the code yourself.
 - **PARK** — needs a human call: the environment won't stand up, a nondeterministic/flaky failure
   needs judgment, the AC's expected behavior is genuinely ambiguous, or the change **meets the AC but
@@ -95,7 +101,9 @@ spawn it.
   specifics.
 
 ### 4. STOP
-One-line result: `VERIFY: <#issue> → ADVANCE(audit)|BOUNCE(build)|PARK — <reason>`.
+One-line result (a return value to the dispatcher, **not** a shell command — no redirects,
+no `→` in a shell; EMIT only via `sdlc emit`, per the core loop):
+`VERIFY: <#issue> → ADVANCE(audit)|BOUNCE(build)|PARK — <reason>`.
 
 ---
 
@@ -104,10 +112,10 @@ One-line result: `VERIFY: <#issue> → ADVANCE(audit)|BOUNCE(build)|PARK — <re
   keeps the stage boundary clean and the fix on build's accountable branch.
 - **A real run is mandatory, not optional.** Green tests without walking the ACs in the running
   software is a half-done verify; behavior bugs hide where unit tests don't look.
-- **Idempotent.** A green report for the current branch HEAD = done. Any new commit invalidates it.
-  An item rewound here by a human with a still-valid green report → re-confirm cheaply and ADVANCE,
-  unless their rewind comment names a reason to distrust it — then re-verify that part. Evidence that
-  the work already shipped (merged PR) → PARK with the evidence for a human to close.
+- **Prior work is re-checked, not trusted.** An existing report — green or not, current HEAD or
+  not — is re-run, never skipped on (README WORK); a human's rewind comment says where to look
+  first. Evidence that the work already shipped (merged PR) → PARK with the evidence for a human to
+  close.
 - **Reuse build's `feat/<issue>` branch** for new tests; don't cut a new one. (Exception: the
   no-branch fallback — an item built outside the pipeline is verified on `<DEFAULT_BRANCH>`, and its
   new specs are handed to ship for a home.)

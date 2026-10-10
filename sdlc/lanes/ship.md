@@ -18,7 +18,8 @@ stop.
 Per the README universal loop — lane `stage:ship`, idle reply `SHIP: idle`.
 
 ### 2. WORK
-Idempotency first: a PR for this branch already open with the docs fan-out done → skip to **ADVANCE**.
+Prior work first: a PR for this branch already open with the docs fan-out done is checked, not
+trusted — confirm the fan-out against the diff (README WORK) and fix any gap, then **ADVANCE**.
 A PR for this branch already **merged** with the issue still open → PARK with the merge evidence for a
 human to close (a close cascades to dependents through the dependency edges; intake's close sweep posts the bookkeeping).
 Otherwise, in the issue's worktree (`<WORKTREE_ROOT>/<issue#>`) on build's branch
@@ -67,7 +68,9 @@ Otherwise, in the issue's worktree (`<WORKTREE_ROOT>/<issue#>`) on build's branc
   Lane stays `stage:ship`. (Code merge conflicts BOUNCE to build, not PARK.)
 
 ### 4. STOP
-One-line result: `SHIP: <#issue> → ADVANCE(PR open)|BOUNCE(build)|PARK — <reason>`.
+One-line result (a return value to the dispatcher, **not** a shell command — no redirects,
+no `→` in a shell; EMIT only via `sdlc emit`, per the core loop):
+`SHIP: <#issue> → ADVANCE(PR open)|BOUNCE(build)|PARK — <reason>`.
 
 ---
 

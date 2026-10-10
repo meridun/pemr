@@ -248,8 +248,10 @@ Spec version: <framework tag>
 ```
 
 Worked examples: [Development_SdlcProfileExample.md](Development_SdlcProfileExample.md) (the minimal
-single-repo GitHub case with the reference CLI); the Azure DevOps examples (`ado-feature`,
-`ado-pbi`) live upstream in agentic-sdlc under `docs/profiles/`.
+single-repo GitHub case with the reference CLI);
+[Development_SdlcProfileExample_AdoFeature.md](https://github.com/meridun/model-repo/blob/21c127c/docs/Development_SdlcProfileExample_AdoFeature.md) (multi-repo
+Azure DevOps Features, model-repo only); [Development_SdlcProfileExample_AdoPbi.md](https://github.com/meridun/model-repo/blob/21c127c/docs/Development_SdlcProfileExample_AdoPbi.md)
+(single-repo Azure DevOps PBIs, model-repo only).
 
 The "known deviations" line is load-bearing: fork-per-project means divergence is legitimate, but
 *undeclared* divergence is drift. An audit pass = read profile, read spec, list deltas, file

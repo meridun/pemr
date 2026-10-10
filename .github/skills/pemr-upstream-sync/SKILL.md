@@ -21,7 +21,7 @@ migrate components **out** of it. Both sides run this same skill, so the steps a
 - Editing a component for this repo only, with no intent to share — normal editing rules apply.
 - Syncing `.github/` → `.claude/` inside one repo — that is `npm run sync:claude-config`, covered
   by [pemr-agent-skill](../pemr-agent-skill/SKILL.md).
-- External upstreams (pilotfish, graphify, agentic-sdlc) — same pin format, but the re-sync
+- External upstreams (pilotfish, graphify) — same pin format, but the re-sync
   instructions live in the component's own L3 doc; follow those.
 
 ## Vocabulary

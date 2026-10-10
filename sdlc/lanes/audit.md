@@ -20,8 +20,9 @@ stop.
 Per the README universal loop — lane `stage:audit`, idle reply `AUDIT: idle`.
 
 ### 2. WORK
-Idempotency first: a clean audit report for the **current branch HEAD** (no new commits since) → skip
-to **ADVANCE**. New commits invalidate a prior report — re-audit. Otherwise:
+Prior work first: a clean audit report that already exists — even for the current HEAD — is
+evidence, not a pass. Re-audit (README WORK, *Existing work is evidence, not proof*) and note in the
+emit body where the new result agrees or disagrees with it. Then:
 
 Apply the `security-executor` role's checklist **inline**, adversarially (see
 `.github/agents/security-executor.agent.md`). Never spawn it.
@@ -71,8 +72,9 @@ Apply the `security-executor` role's checklist **inline**, adversarially (see
 - **BOUNCE → `stage:build`** — a blocking, fixable defect: a missing authz check, unvalidated input, an
   injection surface, a single-actor assumption, an invariant violation. Swap `stage:audit` →
   `stage:build`, remove `sdlc:wip`, comment the specific finding (**file:line** + fix direction).
-  Apply the README **bounce cap**: two prior audit→build bounces on this issue for the same failure
-  class → PARK with the loop history instead of a third bounce. The
+  Apply the README **bounce cap**: two prior audit→build bounces on this issue for the same finding
+  class (the `bounces:` line of `sdlc context <issue>` gives the pair counts; the class is your call)
+  → PARK with the loop history instead of a third bounce. The
   fix re-flows build → verify → audit — that re-validation is intended, not waste. **Audit finds; build
   fixes** — don't patch it here (patching would skip re-verification).
 - **PARK** — needs a human **risk** call: a known tradeoff to accept, an ambiguous threat model, or a
@@ -81,7 +83,9 @@ Apply the `security-executor` role's checklist **inline**, adversarially (see
   remove `sdlc:wip`, comment specifics. Lane stays `stage:audit`.
 
 ### 4. STOP
-One-line result: `AUDIT: <#issue> → ADVANCE(ship)|BOUNCE(build)|PARK — <reason>`.
+One-line result (a return value to the dispatcher, **not** a shell command — no redirects,
+no `→` in a shell; EMIT only via `sdlc emit`, per the core loop):
+`AUDIT: <#issue> → ADVANCE(ship)|BOUNCE(build)|PARK — <reason>`.
 
 ---
 
@@ -91,9 +95,8 @@ One-line result: `AUDIT: <#issue> → ADVANCE(ship)|BOUNCE(build)|PARK — <reas
   loop — that's the cost of correctness, not a kink.
 - **Review the diff, not the world.** Scope to what the branch changed vs `<DEFAULT_BRANCH>`; full-repo
   audits are a separate, human-initiated activity.
-- **Idempotent.** A clean report for the current branch HEAD = done; any new commit invalidates it.
-  An item rewound here by a human with a still-valid clean report → re-confirm cheaply and ADVANCE,
-  unless their rewind comment names a reason to distrust it — then re-audit that part. Evidence that
-  the work already shipped (merged PR) → PARK with the evidence for a human to close.
+- **Prior work is re-checked, not trusted.** An existing report is re-audited, never skipped on
+  (README WORK); a human's rewind comment says where to look first. Evidence that the work already
+  shipped (merged PR) → PARK with the evidence for a human to close.
 - Audit **commits nothing and cuts no branch** — it reads build's branch and re-stages.
 - Honors the universal worker loop in [`../README.md`](../README.md).

@@ -7,7 +7,7 @@ picked not edited), **profile** (the one file you fill) — see [`sdlc/README.md
 ## 1. Copy the tree
 
 - `sdlc/` → `sdlc/` in your repo. One directory, copied verbatim: the core (`README.md`,
-  `lanes/`, `dispatch.md`), the bindings (`bindings/*`), the profile template (`PROFILE.md`), and
+  `lanes/`, `dispatch.md`, `focus.md`), the bindings (`bindings/*`), the profile template (`PROFILE.md`), and
   the tracker-neutral tools (`tools/`). Keep the path — the gh-issue CLI resolves your repo root
   as three directories above itself, and every pointer in this guide assumes `sdlc/` at the root.
   You may delete the `bindings/<name>/` directories you don't bind.
@@ -39,7 +39,7 @@ Two Claude Code notes:
 | You have | Bind | Then |
 |---|---|---|
 | GitHub issues, one repo | [`gh-issue`](../sdlc/bindings/gh-issue/BINDING.md) | create the labels: run the `gh` script in [`labels.md`](../sdlc/bindings/gh-issue/labels.md) |
-| Azure DevOps | [`ado-feature`](https://github.com/meridun/agentic-sdlc/tree/34b769e/sdlc/bindings/ado-feature/BINDING.md) (multi-repo) or [`ado-pbi`](https://github.com/meridun/agentic-sdlc/tree/34b769e/sdlc/bindings/ado-pbi/BINDING.md) (single repo, proposed) — **upstream only**, not carried in this repo | copy the binding directory from upstream agentic-sdlc into `sdlc/bindings/` first |
+| Azure DevOps | [`ado-feature`](https://github.com/meridun/model-repo/blob/21c127c/sdlc/bindings/ado-feature/BINDING.md) (multi-repo) or [`ado-pbi`](https://github.com/meridun/model-repo/blob/21c127c/sdlc/bindings/ado-pbi/BINDING.md) (single repo, proposed) — **model-repo only**, not carried in this repo | copy the binding directory from model-repo into `sdlc/bindings/` first; no reference CLI — the fork supplies its own `sdlc.ps1` |
 
 The binding is read at runtime, not edited: every abstract operation the core names (`claim`,
 `emit`, `dep-edge`, …) is a row in its table. If your substrate needs something different, that
@@ -92,8 +92,10 @@ implements to, verify exercises, and audit reviews for. Be specific and concrete
 Then fill the profile's variation-point lines and **known deviations** (skeleton in
 [Development_SdlcComposability.md](Development_SdlcComposability.md#the-conformance-profile)). Worked examples:
 [Development_SdlcProfileExample.md](Development_SdlcProfileExample.md) (the minimal single-repo GitHub case
-with the reference CLI); the Azure DevOps examples (`ado-feature`, `ado-pbi`) live upstream in
-agentic-sdlc under `docs/profiles/`.
+with the reference CLI); the Azure DevOps examples live in model-repo:
+[Development_SdlcProfileExample_AdoFeature.md](https://github.com/meridun/model-repo/blob/21c127c/docs/Development_SdlcProfileExample_AdoFeature.md)
+(multi-repo Features) and [Development_SdlcProfileExample_AdoPbi.md](https://github.com/meridun/model-repo/blob/21c127c/docs/Development_SdlcProfileExample_AdoPbi.md)
+(single-repo PBIs).
 
 ## 4. The gh-issue deterministic core (recommended)
 
@@ -177,6 +179,11 @@ itself has no dependencies) and runs through the ESLint Node API with `cache: fa
 
 Non-ESLint stacks: the pure helpers (`aggregateCounts` / `compareToBaseline` / `reportCheck`)
 are generic — swap `lintRepo` for your linter's JSON output and keep the same baseline shape.
+
+The **shape** generalises past lint: any counter you want to stop getting worse — stray console
+output, TODO markers, bundle size, skipped tests — can ride the same committed-baseline /
+fail-on-growth / new-key-fails contract as a sibling check (e.g. a `check:console-baseline` script
+wired into CI next to the lint ratchet).
 
 ## 6. Choose your concurrency variant
 

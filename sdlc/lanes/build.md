@@ -31,7 +31,7 @@ Decide the sub-case first (idempotency — schedulers fire on a clock, not on ne
   (adopt it as-is; don't recut or rename it to the standard pattern — the issue link lives in the
   body and comments, not the branch name) → continue on it in its worktree (merge
   `origin/<DEFAULT_BRANCH>` first per the README staleness rule; build owns conflict resolution).
-  If the branch isn't the pipeline's, post the README reconciliation note first: diff it against
+  If the branch isn't the pipeline's, run the README Prior-work check first: diff it against
   the plan, state what's done with evidence and what remains, then build only the gap — extending
   its existing tests rather than starting parallel ones.
   The reviewed plan stands — don't re-plan unless the merge invalidated it (spec-rot check below).
@@ -107,7 +107,8 @@ usually sound; most build failures are implementation or readiness, not "the des
   Use this instead of a bounce when the only problem is "ran out of road," not "wrong lane."
 
 ### 4. STOP
-One-line result:
+One-line result (a return value to the dispatcher, **not** a shell command — no redirects,
+no `→` in a shell; EMIT only via `sdlc emit`, per the core loop):
 `BUILD: <#issue> → ADVANCE(verify)|BOUNCE(queued|design|intake)|PARK|CONTINUE — <reason>`.
 
 ---
@@ -123,10 +124,9 @@ One-line result:
 - **Minimal change.** Build only to the acceptance criteria; a good idea spotted mid-build is a new
   issue, not a bigger diff.
 - **Idempotent.** An existing pushed branch with green targeted tests = done → ADVANCE. Re-runs
-  continue an incomplete branch; they never restart it. An item **rewound here by a human** is
-  reconciled per README: read their rewind comment, post a reconciliation note (what's already
-  implemented + evidence, what remains), and build only the gap — existing work is presumed good
-  unless the comment or your own check says otherwise.
+  continue an incomplete branch; they never restart it. An existing branch is checked before it is
+  trusted (README WORK): re-run its targeted tests and read the diff against each acceptance
+  criterion, record the Prior-work check in the emit body, then build only the gap.
 - **Targeted tests only.** Full suite, integration, and a real run belong to verify; build proves the
   unit-level wiring it changed. The PR is ship's job, not build's.
 - Honors the universal worker loop in [`../README.md`](../README.md).

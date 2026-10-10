@@ -90,14 +90,14 @@ Where the binding's deterministic core provides it (gh-issue: `sdlc maint-lock <
 
 **`cycle-prep` — the whole pre-dispatch sequence in one shot.** Where the binding's core provides
 it, the fixed, zero-judgment sequence of Steps -1/0/0a (mint → maint-lock → lanes → gate --reap →
-deps → sweep → git-maint → worktree-sweep → conflict-scan → maint-release) collapses into **one
+deps → sweep → git-maint → node-modules → worktree-sweep → conflict-scan → maint-release) collapses into **one
 command** (gh-issue: `sdlc cycle-prep --apply`). It mints the run-id internally and prints it
 verbatim on a `run-id: <id>` line — capture that line as the cycle's **single source of truth** —
 plus a `started: <iso>` line for the digest's wall-clock duration, and emits one delimited,
 sectioned report (`=== <section> ===` headers). **Read Steps 0/0a's results from that report;
 don't re-run the commands.** Semantics are identical to the manual protocol in this file, which
 remains **normative for CLI-less forks** (and documents what each report section means). A
-maintenance lock held by another live run skips the git/worktree/conflict trio without failing the
+maintenance lock held by another live run skips the git/node-modules/worktree/conflict sections without failing the
 cycle and is released at the end of the maintenance section, not at cycle end; run without
 `--apply` to preview the mutating steps.
 
@@ -193,19 +193,35 @@ that refusal as "in use — leave it", never force.
    Running processes keep their old version; GC old version dirs that aren't the link target
    (a dir that refuses deletion is still executing — leave it, record it). Omit if the project has
    no such artifact.
-4. **Worktree sweep:** `git worktree list`. For each `<WORKTREE_ROOT>/<issue#>` worktree whose branch
-   is merged to `<DEFAULT_BRANCH>` (checks in step 5) or deleted upstream with the issue closed: if
+4. **Shared dependency install refresh** (hosts that share one install across worktrees — the
+   reference CLI's `worktree` command junctions the main checkout's `node_modules` into every
+   issue worktree; gh-issue: `sdlc node-modules --apply`, the `=== node-modules ===` section).
+   One shared install means a dependency-changing merge otherwise leaves every worker on this
+   machine running the OLD tree until one of them triages a version-shaped red test — and a
+   security bump stays un-installed. Probe: sha256 of the **main checkout's** lockfile vs a stamp
+   the last install wrote (`node_modules/.sdlc-install-stamp`); equal → `node-modules: current
+   (lock <sha8>)`, nothing runs. On drift, run a plain install (`npm install`, never `npm ci` —
+   its recursive delete can empty the shared install through a junction) **in the main checkout
+   only** — never inside a worktree (writing through the junction corrupts the shared install);
+   resolve the main checkout from `git rev-parse --git-common-dir` so the step is worktree-safe.
+   Skip while the dependency manifest or lockfile is dirty in the main checkout: human dependency
+   WIP is never installed over. A failed install is one greppable line (`node-modules: install
+   FAILED (…)`) and never fails the cycle. It runs here — after step 2, which is what brings a
+   merged lockfile into the main tree, and before this cycle's workers spawn. Carry the line into
+   the digest. Omit on hosts that install per worktree.
+5. **Worktree sweep:** `git worktree list`. For each `<WORKTREE_ROOT>/<issue#>` worktree whose branch
+   is merged to `<DEFAULT_BRANCH>` (checks in step 6) or deleted upstream with the issue closed: if
    its tree is clean, `git worktree remove` it; dirty → leave it, record it. Finish with
    `git worktree prune`. Touch ONLY worktrees matching the `<WORKTREE_ROOT>/<issue#>` pattern —
    never human worktrees elsewhere.
-5. Prune local branches merged to `<DEFAULT_BRANCH>`: for every branch in
+6. Prune local branches merged to `<DEFAULT_BRANCH>`: for every branch in
    `git branch --merged <DEFAULT_BRANCH>` except `<DEFAULT_BRANCH>`, `<PROD_BRANCH>`, and any branch
    checked out in a worktree — confirm `git merge-base --is-ancestor <branch> <DEFAULT_BRANCH>`, then
    `git branch -D <branch>`. Squash-merged branches (won't appear in `--merged`) may be deleted ONLY
    if all three hold: upstream shows `[gone]` in `git branch -vv`, `pr-state <branch>` reports
    merged, and the local tip SHA equals the PR's head SHA. Any check ambiguous → leave it,
    record it.
-6. PR snapshot: `pr-list`. For each PR that is **conflicting** with `<DEFAULT_BRANCH>` and whose
+7. PR snapshot: `pr-list`. For each PR that is **conflicting** with `<DEFAULT_BRANCH>` and whose
    linked issue is not `sdlc:wip`/`sdlc:needs-human`/`sdlc:hold`: `comment` on the issue
    `sdlc-dispatch: branch <name> conflicts with <DEFAULT_BRANCH> — needs a merge`, and if the
    issue sits in `stage:verify`/`stage:audit`/`stage:ship`, `advance` it back to `stage:build`
@@ -262,7 +278,9 @@ the human throttle):
    | ship | mid (sonnet-class) | docs fan-out + PR ritual; template-shaped work |
 
    Two routing cautions: **set concrete tiers, not provider aliases** — a family alias like `opus`
-   resolves provider/account/settings-dependently, so what it names can shift under you; and
+   resolves provider/account/settings-dependently, so what it names can shift under you, so **re-check
+   this table when a new model family ships** rather than assuming a binding still points at the tier
+   it did when the row was written; and
    **avoid Fable-class models for the audit lane** — their safety classifiers can refuse benign
    defensive-security review work, which is exactly audit's job (same reason session-orchestration
    layers keep security roles off Fable).
@@ -276,11 +294,14 @@ the human throttle):
    every backticked operation). Then execute the lane prompt at sdlc/lanes/<lane>.md. Candidate
    snapshot for your lane (from this cycle's Step 0 snapshot — seeds selection only; claim per
    the README against live data):
-   <for each eligible item: `#<id> markers=[<marker,...>] createdAt=<createdAt>`>. If no
+   <for each eligible item, in the report's CLAIM order: `#<id> markers=[<marker,...>] createdAt=<createdAt>`>. If no
    candidate can be claimed, report idle. Return your one-line result plus any PARK/BOUNCE
    specifics, ending with the fenced JSON result block per the README STOP contract." Build the
-   candidate list from the same Step 0 snapshot as step 1 (the lane's eligible items only, all
-   three fields per item); a fresh per-lane re-query happens only in the step-1 ADVANCE case.
+   candidate list from the same Step 0 snapshot as step 1 (the lane's eligible items only). It is
+   already CLAIM-ordered (priority, then FIFO by creation date), so inline it in order and don't
+   re-sort. `markers=`/`createdAt=` come from the same snapshot; omit either field the report
+   didn't carry (the gh-issue `=== lanes ===` report carries ids only) rather than issuing a fresh
+   query. A fresh per-lane re-query happens only in the step-1 ADVANCE case.
 3. **Concurrency:** lane workers claim per-issue and work in issue-scoped worktrees, so they may run
    concurrently — spawn all non-empty lanes' workers in one batch and wait for all. Spawn each
    worker **in the background** (Claude Code: `run_in_background: true`), then collect results: a
@@ -339,5 +360,6 @@ Finish with:
 - Queue depths after the cycle, parked items and holds by issue id — with the binding's core
   (gh-issue: `sdlc digest`), depths, parked/hold lists, and the **arrivals/departures delta vs
   the last cycle** come from one fresh snapshot.
-- Token cost per lane plus cycle total — the trend line for spotting cost regressions across
-  cycles.
+- Token cost per lane plus cycle total, from each worker's completion notification (its
+  `subagent_tokens` figure, including any resumes) — one line, `tokens: <lane> <n>k / … / total
+  <n>k`. This is the trend line for spotting cost regressions across cycles.
