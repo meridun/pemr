@@ -1501,6 +1501,14 @@ default to the same exclusion unless a human explicitly decides otherwise.
   internal fixation)`, and a pattern written entirely inside parentheses matches nothing.
   Unlike `[synonyms]` the list never reaches a dedup key, so editing it needs no
   `pemr rekey`.
+  Medication names in the summary and brief render in house style (issue #209), a
+  **display-only** transform in `pemr/names.py`: source casing is discarded (ALL-CAPS and
+  tall-man both collapse), each word and hyphenated part is capitalised, and fixed-form
+  tokens keep their conventional form (`HCl`, `ER`, `mg`, `mL`). An optional
+  `[medication_display]` table in `dictionary.toml`, keyed by the `norm()` canonical
+  token, overrides the rule. The stored `name`, dedup keys, verdicts and `query --json`
+  stay source-faithful, and the table never reaches a dedup key, so editing it needs no
+  `pemr rekey`.
 - **appointment brief** — for a given upcoming appointment: relevant history for that
   specialty, recent labs/imaging, current meds, med-interaction flags, suggested
   questions. This is your "walk-in readiness" as a repeatable command. Since issue #180,
