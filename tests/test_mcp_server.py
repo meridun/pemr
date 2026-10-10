@@ -275,6 +275,26 @@ def test_render_summary_narrows_procedures_like_the_cli(seeded):
     assert "Office Visit, Established Patient" in journal
 
 
+def test_render_medication_display_like_the_cli(seeded, tmp_path, monkeypatch):
+    """Issue #209: the MCP front door reads `[medication_display]` from the same resolved
+    dictionary file the CLI does, for both summary and brief. Names are made up."""
+    doc = _doc(seeded, "jane-doe")
+    dedup.commit_extraction(seeded, doc, {"medication": [
+        {"name": "ZORBAPEN", "started_on": "2025-01-01"},
+        {"name": "zorBAFen HCL", "started_on": "2025-01-01"},
+    ]}, {})
+    d = tmp_path / "dict.toml"
+    d.write_text('[medication_display]\n"zorbapen" = "ZorbaPen"\n', encoding="utf-8")
+    monkeypatch.setattr(mcp_server._ARGS, "dictionary", str(d))
+
+    for md in (
+        mcp_server.render_summary(seeded, person="jane-doe")["markdown"],
+        mcp_server.render_brief(seeded, appointment=_appt_id(seeded))["markdown"],
+    ):
+        assert "- ZorbaPen" in md and "- Zorbafen HCl" in md
+        assert "ZORBAPEN" not in md and "zorBAFen" not in md
+
+
 def test_read_tools_leave_db_byte_stable(seeded, db_path):
     seeded.commit()
     before = _sha(db_path)

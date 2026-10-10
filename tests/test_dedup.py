@@ -86,6 +86,28 @@ def test_load_routine_procedures_normalizes_and_dedupes(tmp_path):
     assert dedup.load_routine_procedures(p) == ("office visit", "venipuncture")
 
 
+def test_load_medication_display_missing_or_absent(tmp_path):
+    """Issue #209: no file, no table -- no overrides, the casing rule alone."""
+    assert dedup.load_medication_display(None) == {}
+    assert dedup.load_medication_display(tmp_path / "nope.toml") == {}
+    p = tmp_path / "d.toml"
+    p.write_text('[synonyms]\n"a1c" = "hba1c"\n', encoding="utf-8")
+    assert dedup.load_medication_display(p) == {}
+    # the shipped example documents the table commented out: nothing is seeded
+    assert dedup.load_medication_display(DICT_PATH) == {}
+
+
+def test_load_medication_display_normalizes_keys_and_drops_blanks(tmp_path):
+    p = tmp_path / "d.toml"
+    p.write_text(
+        "[medication_display]\n"
+        '"  ZorbaPen  " = " ZorbaPen "\n'
+        '"quilamol" = "   "\n',
+        encoding="utf-8",
+    )
+    assert dedup.load_medication_display(p) == {"zorbapen": "ZorbaPen"}
+
+
 def test_example_dictionary_keeps_both_tables():
     """The shipped example must yield BOTH overlays. `[synonyms]` runs to EOF, so a
     `[procedures]` header placed above it would silently swallow every following synonym

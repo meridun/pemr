@@ -2545,3 +2545,65 @@ def test_latest_vitals_picks_the_newest_across_mixed_separators(seeded, reverse)
     _seed_symptoms(seeded, list(reversed(rows)) if reverse else rows)
     line = _line(_symptom_summary(seeded), "heart_rate")
     assert "88" in line and "61" not in line
+
+
+# --------------------------------------------------------------------------- #
+# Medication display names (issue #209). Every drug name here is made up.
+# --------------------------------------------------------------------------- #
+
+def _seed_cased_meds(conn):
+    doc = _doc(conn, "jane-doe")
+    dedup.commit_extraction(conn, doc, {
+        "medication": [
+            {"name": "ZORBAFEN HCL ER 10 MG TABLET (Common brand(s): Zorbex)",
+             "started_on": "2025-01-01"},                                       # label
+            {"name": "quiLAMol", "started_on": "2025-02-01"},                  # tall-man
+            {"name": "ZORBAPEN-QUILAMOL", "started_on": "2025-03-01"},         # combination
+        ],
+    }, dedup.load_dictionary(DICT_PATH))
+
+
+def _brief_appt(conn):
+    return conn.execute(
+        "SELECT appointment_id FROM appointment WHERE provider = 'Dr. Smith'"
+    ).fetchone()["appointment_id"]
+
+
+def test_med_lines_render_in_house_style(seeded):
+    _seed_cased_meds(seeded)
+    summary = render.render_summary(seeded, "jane-doe")
+    brief = render.render_brief(seeded, _brief_appt(seeded))
+    for md in (summary, brief):
+        assert "- Zorbafen HCl ER 10 mg Tablet (Common brand(s): Zorbex)" in md
+        assert "- Quilamol" in md
+        assert "- Zorbapen-Quilamol" in md
+        assert "- Metformin 500mg BID" in md           # already proper-cased: unchanged
+        assert "ZORBAFEN" not in md and "quiLAMol" not in md
+
+
+def test_med_display_override_wins_for_its_key_only(seeded):
+    _seed_cased_meds(seeded)
+    overrides = {"zorbapen-quilamol": "ZorbaPen-Quilamol"}
+    summary = render.render_summary(seeded, "jane-doe", medication_display=overrides)
+    brief = render.render_brief(seeded, _brief_appt(seeded), medication_display=overrides)
+    for md in (summary, brief):
+        assert "- ZorbaPen-Quilamol" in md
+        assert "- Quilamol" in md                      # no override: the rule alone
+    # no mapping (None or empty) is the rule alone
+    for mapping in (None, {}):
+        md = render.render_summary(seeded, "jane-doe", medication_display=mapping)
+        assert "- Zorbapen-Quilamol" in md
+
+
+def test_med_display_leaves_stored_rows_and_keys_untouched(seeded):
+    _seed_cased_meds(seeded)
+    sql = "SELECT name, dedup_key FROM medication ORDER BY medication_id"
+    before = [tuple(r) for r in seeded.execute(sql)]
+    render.render_summary(seeded, "jane-doe",
+                          medication_display={"quilamol": "QuilaMol"})
+    render.render_brief(seeded, _brief_appt(seeded))
+    assert [tuple(r) for r in seeded.execute(sql)] == before
+    names = {r[0] for r in before}
+    assert "quiLAMol" in names and "ZORBAPEN-QUILAMOL" in names
+    queried = {m["name"] for m in query.query_meds(seeded, "jane-doe")}
+    assert "quiLAMol" in queried and "ZORBAPEN-QUILAMOL" in queried

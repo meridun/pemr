@@ -3070,6 +3070,7 @@ def _cmd_render_summary(args: argparse.Namespace) -> int:
             args.person,
             dictionary=dedup.load_dictionary(path),
             routine_procedures=dedup.load_routine_procedures(path),
+            medication_display=dedup.load_medication_display(path),
         )
         return _emit_markdown(markdown, args.out)
 
@@ -3078,12 +3079,13 @@ def _cmd_render_summary(args: argparse.Namespace) -> int:
 
 def _cmd_render_brief(args: argparse.Namespace) -> int:
     def work(conn):
-        dictionary = dedup.load_dictionary(_resolve_dictionary_path(args))
+        path = _resolve_dictionary_path(args)
         markdown = render.render_brief(
             conn,
             args.appointment,
-            dictionary=dictionary,
+            dictionary=dedup.load_dictionary(path),
             include_self_reported=args.include_self_reported,
+            medication_display=dedup.load_medication_display(path),
         )
         return _emit_markdown(markdown, args.out)
 

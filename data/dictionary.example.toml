@@ -344,3 +344,22 @@ routine = [
   "cast application",
   "cast removal",
 ]
+
+# --- Medication display overrides (issue #209) -------------------------------------
+# `pemr render summary` and `pemr render brief` show medication names in house style:
+# source capitalisation (ALL-CAPS pharmacy labels, tall-man EHR lettering) is discarded,
+# each word is capitalised, and fixed-form tokens keep their set form (HCl, ER, mg, mL).
+# A name that rule cases wrongly — a brand really written with an inner capital — can
+# be given an exact display form here, one entry at a time as it turns up.
+#
+# Rules:
+#   * The KEY is the medication's canonical token: the stored name lowercased, trimmed,
+#     whitespace-collapsed, parentheticals dropped, then mapped through [synonyms].
+#   * The VALUE is printed verbatim in place of the stored name on those two renders.
+#   * RENDER-ONLY. Nothing here touches dedup identity or stored rows — `query --json`
+#     keeps the source text, and adding or removing an entry does NOT require
+#     `pemr rekey`.
+#   * An absent table means the casing rule alone. The example name below is made up.
+#
+# [medication_display]
+# "zorbapen" = "ZorbaPen"
