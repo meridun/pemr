@@ -1521,7 +1521,9 @@ def test_a_family_verdict_on_the_vacated_base_is_reported_and_re_pointable(
     # And the report *is* a `record reaffirm --map-file` payload, unmodified.
     map_file = tmp_path / "orphans.json"
     map_file.write_text(json.dumps(report.curation_orphaned), encoding="utf-8")
-    plan = cli._plan_reaffirm(conn, live, cli._load_reaffirm_map(str(map_file)), False)
+    orphans, breadcrumbs = cli._load_reaffirm_map(str(map_file))
+    assert breadcrumbs == []
+    plan = cli._plan_reaffirm(conn, live, orphans, False, breadcrumbs)
     assert [action.action for action in plan] == ["reaffirm"]
     assert plan[0].to_base == report.new_dedup_base
 
